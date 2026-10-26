@@ -10,6 +10,8 @@ export interface ActionContext extends DetectorContext {
   policy: Policy;
   notifier: Notifier;
   rotate: RotateExecutor;
+  /** True only when approval uses an interactive executor that can prompt and reveal replacement values. */
+  interactive?: boolean;
   /** Called before irreversible actions and after state changes. A failed save stops execution. */
   saveState?: () => Promise<void>;
 }
@@ -28,6 +30,14 @@ function highConfidence(signal: Signal): boolean {
     && ['canary_triggered','leak_detected','revoked_upstream'].includes(signal.kind);
 }
 
+function approvalRequirements(action: MonitorPendingAction['action'], ids: readonly string[], isHighConfidence: boolean, ctx: ActionContext) {
+  const rotation = action === 'rotate' || action === 'breach-mode';
+  return {
+    requiresInteractive: rotation && ctx.inventory.clusters.some(cluster => ids.includes(cluster.id) && cluster.method === 'atomic-roll'),
+    revokeUnconfirmed: rotation && isHighConfidence && ctx.policy.revokeUnconfirmedOnHighConfidence,
+  };
+}
+
 async function pend(decision: Decision, ctx: ActionContext): Promise<void> {
   const ids = [...new Set(decision.clusterIds)].sort();
   let pending = ctx.state.pendingActions.find(action => action.status === 'pending' && action.action === decision.action
@@ -35,14 +45,23 @@ async function pend(decision: Decision, ctx: ActionContext): Promise<void> {
   if (!pending) {
     pending = {id:`action-${randomUUID()}`,createdAt:now(ctx).toISOString(),signalId:decision.signalId,
       action:decision.action,clusterIds:ids,status:'pending',note:decision.reason ?? 'Approval required.',
-      highConfidence:highConfidence(decision.signal)};
+      highConfidence:highConfidence(decision.signal),
+      ...approvalRequirements(decision.action,ids,highConfidence(decision.signal),ctx)};
     ctx.state.pendingActions.push(pending);
     await save(ctx);
-  } else if(highConfidence(decision.signal) && !pending.highConfidence) {
-    pending.highConfidence=true;
-    await save(ctx);
+  } else {
+    const isHighConfidence=pending.highConfidence === true || highConfidence(decision.signal);
+    const requirements=approvalRequirements(pending.action,ids,isHighConfidence,ctx);
+    requirements.requiresInteractive ||= pending.requiresInteractive === true;
+    if(pending.highConfidence !== isHighConfidence || pending.requiresInteractive !== requirements.requiresInteractive
+      || pending.revokeUnconfirmed !== requirements.revokeUnconfirmed) {
+      Object.assign(pending,{highConfidence:isHighConfidence,...requirements});
+      await save(ctx);
+    }
   }
-  await notify(ctx,'keysentry: action pending',`${pending.action} requested for ${ids.length} secret cluster(s). Approve action ${pending.id}.`);
+  const interactive=pending.requiresInteractive ? ' An atomic roll kills the old key immediately and needs a human present; interactive approval is required.' : '';
+  const revocation=pending.revokeUnconfirmed ? ' Approval will revoke old keys even when consumer activation is unconfirmed.' : '';
+  await notify(ctx,'keysentry: action pending',`${pending.action} requested for ${ids.length} secret cluster(s).${interactive}${revocation} Approve action ${pending.id}.`);
 }
 
 async function rotateClusters(ids: string[], ctx: ActionContext, automatic: boolean, pending: MonitorPendingAction): Promise<RotationReport|undefined> {
@@ -55,6 +74,17 @@ async function rotateClusters(ids: string[], ctx: ActionContext, automatic: bool
     pending.status='failed';pending.note='The monitor cannot generate secrets; human remediation is required.';
     await save(ctx);await notify(ctx,'keysentry: monitor alert',pending.note);return;
   }
+  // Recheck the live plan: historical pending records may predate the interactive requirement.
+  if(plan.steps.some(step=>step.method==='atomic-roll')) pending.requiresInteractive=true;
+  if(pending.requiresInteractive && (automatic || ctx.interactive !== true)) {
+    pending.status='pending';
+    pending.note='An atomic roll kills the old key immediately and needs a human present; approval requires an interactive run.';
+    await save(ctx);await notify(ctx,'keysentry: action pending',pending.note);
+    if(automatic) return;
+    throw new Error(pending.note);
+  }
+  // A later policy can narrow a recorded choice, but must never silently broaden it during approval.
+  pending.revokeUnconfirmed=pending.revokeUnconfirmed === true && ctx.policy.revokeUnconfirmedOnHighConfidence;
   const at = now(ctx).toISOString();
   pending.status='approved';
   const previousVerify = new Map(ids.map(id=>[id,ctx.state.lastVerify[id]]));
@@ -78,7 +108,7 @@ async function rotateClusters(ids: string[], ctx: ActionContext, automatic: bool
   }
   let report: RotationReport;
   try { report=await ctx.rotate(plan, {
-    revokeUnconfirmed:pending.highConfidence === true && ctx.policy.revokeUnconfirmedOnHighConfidence,
+    revokeUnconfirmed:pending.revokeUnconfirmed,
     allowGenerate:false,
   }); }
   catch {
@@ -156,14 +186,16 @@ async function containClusters(ids: string[], ctx: ActionContext, automatic: boo
 async function executeCurrent(decision: Decision, ctx: ActionContext): Promise<void> {
   if (decision.action==='alert') {
     const note=decision.reason==='incomplete-scan' ? ' Automatic action excluded because a consumer host failed to scan.'
-      : decision.reason==='generate-disabled' ? ' The monitor cannot generate secrets; human remediation is required.' : '';
+      : decision.reason==='generate-disabled' ? ' The monitor cannot generate secrets; human remediation is required.'
+      : decision.reason==='atomic-roll-disabled' ? ' Automatic rotation excluded because an atomic roll kills the old key immediately and needs a human present.' : '';
     await notify(ctx,'keysentry: monitor alert',`${decision.signal.kind}: ${decision.clusterIds.length} secret cluster(s) implicated.${note}`);
     return;
   }
   const enabled=decision.action==='cap' ? ctx.policy.autoContain : ctx.policy.autoExecute;
   if (!decision.automatic || !enabled) { await pend(decision,ctx);return; }
   const pending:MonitorPendingAction={id:`action-${randomUUID()}`,createdAt:now(ctx).toISOString(),signalId:decision.signalId,
-    action:decision.action,clusterIds:[...decision.clusterIds],status:'approved',highConfidence:highConfidence(decision.signal)};
+    action:decision.action,clusterIds:[...decision.clusterIds],status:'approved',highConfidence:highConfidence(decision.signal),
+    ...approvalRequirements(decision.action,decision.clusterIds,highConfidence(decision.signal),ctx)};
   ctx.state.pendingActions.push(pending);
   if(decision.action==='cap') { await containClusters(decision.clusterIds,ctx,true,pending,decision.signal);return; }
   await rotateClusters(decision.clusterIds,ctx,true,pending);

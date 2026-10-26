@@ -42,17 +42,19 @@ interface RailwayReference {
 interface InventoryVariable {
   service: ServiceRef;
   variable: RawVariable;
-  reference?: RailwayReference;
+  references?: RailwayReference[];
   clusterId?: string;
 }
 
-function parseRailwayReference(value: string | undefined): RailwayReference | undefined {
-  if (value === undefined) return undefined;
-  // Only a whole-value reference shares its source's value; interpolated strings do not.
-  const match = /^\s*\$\{\{\s*([^{}]+?)\s*\.\s*([^.\s{}]+)\s*\}\}\s*$/.exec(value);
-  const serviceName = match?.[1]?.trim();
-  const varName = match?.[2];
-  return serviceName && varName ? { serviceName, varName } : undefined;
+function parseRailwayReferences(value: string | undefined): RailwayReference[] {
+  const references: RailwayReference[] = [];
+  if (value === undefined) return references;
+  for (const match of value.matchAll(/\$\{\{\s*([^{}]+?)\s*\.\s*([^.\s{}]+)\s*\}\}/g)) {
+    const serviceName = match[1]?.trim();
+    const varName = match[2];
+    if (serviceName && varName) references.push({ serviceName, varName });
+  }
+  return references;
 }
 
 function referenceServiceKey(service: ServiceRef, serviceName: string): string {
@@ -93,9 +95,9 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
         const value = variable.sealed ? undefined : variable.value;
         const entry: InventoryVariable = { service, variable };
         if (service.host === 'railway') {
-          const reference = parseRailwayReference(value);
-          if (reference) {
-            entry.reference = reference;
+          const parsedReferences = parseRailwayReferences(value);
+          if (parsedReferences.length > 0) {
+            entry.references = parsedReferences;
             references.push(entry);
           }
           const entryKey = variableKey(serviceId, variable.name);
@@ -106,7 +108,6 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
             // Conflicting observations of one variable cannot safely identify a reference target.
             railwayVariables.set(entryKey, null);
           }
-          if (reference) continue;
         }
         let classification = classify(variable.name, value);
         if (!classification.isSecret) {
@@ -165,56 +166,49 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
   }
 
   // Resolve after ordinary clusters are complete, including their final safety-selected classification.
-  const resolvedReferences = new Map<InventoryVariable, ClusterEntry | null>();
-  function resolveReference(start: InventoryVariable): ClusterEntry | null {
-    if (railwayVariables.get(variableKey(serviceKey(start.service), start.variable.name)) === null) return null;
-    const path: InventoryVariable[] = [];
+  function resolveReferences(start: InventoryVariable): ClusterEntry[] {
+    if (railwayVariables.get(variableKey(serviceKey(start.service), start.variable.name)) === null) return [];
+    const pending: InventoryVariable[] = [start];
     const visited = new Set<InventoryVariable>();
-    let current = start;
-    let resolved: ClusterEntry | null = null;
+    const resolved = new Map<string, ClusterEntry>();
 
-    while (true) {
-      const cached = resolvedReferences.get(current);
-      if (cached !== undefined) {
-        resolved = cached;
-        break;
-      }
-      if (current.clusterId !== undefined) {
-        resolved = clusters.get(current.clusterId) ?? null;
-        break;
-      }
-      if (!current.reference || visited.has(current)) break;
+    // Traverse independently for each observation: caching a partial cyclic path can hide valid branches.
+    for (let index = 0; index < pending.length; index += 1) {
+      const current = pending[index]!;
+      if (visited.has(current)) continue;
       visited.add(current);
-      path.push(current);
-
-      const matchingServices = railwayServices.get(referenceServiceKey(current.service, current.reference.serviceName));
-      // Service names are only meaningful within one host/project/environment and must be unambiguous.
-      if (matchingServices?.size !== 1) break;
-      const targetServiceId = matchingServices.values().next().value;
-      if (targetServiceId === undefined) break;
-      const target = railwayVariables.get(variableKey(targetServiceId, current.reference.varName));
-      if (!target) break;
-      current = target;
+      // An interpolated value may also contain literal credentials; keep its direct consumer exactly once.
+      if (current.clusterId !== undefined && current.clusterId !== start.clusterId) {
+        const cluster = clusters.get(current.clusterId);
+        if (cluster) resolved.set(current.clusterId, cluster);
+      }
+      for (const reference of current.references ?? []) {
+        const matchingServices = railwayServices.get(referenceServiceKey(current.service, reference.serviceName));
+        // Service names are only meaningful within one host/project/environment and must be unambiguous.
+        if (matchingServices?.size !== 1) continue;
+        const targetServiceId = matchingServices.values().next().value;
+        if (targetServiceId === undefined) continue;
+        const target = railwayVariables.get(variableKey(targetServiceId, reference.varName));
+        if (target) pending.push(target);
+      }
     }
 
-    for (const entry of path) resolvedReferences.set(entry, resolved);
-    return resolved;
+    return [...resolved.values()];
   }
 
   for (const entry of references) {
-    const resolved = resolveReference(entry);
-    if (!resolved) continue;
-    const { cluster, confidence } = resolved;
-    const consumer: Consumer = {
-      service: entry.service,
-      varName: entry.variable.name,
-      fingerprint: cluster.fingerprint,
-      hint: cluster.hint,
-      sealed: cluster.fingerprint === null,
-      reference: true,
-    };
-    cluster.consumers.push(consumer);
-    findings.push({ ...consumer, provider: cluster.provider, tier: cluster.tier, isSecret: true, confidence });
+    for (const { cluster, confidence } of resolveReferences(entry)) {
+      const consumer: Consumer = {
+        service: entry.service,
+        varName: entry.variable.name,
+        fingerprint: cluster.fingerprint,
+        hint: cluster.hint,
+        sealed: cluster.fingerprint === null,
+        reference: true,
+      };
+      cluster.consumers.push(consumer);
+      findings.push({ ...consumer, provider: cluster.provider, tier: cluster.tier, isSecret: true, confidence });
+    }
   }
 
   return {

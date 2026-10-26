@@ -101,8 +101,10 @@ const cases: Case[] = [
   ['Better Auth secret', 'BETTER_AUTH_SECRET', random, 'app-secret', true],
   ['Rails secret key base', 'SECRET_KEY_BASE', random, 'app-secret', true],
   ['CSRF secret', 'CSRF_SECRET', random, 'app-secret', true],
-  ['Namespaced session secret', 'ADMIN_SESSION_SECRET', random, 'app-secret', true],
-  ['Namespaced JWT secret', 'ADMIN_JWT_SECRET', random, 'app-secret', true],
+  ['Namespaced session secret', 'ADMIN_SESSION_SECRET', random, 'unknown', true],
+  ['Namespaced JWT secret', 'ADMIN_JWT_SECRET', random, 'unknown', true],
+  ['Sealed namespaced session secret', 'ADMIN_SESSION_SECRET', undefined, 'unknown', true],
+  ['Sealed namespaced JWT secret', 'ADMIN_JWT_SECRET', undefined, 'unknown', true],
   ['Encryption key', 'ENCRYPTION_KEY', hex, 'encryption-key', true],
   ['Namespaced encryption key', 'APP_ENCRYPTION_KEY', hex, 'encryption-key', true],
   ['Provider-named encryption key', 'OPENAI_ENCRYPTION_KEY', hex, 'encryption-key', true],
@@ -161,6 +163,48 @@ describe('classify', () => {
   it.each(cases)('%s', (_label, name, value, provider, isSecret) => {
     expect(classify(name, value)).toMatchObject({ provider, isSecret });
     if (value && value.length >= 16) expect(JSON.stringify(classify(name, value))).not.toContain(value);
+  });
+
+  const appSecretNames = [
+    'JWT_SECRET', 'JWT_SIGNING_SECRET', 'SESSION_SECRET', 'COOKIE_SECRET', 'NEXTAUTH_SECRET',
+    'AUTH_SECRET', 'BETTER_AUTH_SECRET', 'SECRET_KEY_BASE', 'CSRF_SECRET',
+  ];
+
+  it.each(appSecretNames)('permits local generation only for the exact app name %s', name => {
+    for (const value of [random, undefined]) {
+      const classified = classify(name, value);
+      expect(classified).toMatchObject({ provider: 'app-secret', isSecret: true });
+      expect(methodFor(classified.provider)).toBe('generate');
+    }
+  });
+
+  it.each([
+    ['SUPABASE_JWT_SECRET', random],
+    ['HASURA_GRAPHQL_JWT_SECRET', JSON.stringify({ type: 'HS256', key: random })],
+    ['HASURA_GRAPHQL_JWT_SECRET', JSON.stringify({ type: 'HS256', key: random }, null, 2)],
+    ['AUTH0_JWT_SECRET', random],
+    ['CLERK_JWT_SECRET', random],
+    ['KEYCLOAK_JWT_SECRET', random],
+    ['FIREBASE_JWT_SECRET', random],
+  ])('requires guided rotation for the third-party JWT secret %s', (name, value) => {
+    const classified = classify(name!, value);
+    expect(classified).toMatchObject({ provider: 'unknown', isSecret: true });
+    expect(methodFor(classified.provider)).toBe('guided');
+  });
+
+  it.each(appSecretNames)('keeps JSON-looking values under %s on the guided path', name => {
+    for (const value of [
+      JSON.stringify({ key: random }),
+      JSON.stringify([random]),
+      `  { "key": "${random}" }`,
+      `\n [ "${random}" ]`,
+      `{${random}`,
+      `[${random}`,
+    ]) {
+      const classified = classify(name, value);
+      expect(classified).toMatchObject({ provider: 'unknown', isSecret: true });
+      expect(methodFor(classified.provider)).toBe('guided');
+    }
   });
 
   it('uses confidence to distinguish shapes, provider names, and generic names', () => {

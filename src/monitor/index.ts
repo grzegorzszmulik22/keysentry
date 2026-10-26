@@ -1,5 +1,5 @@
 export { createMonitorState, createFileMonitorStateStore, createMemoryMonitorStateStore, usageKey, pruneUsageHistory } from './state.js';
-export type { MonitorState, MonitorStateStore, UsageBucket, CumulativeTotal, Canary, LastVerify } from './state.js';
+export type { MonitorState, MonitorStateStore, MonitorPendingAction, UsageBucket, CumulativeTotal, Canary, LastVerify } from './state.js';
 export type { DetectorContext, AdapterCollection } from './context.js';
 export { detectUsage } from './detectors/usage.js';
 export type { UsageOptions } from './detectors/usage.js';

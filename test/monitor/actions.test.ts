@@ -240,4 +240,103 @@ describe('monitor actions',()=>{
     expect(ctx.plans[0]!.steps.map(step=>step.clusterId)).toEqual([ctx.inventory.clusters[1]!.id]);
     expect(ctx.notifications.join('')).toContain('generat');
   });
+
+  it('alerts about immediate key revocation and human presence instead of automatically rolling a key',async()=>{
+    const ctx=await setup(2);ctx.policy.autoExecute=true;
+    ctx.inventory.clusters[0]!.method='atomic-roll';
+    const s=signal([ctx.inventory.clusters[0]!.id],'canary_triggered');
+    await executeDecisions(decide(s,ctx.inventory,ctx.policy,ctx.state),ctx);
+    expect(ctx.plans).toHaveLength(1);
+    expect(ctx.plans[0]!.steps.map(step=>step.clusterId)).toEqual([ctx.inventory.clusters[1]!.id]);
+    expect(ctx.state.autoRotations['2026-01-01']).toBe(1);
+    expect(ctx.notifications.join('')).toMatch(/atomic roll[\s\S]*old key immediately[\s\S]*human present/i);
+  });
+
+  it('rechecks atomic-roll exclusions before executing a stale automatic decision',async()=>{
+    const ctx=await setup();ctx.policy.autoExecute=true;
+    const s=signal([ctx.inventory.clusters[0]!.id]);
+    const decisions=decide(s,ctx.inventory,ctx.policy,ctx.state);
+    ctx.inventory.clusters[0]!.method='atomic-roll';
+    await executeDecisions(decisions,ctx);
+    expect(ctx.plans).toEqual([]);expect(ctx.state.autoRotations).toEqual({});
+    expect(ctx.notifications.join('')).toContain('human present');
+  });
+
+  it('persists interactive approval requirements when pending targets become atomic-roll',async()=>{
+    const ctx=await setup();const s=signal([ctx.inventory.clusters[0]!.id]);
+    const decisions=decide(s,ctx.inventory,ctx.policy,ctx.state);
+    ctx.inventory.clusters[0]!.method='atomic-roll';
+    await executeDecisions(decisions,ctx);
+    ctx.state=await createMemoryMonitorStateStore(ctx.state).load();
+    expect(ctx.state.pendingActions[0]).toMatchObject({requiresInteractive:true,revokeUnconfirmed:true,status:'pending'});
+    const id=ctx.state.pendingActions[0]!.id;
+    await expect(approve(id,ctx)).rejects.toThrow(/interactive/i);
+    await expect(approve(id,{...ctx,interactive:false})).rejects.toThrow(/interactive/i);
+    expect(ctx.plans).toEqual([]);expect(ctx.state.cooldowns).toEqual({});
+    expect(ctx.state.pendingActions[0]!.status).toBe('pending');
+    await approve(id,{...ctx,interactive:true});
+    expect(ctx.plans).toHaveLength(1);expect(ctx.state.pendingActions[0]!.status).toBe('executed');
+  });
+
+  it('refuses unattended approval of legacy atomic-roll actions without metadata',async()=>{
+    const ctx=await setup();const cluster=ctx.inventory.clusters[0]!;cluster.method='atomic-roll';
+    ctx.state.pendingActions.push({id:'legacy-atomic',createdAt:clock().toISOString(),signalId:'legacy',
+      action:'rotate',clusterIds:[cluster.id],status:'pending',highConfidence:true});
+    await expect(approve('legacy-atomic',ctx)).rejects.toThrow(/interactive/i);
+    expect(ctx.plans).toEqual([]);expect(ctx.state.cooldowns).toEqual({});
+    expect(ctx.state.pendingActions[0]).toMatchObject({status:'pending',requiresInteractive:true});
+    await approve('legacy-atomic',{...ctx,interactive:true});
+    expect(ctx.options).toEqual([{revokeUnconfirmed:false,allowGenerate:false}]);
+  });
+
+  it.each([
+    ['leak_detected','high',true,true], ['revoked_upstream','high',true,true], ['canary_triggered','high',true,true],
+    ['leak_detected','high',false,false], ['canary_triggered','medium',true,false],
+    ['host_breach_advisory','high',true,false], ['usage_anomaly','high',true,false],
+  ] as const)('records revocation consent for pending %s/%s under policy %s',async(kind,confidence,enabled,expected)=>{
+    const ctx=await setup();ctx.policy.revokeUnconfirmedOnHighConfidence=enabled;
+    ctx.policy.rules[kind].action='rotate';ctx.policy.rules[kind].scope='cluster';
+    const s={...signal([ctx.inventory.clusters[0]!.id],kind),confidence};
+    await executeDecisions(decide(s,ctx.inventory,ctx.policy,ctx.state),ctx);
+    ctx.state=await createMemoryMonitorStateStore(ctx.state).load();
+    expect(ctx.state.pendingActions[0]).toMatchObject({revokeUnconfirmed:expected,requiresInteractive:false});
+    await approve(ctx.state.pendingActions[0]!.id,ctx);
+    expect(ctx.options).toEqual([{revokeUnconfirmed:expected,allowGenerate:false}]);
+  });
+
+  it.each([[false,true,false],[true,false,false]] as const)('does not broaden pending revocation consent after policy changes %s to %s',async(before,after,expected)=>{
+    const ctx=await setup();ctx.policy.revokeUnconfirmedOnHighConfidence=before;
+    const s=signal([ctx.inventory.clusters[0]!.id]);
+    await executeDecisions(decide(s,ctx.inventory,ctx.policy,ctx.state),ctx);
+    expect(ctx.state.pendingActions[0]).toMatchObject({revokeUnconfirmed:before});
+    ctx.policy.revokeUnconfirmedOnHighConfidence=after;
+    await approve(ctx.state.pendingActions[0]!.id,ctx);
+    expect(ctx.options).toEqual([{revokeUnconfirmed:expected,allowGenerate:false}]);
+  });
+
+  it('keeps legacy high-confidence approvals conservative without a recorded revocation choice',async()=>{
+    const ctx=await setup();
+    ctx.state.pendingActions.push({id:'legacy',createdAt:clock().toISOString(),signalId:'legacy',action:'rotate',
+      clusterIds:[ctx.inventory.clusters[0]!.id],status:'pending',highConfidence:true});
+    await approve('legacy',ctx);
+    expect(ctx.options).toEqual([{revokeUnconfirmed:false,allowGenerate:false}]);
+  });
+
+  it('updates and persists deduplicated pending revocation metadata when stronger evidence arrives',async()=>{
+    const ctx=await setup();ctx.policy.rules.usage_anomaly.action='rotate';
+    const ids=[ctx.inventory.clusters[0]!.id];
+    await executeDecisions(decide(signal(ids,'usage_anomaly'),ctx.inventory,ctx.policy,ctx.state),ctx);
+    expect(ctx.state.pendingActions[0]).toMatchObject({revokeUnconfirmed:false});
+    await executeDecisions(decide(signal(ids),ctx.inventory,ctx.policy,ctx.state),ctx);
+    ctx.state=await createMemoryMonitorStateStore(ctx.state).load();
+    expect(ctx.state.pendingActions).toHaveLength(1);
+    expect(ctx.state.pendingActions[0]).toMatchObject({highConfidence:true,revokeUnconfirmed:true});
+    expect(ctx.notifications.at(-1)).toMatch(/revok[\s\S]*unconfirmed/i);
+  });
+
+  it('records no rotation revocation override for a pending containment action',async()=>{
+    const ctx=await setup();ctx.policy.rules.leak_detected.action='cap';
+    await executeDecisions(decide(signal([ctx.inventory.clusters[0]!.id]),ctx.inventory,ctx.policy,ctx.state),ctx);
+    expect(ctx.state.pendingActions[0]).toMatchObject({action:'cap',revokeUnconfirmed:false,requiresInteractive:false});
+  });
 });

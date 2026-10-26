@@ -1,6 +1,7 @@
 import { classify, fingerprint, serviceKey } from '../core/index.js';
+import { RotationAbortedError } from '../types.js';
 import type {
-  GuidedPrompt, HostAdapter, HostId, Inventory, Journal, JournalEntry, Logger, PlanStep,
+  Consumer, GuidedPrompt, HostAdapter, HostId, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
   RotationReport, RotationResult, ServiceRef, StepReport, StepStatus,
 } from '../types.js';
@@ -16,7 +17,8 @@ export interface EngineDeps {
   log: Logger;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
-  reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<void>;
+  /** True only when the replacement was actually presented to a human. */
+  reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<boolean>;
 }
 
 export interface RotateOptions {
@@ -59,6 +61,7 @@ interface StepWork {
   unwritten?: Set<string>;
   delivered?: Set<string>;
   revealed?: boolean;
+  referenceTargets?: Map<string, Consumer>;
 }
 
 class JournalFailure extends Error {
@@ -131,6 +134,7 @@ export async function executePlan(
     return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
   });
   const services = new Map<string, ServiceWork>();
+  let railwayNamespace: Promise<ServiceRef[]> | undefined;
   const plannedLocations = new Set(plan.steps.flatMap(step => step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`)));
   const referenceLocations = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
     .filter(c => c.reference).map(c => `${serviceKey(c.service)}\0${c.varName}`));
@@ -221,6 +225,93 @@ export async function executePlan(
     } catch { service.readFailed = true; }
     return service;
   }
+  function isRailwayShared(service: ServiceRef): boolean {
+    return service.host === 'railway' && service.serviceId === '';
+  }
+  function referenceServiceKeys(work: StepWork, sourceKey: string): string[] {
+    const references = work.step.consumers.filter(consumer => {
+      if (!consumer.reference || isRailwayShared(consumer.service)) return false;
+      let current: Consumer | undefined = consumer;
+      const visited = new Set<string>();
+      while (current?.reference) {
+        const location: string = `${serviceKey(current.service)}\0${current.varName}`;
+        if (visited.has(location)) return false;
+        visited.add(location);
+        current = work.referenceTargets?.get(location);
+        if (current && serviceKey(current.service) === sourceKey) return true;
+      }
+      return false;
+    });
+    return [...new Set(references.map(consumer => serviceKey(consumer.service)))];
+  }
+  function cannotConfirmActivation(work: StepWork, key: string): boolean {
+    const service = services.get(key)!;
+    if (isRailwayShared(service.service)) {
+      const references = referenceServiceKeys(work, key);
+      return references.length === 0 || references.some(ref => cannotConfirmActivation(work, ref));
+    }
+    return !redeploy || !service.host?.capabilities.redeploy
+      || ['dotenv', 'github-actions', 'fly'].includes(service.service.host)
+      || (service.service.host === 'vercel' && service.service.environmentId !== 'production');
+  }
+  async function referenceIsCurrent(work: StepWork, consumer: Consumer, visited = new Set<string>()): Promise<boolean> {
+    const key = serviceKey(consumer.service);
+    const location = `${key}\0${consumer.varName}`;
+    if (consumer.service.host !== 'railway' || visited.has(location)) return false;
+    visited.add(location);
+    const service = await readService(consumer.service);
+    const variables = service.variables.filter(variable => variable.name === consumer.varName);
+    const variable = variables[0];
+    if (variables.length !== 1 || !variable || variable.sealed || variable.value === undefined) return false;
+    // Inventory stores the resolved secret fingerprint, not the template. Check
+    // that the current whole-value reference still resolves inside this cluster.
+    const match = /^\s*\$\{\{\s*([^{}]+?)\s*\.\s*([^.\s{}]+)\s*\}\}\s*$/.exec(variable.value);
+    if (!match) return false;
+    // Railway resolves names at runtime. A saved name can now belong to a
+    // different service; refresh the namespace once and fail closed on errors.
+    railwayNamespace ??= (async () => {
+      try { return await deps.hosts.railway?.listServices() ?? []; }
+      catch { return []; }
+    })();
+    const targets = new Set((await railwayNamespace).filter(candidate => candidate.host === 'railway'
+      && candidate.projectId === consumer.service.projectId && candidate.environmentId === consumer.service.environmentId
+      && candidate.serviceName === match[1]!.trim()).map(candidate => serviceKey(candidate)));
+    if (targets.size !== 1) return false;
+    const target = work.step.consumers.find(candidate => targets.has(serviceKey(candidate.service)) && candidate.varName === match[2]);
+    if (!target || (target.reference && !await referenceIsCurrent(work, target, visited))) return false;
+    work.referenceTargets ??= new Map();
+    work.referenceTargets.set(location, target);
+    return true;
+  }
+  function activationFor(work: StepWork, key: string): ServiceWork['activation'] {
+    const service = services.get(key)!;
+    if (!isRailwayShared(service.service)) return service.activation;
+    if (!service.written) return 'skipped';
+    const references = referenceServiceKeys(work, key);
+    return references.length > 0 && references.every(ref => services.get(ref)!.activation === 'success') ? 'success' : 'unconfirmed';
+  }
+  async function reportUnwritten(work: StepWork, missing: string[], context = '', bestEffort = false): Promise<void> {
+    const locations = missing.map(key => {
+      const service = services.get(key)!.service;
+      return `${service.host}/${service.serviceName} (${key})`;
+    });
+    const reason = `URGENT: ROLLED VALUE UNWRITTEN${context} at ${locations.join(', ')}; the old key is already revoked.`;
+    // Resolving a callback is not proof of delivery: unattended/no-op callbacks
+    // must never suppress the lost-value warning.
+    if (!work.revealed && deps.reveal) try {
+      work.revealed = await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: clean(reason) }, work.result!.newValue) === true;
+    } catch { work.revealed = false; }
+    const message = work.revealed
+      ? `${reason} The replacement was revealed; paste it manually and restart/deploy these services.`
+      : `${reason} ROLLED VALUE LOST: manual recovery requires the provider dashboard to roll again, then update and restart/deploy these services.`;
+    work.report.status = 'failed';
+    work.report.error = clean(message);
+    try { warn(work, message); } catch { /* failed logging must not suppress recovery metadata */ }
+    try { await journal('failed', { clusterId: work.step.clusterId, data: {
+      phase: 'value-unwritten', serviceKeys: missing, newFingerprint: work.report.newFingerprint, oldRevoked: true,
+      revealed: work.revealed === true, valueLost: work.revealed !== true, error: message,
+    } }); } catch (error) { if (!bestEffort) throw error; }
+  }
   // Deliver earlier rolls before a late human prompt or after execution stops.
   // Emergency recovery is deliberately independent of failing injected facilities.
   async function preserveRolledValues(reason: 'execution-failure' | 'guided-fallback'): Promise<void> {
@@ -269,20 +360,7 @@ export async function executePlan(
         catch { /* a broken logger must not undo successful recovery */ }
         continue;
       }
-      if (work.revealed) continue;
-      const message = reason === 'guided-fallback'
-        ? 'URGENT: ROLLED VALUE UNWRITTEN before guided rotation; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.'
-        : 'URGENT: ROLLED VALUE UNWRITTEN after execution failure; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.';
-      work.report.status = 'failed';
-      work.report.error = message;
-      try { warn(work, message); } catch { /* a broken logger must not suppress reveal */ }
-      if (deps.reveal) try {
-        await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: message }, work.result!.newValue);
-        work.revealed = true;
-      } catch { /* preserve the original fixed execution error */ }
-      try { await journal('failed', { clusterId: work.step.clusterId, data: {
-        phase: 'value-unwritten', serviceKeys: missing, newFingerprint: work.report.newFingerprint, oldRevoked: true,
-      } }); } catch { /* journal failure is already being propagated */ }
+      await reportUnwritten(work, missing, reason === 'guided-fallback' ? ' before guided rotation' : ' after execution failure', true);
     }
   }
   try {
@@ -307,7 +385,10 @@ export async function executePlan(
         const variable = service.variables.find(candidate => candidate.name === consumer.varName);
         if (!variable) { stale = true; continue; }
         // A reference contains a template, not the rendered secret fingerprint.
-        if (consumer.reference) continue;
+        if (consumer.reference) {
+          if (!await referenceIsCurrent(work, consumer)) stale = true;
+          continue;
+        }
         const value = variable.sealed ? undefined : variable.value;
         if (consumer.fingerprint !== null && (value === undefined || fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
           stale = true;
@@ -355,7 +436,7 @@ export async function executePlan(
     if (dryRun) {
       for (const [key, service] of services) {
         if (!works.some(work => work.ready && work.services.has(key))) continue;
-        if (redeploy && service.host?.capabilities.redeploy) report.diff.push(`Redeploy ${key}`);
+        if (redeploy && service.host?.capabilities.redeploy && !isRailwayShared(service.service)) report.diff.push(`Redeploy ${key}`);
         report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
       }
     } else {
@@ -369,9 +450,18 @@ export async function executePlan(
           work.guided = work.step.provider === 'encryption-key' || work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate
             || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll'));
           work.atomicRoll = !work.guided && (work.step.method === 'atomic-roll' || provider.method === 'atomic-roll');
-          if (work.atomicRoll && blockedBySealed(work)) {
-            work.report.status = 'skipped';
-            work.ready = false;
+          if (work.atomicRoll) {
+            let blocked = blockedBySealed(work);
+            if (!deps.reveal) { warn(work, 'atomic roll needs an interactive run'); blocked = true; }
+            if (revoke === 'never') { warn(work, 'Atomic roll skipped: revoke is never, but rolling would immediately revoke the old key.'); blocked = true; }
+            const unconfirmed = [...work.services].filter(key => cannotConfirmActivation(work, key));
+            if (unconfirmed.length > 0) {
+              if (!revokeUnconfirmed) {
+                warn(work, `Atomic roll skipped: activation would be unconfirmed for ${unconfirmed.join(', ')}; revokeUnconfirmed must explicitly accept this risk.`);
+                blocked = true;
+              } else warn(work, `Atomic roll will revoke the old key despite unconfirmed activation because revokeUnconfirmed is enabled: ${unconfirmed.join(', ')}.`);
+            }
+            if (blocked) { work.report.status = 'skipped'; work.ready = false; }
           } else if (work.step.provider !== 'encryption-key' && !allowGenerate && (work.step.method === 'generate' || provider.method === 'generate')) {
             work.report.status = 'skipped';
             work.ready = false;
@@ -512,7 +602,7 @@ export async function executePlan(
           if (verified) await transition(work, 'verified', 'verified');
           work.ready = true;
         } catch (error) {
-          if (error instanceof JournalFailure) throw error;
+          if (error instanceof JournalFailure || error instanceof RotationAbortedError) throw error;
           if (work.atomicRoll && work.result) {
             work.ready = true;
             warn(work, 'URGENT: Rolled credential preparation could not finish; attempting delivery because the old key is already revoked.');
@@ -572,25 +662,9 @@ export async function executePlan(
         return additions;
       }
       async function valueUnwritten(work: StepWork): Promise<void> {
-        const locations = [...work.unwritten!].map(key => {
-          const service = services.get(key)!.service;
-          return `${service.host}/${service.serviceName}`;
-        });
-        const reason = `URGENT: ROLLED VALUE UNWRITTEN at ${locations.join(', ')}; the old key is already revoked. Paste the replacement manually and restart/deploy these services.`;
-        warn(work, reason);
         // The shared journal event union has no value-unwritten event; record it as
         // an explicit failure phase without ever serializing the replacement.
-        work.report.status = 'failed';
-        work.report.error = clean(reason);
-        if (deps.reveal) {
-          try {
-            await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: clean(reason) }, work.result!.newValue);
-            work.revealed = true;
-          } catch { warn(work, 'URGENT: Manual replacement reveal failed; the rolled credential still needs manual recovery.'); }
-        }
-        await journal('failed', { clusterId: work.step.clusterId, data: {
-          phase: 'value-unwritten', serviceKeys: [...work.unwritten!], newFingerprint: work.report.newFingerprint, oldRevoked: true,
-        } });
+        await reportUnwritten(work, [...work.unwritten!]);
       }
       for (const [key, service] of services) {
         if (service.steps.size === 0) continue;
@@ -700,7 +774,7 @@ export async function executePlan(
         }
       }
       // Fixed worker count bounds both starting deployments and polling them.
-      const deploymentServices = [...services];
+      const deploymentServices = [...services].filter(([, service]) => !isRailwayShared(service.service));
       let nextService = 0;
       let deploymentStopped = false;
       const deploymentTasks = Array.from({ length: Math.min(8, deploymentServices.length) }, async () => {
@@ -712,10 +786,22 @@ export async function executePlan(
       });
       const deploymentResults = await Promise.allSettled(deploymentTasks);
       for (const result of deploymentResults) if (result.status === 'rejected') throw result.reason;
+      // Shared variables activate through their referring services. Derive each
+      // step independently so an unrelated shared key cannot block revocation.
+      for (const [key, service] of services) {
+        if (!isRailwayShared(service.service) || service.steps.size === 0) continue;
+        service.activation = !service.written ? 'skipped'
+          : [...service.steps].every(work => activationFor(work, key) === 'success') ? 'success' : 'unconfirmed';
+        report.deployments.push({ serviceKey: key, deploymentId: null, state: service.activation });
+        await journal('deploy-result', { serviceKey: key, data: { deploymentId: null, state: service.activation, shared: true } });
+        for (const work of service.steps) if (activationFor(work, key) === 'unconfirmed') {
+          warn(work, `Consumer activation unconfirmed: ${service.service.host}/${service.service.serviceName} (${key}) requires at least one reference service and successful deployments of every reference service.`);
+        }
+      }
       for (const work of works) {
         if (!work.ready || work.report.status === 'failed') continue;
-        const deployed = [...work.services].every(key => services.get(key)!.activation === 'success');
-        const activatedOrUnconfirmed = [...work.services].every(key => ['success', 'unconfirmed'].includes(services.get(key)!.activation));
+        const deployed = [...work.services].every(key => activationFor(work, key) === 'success');
+        const activatedOrUnconfirmed = [...work.services].every(key => ['success', 'unconfirmed'].includes(activationFor(work, key)));
         if (deployed) {
           if (work.report.status !== 'revoked') work.report.status = 'deployed';
           if (revoke === 'after-deploy' || work.oldRevoked) await revokeOld(work);
@@ -735,6 +821,23 @@ export async function executePlan(
     await journal('plan-end', { data: { dryRun, steps: report.steps } });
     return sanitize(report, true);
   } catch (error) {
+    if (error instanceof RotationAbortedError) {
+      // Cancellation must bypass cleanup and emergency host delivery as well:
+      // after Ctrl-C no provider or host may be mutated again.
+      for (const work of works) {
+        if (['pending', 'created', 'verified'].includes(work.report.status)) {
+          work.ready = false;
+          work.report.status = 'skipped';
+          warn(work, 'Rotation aborted by the operator; no further changes were made.');
+          if (work.result) warn(work, work.atomicRoll
+            ? 'The old key was already rolled before cancellation; confirm the previously staged replacement and restart/deploy manually.'
+            : 'A replacement was prepared before cancellation; revoke the unused replacement manually.');
+        }
+      }
+      report.finishedAt = now().toISOString();
+      await journal('plan-end', { data: { dryRun, aborted: true, steps: report.steps } });
+      return sanitize(report, true);
+    }
     await preserveRolledValues('execution-failure');
     throw error;
   }

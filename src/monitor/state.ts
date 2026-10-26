@@ -10,8 +10,14 @@ export interface Canary {
   createdAt: string; triggeredAt?: string;
 }
 export interface LastVerify { at: string; ok: boolean; status?: number; fingerprint: string }
-/** Only the minimum signal provenance needed by a later human approval is persisted. */
-export interface MonitorPendingAction extends PendingAction { highConfidence?: boolean }
+/** Only the safety options and minimum signal provenance needed by a later human approval are persisted. */
+export interface MonitorPendingAction extends PendingAction {
+  highConfidence?: boolean;
+  /** Atomic rolls invalidate the old key immediately and require an interactive approval executor. */
+  requiresInteractive?: boolean;
+  /** Recorded revocation choice; absent on legacy actions means false. */
+  revokeUnconfirmed?: boolean;
+}
 export interface MonitorState {
   version: 1;
   usageHistory: Record<string, UsageBucket[]>;
@@ -76,7 +82,8 @@ const schema = z.object({
   containCooldowns:z.record(safeText,date).default({}),
   pendingActions:z.array(z.object({id:safeText,createdAt:date,signalId:safeText,
     action:z.enum(['alert','cap','rotate','breach-mode']),clusterIds:z.array(safeText),
-    status:z.enum(['pending','approved','executed','dismissed','failed']),note:safeText.optional(),highConfidence:z.boolean().optional()})),
+    status:z.enum(['pending','approved','executed','dismissed','failed']),note:safeText.optional(),highConfidence:z.boolean().optional(),
+    requiresInteractive:z.boolean().optional(),revokeUnconfirmed:z.boolean().optional()})),
   autoRotations:z.record(z.string().regex(/^\d{4}-\d{2}-\d{2}$/),z.number().int().nonnegative()),
   autoContainments:z.record(z.string().regex(/^\d{4}-\d{2}-\d{2}$/),z.number().int().nonnegative()).default({}),
 });

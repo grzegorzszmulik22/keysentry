@@ -29,7 +29,7 @@ async function fixture(hosts: FakeHost[], provider: FakeProvider) {
     providers(id: ProviderId) { if (id !== provider.id) throw new Error('Unexpected provider.'); return provider; },
     providerCtx: { http: new FakeHttp(), credentials: {}, log },
     journal: { async append(entry) { entries.push(structuredClone(entry)); }, async read() { return entries; } },
-    prompt: async () => null, fingerprintKey: key, redactor, log, sleep: async () => undefined,
+    prompt: async () => null, fingerprintKey: key, redactor, log, sleep: async () => undefined, reveal: async () => true,
     now: () => new Date(instant),
   };
   return { inv, plan, deps, entries };

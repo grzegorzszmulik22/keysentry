@@ -1,4 +1,5 @@
 import { CliError } from './errors.js';
+import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
@@ -7,7 +8,7 @@ import {
   scanHosts, serviceKey, statePaths, writeJsonAtomic,
 } from '../core/index.js';
 import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
-import { executePlan, type EngineDeps, type RotateOptions } from '../rotate/index.js';
+import { executePlan, type RotateOptions } from '../rotate/index.js';
 import {
   approve, createCanary, createFileMonitorStateStore, dismiss, listCanaries, removeCanary,
   runMonitorOnce, type BreachFeed, type DetectorContext, type MonitorState, type MonitorStateStore, type RotateExecutor,
@@ -19,22 +20,26 @@ import type {
 import { loadConfig } from './config.js';
 import { inventorySchema, planIdSchema, planSchema } from './schemas.js';
 import { humanizeServices, serviceLabel } from './display.js';
+import { hasInteractiveTerminal, promptSecret, revealSecret, type RevealInfo } from './prompts.js';
+import { RotationAbortedError } from '../types.js';
 
 export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
+type Reveal = (info: RevealInfo, value: string) => Promise<boolean>;
 export interface RuntimeOptions {
   cwd?: string; config?: string; env?: NodeJS.ProcessEnv; http?: HttpClient;
   hosts?: HostAdapter[]; providers?: (id: ProviderId) => ProviderAdapter;
   policy?: Policy; feeds?: BreachFeed[]; fingerprintKey?: Buffer;
   prompt?: (p: GuidedPrompt) => Promise<string | null>; log?: Logger;
-  reveal?: EngineDeps['reveal'];
+  reveal?: Reveal;
   verbose?: boolean; json?: boolean; sleep?: (ms: number) => Promise<void>; now?: () => Date;
 }
 export interface ExecutionOptions {
   execute?: boolean; prompt?: (p: GuidedPrompt) => Promise<string | null>;
   revoke?: RotateOptions['revoke']; redeploy?: boolean;
   revokeUnconfirmed?: boolean; acceptUnplannedSealed?: boolean; allowGenerate?: boolean; verifyRetries?: number;
-  reveal?: EngineDeps['reveal'];
+  reveal?: Reveal;
 }
+export interface ApprovalOptions extends Pick<ExecutionOptions, 'prompt' | 'reveal'> { interactive?: boolean; reviewHash?: string }
 
 /** Register opaque and even short secrets as well as the core's recognizable patterns. */
 function outputRedactor(): Redactor {
@@ -184,14 +189,36 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     return safe(result.data);
   }
 
-  async function execute(rotationPlan: RotationPlan, inv: Inventory, opts: ExecutionOptions): Promise<RotationReport> {
+  async function execute(rotationPlan: RotationPlan, inv: Inventory, opts: ExecutionOptions, inheritInteraction = true): Promise<RotationReport> {
     remember(rotationPlan.services);
     if (opts.execute === true) assertPlanScan(rotationPlan, inv);
+    let aborted: RotationAbortedError | undefined;
+    const prompt = opts.prompt ?? (inheritInteraction ? options.prompt : undefined) ?? (async () => null);
+    const reveal = Object.hasOwn(opts, 'reveal') ? opts.reveal : inheritInteraction ? options.reveal : undefined;
+    const ensureActive = () => { if (aborted) throw aborted; };
+    const preserveAbort = async <T>(operation: () => Promise<T>): Promise<T> => {
+      ensureActive();
+      try { return await operation(); }
+      catch (error) { if (error instanceof RotationAbortedError) aborted = error; throw error; }
+    };
+    // A downstream error boundary must not turn operator cancellation into
+    // permission to continue another host write, deployment, or revocation.
+    const guardMutations = <T extends object>(adapter: T, mutations: string[]): T => new Proxy(adapter, {
+      get(target, property) {
+        const member: unknown = Reflect.get(target, property, target);
+        if (typeof member !== 'function') return member;
+        return (...args: unknown[]) => {
+          if (typeof property === 'string' && mutations.includes(property)) ensureActive();
+          return Reflect.apply(member, target, args);
+        };
+      },
+    });
+    const executionHosts = Object.fromEntries(Object.entries(hostMap).map(([id, host]) => [id, guardMutations(host, ['writeVariables', 'redeploy'])]));
     const report = await executePlan(rotationPlan, inv, {
-      hosts: hostMap, providers, providerCtx: config.providerCtx, journal,
-      prompt: opts.prompt ?? options.prompt ?? (async () => null), fingerprintKey, redactor, log,
-      sleep: options.sleep, now: options.now,
-      reveal: opts.reveal ?? options.reveal,
+      hosts: executionHosts, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: config.providerCtx, journal,
+      prompt: p => preserveAbort(() => prompt(p)), fingerprintKey, redactor, log,
+      sleep: async ms => { ensureActive(); await (options.sleep ? options.sleep(ms) : new Promise<void>(done => setTimeout(done, ms))); }, now: options.now,
+      reveal: reveal ? (info, value) => preserveAbort(() => reveal(info, value)) : undefined,
     }, { ...config.rotation, dryRun: opts.execute !== true,
       ...(opts.revoke ? { revoke: opts.revoke } : {}), ...(opts.redeploy !== undefined ? { redeploy: opts.redeploy } : {}),
       ...(opts.revokeUnconfirmed !== undefined ? { revokeUnconfirmed: opts.revokeUnconfirmed } : {}),
@@ -200,6 +227,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       ...(opts.verifyRetries !== undefined ? { verifyRetries: opts.verifyRetries } : {}),
     });
     await writeJsonAtomic(join(paths.dir, 'rotation-report.json'), safe(report));
+    if (aborted) throw aborted;
     return report;
   }
 
@@ -234,11 +262,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     log.warn('Host scans failed outside this plan; proceeding with unaffected consumers. Unscanned copies may exist.');
   }
 
-  async function unattended(rotationPlan: RotationPlan, inv: Inventory, opts: Parameters<RotateExecutor>[1]): Promise<RotationReport> {
-    const report = await execute(rotationPlan, inv, { execute: true, prompt: async () => null,
+  async function monitored(rotationPlan: RotationPlan, inv: Inventory, opts: Parameters<RotateExecutor>[1], interaction: Pick<ExecutionOptions, 'prompt' | 'reveal'> = {}): Promise<RotationReport> {
+    const report = await execute(rotationPlan, inv, { execute: true,
       revoke: 'after-deploy', redeploy: true, acceptUnplannedSealed: false,
-      revokeUnconfirmed: opts.revokeUnconfirmed, allowGenerate: false, reveal: async () => {},
-    });
+      revokeUnconfirmed: opts.revokeUnconfirmed, allowGenerate: false, ...interaction,
+    }, false);
     // Engine 'deployed' means new-key verification, all writes and activation succeeded,
     // while monitor's completion contract accepts 'verified'/'revoked'. Preserve the
     // exact engine report on disk and every warning about manual old-key revocation.
@@ -250,10 +278,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     if (inv.errors.length) log.warn('Host scans failed or are disabled; monitoring continues on partial inventory. Clusters on unavailable hosts require remediation.');
     const ctx = { ...detector(inv, await stateStore.load()), state: stateStore as MonitorStateStore,
       ...config.monitor, policy: config.monitor.policy, notifier: config.monitor.notifier,
-      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => unattended(rotationPlan, inv, opts),
+      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => monitored(rotationPlan, inv, opts),
     };
     const result = await runMonitorOnce(ctx);
-    await scan();
     return safe(result);
   }
 
@@ -270,13 +297,63 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     }
   }
 
-  async function actionContext() {
+  async function actionContext(interaction: Pick<ExecutionOptions, 'prompt' | 'reveal'> = {}, interactive = false) {
     const inv = await inventory();
     const state = await stateStore.load();
-    return { ...detector(inv, state), policy: config.monitor.policy, notifier: config.monitor.notifier,
-      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => unattended(rotationPlan, inv, opts),
+    return { ...detector(inv, state), policy: config.monitor.policy, notifier: config.monitor.notifier, interactive,
+      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => monitored(rotationPlan, inv, opts, interaction),
       saveState: () => stateStore.save(state),
     };
+  }
+
+  function manualActivation(service: ServiceRef): boolean {
+    return !hostMap[service.host]?.capabilities.redeploy || ['dotenv', 'fly', 'github-actions'].includes(service.host)
+      || service.host === 'vercel' && service.environmentId !== 'production'
+      || service.host === 'railway' && service.serviceId === '';
+  }
+
+  function describeAction(id: string, inv: Inventory, state: MonitorState) {
+    const action = state.pendingActions.find(action => action.id === id && action.status === 'pending');
+    if (!action) throw new CliError('No pending monitor action with this identifier.');
+    const selected = buildPlan(inv, { clusterIds: action.clusterIds });
+    const rotation = action.action === 'rotate' || action.action === 'breach-mode';
+    const details = {
+      requiresInteractive: action.requiresInteractive === true || rotation && selected.steps.some(step => step.method === 'atomic-roll'),
+      revokeUnconfirmed: rotation && action.revokeUnconfirmed === true && config.monitor.policy.revokeUnconfirmedOnHighConfidence,
+      manualRestarts: rotation ? selected.services.filter(manualActivation) : [],
+    };
+    // Bind confirmation to stable plan content, excluding its fresh id/timestamp.
+    const reviewHash = createHash('sha256').update(JSON.stringify({ action, steps: selected.steps, services: selected.services, ...details })).digest('hex');
+    return safe({ action, plan: selected, ...details, reviewHash });
+  }
+
+  async function reviewAction(id: string) {
+    return describeAction(id, await inventory(), await stateStore.load());
+  }
+
+  async function approveAction(id: string, opts: ApprovalOptions = {}) {
+    const interactive = opts.interactive ?? hasInteractiveTerminal();
+    const diagnostic = (text: string) => process.stderr.write(`${redactor.redact(humanize(text))}\n`);
+    const interaction = interactive ? {
+      prompt: opts.prompt ?? options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic)),
+      reveal: opts.reveal ?? options.reveal ?? ((info: RevealInfo, value: string) => revealSecret(info, value, diagnostic)),
+    } : {};
+    const ctx = await actionContext(interaction, interactive);
+    const review = describeAction(id, ctx.inventory, ctx.state);
+    if (opts.reviewHash !== undefined && opts.reviewHash !== review.reviewHash) throw new CliError('Pending action changed after review; inspect it and approve again.');
+    if (review.requiresInteractive && !interactive) throw new CliError('This action requires an interactive terminal for atomic-roll recovery. Run keysentry approve <id> in a terminal; --yes only skips confirmation.');
+    // Monitor integrations may translate executor errors into a failed action. Preserve
+    // explicit operator cancellation so the CLI always reports a whole-run abort.
+    let aborted: RotationAbortedError | undefined;
+    const rotate = ctx.rotate;
+    ctx.rotate = async (plan, options) => {
+      try { return await rotate(plan, options); }
+      catch (error) { if (error instanceof RotationAbortedError) aborted = error; throw error; }
+    };
+    const result = await approve(id, ctx);
+    if (aborted) throw aborted;
+    await scan();
+    return safe(result);
   }
 
   async function plant(opts: { host: HostId; service: string; varName?: string; execute?: boolean }) {
@@ -320,7 +397,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   return {
-    config, paths, redactor, providers, safe, humanize, scan, inventory, plan, loadPlan, rotate, monitorOnce, monitor,
+    config, paths, redactor, providers, safe, humanize, scan, inventory, plan, loadPlan, rotate, monitorOnce, monitor, reviewAction,
     createCanary: plant, drill: readiness,
     async init() {
       await stateStore.save(await stateStore.load());
@@ -343,7 +420,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       const state = await stateStore.load();
       return safe({ policy: config.monitor.policy, canaries: listCanaries(state), pendingActions: state.pendingActions, cooldowns: state.cooldowns, autoRotations: state.autoRotations });
     },
-    async approve(id: string) { const result = await approve(id, await actionContext()); await scan(); return safe(result); },
+    approve: approveAction,
     async dismiss(id: string) { await dismiss(id, await actionContext()); return { id, status: 'dismissed' }; },
     async writeRunbook(path: string, text: string) {
       const target = resolve(config.cwd, path);

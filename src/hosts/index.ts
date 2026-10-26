@@ -1,4 +1,4 @@
-export { createRailwayHost } from './railway.js';
+export { createRailwayHost, isRailwaySharedService } from './railway.js';
 export type { RailwayHostOptions } from './railway.js';
 export { createVercelHost } from './vercel.js';
 export type { VercelHostOptions } from './vercel.js';

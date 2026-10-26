@@ -6,13 +6,13 @@ import { credential, ensureOk, matchHint, readJson, request, safeIdentity, verif
 const BASE = 'https://api.openai.com/v1';
 const PROVIDER = 'OpenAI';
 
-/** A user key's permissions cannot safely be recreated by creating a service account. */
+/** Automatic rotation must preserve both ownership and explicit per-key permissions. */
 export class OpenAIGuidedRotationRequiredError extends Error {
   readonly code = 'GUIDED_ROTATION_REQUIRED';
   readonly provider = 'openai';
 
   constructor() {
-    super('OpenAI user-owned keys require guided rotation to preserve their permissions.');
+    super('OpenAI key ownership or permissions cannot be preserved safely; use guided rotation.');
     this.name = 'OpenAIGuidedRotationRequiredError';
   }
 }
@@ -45,7 +45,7 @@ export const OPENAI_MODEL_PRICES: Record<string, OpenAIModelPrice> = {
 
 type Row = Record<string, unknown>;
 interface Page { data: unknown[]; has_more?: boolean; last_id?: unknown; next_page?: unknown }
-interface KeyRecord { info: ProviderKeyInfo; rawHint?: string }
+interface KeyRecord { info: ProviderKeyInfo; rawHint?: string; scopes: unknown }
 interface KeyRef { projectId: string; keyId: string; serviceAccountId?: string }
 
 function object(value: unknown): value is Row {
@@ -156,27 +156,46 @@ async function keyRecords(ctx: ProviderContext): Promise<KeyRecord[]> {
           ...(createdAt(key.created_at) ? { createdAt: createdAt(key.created_at)! } : {}),
         },
         ...(typeof key.redacted_value === 'string' ? { rawHint: key.redacted_value } : {}),
+        scopes: key.scopes,
       });
     }
   }
   return records;
 }
 
-async function resolveKeyRef(value: string, ctx: ProviderContext): Promise<string | null> {
+async function resolveKey(value: string, ctx: ProviderContext): Promise<KeyRecord | undefined> {
   const matches = (await keyRecords(ctx)).filter(key => key.rawHint !== undefined && matchHint(value, key.rawHint));
-  return matches.length === 1 ? matches[0]!.info.keyRef : null;
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+async function resolveKeyRef(value: string, ctx: ProviderContext): Promise<string | null> {
+  return (await resolveKey(value, ctx))?.info.keyRef ?? null;
 }
 
 async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationResult> {
-  const oldKeyRef = await resolveKeyRef(oldValue, ctx);
-  if (!oldKeyRef) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
+  const oldKey = await resolveKey(oldValue, ctx);
+  if (!oldKey) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
+  const oldKeyRef = oldKey.info.keyRef;
   const { projectId, serviceAccountId } = parseRef(oldKeyRef, ctx);
   if (!serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
+  const scopes = oldKey.scopes;
+  // Missing scopes do not prove unrestricted access. Empty/default scope semantics
+  // are ambiguous, so only explicit, representable permissions permit creation.
+  if (!Array.isArray(scopes) || scopes.length === 0 || scopes.some(scope => typeof scope !== 'string'
+    || scope.length === 0 || /[\s\u0000-\u001f\u007f]/.test(scope)
+    || safeLabel(scope, '', ctx, [oldValue]) !== scope)) {
+    throw new OpenAIGuidedRotationRequiredError();
+  }
   const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
-  const data = await adminJson(ctx, {
+  const response = await request(ctx, {
     method: 'POST', url: `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys`,
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}` }),
-  });
+    headers: { ...headers(ctx), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}`, scopes }),
+  }, PROVIDER);
+  // A rejected scoped request must never be retried with broader default permissions.
+  if ([400, 404, 405, 422, 501].includes(response.status)) throw new OpenAIGuidedRotationRequiredError();
+  ensureOk(response, PROVIDER);
+  const data = readJson<unknown>(response, PROVIDER);
   const key = object(data) ? data : undefined;
   if (!object(key) || typeof key.value !== 'string'
     || key.value.trim().length === 0 || key.value === oldValue) {
@@ -265,7 +284,7 @@ export const openaiProvider: ProviderAdapter = {
     steps: [
       'Select the same project and create a replacement API key with the same owner and permissions as the previous key.',
       'Update every consumer, redeploy, and verify the new key before deleting the old key.',
-      'Automatic rotation supports service-account keys in the same account and needs OPENAI_ADMIN_KEY; user-owned keys require guided rotation.',
+      'Automatic rotation needs OPENAI_ADMIN_KEY and explicit scopes that can be copied to a new key in the same service account; otherwise use guided rotation.',
       'Usage cost is an estimate from OPENAI_MODEL_PRICES; update the table for current models and pricing.',
     ],
   }),

@@ -29,7 +29,7 @@ async function fixture(host: FakeHost, providers: ProviderAdapter[]) {
     providers(id) { const provider = providers.find(p => p.id === id); if (!provider) throw new Error('Missing fake provider'); return provider; },
     providerCtx: { http: new FakeHttp(), credentials: {}, log },
     journal: { async append(entry) { entries.push(structuredClone(entry)); }, async read() { return entries; } },
-    fingerprintKey: key, redactor, log, prompt, sleep,
+    fingerprintKey: key, redactor, log, prompt, sleep, reveal: async () => true,
   };
   return { inv, plan, deps, entries, lines, prompt, sleep };
 }
@@ -117,7 +117,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
     host.addService('api', { CLOUDFLARE_API_TOKEN: old.value });
     host.failWritesFor.add('api');
     const h = await fixture(host, [provider]);
-    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(undefined);
+    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(true);
     h.deps.reveal = reveal;
     const write = vi.spyOn(host, 'writeVariables');
 
@@ -143,7 +143,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
     const rotate = auto.rotate.bind(auto);
     vi.spyOn(auto, 'rotate').mockImplementation(async (...args) => ({ ...await rotate(...args), companions: { CLOUDFLARE_API_TOKEN: 'different_companion_abcdef0123456789' } }));
     const recovered: string[] = [];
-    h.deps.reveal = async (_info, value) => { recovered.push(value); };
+    h.deps.reveal = async (_info, value) => { recovered.push(value); return true; };
 
     const report = await executePlan(h.plan, h.inv, h.deps, options);
 
@@ -173,7 +173,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
       return { ...result, companions: { SHARED_COMPANION: companion } };
     });
     const recovered: string[] = [];
-    h.deps.reveal = async (_info, value) => { recovered.push(value); };
+    h.deps.reveal = async (_info, value) => { recovered.push(value); return true; };
 
     const report = await executePlan(h.plan, h.inv, h.deps, options);
 
@@ -220,7 +220,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
     const append = h.deps.journal.append.bind(h.deps.journal);
     h.deps.journal.append = async entry => { if (entry.event === 'created') throw new Error('journal offline'); return append(entry); };
     const recovered: string[] = [];
-    h.deps.reveal = async (_info, value) => { recovered.push(value); };
+    h.deps.reveal = async (_info, value) => { recovered.push(value); return true; };
 
     await expect(executePlan(h.plan, h.inv, h.deps, options)).rejects.toThrow('Unable to record rotation journal');
 
@@ -264,7 +264,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
       if (entry.event === 'failed' && entry.data?.phase === 'value-unwritten') throw new Error('journal offline');
       return append(entry);
     };
-    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(undefined);
+    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(true);
     h.deps.reveal = reveal;
 
     await expect(executePlan(h.plan, h.inv, h.deps, options)).rejects.toThrow('Unable to record rotation journal');
@@ -285,7 +285,7 @@ describe('rotation review: credentials and irreversible rolls', () => {
     vi.spyOn(h.deps.log, 'info').mockImplementation(() => { throw new Error('logger offline'); });
     vi.spyOn(h.deps.log, 'warn').mockImplementation(() => { throw new Error('logger offline'); });
     const recovered: string[] = [];
-    h.deps.reveal = async (_info, value) => { recovered.push(value); };
+    h.deps.reveal = async (_info, value) => { recovered.push(value); return true; };
 
     await expect(executePlan(h.plan, h.inv, h.deps, options)).rejects.toThrow('logger offline');
 

@@ -8,6 +8,11 @@ export interface RailwayHostOptions {
   log: Logger;
 }
 
+/** Environment-level variables have no deployment; activation follows their referencing services. */
+export function isRailwaySharedService(service: ServiceRef): boolean {
+  return service.host === 'railway' && service.serviceId === '' && service.serviceName === 'shared';
+}
+
 const endpoint = 'https://backboard.railway.com/graphql/v2';
 
 const projectsQuery = `query KeysentryProjects($after: String) {

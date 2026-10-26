@@ -168,6 +168,30 @@ describe('Render host', () => {
   });
 
   it.each([
+    { id: 'dep-image-live', status: 'live', image: { ref: 'registry.example.test/api:stable' } },
+    { id: 'dep-image-live', status: 'live', image: { ref: 'registry.example.test/api:stable' }, commit: null },
+  ])('redeploys an image-backed service without a commit using the plain request: %j', async (deployment) => {
+    const http = new FakeHttp()
+      .on('GET', /\/services\/srv-one\/deploys\?limit=1&status=live$/, () => json(200, [
+        { cursor: 'live-cursor', deploy: deployment },
+      ]))
+      .on('POST', /\/services\/srv-one\/deploys$/, () => json(201, { id: 'dep-image-new' }));
+
+    expect(await hostFor(http).redeploy(service)).toBe('dep-image-new');
+    expect(http.calls).toEqual([
+      {
+        method: 'GET', url: `${base}/services/srv-one/deploys?limit=1&status=live`,
+        headers: { Authorization: `Bearer ${apiKey}` },
+      },
+      {
+        method: 'POST', url: `${base}/services/srv-one/deploys`,
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clearCache: 'do_not_clear' }),
+      },
+    ]);
+  });
+
+  it.each([
     { response: null },
     { response: {} },
     { response: [null] },
@@ -176,6 +200,9 @@ describe('Render host', () => {
     { response: [{ deploy: { commit: null } }] },
     { response: [{ deploy: { commit: {} } }] },
     { response: [{ deploy: { commit: { id: '' } } }] },
+    { response: [{ deploy: { id: 'dep-live', commit: {} } }] },
+    { response: [{ deploy: { id: 'dep-live', commit: 'invalid' } }] },
+    { response: [{ deploy: { id: 'dep-live', commit: { id: '' } } }] },
   ])(
     'does not deploy after a malformed live-deployment lookup: %j', async ({ response }) => {
       const http = new FakeHttp()

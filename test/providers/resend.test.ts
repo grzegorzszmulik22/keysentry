@@ -167,22 +167,37 @@ describe('resendProvider', () => {
     }
   });
 
-  it.each([401, 429, 500])('never creates a replacement when old-key verification returns HTTP %s', async (status) => {
+  it.each([401, 429, 500])('requires guided rotation before mutation when old-key verification returns HTTP %s', async (status) => {
     const oldValue = secret();
     const http = new FakeHttp().on('GET', /\/domains$/, () => json(status, { message: oldValue }))
       .on('POST', /\/api-keys$/, () => json(201, { id: 'replacement-id', token: secret() }));
-    expect(await failure(resendProvider.rotate!(oldValue, context(http)))).toMatch(/verif/i);
+    await expect(resendProvider.rotate!(oldValue, context(http))).rejects.toMatchObject({
+      name: 'ResendGuidedRotationRequiredError', code: 'GUIDED_ROTATION_REQUIRED', provider: 'resend',
+    });
     expect(http.calls.map(call => call.method)).toEqual(['GET']);
   });
 
-  it('never creates a replacement when the old-key verification response is malformed', async () => {
+  it('requires guided rotation before mutation when the old-key verification response is malformed', async () => {
     const oldValue = secret();
     for (const response of [text(200, oldValue), json(200, null), json(200, { data: 'invalid' })]) {
       const http = new FakeHttp().on('GET', /\/domains$/, () => response)
         .on('POST', /\/api-keys$/, () => json(201, { id: 'replacement-id', token: secret() }));
-      expect(await failure(resendProvider.rotate!(oldValue, context(http)))).toMatch(/verif/i);
+      await expect(resendProvider.rotate!(oldValue, context(http))).rejects.toMatchObject({
+        name: 'ResendGuidedRotationRequiredError', code: 'GUIDED_ROTATION_REQUIRED', provider: 'resend',
+      });
       expect(http.calls.map(call => call.method)).toEqual(['GET']);
     }
+  });
+
+  it('requires secret-safe guided rotation before mutation when old-key verification cannot connect', async () => {
+    const oldValue = secret();
+    const http = new FakeHttp().on('GET', /\/domains$/, () => { throw new Error(oldValue); });
+    let error: unknown;
+    try { await resendProvider.rotate!(oldValue, context(http)); } catch (cause) { error = cause; }
+    expect(error instanceof ResendGuidedRotationRequiredError).toBe(true);
+    expect(error).toMatchObject({ code: 'GUIDED_ROTATION_REQUIRED', provider: 'resend' });
+    expect(String(error).includes(oldValue)).toBe(false);
+    expect(http.calls.map(call => call.method)).toEqual(['GET']);
   });
 
   it('requires the management credential before creating a key', async () => {

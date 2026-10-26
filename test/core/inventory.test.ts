@@ -169,6 +169,113 @@ describe('buildInventory', () => {
     });
   });
 
+  it('tracks interpolated Railway references to service and shared secrets without serializing templates', () => {
+    const dependent = svc('railway', 'dependent');
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: dependent, vars: [
+        { name: 'AUTHORIZATION', value: 'Bearer ${{api.OPENAI_API_KEY}}', sealed: false },
+        { name: 'DATABASE_URL', value: 'postgresql://u:${{shared.PGPASSWORD}}@h/db', sealed: false },
+      ] },
+      { service: svc('railway', 'api'), vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+      { service: { ...svc('railway', ''), serviceName: 'shared' }, vars: [
+        { name: 'PGPASSWORD', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(2);
+    expect(inventory.clusters.map((cluster) => cluster.consumers.map((consumer) => consumer.varName)))
+      .toEqual([['OPENAI_API_KEY', 'AUTHORIZATION'], ['PGPASSWORD', 'DATABASE_URL']]);
+    expect(inventory.findings.filter((finding) => finding.reference)).toMatchObject([
+      { service: dependent, varName: 'AUTHORIZATION', provider: 'openai', sealed: false },
+      { service: dependent, varName: 'DATABASE_URL', provider: 'unknown', sealed: false },
+    ]);
+    const serialized = JSON.stringify(inventory);
+    expect(serialized).not.toContain(openaiValue);
+    expect(serialized).not.toContain(randomValue);
+    expect(serialized).not.toContain('${{');
+    expect(serialized).not.toContain('Bearer ');
+    expect(serialized).not.toContain('postgresql://');
+  });
+
+  it('adds interpolated chains to every source cluster once per variable, including sealed sources', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'CONFIG', value: 'prefix ${{alias.CONFIG}} ${{api.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: svc('railway', 'alias'), vars: [
+        { name: 'CONFIG', value: '${{api.OPENAI_API_KEY}}:${{shared.PASSWORD}}:${{api.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: svc('railway', 'api'), vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+      { service: { ...svc('railway', ''), serviceName: 'shared' }, vars: [
+        { name: 'PASSWORD', sealed: true },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(2);
+    expect(inventory.clusters.map((cluster) => cluster.consumers.map((consumer) => consumer.service.serviceId)))
+      .toEqual([['api', 'dependent', 'alias'], ['', 'dependent', 'alias']]);
+    expect(inventory.findings.filter((finding) => finding.reference)).toHaveLength(4);
+    expect(inventory.clusters[1]?.consumers.filter((consumer) => consumer.reference)).toMatchObject([
+      { sealed: true, fingerprint: null, hint: null },
+      { sealed: true, fingerprint: null, hint: null },
+    ]);
+  });
+
+  it.each([false, true])('resolves valid branches of cyclic interpolations independently of scan order (%s)', (reverse) => {
+    const services: HostScan['services'] = [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'CONFIG', value: 'Bearer ${{first.CONFIG}}', sealed: false },
+      ] },
+      { service: svc('railway', 'first'), vars: [
+        { name: 'CONFIG', value: '${{second.CONFIG}} ${{api.OPENAI_API_KEY}} ${{missing.TOKEN}}', sealed: false },
+      ] },
+      { service: svc('railway', 'second'), vars: [
+        { name: 'CONFIG', value: '${{first.CONFIG}} ${{shared.PASSWORD}} ${{api.PORT}}', sealed: false },
+      ] },
+      { service: svc('railway', 'api'), vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+        { name: 'PORT', value: '3000', sealed: false },
+      ] },
+      { service: { ...svc('railway', ''), serviceName: 'shared' }, vars: [
+        { name: 'PASSWORD', value: randomValue, sealed: false },
+      ] },
+    ];
+    const inventory = buildInventory([{ host: 'railway', services: reverse ? services.reverse() : services }], key, now);
+
+    expect(inventory.clusters).toHaveLength(2);
+    for (const cluster of inventory.clusters) {
+      expect(cluster.consumers.filter((consumer) => consumer.reference)
+        .map((consumer) => consumer.service.serviceId).sort()).toEqual(['dependent', 'first', 'second']);
+    }
+    expect(inventory.findings).toHaveLength(8);
+  });
+
+  it('preserves direct literal credentials while following their interpolated dependencies', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'DATABASE_URL', value: '${{api.DATABASE_URL}}', sealed: false },
+      ] },
+      { service: svc('railway', 'api'), vars: [
+        { name: 'DATABASE_URL', value: 'postgresql://u:literal-password@${{shared.HOST}}/db?password=${{shared.PASSWORD}}', sealed: false },
+      ] },
+      { service: { ...svc('railway', ''), serviceName: 'shared' }, vars: [
+        { name: 'HOST', value: 'database.internal', sealed: false },
+        { name: 'PASSWORD', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(2);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'database', method: 'guided' });
+    expect(inventory.clusters[0]?.consumers.map((consumer) => consumer.service.serviceId)).toEqual(['api', 'dependent']);
+    expect(inventory.clusters[1]?.consumers.map((consumer) => consumer.service.serviceId)).toEqual(['', 'dependent', 'api']);
+    expect(inventory.findings.filter((finding) => !finding.reference)).toHaveLength(2);
+    expect(JSON.stringify(inventory)).not.toContain('literal-password');
+  });
+
   it.each([
     ['another host', svc('vercel', 'source')],
     ['another project', svc('railway', 'source', 'production', 'other-project')],
@@ -178,6 +285,7 @@ describe('buildInventory', () => {
     const inventory = buildInventory([
       { host: 'railway', services: [{ service: svc('railway', 'dependent'), vars: [
         { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+        { name: 'AUTHORIZATION', value: 'Bearer ${{source.OPENAI_API_KEY}}', sealed: false },
       ] }] },
       { host: source.host, services: [{ service: source, vars: [
         { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
@@ -189,7 +297,7 @@ describe('buildInventory', () => {
     expect(inventory.findings.some((finding) => finding.reference)).toBe(false);
   });
 
-  it('leaves missing, nonsecret, cyclic and interpolated Railway references unresolved', () => {
+  it('leaves missing, nonsecret and cyclic Railway references unresolved', () => {
     const inventory = buildInventory([{ host: 'railway', services: [
       { service: svc('railway', 'dependent'), vars: [
         { name: 'MISSING_SERVICE_TOKEN', value: '${{missing.OPENAI_API_KEY}}', sealed: false },
@@ -197,8 +305,6 @@ describe('buildInventory', () => {
         { name: 'CONFIG_TOKEN', value: '${{source.PORT}}', sealed: false },
         { name: 'CYCLE_A', value: '${{source.CYCLE_B}}', sealed: false },
         { name: 'SELF_TOKEN', value: '${{dependent.SELF_TOKEN}}', sealed: false },
-        { name: 'EMBEDDED_TOKEN', value: 'prefix-${{source.OPENAI_API_KEY}}', sealed: false },
-        { name: 'TWO_TOKENS', value: '${{source.OPENAI_API_KEY}}${{source.OPENAI_API_KEY}}', sealed: false },
       ] },
       { service: svc('railway', 'source'), vars: [
         { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
@@ -228,18 +334,42 @@ describe('buildInventory', () => {
     expect(inventory.clusters[0]?.consumers).toHaveLength(2);
   });
 
+  it('keeps valid interpolated branches when another target service name is ambiguous', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'CONFIG', value: '${{source.OPENAI_API_KEY}}:${{shared.PASSWORD}}', sealed: false },
+      ] },
+      { service: { ...svc('railway', 'first'), serviceName: 'source' }, vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+      { service: { ...svc('railway', 'second'), serviceName: 'source' }, vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+      { service: { ...svc('railway', ''), serviceName: 'shared' }, vars: [
+        { name: 'PASSWORD', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters[0]?.consumers).toHaveLength(2);
+    expect(inventory.clusters[1]?.consumers).toHaveLength(2);
+    expect(inventory.findings.filter((finding) => finding.reference)).toMatchObject([
+      { varName: 'CONFIG', provider: 'unknown', reference: true },
+    ]);
+  });
+
   it('resolves references across repeated scans of the same Railway service', () => {
     const source: HostScan = { host: 'railway', services: [{ service: svc('railway', 'source'), vars: [
       { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
     ] }] };
     const dependent: HostScan = { host: 'railway', services: [{ service: svc('railway', 'dependent'), vars: [
       { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+      { name: 'AUTHORIZATION', value: 'Bearer ${{source.OPENAI_API_KEY}}', sealed: false },
     ] }] };
     const inventory = buildInventory([source, dependent, source, dependent], key, now);
 
     expect(inventory.clusters).toHaveLength(1);
-    expect(inventory.clusters[0]?.consumers).toHaveLength(4);
-    expect(inventory.findings.filter((finding) => finding.reference)).toHaveLength(2);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(6);
+    expect(inventory.findings.filter((finding) => finding.reference)).toHaveLength(4);
   });
 
   it('leaves references unresolved when repeated target observations conflict', () => {
@@ -247,6 +377,7 @@ describe('buildInventory', () => {
     const inventory = buildInventory([{ host: 'railway', services: [
       { service: svc('railway', 'dependent'), vars: [
         { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+        { name: 'AUTHORIZATION', value: 'Bearer ${{source.OPENAI_API_KEY}}', sealed: false },
       ] },
       { service: source, vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
       { service: source, vars: [{ name: 'OPENAI_API_KEY', value: randomValue, sealed: false }] },
@@ -256,12 +387,12 @@ describe('buildInventory', () => {
     expect(inventory.findings.some((finding) => finding.reference)).toBe(false);
   });
 
-  it('leaves conflicting reference definitions unresolved across repeated scans', () => {
+  it.each(['', 'Bearer '])('leaves conflicting reference definitions unresolved across repeated scans (%s)', (prefix) => {
     const dependent = svc('railway', 'dependent');
     const inventory = buildInventory([{ host: 'railway', services: [
-      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: '${{first.OPENAI_API_KEY}}', sealed: false }] },
+      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: `${prefix}\${{first.OPENAI_API_KEY}}`, sealed: false }] },
       { service: svc('railway', 'first'), vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
-      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: '${{second.API_KEY}}', sealed: false }] },
+      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: `${prefix}\${{second.API_KEY}}`, sealed: false }] },
       { service: svc('railway', 'second'), vars: [{ name: 'API_KEY', value: randomValue, sealed: false }] },
     ] }], key, now);
 

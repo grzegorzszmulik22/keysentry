@@ -106,6 +106,13 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
     return entries.map(environment);
   }
 
+  function pinnedProduction(service: ServiceRef): null {
+    opts.log.warn('Vercel production is pinned by an Instant Rollback; activation unconfirmed', {
+      projectId: service.projectId,
+    });
+    return null;
+  }
+
   return {
     id: 'vercel',
     capabilities: { readValues: true, batchWrite: false, redeploy: true },
@@ -132,13 +139,18 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
       const entries = (await environments(service)).filter((entry) => entry.type !== 'system' && entry.target.includes(service.environmentId));
       const ambiguous = ambiguousKeys(entries);
       if (ambiguous.size > 0) {
-        opts.log.warn('Vercel skipped ambiguous variables for this target; update branch overrides in Vercel', {
+        opts.log.warn('Vercel sealed ambiguous variables for this target; update branch overrides in Vercel', {
           projectId: service.projectId, target: service.environmentId, keys: [...ambiguous],
         });
       }
       const variables: RawVariable[] = [];
+      const emittedAmbiguous = new Set<string>();
       for (const entry of entries) {
-        if (ambiguous.has(entry.key)) continue;
+        if (ambiguous.has(entry.key)) {
+          if (!emittedAmbiguous.has(entry.key)) variables.push({ name: entry.key, sealed: true });
+          emittedAmbiguous.add(entry.key);
+          continue;
+        }
         if (entry.type === 'sensitive' || entry.type === 'secret' || entry.visibility === 'secret') {
           variables.push({ name: entry.key, sealed: true });
           continue;
@@ -186,20 +198,26 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
       const project = object(await request('GET', `/v9/projects/${encodeURIComponent(service.projectId)}`));
       const production = project.targets == null ? undefined : object(project.targets).production;
       const servingId = production == null ? undefined : object(production).id;
-      let previousId = servingId == null ? undefined : identifier(servingId);
+      const previousId = servingId == null ? undefined : identifier(servingId);
+      // These project fields are treated conservatively as rollback markers. A
+      // redeployment reaching READY does not prove pinned domains switched to it.
+      if (project.rollbackDescription || project.lastRollbackTarget) return pinnedProduction(service);
+      const response = object(await request('GET', '/v6/deployments', {
+        projectId: service.projectId, target: 'production', state: 'READY', limit: '1',
+      }));
+      if (!Array.isArray(response.deployments)) return invalidResponse();
+      if (response.deployments.length === 0) throw new Error('Vercel has no ready production deployment to redeploy');
+      const latestId = identifier(object(response.deployments[0]).uid);
+      // The list is newest-first. A different serving target may be an Instant
+      // Rollback; fail closed even if the response does not supply its metadata.
+      if (previousId !== undefined && previousId !== latestId) return pinnedProduction(service);
       if (previousId === undefined) {
         opts.log.warn('Vercel serving production deployment is unavailable; falling back to the latest READY production deployment, which may undo a rollback', {
           projectId: service.projectId,
         });
-        const response = object(await request('GET', '/v6/deployments', {
-          projectId: service.projectId, target: 'production', state: 'READY', limit: '1',
-        }));
-        if (!Array.isArray(response.deployments)) return invalidResponse();
-        if (response.deployments.length === 0) throw new Error('Vercel has no ready production deployment to redeploy');
-        previousId = identifier(object(response.deployments[0]).uid);
       }
       const deployment = object(await request('POST', '/v13/deployments', { forceNew: '1' }, {
-        name: service.projectName, deploymentId: previousId, target: 'production',
+        name: service.projectName, deploymentId: previousId ?? latestId, target: 'production',
       }));
       return identifier(deployment.id);
     },

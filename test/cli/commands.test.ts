@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from '../../src/cli/index.js';
 import { createRuntime } from '../../src/cli/runtime.js';
@@ -133,7 +134,7 @@ describe('CLI commands', () => {
     await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
     expect(await runCli(['actions', '--json'], f.io)).toBe(0); expect(JSON.parse(f.output.at(-1)!)).toHaveLength(2);
     expect(await runCli(['dismiss', 'dismiss-me'], f.io)).toBe(0); expect(f.host.writes).toHaveLength(0);
-    expect(await runCli(['approve', 'approve-me', '--json'], f.io)).toBe(0); expect(f.host.writes).toHaveLength(2);
+    expect(await runCli(['approve', 'approve-me', '--yes', '--json'], f.io)).toBe(0); expect(f.host.writes).toHaveLength(2);
     expect(await runCli(['actions', '--json'], f.io)).toBe(0); expect(JSON.parse(f.output.at(-1)!)).toEqual([]);
   });
 
@@ -141,10 +142,10 @@ describe('CLI commands', () => {
     const f = await fixture(true); const inv = await f.runtime.scan();
     const state = createMonitorState();
     state.canaries.push({ id: 'decoy-test', provider: 'openrouter', keyRef: 'decoy-ref', service: inv.services[0]!, varName: 'DECOY_KEY', createdAt: new Date().toISOString() });
-    // Real automatic canary integration is covered by e2e; explicit approval shares the unattended executor.
+    // Non-TTY approval skips guided input; TTY approval is covered separately.
     state.pendingActions.push({ id: 'guided-action', createdAt: new Date().toISOString(), signalId: 'canary-signal', action: 'rotate', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
     await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
-    expect(await runCli(['approve', 'guided-action', '--json'], { ...f.io, prompt: async () => { throw new Error('must never prompt'); } })).toBe(0);
+    expect(await runCli(['approve', 'guided-action', '--yes', '--json'], { ...f.io, prompt: async () => { throw new Error('must never prompt'); } })).toBe(0);
     expect(f.host.writes).toHaveLength(0); expect((await f.runtime.pendingActions())[0]?.status).toBe('pending');
   });
 
@@ -152,7 +153,7 @@ describe('CLI commands', () => {
     const f = await fixture(); const inv = await f.runtime.scan(); const state = createMonitorState();
     state.pendingActions.push({ id: 'approve-cap', createdAt: new Date().toISOString(), signalId: 'usage-signal', action: 'cap', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
     await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
-    expect(await runCli(['approve', 'approve-cap', '--json'], f.io)).toBe(0);
+    expect(await runCli(['approve', 'approve-cap', '--yes', '--json'], f.io)).toBe(0);
     expect(f.provider.capped).toEqual([f.key.ref]);
     expect(JSON.parse(f.output.at(-1)!).action.status).toBe('executed');
     expect(await f.runtime.pendingActions()).toEqual([]);
@@ -356,10 +357,12 @@ describe('CLI commands', () => {
     const runtime = await createRuntime({ cwd, env: {}, hosts: [host], providers: id => id === provider.id ? provider : getProvider(id), http: new FakeHttp(), log: silentLogger, feeds: [], sleep: async () => {} });
     expect((await runtime.scan()).clusters[0]?.provider).toBe('cloudflare');
     const output: string[] = []; const errors: string[] = []; let reveals = 0;
-    expect(await runCli(['rotate', '--execute', '--yes'], { runtime, output: line => output.push(line), error: line => errors.push(line), reveal: async (info, value) => {
+    const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode() { return this; } });
+    expect(await runCli(['rotate', '--execute', '--yes'], { runtime, promptIO: { input: input as unknown as NodeJS.ReadStream, output: { isTTY: true, write: () => true } }, output: line => output.push(line), error: line => errors.push(line), reveal: async (info, value) => {
       reveals++; expect(info.provider).toBe('cloudflare'); expect(info.reason).toMatch(/unwritten/i);
       expect(provider.refOf(value) !== null).toBe(true);
       expect(output.some(line => line.includes(value)) || errors.some(line => line.includes(value))).toBe(false);
+      return true;
     } })).toBe(1);
     expect(reveals).toBe(1);
     const stored = await readFile(join(runtime.paths.dir, 'rotation-report.json'), 'utf8');

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createRailwayHost } from '../../src/hosts/railway.js';
+import { createRailwayHost, isRailwaySharedService } from '../../src/hosts/railway.js';
+import { isRailwaySharedService as sharedServiceFromIndex } from '../../src/hosts/index.js';
 import type { HttpRequest, ServiceRef } from '../../src/types.js';
 import { FakeHttp, json, silentLogger, text } from '../helpers/fake-http.js';
 
@@ -29,6 +30,28 @@ function queuedHttp(...responses: unknown[]): FakeHttp {
 }
 
 describe('Railway host', () => {
+  it('exports recognition of the shared pseudo-service for activation tracking', () => {
+    expect(isRailwaySharedService(shared)).toBe(true);
+    expect(sharedServiceFromIndex).toBe(isRailwaySharedService);
+  });
+
+  it.each([
+    service,
+    { ...shared, host: 'dotenv' as const },
+    { ...shared, serviceName: 'api' },
+    { ...shared, serviceId: 's1' },
+  ])('does not identify another service as Railway shared: %j', (candidate) => {
+    expect(isRailwaySharedService(candidate)).toBe(false);
+  });
+
+  it('does not request a deployment for the shared pseudo-service', async () => {
+    const http = new FakeHttp();
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    expect(await host.redeploy(shared)).toBeNull();
+    expect(http.calls).toEqual([]);
+  });
+
   it('paginates projects, environments and services and includes shared variables for every environment', async () => {
     const http = queuedHttp(
       { data: { projects: connection([{ id: 'p1', name: 'Project One' }], true, 'projects-next') } },

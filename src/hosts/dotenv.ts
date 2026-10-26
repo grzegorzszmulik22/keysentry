@@ -80,11 +80,13 @@ function encode(value: string, quote: Quote, inContext: (encoded: string) => boo
   }
   const preferred = candidate(quote);
   if (roundTrips(preferred)) return preferred;
+  // Single quotes preserve literal escapes even across real LF newlines.
+  // The round-trip check still rejects CR/CRLF normalization or delimiter collisions.
+  if (!value.includes("'")) {
+    const single = candidate("'");
+    if (roundTrips(single)) return single;
+  }
   if (!/[\r\n]/.test(value)) {
-    if (!value.includes("'")) {
-      const single = candidate("'");
-      if (roundTrips(single)) return single;
-    }
     if (!value.includes('`')) {
       const backtick = candidate('`');
       if (roundTrips(backtick)) return backtick;

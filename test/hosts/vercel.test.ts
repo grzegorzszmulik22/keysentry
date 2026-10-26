@@ -236,19 +236,24 @@ describe('createVercelHost', () => {
     expect(http.calls).toHaveLength(1);
   });
 
-  it('skips ambiguous same-key/target entries with a warning while scanning other keys', async () => {
+  it('seals ambiguous same-key/target entries once per key while scanning other keys', async () => {
     const log = { ...silentLogger, warn: vi.fn() };
     const http = new FakeHttp()
       .on('GET', /\/v10\/projects\/prj_site\/env$/, () => json(200, { envs: [
         { id: 'safe', key: 'SAFE_KEY', type: 'encrypted', target: ['preview'] },
         { id: 'first', key: 'KEY', type: 'encrypted', target: ['preview'], gitBranch: 'branch-one', value: 'private-first-value' },
         { id: 'second', key: 'KEY', type: 'encrypted', target: ['preview'], gitBranch: 'branch-two', value: 'private-second-value' },
+        { id: 'third', key: 'KEY', type: 'sensitive', target: ['preview'], gitBranch: 'branch-three' },
+        { id: 'other-first', key: 'OTHER_KEY', type: 'secret', target: ['preview'] },
+        { id: 'other-second', key: 'OTHER_KEY', type: 'encrypted', target: ['preview'], gitBranch: 'branch-two' },
       ] }))
       .on('GET', /\/v1\/projects\/prj_site\/env\/safe$/, () => json(200, { value: 'safe-private-value' }));
     const host = createVercelHost({ token, http, log });
 
     await expect(host.readVariables({ ...project, environmentId: 'preview', environmentName: 'preview' })).resolves.toEqual([
       { name: 'SAFE_KEY', value: 'safe-private-value', sealed: false },
+      { name: 'KEY', sealed: true },
+      { name: 'OTHER_KEY', sealed: true },
     ]);
     expect(http.calls).toHaveLength(2);
     expect(log.warn).toHaveBeenCalledTimes(1);
@@ -296,7 +301,8 @@ describe('createVercelHost', () => {
     expect(http.calls).toHaveLength(2);
   });
 
-  it('redeploys the currently serving production deployment after a rollback', async () => {
+  it('does not redeploy when production points to an older READY deployment after a rollback', async () => {
+    const log = { ...silentLogger, warn: vi.fn() };
     const http = new FakeHttp()
       .on('GET', /\/v9\/projects\/prj%2Fsite\?/, (req) => {
         expectRequest(req, 'GET', '/v9/projects/prj%2Fsite', { teamId: 'team_one' });
@@ -308,11 +314,53 @@ describe('createVercelHost', () => {
         expect(JSON.parse(req.body!)).toEqual({ name: 'site', deploymentId: 'dpl_serving', target: 'production' });
         return json(200, { id: 'dpl_new' });
       });
-    const host = createVercelHost({ token, teamId: 'team_one', http, log: silentLogger });
+    const host = createVercelHost({ token, teamId: 'team_one', http, log });
 
-    await expect(host.redeploy({ ...project, projectId: 'prj/site', serviceId: 'prj/site' })).resolves.toBe('dpl_new');
+    await expect(host.redeploy({ ...project, projectId: 'prj/site', serviceId: 'prj/site' })).resolves.toBeNull();
     expect(http.calls).toHaveLength(2);
-    expect(http.callsTo('GET', /\/v6\/deployments\?/)).toHaveLength(0);
+    expect(http.callsTo('POST', /\/v13\/deployments\?/)).toHaveLength(0);
+    expect(log.warn).toHaveBeenCalledWith('Vercel production is pinned by an Instant Rollback; activation unconfirmed', { projectId: 'prj/site' });
+  });
+
+  it.each([
+    { rollbackDescription: 'rolled back for private-reason' },
+    { lastRollbackTarget: 'dpl_rolled_back' },
+    { lastRollbackTarget: { id: 'dpl_rolled_back', private: token } },
+  ])('does not redeploy when project rollback metadata indicates pinned production %#', async (metadata) => {
+    const log = { ...silentLogger, warn: vi.fn() };
+    const http = new FakeHttp()
+      .on('GET', /\/v9\/projects\/prj_site$/, () => json(200, { ...metadata, targets: { production: { id: 'dpl_serving' } } }))
+      .on('GET', /\/v6\/deployments\?/, () => json(200, { deployments: [{ uid: 'dpl_serving' }] }))
+      .on('POST', /\/v13\/deployments\?/, () => json(200, { id: 'unsafe_new' }));
+    const host = createVercelHost({ token, http, log });
+
+    await expect(host.redeploy(project)).resolves.toBeNull();
+    expect(http.calls).toHaveLength(1);
+    expect(log.warn).toHaveBeenCalledWith('Vercel production is pinned by an Instant Rollback; activation unconfirmed', { projectId: 'prj_site' });
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain('private-reason');
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain(token);
+  });
+
+  it('redeploys normally when serving production matches the latest READY deployment and rollback metadata is empty', async () => {
+    const log = { ...silentLogger, warn: vi.fn() };
+    const http = new FakeHttp()
+      .on('GET', /\/v9\/projects\/prj_site\?/, () => json(200, {
+        rollbackDescription: '', lastRollbackTarget: null, targets: { production: { id: 'dpl_serving' } },
+      }))
+      .on('GET', /\/v6\/deployments\?/, (req) => {
+        expectRequest(req, 'GET', '/v6/deployments', { projectId: 'prj_site', target: 'production', state: 'READY', limit: '1', teamId: 'team_one' });
+        return json(200, { deployments: [{ uid: 'dpl_serving' }] });
+      })
+      .on('POST', /\/v13\/deployments\?/, (req) => {
+        expectRequest(req, 'POST', '/v13/deployments', { forceNew: '1', teamId: 'team_one' });
+        expect(JSON.parse(req.body!)).toEqual({ name: 'site', deploymentId: 'dpl_serving', target: 'production' });
+        return json(200, { id: 'dpl_new' });
+      });
+    const host = createVercelHost({ token, teamId: 'team_one', http, log });
+
+    await expect(host.redeploy(project)).resolves.toBe('dpl_new');
+    expect(http.calls).toHaveLength(3);
+    expect(log.warn).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -375,13 +423,13 @@ describe('createVercelHost', () => {
   it('does not fall back or retry when deployment creation fails', async () => {
     const http = new FakeHttp()
       .on('GET', /\/v9\/projects\/prj_site$/, () => json(200, { targets: { production: { id: 'dpl_serving' } } }))
-      .on('GET', /\/v6\/deployments\?/, () => json(200, { deployments: [{ uid: 'unsafe_latest' }] }))
+      .on('GET', /\/v6\/deployments\?/, () => json(200, { deployments: [{ uid: 'dpl_serving' }] }))
       .on('POST', /\/v13\/deployments\?/, () => json(503, { error: `Unavailable ${token}` }));
     const host = createVercelHost({ token, http, log: silentLogger });
 
     await expect(host.redeploy(project)).rejects.toThrow(/vercel/i);
-    expect(http.calls).toHaveLength(2);
-    expect(http.callsTo('GET', /\/v6\/deployments\?/)).toHaveLength(0);
+    expect(http.calls).toHaveLength(3);
+    expect(http.callsTo('GET', /\/v6\/deployments\?/)).toHaveLength(1);
     expect(http.callsTo('POST', /\/v13\/deployments\?/)).toHaveLength(1);
   });
 
@@ -501,10 +549,11 @@ describe('createVercelHost', () => {
   it('rejects a created deployment without an ID', async () => {
     const http = new FakeHttp()
       .on('GET', /\/v9\/projects\/prj_site$/, () => json(200, { targets: { production: { id: 'dpl_previous' } } }))
+      .on('GET', /\/v6\/deployments\?/, () => json(200, { deployments: [{ uid: 'dpl_previous' }] }))
       .on('POST', /\/v13\/deployments\?/, () => json(200, {}));
     const host = createVercelHost({ token, http, log: silentLogger });
 
     await expect(host.redeploy(project)).rejects.toThrow(/vercel/i);
-    expect(http.calls).toHaveLength(2);
+    expect(http.calls).toHaveLength(3);
   });
 });

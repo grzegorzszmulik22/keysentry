@@ -60,4 +60,19 @@ describe('monitor state', () => {
     expect(state.usageHistory.orphan).toBeUndefined();
     expect(state.usageHistory.active).toHaveLength(1);
   });
+
+  it('persists pending approval safety flags while accepting legacy actions without them',async()=>{
+    const state=createMonitorState();
+    const action={id:'atomic-action',createdAt:'2026-10-26T12:00:00.000Z',signalId:'leak',
+      action:'rotate' as const,clusterIds:['cluster'],status:'pending' as const};
+    state.pendingActions.push({...action,requiresInteractive:true,revokeUnconfirmed:true});
+    const store=createMemoryMonitorStateStore(state);
+    expect((await store.load()).pendingActions[0]).toMatchObject({requiresInteractive:true,revokeUnconfirmed:true});
+    await store.save({...state,pendingActions:[action]});
+    expect((await store.load()).pendingActions[0]).toEqual(action);
+    await expect(store.save({...state,pendingActions:[{...action,revokeUnconfirmed:'true'}]} as never))
+      .rejects.toThrow('Invalid monitor state');
+    await expect(store.save({...state,pendingActions:[{...action,requiresInteractive:'true'}]} as never))
+      .rejects.toThrow('Invalid monitor state');
+  });
 });

@@ -49,7 +49,7 @@ function verify(value: string, ctx: ProviderContext) {
 
 async function keyScope(oldValue: string, admin: string, ctx: ProviderContext): Promise<KeyScope> {
   const verified = await verify(oldValue, ctx);
-  if (!verified.ok) throw new Error('resend old API key verification failed');
+  if (!verified.ok) throw new ResendGuidedRotationRequiredError();
   const permission = verified.status === 403 ? 'sending_access' : 'full_access';
   try {
     const response = await request(ctx, {

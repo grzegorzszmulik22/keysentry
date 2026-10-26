@@ -3,8 +3,9 @@ import { pathToFileURL } from 'node:url';
 import { Command, CommanderError, InvalidArgumentError } from 'commander';
 import { createRedactor, renderBlastRadius } from '../core/index.js';
 import type { GuidedPrompt, Inventory, RotationReport } from '../types.js';
+import { RotationAbortedError } from '../types.js';
 import { startMcpServer } from '../mcp/server.js';
-import { confirmRotation, promptSecret, revealSecret } from './prompts.js';
+import { confirmAction, confirmRotation, hasInteractiveTerminal, promptSecret, revealSecret, type PromptIO } from './prompts.js';
 import { createRuntime, type KeysentryRuntime, type PlanFilters, type RuntimeOptions } from './runtime.js';
 import { hostIdSchema, tierSchema } from './schemas.js';
 import { CliError } from './errors.js';
@@ -19,6 +20,8 @@ export interface CliOptions extends RuntimeOptions {
   output?: (line: string) => void;
   error?: (line: string) => void;
   confirm?: (count: number) => Promise<boolean>;
+  confirmAction?: (id: string) => Promise<boolean>;
+  promptIO?: PromptIO;
 }
 
 const collect = (value: string, previous: string[] = []) => [...previous, ...value.split(',').map(item => item.trim()).filter(Boolean)];
@@ -125,11 +128,15 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       const preview = await rt.rotate(rotationPlan, rotationOptions);
       if (!opts.execute) { emit({ report: preview, journal: rt.paths.journal }, `${preview.diff.join('\n')}\n${summary(preview, rt.paths.journal)}`); reportExit(preview); return; }
       diagnostic(`Rotation preview (${rotationPlan.steps.length} secret clusters):\n${preview.diff.join('\n')}`);
+      const interactive = hasInteractiveTerminal(options.promptIO);
+      if (rotationPlan.steps.some(step => step.method === 'atomic-roll') && !interactive) {
+        throw new CliError('Atomic-roll rotation requires an interactive terminal for replacement recovery. Run rotate --execute in a terminal.');
+      }
       if (rotationPlan.steps.length && !opts.yes && !await (options.confirm ?? (count => confirmRotation(count, diagnostic)))(rotationPlan.steps.length)) {
         emit({ cancelled: true, report: preview, journal: rt.paths.journal }, 'Rotation cancelled. No host or provider changes.'); return;
       }
-      const prompt = options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic));
-      const reveal = options.reveal ?? ((info, value) => revealSecret(info, value, diagnostic));
+      const prompt = options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic, options.promptIO));
+      const reveal = options.reveal ?? (interactive ? ((info, value) => revealSecret(info, value, diagnostic, options.promptIO)) : undefined);
       const report = await rt.rotate(rotationPlan, { ...rotationOptions, execute: true, prompt, reveal });
       emit({ preview, report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report);
     });
@@ -165,8 +172,29 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
     });
   program.command('actions').description('List pending monitor actions').action(async () => { const rt = await getRuntime(); emit(await rt.pendingActions()); });
-  program.command('approve <id>').description('Explicitly approve and execute exactly this pending rotation or containment action').action(async id => {
-    const rt = await getRuntime(); const report = await rt.approve(id);
+  program.command('approve <id>').description('Review, confirm, and execute a pending rotation or containment action')
+    .option('--yes', 'Skip typing the action id after reviewing the action')
+    .action(async (id: string, opts: { yes?: boolean }) => {
+    const rt = await getRuntime(); const review = await rt.reviewAction(id);
+    const rotation = review.action.action === 'rotate' || review.action.action === 'breach-mode';
+    diagnostic([`Action ${review.action.id}: ${review.action.action} ${review.action.clusterIds.length} secret cluster(s).`,
+      ...review.plan.steps.map(step => `${step.provider} (${step.method}): ${step.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}`),
+      rotation ? 'Creates replacements, writes consumers, redeploys supported services, then revokes old keys after deployment.' : 'Disables or caps the selected keys at the provider; consumers may stop working.',
+      `revokeUnconfirmed: ${review.revokeUnconfirmed}${review.revokeUnconfirmed ? ' — old keys may be revoked before manual restarts or other unconfirmed activation.' : ' — old keys are retained when activation is unconfirmed.'}`,
+      review.requiresInteractive ? 'Interactive atomic-roll recovery is required; the old key dies when its replacement is created.' : '',
+      review.manualRestarts.length ? `Manual restart / activation required:\n${review.manualRestarts.map(service => `  ${serviceLabel(service)}`).join('\n')}` : 'Manual restart / activation required: none known.',
+    ].filter(Boolean).join('\n'));
+    const interactive = hasInteractiveTerminal(options.promptIO);
+    if (review.requiresInteractive && !interactive) throw new CliError('This action requires an interactive terminal for atomic-roll recovery; --yes only skips confirmation.');
+    if (!opts.yes) {
+      if (!interactive && !options.confirmAction) throw new CliError('Approval confirmation requires an interactive terminal. Pass --yes after reviewing the action.');
+      if (!await (options.confirmAction ?? (actionId => confirmAction(actionId, diagnostic, options.promptIO)))(review.action.id)) {
+        emit({ cancelled: true, action: review.action }, 'Approval cancelled. No host or provider changes.'); return;
+      }
+    }
+    const prompt = options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic, options.promptIO));
+    const reveal = options.reveal ?? ((info, value) => revealSecret(info, value, diagnostic, options.promptIO));
+    const report = await rt.approve(id, { interactive, reviewHash: review.reviewHash, ...(interactive ? { prompt, reveal } : {}) });
     if (report) { emit({ report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report); }
     else {
       const action = (await rt.monitorStatus()).pendingActions.find(action => action.id === id);
@@ -187,6 +215,8 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     if (error instanceof CommanderError) {
       if (error.exitCode === 0) return 0;
       diagnostic('Invalid command or option. Run keysentry --help for usage.');
+    } else if (error instanceof RotationAbortedError) {
+      diagnostic('aborted, no further changes');
     } else {
       // Only local fixed errors are surfaced; arbitrary adapters can include unregistered secrets.
       diagnostic(error instanceof CliError ? error.message : 'Command failed. Check configuration, enabled hosts, and the redacted rotation journal.');

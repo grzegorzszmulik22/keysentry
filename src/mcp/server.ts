@@ -32,7 +32,7 @@ export interface McpRuntime {
     acceptUnplannedSealed?: boolean;
     allowGenerate?: boolean;
     verifyRetries?: number;
-    reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<void>;
+    reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<boolean>;
   }): Promise<RotationReport>;
   monitorStatus(): Promise<unknown>;
   pendingActions(): Promise<PendingAction[]>;
@@ -208,7 +208,7 @@ export function createToolHandlers(runtime: McpRuntime) {
         ...reviewed.options, execute,
         // Recovery values must never cross a tool result or a runtime's default
         // terminal reveal callback. The interactive CLI owns that recovery path.
-        reveal: async () => {},
+        reveal: undefined,
         prompt: async (prompt) => {
           if (!instructions.some((item) => item.clusterId === prompt.clusterId)) instructions.push(prompt);
           return null;

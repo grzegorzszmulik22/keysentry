@@ -11,10 +11,10 @@ const context = (http: FakeHttp, admin = secret()): ProviderContext => ({
 const hint = (value: string) => `${value.slice(0, 12)}...${value.slice(-4)}`;
 const projectsUrl = /^https:\/\/api\.openai\.com\/v1\/organization\/projects\?limit=100$/;
 const keysUrl = /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/api_keys\?limit=100$/;
-function oneKey(http: FakeHttp, value: string, serviceAccount = true) {
+function oneKey(http: FakeHttp, value: string, serviceAccount = true, scopes: unknown = ['api.responses.write']) {
   http.on('GET', projectsUrl, () => json(200, { object: 'list', data: [{ id: 'proj_one' }], has_more: false }));
   http.on('GET', keysUrl, () => json(200, { object: 'list', data: [{
-    id: 'key_old', name: 'Production', redacted_value: hint(value), created_at: 1_700_000_000,
+    id: 'key_old', name: 'Production', redacted_value: hint(value), created_at: 1_700_000_000, scopes,
     owner: serviceAccount ? { type: 'service_account', service_account: { id: 'svc_acct_old', name: 'Worker' } }
       : { type: 'user', user: { id: 'user_old', email: 'owner@example.test' } },
   }], has_more: false }));
@@ -90,7 +90,8 @@ describe('OpenAI provider', () => {
         expect(req.headers?.Authorization === `Bearer ${admin}`).toBe(true);
         expect(req.headers?.['Content-Type']).toBe('application/json');
         const body = JSON.parse(req.body!) as Record<string, unknown>;
-        expect(Object.keys(body)).toEqual(['name']);
+        expect(Object.keys(body)).toEqual(['name', 'scopes']);
+        expect(body.scopes).toEqual(['api.responses.write']);
         expect(body.name).toMatch(/^keysentry-\d{4}-\d\d-\d\dT/);
         return json(200, { id: 'key_new', value: newValue });
       }).on('DELETE',
@@ -108,6 +109,70 @@ describe('OpenAI provider', () => {
       'https://api.openai.com/v1/organization/projects/proj_one/service_accounts/svc_acct_old/api_keys',
       'https://api.openai.com/v1/organization/projects/proj_one/api_keys/key_old',
     ]);
+  });
+
+  it('copies each explicit permission scope to the replacement without broadening access', async () => {
+    const value = secret();
+    const newValue = secret();
+    const http = oneKey(new FakeHttp(), value, true, ['api.models.read', 'api.responses.write']).on('POST',
+      /\/service_accounts\/svc_acct_old\/api_keys$/, () => json(200, { id: 'key_new', value: newValue }));
+    const result = await openaiProvider.rotate!(value, context(http));
+    const creation = http.calls.filter(call => call.method === 'POST');
+    expect(creation).toHaveLength(1);
+    expect(JSON.parse(creation[0]!.body!).scopes).toEqual(['api.models.read', 'api.responses.write']);
+    expect(result.oldRevoked).toBe(false);
+    expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
+  });
+
+  it('requires guided rotation before mutation when service-account scopes cannot be safely expressed', async () => {
+    const value = secret();
+    const admin = secret();
+    const invalidScopes = [null, 'api.responses.write', {}, [], [null], [1], [''], [' '],
+      ['api.models.read', null], ['api.responses.write\n'], [value], [admin]];
+    for (const scopes of invalidScopes) {
+      const http = oneKey(new FakeHttp(), value, true, scopes).on('POST',
+        /\/service_accounts\/svc_acct_old\/api_keys$/, () => json(200, { id: 'key_new', value: secret() }));
+      let error: unknown;
+      try { await openaiProvider.rotate!(value, context(http, admin)); } catch (cause) { error = cause; }
+      expect(error instanceof OpenAIGuidedRotationRequiredError).toBe(true);
+      expect(error).toMatchObject({ code: 'GUIDED_ROTATION_REQUIRED', provider: 'openai' });
+      expect(http.calls.every(call => call.method === 'GET')).toBe(true);
+      expect(String(error).includes(value)).toBe(false);
+      expect(String(error).includes(admin)).toBe(false);
+    }
+  });
+
+  it('requires guided rotation when the project API key object omits scopes', async () => {
+    const value = secret();
+    const http = new FakeHttp().on('GET', projectsUrl, () => json(200, { data: [{ id: 'proj_one' }], has_more: false }))
+      .on('GET', keysUrl, () => json(200, { data: [{ id: 'key_old', redacted_value: hint(value),
+        owner: { type: 'service_account', service_account: { id: 'svc_acct_old' } },
+      }], has_more: false }))
+      .on('POST', /\/service_accounts\/svc_acct_old\/api_keys$/, () => json(200, { id: 'key_new', value: secret() }));
+    let error: unknown;
+    try { await openaiProvider.rotate!(value, context(http)); } catch (cause) { error = cause; }
+    expect(error instanceof OpenAIGuidedRotationRequiredError).toBe(true);
+    expect(error).toMatchObject({ code: 'GUIDED_ROTATION_REQUIRED', provider: 'openai' });
+    expect(http.calls.every(call => call.method === 'GET')).toBe(true);
+  });
+
+  it('falls back to guided rotation when scoped creation is unsupported without retrying a broader key', async () => {
+    const value = secret();
+    const admin = secret();
+    for (const status of [400, 404, 405, 422, 501]) {
+      const http = oneKey(new FakeHttp(), value).on('POST', /\/service_accounts\/svc_acct_old\/api_keys$/,
+        () => json(status, { error: { message: `${value} ${admin}` } }));
+      let error: unknown;
+      try { await openaiProvider.rotate!(value, context(http, admin)); } catch (cause) { error = cause; }
+      expect(error instanceof OpenAIGuidedRotationRequiredError).toBe(true);
+      expect(error).toMatchObject({ code: 'GUIDED_ROTATION_REQUIRED', provider: 'openai' });
+      const mutations = http.calls.filter(call => call.method !== 'GET');
+      expect(mutations).toHaveLength(1);
+      expect(mutations[0]!.method).toBe('POST');
+      expect(JSON.parse(mutations[0]!.body!).scopes).toEqual(['api.responses.write']);
+      expect(String(error).includes(value)).toBe(false);
+      expect(String(error).includes(admin)).toBe(false);
+    }
   });
 
   it('requires guided rotation for user-owned keys without creating a service account', async () => {

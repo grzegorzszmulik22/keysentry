@@ -101,7 +101,23 @@ describe('stdio MCP server tools', () => {
       execute: true, revoke: 'never', redeploy: true, revokeUnconfirmed: false,
       acceptUnplannedSealed: false, allowGenerate: false, verifyRetries: 4,
     });
-    expect(vi.mocked(runtime.rotate).mock.calls[1]![1].reveal).toBeTypeOf('function');
+    expect(vi.mocked(runtime.rotate).mock.calls[1]![1].reveal).toBeUndefined();
+  });
+
+  it('explicitly disables runtime reveal callbacks for MCP preview and execution', async () => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({});
+    const { planId, planHash } = preview.structuredContent!;
+    const executed = await handlers.rotate({ execute: true, planId, planHash });
+    expect(preview.isError).not.toBe(true);
+    expect(executed.isError).not.toBe(true);
+    expect(runtime.rotate).toHaveBeenCalledTimes(2);
+    for (const [, opts] of vi.mocked(runtime.rotate).mock.calls) {
+      expect(Object.hasOwn(opts, 'reveal')).toBe(true);
+      expect(opts.reveal).toBeUndefined();
+    }
   });
 
   it('checks the execution environment again after a successful dry run and names that plan for the terminal', async () => {

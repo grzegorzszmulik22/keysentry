@@ -99,9 +99,9 @@ function randomLooking(value: string): boolean {
 
 const SECRET_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
 const PUBLIC_NAME = /^(?:NEXT_PUBLIC_|VITE_|PUBLIC_)/;
-const APP_NAME = /^(?:JWT_SECRET|JWT_SIGNING_SECRET|SESSION_SECRET|COOKIE_SECRET|NEXTAUTH_SECRET|AUTH_SECRET|BETTER_AUTH_SECRET|SECRET_KEY_BASE|CSRF_SECRET)$|_(?:SESSION_SECRET|JWT_SECRET)$/;
+const APP_NAME = /^(?:JWT_SECRET|JWT_SIGNING_SECRET|SESSION_SECRET|COOKIE_SECRET|NEXTAUTH_SECRET|AUTH_SECRET|BETTER_AUTH_SECRET|SECRET_KEY_BASE|CSRF_SECRET)$/;
 const ENCRYPTION_NAME = /^(?:ENCRYPTION_KEY|MASTER_KEY|DATA_KEY|APP_KEY)$|_(?:ENCRYPTION_KEY|CIPHER_KEY)$/;
-const ISSUED_SECRET_NAME = /_(?:CLIENT_SECRET|WEBHOOK_SECRET|API_SECRET|APP_SECRET|SIGNING_SECRET)$/;
+const ISSUED_SECRET_NAME = /_(?:CLIENT_SECRET|WEBHOOK_SECRET|API_SECRET|APP_SECRET|SIGNING_SECRET|SESSION_SECRET|JWT_SECRET)$/;
 const WALLET_NAME = /(?:^|_)(?:PRIVATE_?KEY|WALLET|MNEMONIC|SEED)(?:_|$)/;
 
 function providerFromName(name: string): ProviderId | undefined {
@@ -162,6 +162,11 @@ export function classify(name: string, value: string | undefined): Classificatio
     return no();
   }
   if (upper === 'AWS_SECRET_ACCESS_KEY' && text !== undefined && /^[A-Za-z0-9/+]{40}$/.test(text)) return result('aws', true, 'high');
+  // Structured credentials/configuration cannot be replaced by random bytes.
+  // Keep them guided even when formatting whitespace defeats the entropy test.
+  if (text !== undefined && (text.startsWith('{') || text.startsWith('[')) && SECRET_NAME.test(upper)) {
+    return result('unknown', true, 'low');
+  }
   if (text !== undefined && !randomLooking(text)) return no();
   if (ENCRYPTION_NAME.test(upper)) return result('encryption-key', true, 'medium');
   if (APP_NAME.test(upper)) return result('app-secret', true, 'medium');

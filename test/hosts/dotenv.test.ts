@@ -171,6 +171,9 @@ DOLLAR=$UNCHANGED
     ['backtick', 'old', 'has` # hash', "'has` # hash'"],
     ['single and backtick quotes', 'old', 'has\'` # $HOME', '"has\'` # $HOME"'],
     ['literal carriage escape', '"old"', 'literal\\rreturn', "'literal\\rreturn'"],
+    ['multiline literal newline escape', '"old"', 'literal\\n and\nnewline', "'literal\\n and\nnewline'"],
+    ['multiline literal carriage escape', 'old', 'literal\\r and\nnewline', "'literal\\r and\nnewline'"],
+    ['multiline JSON with literal escapes', '"old"', '{\n  "private_key": "first\\nsecond\\n"\n}', "'{\n  \"private_key\": \"first\\nsecond\\n\"\n}'"],
     ['dollar', 'old', '$HOME', '$HOME'],
     ['real newlines', 'old', 'one\ntwo\rthree', '"one\\ntwo\\rthree"'],
   ])('writes %s without changing the value under dotenv parsing', async (_label, before, value, encoded) => {
@@ -186,7 +189,7 @@ DOLLAR=$UNCHANGED
     ]);
   });
 
-  it.each(['literal\\n and\nnewline', 'literal\\r and\nnewline', "all'`quotes\\n #"])(
+  it.each(['literal\\n and\rreturn', 'literal\\r and\r\nnewline', "all'`quotes\\n #"])(
     'refuses an unrepresentable write without changing the original or leaking the value', async (value) => {
       const dir = await root();
       const file = join(dir, '.env');
@@ -201,6 +204,35 @@ DOLLAR=$UNCHANGED
       expect(await readdir(dir)).toEqual(['.env']);
     },
   );
+
+  it('reads multiline quoted literals without expanding escapes, comments, or interpolation', async () => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, "SINGLE='first\\n # $HOME\n\"second\" `tick`\\r' # keep\nBACK=`first\\n\nsecond\\r`\nDOUBLE=\"first\\n\nsecond\\r\"\nAFTER=keep\n");
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    expect(await host.readVariables(service!)).toEqual([
+      { name: 'SINGLE', value: 'first\\n # $HOME\n"second" `tick`\\r', sealed: false },
+      { name: 'BACK', value: 'first\\n\nsecond\\r', sealed: false },
+      { name: 'DOUBLE', value: 'first\n\nsecond\r', sealed: false },
+      { name: 'AFTER', value: 'keep', sealed: false },
+    ]);
+  });
+
+  it('appends a multiline literal escape value using single quotes and preserves the existing bytes', async () => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, '\uFEFFKEEP="unchanged" # preserved\r\n');
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    await host.writeVariables(service!, { NEW: '  first\\n\nsecond\\r # $HOME  ' }, { skipDeploy: true });
+    expect(await readFile(file, 'utf8')).toBe('\uFEFFKEEP="unchanged" # preserved\r\nNEW=\'  first\\n\nsecond\\r # $HOME  \'\r\n');
+    expect(await host.readVariables(service!)).toEqual([
+      { name: 'KEEP', value: 'unchanged', sealed: false },
+      { name: 'NEW', value: '  first\\n\nsecond\\r # $HOME  ', sealed: false },
+    ]);
+    expect(await readdir(dir)).toEqual(['.env']);
+  });
 
   it('normalizes CRLF inside quoted values and supports dotenv colon and numeric-key syntax', async () => {
     const dir = await root();

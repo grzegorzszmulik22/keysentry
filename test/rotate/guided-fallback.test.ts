@@ -29,7 +29,7 @@ async function fixture(host: FakeHost, providers: ProviderAdapter[]) {
     providers(id) { const provider = providers.find(p => p.id === id); if (!provider) throw new Error('Missing fake provider'); return provider; },
     providerCtx: { http: new FakeHttp(), credentials: {}, log },
     journal: { async append(entry) { entries.push(structuredClone(entry)); }, async read() { return entries; } },
-    fingerprintKey: key, redactor, log, prompt, sleep: async () => {},
+    fingerprintKey: key, redactor, log, prompt, sleep: async () => {}, reveal: async () => true,
   };
   return { inv, plan, deps, entries, lines, prompt };
 }
@@ -301,7 +301,7 @@ describe('automatic rotation requiring guided permission preservation', () => {
       rolled = result.newValue;
       return result;
     });
-    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(undefined);
+    const reveal = vi.fn<NonNullable<EngineDeps['reveal']>>().mockResolvedValue(true);
     h.deps.reveal = reveal;
     const revoke = provider.revoke.bind(provider);
     vi.spyOn(provider, 'revoke').mockImplementation(async (ref, ctx) => {

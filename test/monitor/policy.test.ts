@@ -97,6 +97,28 @@ describe('monitor policy', () => {
     expect(decisions.find(d => d.clusterIds.includes('safe'))).toMatchObject({ action, automatic: true });
   });
 
+  it.each([
+    ['rotate', true], ['breach-mode', true], ['rotate', false], ['breach-mode', false],
+  ] as const)('makes atomic rolls alert-only for %s with autoExecute=%s', (action, autoExecute) => {
+    const one = svc('railway', 'one');
+    const atomic = { ...cluster('atomic', [one]), method: 'atomic-roll' as const };
+    const policy = defaultPolicy(); policy.autoExecute = autoExecute;
+    policy.rules.canary_triggered.action = action;
+    const decisions = decide(signal({ kind: 'canary_triggered', serviceKeys: [serviceKey(one)] }),
+      inventory([atomic, cluster('safe', [one])]), policy, createMonitorState());
+    expect(decisions.find(d => d.clusterIds.includes('atomic'))).toMatchObject({
+      action: 'alert', automatic: false, reason: 'atomic-roll-disabled',
+    });
+    expect(decisions.find(d => d.clusterIds.includes('safe'))).toMatchObject({ action, automatic: autoExecute });
+  });
+
+  it('still permits opted-in containment of an atomic-roll key', () => {
+    const atomic = { ...cluster('a', [svc('railway', 'one')]), method: 'atomic-roll' as const };
+    const policy = defaultPolicy(); policy.autoContain = true;
+    expect(decide(signal({ kind: 'usage_anomaly' }), inventory([atomic]), policy, createMonitorState())[0])
+      .toMatchObject({ action: 'cap', automatic: true, clusterIds: ['a'] });
+  });
+
   it('expands a canary service only to clusters consumed in that service', () => {
     const one = svc('railway', 'one');
     const two = svc('railway', 'two');

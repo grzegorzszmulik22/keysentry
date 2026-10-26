@@ -1,11 +1,12 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createRuntime } from '../../src/cli/runtime.js';
 import { runCli } from '../../src/cli/index.js';
 import { serviceKey } from '../../src/core/index.js';
-import { defaultPolicy } from '../../src/monitor/index.js';
+import { createMonitorState, defaultPolicy } from '../../src/monitor/index.js';
 import { getProvider } from '../../src/providers/index.js';
 import { createDotenvHost } from '../../src/hosts/index.js';
 import type { RotationReport } from '../../src/types.js';
@@ -29,6 +30,75 @@ async function filesUnder(directory: string): Promise<string[]> {
 }
 
 describe('breach-night CLI and monitoring flow', () => {
+  it('confirms an atomic approval by id and reveals the undelivered replacement only on its terminal', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-atomic-approval-e2e-')); directories.push(cwd);
+    const host = new FakeHost('railway'); host.pendingPolls = 0;
+    const provider = new FakeProvider('cloudflare', 'atomic-roll', 'cf-f9G7k6R2a4D0p8W5b3H1j9C6e2M4x7U8-');
+    const old = provider.issue(); host.addService('api', { CLOUDFLARE_API_TOKEN: old.value }); host.failWritesFor.add('api');
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [host], providers: id => id === provider.id ? provider : getProvider(id),
+      http: new FakeHttp(), log: silentLogger, feeds: [], sleep: async () => {} });
+    const inv = await runtime.scan(); const state = createMonitorState(); const actionId = 'action-e2e-recovery';
+    state.pendingActions.push({ id: actionId, createdAt: new Date().toISOString(), signalId: 'leak-test', action: 'rotate',
+      clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending', requiresInteractive: true, revokeUnconfirmed: false });
+    await writeFile(runtime.paths.monitor, JSON.stringify(state));
+    const input = Object.assign(new PassThrough(), { isTTY: true, isRaw: false, setRawMode(value: boolean) { this.isRaw = value; return this; } });
+    const terminal: string[] = []; const diagnostics: string[] = []; const output: string[] = [];
+    expect(await runCli(['approve', actionId], { runtime, promptIO: { input: input as unknown as NodeJS.ReadStream,
+      output: { isTTY: true, write: value => { terminal.push(value); return true; } } }, output: line => output.push(line), error: line => {
+      diagnostics.push(line);
+      if (line.includes(`Type ${actionId}`)) queueMicrotask(() => input.write(`${actionId}\r`));
+      if (line.includes('Type SHOW')) queueMicrotask(() => input.write('SHOW\r'));
+    } })).toBe(1);
+    expect(provider.keys.size).toBe(2); expect(provider.keys.get(old.ref)?.active).toBe(false);
+    const replacement = [...provider.keys.values()].find(key => key.ref !== old.ref)!;
+    expect(terminal.filter(text => text.includes(replacement.value))).toHaveLength(1);
+    expect([...diagnostics, ...output].some(text => text.includes(replacement.value))).toBe(false);
+    const metadata = await Promise.all((await filesUnder(runtime.paths.dir)).map(path => readFile(path)));
+    expect(metadata.some(contents => contents.includes(Buffer.from(replacement.value)))).toBe(false);
+    expect(input.isRaw).toBe(false); expect(input.listenerCount('data')).toBe(0);
+  });
+
+  it('aborts from the actual hidden prompt before another provider or host can mutate', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-abort-e2e-')); directories.push(cwd);
+    const host = new FakeHost('railway'); host.pendingPolls = 0;
+    const guided = new FakeProvider('stripe', 'guided', 'sk_live_0123456789abcdef');
+    const automatic = new FakeProvider('openrouter', 'auto', 'sk-or-v1-0123456789abcdef');
+    host.addService('api', { STRIPE_SECRET_KEY: guided.issue().value, OPENROUTER_API_KEY: automatic.issue().value });
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [host], providers: id => id === guided.id ? guided : id === automatic.id ? automatic : getProvider(id),
+      http: new FakeHttp(), log: silentLogger, feeds: [], sleep: async () => {} });
+    const input = Object.assign(new PassThrough(), { isTTY: true, isRaw: false, setRawMode(value: boolean) { this.isRaw = value; return this; } });
+    const diagnostics: string[] = [];
+    expect(await runCli(['rotate', '--execute', '--yes'], { runtime, promptIO: { input: input as unknown as NodeJS.ReadStream,
+      output: { isTTY: true, write: () => true } }, output: () => {}, error: line => {
+      diagnostics.push(line); if (line.includes('Enter the new value')) queueMicrotask(() => input.write('\x03'));
+    } })).toBe(1);
+    expect(diagnostics.join('\n')).toContain('aborted, no further changes');
+    expect(host.writes).toHaveLength(0); expect(host.redeploys).toHaveLength(0); expect(automatic.keys.size).toBe(1);
+    expect(guided.revoked).toHaveLength(0); expect(automatic.revoked).toHaveLength(0); expect(input.isRaw).toBe(false);
+  });
+
+  it('stops further host mutations when the human cancels an atomic recovery reveal', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-recovery-abort-e2e-')); directories.push(cwd);
+    const host = new FakeHost('railway'); host.pendingPolls = 0;
+    const provider = new FakeProvider('cloudflare', 'atomic-roll', 'cf-f9G7k6R2a4D0p8W5b3H1j9C6e2M4x7U8-');
+    const old = provider.issue();
+    host.addService('first', { CLOUDFLARE_API_TOKEN: old.value });
+    host.addService('second', { CLOUDFLARE_API_TOKEN: old.value }); host.failWritesFor.add('first');
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [host], providers: id => id === provider.id ? provider : getProvider(id),
+      http: new FakeHttp(), log: silentLogger, feeds: [], sleep: async () => {} });
+    const input = Object.assign(new PassThrough(), { isTTY: true, isRaw: false, setRawMode(value: boolean) { this.isRaw = value; return this; } });
+    const diagnostics: string[] = []; let prompts = 0; let writesAtCancel = -1;
+    expect(await runCli(['rotate', '--execute', '--yes'], { runtime, promptIO: { input: input as unknown as NodeJS.ReadStream,
+      output: { isTTY: true, write: () => true } }, output: () => {}, error: line => {
+      diagnostics.push(line);
+      if (line.includes('Type SHOW')) { prompts++; writesAtCancel = host.writes.length; queueMicrotask(() => input.write('\x03')); }
+    } })).toBe(1);
+    expect(diagnostics.join('\n')).toContain('aborted, no further changes');
+    expect(prompts).toBe(1); expect(writesAtCancel).toBeGreaterThanOrEqual(0);
+    expect(host.writes).toHaveLength(writesAtCancel); expect(host.redeploys).toHaveLength(0);
+    expect(provider.keys.size).toBe(2); expect(input.isRaw).toBe(false);
+  });
+
   it('rotates every copy, batches each service, responds to a canary, and persists no plaintext', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'keysentry-e2e-'));
     directories.push(cwd);

@@ -88,6 +88,9 @@ export function decide(signal: Signal, inv: Inventory, policy: Policy, state: Mo
     const generated = inv.clusters.filter(cluster => clusterIds.includes(cluster.id) && cluster.method === 'generate').map(cluster => cluster.id);
     if (generated.length) decisions.push(decision(generated, false, 'generate-disabled', 'alert'));
     clusterIds = clusterIds.filter(id => !generated.includes(id));
+    const atomic = inv.clusters.filter(cluster => clusterIds.includes(cluster.id) && cluster.method === 'atomic-roll').map(cluster => cluster.id);
+    if (atomic.length) decisions.push(decision(atomic, false, 'atomic-roll-disabled', 'alert'));
+    clusterIds = clusterIds.filter(id => !atomic.includes(id));
   }
   if (!clusterIds.length) return decisions;
   const enabled = containment ? policy.autoContain : policy.autoExecute;

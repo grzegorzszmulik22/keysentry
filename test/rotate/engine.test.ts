@@ -71,6 +71,7 @@ async function setup(hosts: FakeHost[], providers: FakeProvider[]) {
     log,
     sleep,
     now: () => new Date(instant),
+    reveal: async () => true,
   };
   return { inv, plan, deps, journal, prompt, sleep, redactor, log, lines };
 }

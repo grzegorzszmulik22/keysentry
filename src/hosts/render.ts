@@ -99,9 +99,15 @@ export function createRenderHost({ apiKey, http, log }: RenderHostOptions): Host
       if (!Array.isArray(liveDeployments)) invalidResponse();
       const body: Record<string, unknown> = { clearCache: 'do_not_clear' };
       if (liveDeployments.length > 0) {
-        // Reuse the live code so rotating a secret cannot publish newer branch commits.
         const liveDeployment = record(record(liveDeployments[0]).deploy);
-        body.commitId = nonemptyString(record(liveDeployment.commit).id);
+        if (liveDeployment.commit === undefined || liveDeployment.commit === null) {
+          // Image-backed live deployments have no commit; use Render's plain deploy request.
+          // Still require a deployment identity so a malformed empty envelope fails closed.
+          nonemptyString(liveDeployment.id);
+        } else {
+          // Reuse live Git code so rotating a secret cannot publish newer branch commits.
+          body.commitId = nonemptyString(record(liveDeployment.commit).id);
+        }
       } else {
         log.warn('Render has no live deployment; starting an unpinned deployment of the latest branch commit.');
       }
