@@ -386,6 +386,15 @@ export interface PendingAction {
   note?: string;
 }
 
+/** Thrown by an interactive prompt when the human cancels (Ctrl-C): the engine aborts the whole run. */
+export class RotationAbortedError extends Error {
+  readonly code = 'ROTATION_ABORTED';
+  constructor(message = 'Rotation aborted by the operator before any further changes.') {
+    super(message);
+    this.name = 'RotationAbortedError';
+  }
+}
+
 export interface Notifier {
   notify(title: string, body: string, signal?: Signal): Promise<void>;
 }
