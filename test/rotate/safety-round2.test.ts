@@ -278,7 +278,7 @@ describe('round 2 prompt cancellation', () => {
     expect(h.entries.at(-1)?.data?.aborted).toBe(true);
   });
 
-  it('does no cleanup or further creation after cancellation in an automatic fallback', async () => {
+  it('delivers an earlier provider result without cleanup or further creation after fallback cancellation', async () => {
     const automatic = new FakeProvider('openai', 'auto', 'sk-proj-');
     const fallback = new FakeProvider('resend', 'auto', 're_');
     const atomic = atomicProvider();
@@ -296,13 +296,15 @@ describe('round 2 prompt cancellation', () => {
     expect(automatic.keys.size).toBe(2);
     expect(automatic.revoked).toEqual([]);
     expect(atomic.keys.size).toBe(1);
-    expect(host.writes).toEqual([]);
-    expect(host.redeploys).toEqual([]);
-    expect(report.steps.every(step => step.status === 'skipped')).toBe(true);
+    expect(host.writes).toHaveLength(1);
+    expect(host.writes[0]?.vars).toEqual({ OPENAI_API_KEY: [...automatic.keys.values()].find(key => key.name.startsWith('rotated'))!.value });
+    expect(host.redeploys).toEqual(['api']);
+    expect(report.steps.filter(step => step.status === 'skipped')).toHaveLength(2);
+    expect(report.steps.find(step => step.status !== 'skipped')?.status).toBe('deployed');
     expect(h.entries.at(-1)?.data?.aborted).toBe(true);
   });
 
-  it('does not resume even emergency writes after cancellation in a late atomic fallback', async () => {
+  it('finishes delivery and deployment after cancellation in a late atomic fallback', async () => {
     const provider = atomicProvider();
     const olds = [provider.issue(), provider.issue(), provider.issue()];
     const host = new FakeHost('railway');
@@ -317,15 +319,13 @@ describe('round 2 prompt cancellation', () => {
       if (oldValue === olds[1]!.value) throw Object.assign(new Error('guided required'), { code: 'GUIDED_ROTATION_REQUIRED' });
       return rotate(oldValue, ctx);
     });
-    const write = host.writeVariables.bind(host);
-    vi.spyOn(host, 'writeVariables').mockImplementation(async (...args) => { if (cancelled) mutationsAfterCancel++; await write(...args); });
     h.deps.prompt = async () => { cancelled = true; throw new RotationAbortedError(); };
 
     const report = await executePlan(h.plan, h.inv, h.deps, options);
 
     expect(cancelled).toBe(true);
     expect(mutationsAfterCancel).toBe(0);
-    expect(host.redeploys).toEqual([]);
+    expect(host.redeploys).toEqual(['api']);
     expect(provider.keys.size).toBe(4);
     expect(provider.keys.get(olds[2]!.ref)?.active).toBe(true);
     expect(report.steps.slice(1).map(step => step.status)).toEqual(['skipped', 'skipped']);

@@ -183,7 +183,7 @@ export async function revealSecret(info: RevealInfo, value: string, write: (text
   };
   const tty = terminal(io);
   if (!tty) return fallback();
-  write(`WARNING: displaying the replacement secret exposes it in terminal scrollback. ${info.reason}\nType SHOW and press Enter to display it once; any other answer keeps it hidden.`);
+  write(`WARNING: displaying the replacement secret exposes it in terminal scrollback. ${info.reason}\nType SHOW and press Enter to display it once; any other answer keeps it hidden. Ctrl-C declines this reveal and stops new rotations; remaining replacements will still be offered and staged services deployed.`);
   try {
     const answer = await readHidden(tty);
     if (answer.value !== 'SHOW' || answer.pasted || !tty.input.isTTY || !tty.output.isTTY) return fallback();

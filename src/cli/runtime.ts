@@ -1,4 +1,4 @@
-import { CliError } from './errors.js';
+import { CliError, RotationInterruptedError } from './errors.js';
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -196,13 +196,13 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const prompt = opts.prompt ?? (inheritInteraction ? options.prompt : undefined) ?? (async () => null);
     const reveal = Object.hasOwn(opts, 'reveal') ? opts.reveal : inheritInteraction ? options.reveal : undefined;
     const ensureActive = () => { if (aborted) throw aborted; };
-    const preserveAbort = async <T>(operation: () => Promise<T>): Promise<T> => {
-      ensureActive();
+    const preserveAbort = async <T>(operation: () => Promise<T>, recovery = false): Promise<T> => {
+      if (!recovery) ensureActive();
       try { return await operation(); }
       catch (error) { if (error instanceof RotationAbortedError) aborted = error; throw error; }
     };
-    // A downstream error boundary must not turn operator cancellation into
-    // permission to continue another host write, deployment, or revocation.
+    // Cancellation stops new provider mutations. Delivery, reveal offers and
+    // deployment of values already created must finish even after cancellation.
     const guardMutations = <T extends object>(adapter: T, mutations: string[]): T => new Proxy(adapter, {
       get(target, property) {
         const member: unknown = Reflect.get(target, property, target);
@@ -213,12 +213,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         };
       },
     });
-    const executionHosts = Object.fromEntries(Object.entries(hostMap).map(([id, host]) => [id, guardMutations(host, ['writeVariables', 'redeploy'])]));
     const report = await executePlan(rotationPlan, inv, {
-      hosts: executionHosts, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: config.providerCtx, journal,
+      hosts: hostMap, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: config.providerCtx, journal,
       prompt: p => preserveAbort(() => prompt(p)), fingerprintKey, redactor, log,
-      sleep: async ms => { ensureActive(); await (options.sleep ? options.sleep(ms) : new Promise<void>(done => setTimeout(done, ms))); }, now: options.now,
-      reveal: reveal ? (info, value) => preserveAbort(() => reveal(info, value)) : undefined,
+      sleep: options.sleep, now: options.now,
+      reveal: reveal ? (info, value) => preserveAbort(() => reveal(info, value), true) : undefined,
     }, { ...config.rotation, dryRun: opts.execute !== true,
       ...(opts.revoke ? { revoke: opts.revoke } : {}), ...(opts.redeploy !== undefined ? { redeploy: opts.redeploy } : {}),
       ...(opts.revokeUnconfirmed !== undefined ? { revokeUnconfirmed: opts.revokeUnconfirmed } : {}),
@@ -227,13 +226,20 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       ...(opts.verifyRetries !== undefined ? { verifyRetries: opts.verifyRetries } : {}),
     });
     await writeJsonAtomic(join(paths.dir, 'rotation-report.json'), safe(report));
-    if (aborted) throw aborted;
+    if (aborted) throw new RotationInterruptedError(safe(report));
     return report;
   }
 
   async function rotate(rotationPlan: RotationPlan, opts: ExecutionOptions = {}): Promise<RotationReport> {
     const inv = await inventory();
-    const report = await execute(rotationPlan, inv, opts);
+    let interrupted: RotationInterruptedError | undefined;
+    let report: RotationReport;
+    try { report = await execute(rotationPlan, inv, opts); }
+    catch (error) {
+      if (!(error instanceof RotationInterruptedError)) throw error;
+      interrupted = error;
+      report = error.report;
+    }
     if (!report.dryRun) {
       const state = await stateStore.load();
       for (const step of report.steps) if (step.newFingerprint && step.newKeyRef && ['written', 'deployed', 'verified', 'revoked'].includes(step.status)) {
@@ -244,6 +250,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       await stateStore.save(state);
       await scan();
     }
+    if (interrupted) throw interrupted;
     return safe(report);
   }
 

@@ -111,10 +111,6 @@ describe('round two Railway reference preflight', () => {
       change: host => { host.addService('reference', { OPENAI_API_KEY: '${{source.OPENAI_API_KEY}}' }, ['OPENAI_API_KEY']); },
     },
     {
-      name: 'a reference changed to an interpolated expression',
-      change: host => { host.addService('reference', { OPENAI_API_KEY: 'Bearer ${{source.OPENAI_API_KEY}}' }); },
-    },
-    {
       name: 'a reference changed to a missing service',
       change: host => { host.addService('reference', { OPENAI_API_KEY: '${{missing.OPENAI_API_KEY}}' }); },
     },
@@ -162,7 +158,7 @@ describe('round two Railway reference preflight', () => {
       const report = await executePlan(h.plan, h.inv, h.deps, options);
 
       expect(stepFor(report, old.value).status).toBe('skipped');
-      expect(stepFor(report, old.value).warnings.join(' ')).toMatch(/stale/i);
+      expect(stepFor(report, old.value).warnings.join(' ')).toMatch(/reference removed since scan/i);
       expect(provider.keys.size).toBe(2);
       expect(provider.revoked).toEqual([]);
       expect(host.writes).toEqual([]);

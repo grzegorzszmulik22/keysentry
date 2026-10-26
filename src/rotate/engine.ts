@@ -61,7 +61,9 @@ interface StepWork {
   unwritten?: Set<string>;
   delivered?: Set<string>;
   revealed?: boolean;
-  referenceTargets?: Map<string, Consumer>;
+  revealAttempted?: boolean;
+  recoveryMessage?: string;
+  referenceTargets?: Map<string, Consumer[]>;
 }
 
 class JournalFailure extends Error {
@@ -134,6 +136,8 @@ export async function executePlan(
     return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
   });
   const services = new Map<string, ServiceWork>();
+  let aborted = false;
+  let providerProducedResult = false;
   let railwayNamespace: Promise<ServiceRef[]> | undefined;
   const plannedLocations = new Set(plan.steps.flatMap(step => step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`)));
   const referenceLocations = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
@@ -159,6 +163,7 @@ export async function executePlan(
     log.warn(message, { clusterId: work.step.clusterId });
   }
   async function fail(work: StepWork, message: string): Promise<void> {
+    if (work.recoveryMessage) message += ` ${work.recoveryMessage}`;
     work.report.status = 'failed';
     work.report.error = clean(message);
     await journal('failed', { clusterId: work.step.clusterId, data: { error: message, oldRevoked: work.oldRevoked } });
@@ -190,6 +195,10 @@ export async function executePlan(
       || name === secretName || name === `${prefix}_ACCESS_KEY_ID` || name === `${prefix}_SESSION_TOKEN`));
   }
   async function cleanupUnused(work: StepWork): Promise<void> {
+    if (aborted) {
+      warn(work, 'Cancellation blocks provider cleanup; revoke the unused replacement manually.');
+      return;
+    }
     const result = work.result!;
     if (work.atomicRoll || result.oldRevoked) return;
     if (!result.newKeyRef || result.newKeyRef === result.oldKeyRef || !work.provider!.revoke
@@ -231,14 +240,17 @@ export async function executePlan(
   function referenceServiceKeys(work: StepWork, sourceKey: string): string[] {
     const references = work.step.consumers.filter(consumer => {
       if (!consumer.reference || isRailwayShared(consumer.service)) return false;
-      let current: Consumer | undefined = consumer;
+      const pending = [consumer];
       const visited = new Set<string>();
-      while (current?.reference) {
-        const location: string = `${serviceKey(current.service)}\0${current.varName}`;
-        if (visited.has(location)) return false;
+      while (pending.length > 0) {
+        const current = pending.pop()!;
+        const location = `${serviceKey(current.service)}\0${current.varName}`;
+        if (visited.has(location)) continue;
         visited.add(location);
-        current = work.referenceTargets?.get(location);
-        if (current && serviceKey(current.service) === sourceKey) return true;
+        for (const target of work.referenceTargets?.get(location) ?? []) {
+          if (serviceKey(target.service) === sourceKey) return true;
+          if (target.reference) pending.push(target);
+        }
       }
       return false;
     });
@@ -263,24 +275,31 @@ export async function executePlan(
     const variables = service.variables.filter(variable => variable.name === consumer.varName);
     const variable = variables[0];
     if (variables.length !== 1 || !variable || variable.sealed || variable.value === undefined) return false;
-    // Inventory stores the resolved secret fingerprint, not the template. Check
-    // that the current whole-value reference still resolves inside this cluster.
-    const match = /^\s*\$\{\{\s*([^{}]+?)\s*\.\s*([^.\s{}]+)\s*\}\}\s*$/.exec(variable.value);
-    if (!match) return false;
+    // Inventory stores the resolved secret fingerprint, not the template. A
+    // dependency can appear anywhere in an interpolated value, including among
+    // references to other clusters. Keep every valid path for activation checks.
+    const matches = [...variable.value.matchAll(/\$\{\{\s*([^{}]+?)\s*\.\s*([^.\s{}]+)\s*\}\}/g)];
+    if (matches.length === 0) return false;
     // Railway resolves names at runtime. A saved name can now belong to a
     // different service; refresh the namespace once and fail closed on errors.
     railwayNamespace ??= (async () => {
       try { return await deps.hosts.railway?.listServices() ?? []; }
       catch { return []; }
     })();
-    const targets = new Set((await railwayNamespace).filter(candidate => candidate.host === 'railway'
-      && candidate.projectId === consumer.service.projectId && candidate.environmentId === consumer.service.environmentId
-      && candidate.serviceName === match[1]!.trim()).map(candidate => serviceKey(candidate)));
-    if (targets.size !== 1) return false;
-    const target = work.step.consumers.find(candidate => targets.has(serviceKey(candidate.service)) && candidate.varName === match[2]);
-    if (!target || (target.reference && !await referenceIsCurrent(work, target, visited))) return false;
+    const namespace = await railwayNamespace;
+    const resolved = new Map<string, Consumer>();
+    for (const match of matches) {
+      const targets = new Set(namespace.filter(candidate => candidate.host === 'railway'
+        && candidate.projectId === consumer.service.projectId && candidate.environmentId === consumer.service.environmentId
+        && candidate.serviceName === match[1]!.trim()).map(candidate => serviceKey(candidate)));
+      if (targets.size !== 1) continue;
+      const target = work.step.consumers.find(candidate => targets.has(serviceKey(candidate.service)) && candidate.varName === match[2]);
+      if (!target || (target.reference && !await referenceIsCurrent(work, target, new Set(visited)))) continue;
+      resolved.set(`${serviceKey(target.service)}\0${target.varName}`, target);
+    }
+    if (resolved.size === 0) return false;
     work.referenceTargets ??= new Map();
-    work.referenceTargets.set(location, target);
+    work.referenceTargets.set(location, [...resolved.values()]);
     return true;
   }
   function activationFor(work: StepWork, key: string): ServiceWork['activation'] {
@@ -298,12 +317,18 @@ export async function executePlan(
     const reason = `URGENT: ROLLED VALUE UNWRITTEN${context} at ${locations.join(', ')}; the old key is already revoked.`;
     // Resolving a callback is not proof of delivery: unattended/no-op callbacks
     // must never suppress the lost-value warning.
-    if (!work.revealed && deps.reveal) try {
+    if (!work.revealAttempted && deps.reveal) try {
+      work.revealAttempted = true;
       work.revealed = await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: clean(reason) }, work.result!.newValue) === true;
-    } catch { work.revealed = false; }
+    } catch (error) {
+      if (error instanceof RotationAbortedError) aborted = true;
+      work.revealed = false;
+    }
     const message = work.revealed
       ? `${reason} The replacement was revealed; paste it manually and restart/deploy these services.`
       : `${reason} ROLLED VALUE LOST: manual recovery requires the provider dashboard to roll again, then update and restart/deploy these services.`;
+    if (work.recoveryMessage) work.report.warnings = work.report.warnings.filter(warning => warning !== work.recoveryMessage);
+    work.recoveryMessage = clean(message);
     work.report.status = 'failed';
     work.report.error = clean(message);
     try { warn(work, message); } catch { /* failed logging must not suppress recovery metadata */ }
@@ -340,10 +365,15 @@ export async function executePlan(
         catch { /* fixed recovery diagnostic below; never expose adapter errors */ }
         if (!written && attempt < 3) try { await sleep(1_000 * 2 ** attempt); } catch { /* still retry */ }
       }
-      if (written) for (const work of pending) {
-        if (Object.entries(expected.get(work)!).every(([name, value]) => !referenceLocations.has(`${key}\0${name}`) && payload[name] === value)) {
-          work.delivered ??= new Set();
-          work.delivered.add(key);
+      if (written) {
+        // This staging succeeded even if a later redundant batch write fails.
+        // Running instances still need the one deployment for this service.
+        service.written = true;
+        for (const work of pending) {
+          if (Object.entries(expected.get(work)!).every(([name, value]) => !referenceLocations.has(`${key}\0${name}`) && payload[name] === value)) {
+            work.delivered ??= new Set();
+            work.delivered.add(key);
+          }
         }
       }
     }
@@ -378,15 +408,20 @@ export async function executePlan(
         continue;
       }
       let stale = false;
+      let referenceChanged = false;
       let unreadable = false;
       for (const consumer of work.step.consumers) {
         const service = await readService(consumer.service);
         if (service.readFailed) { unreadable = true; continue; }
         const variable = service.variables.find(candidate => candidate.name === consumer.varName);
-        if (!variable) { stale = true; continue; }
+        if (!variable) {
+          if (consumer.reference) referenceChanged = true;
+          else stale = true;
+          continue;
+        }
         // A reference contains a template, not the rendered secret fingerprint.
         if (consumer.reference) {
-          if (!await referenceIsCurrent(work, consumer)) stale = true;
+          if (!await referenceIsCurrent(work, consumer)) referenceChanged = true;
           continue;
         }
         const value = variable.sealed ? undefined : variable.value;
@@ -400,9 +435,10 @@ export async function executePlan(
         }
       }
       if (unreadable) { await fail(work, 'Unable to read every consumer service; no credentials were changed.'); continue; }
-      if (stale) {
+      if (stale || referenceChanged) {
         work.report.status = 'skipped';
-        warn(work, 'Stale inventory: a consumer value changed or is missing; scan again before rotating.');
+        if (referenceChanged) warn(work, 'Railway reference removed since scan or no longer resolves to the scanned source; scan again before rotating.');
+        if (stale) warn(work, 'Stale inventory: a consumer value changed or is missing; scan again before rotating.');
         continue;
       }
       if (work.step.provider === 'aws') {
@@ -491,6 +527,7 @@ export async function executePlan(
         return false;
       }
       async function guidedReplacement(work: StepWork, permissionsFallback = false): Promise<RotationResult | null> {
+        if (aborted) throw new RotationAbortedError();
         const provider = work.provider!;
         if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
         const value = await deps.prompt({
@@ -514,6 +551,11 @@ export async function executePlan(
       }
       for (const work of preparation) {
         work.ready = false;
+        if (aborted) {
+          work.report.status = 'skipped';
+          warn(work, 'Rotation interrupted by the operator; no new provider mutation or replacement prompt was started.');
+          continue;
+        }
         try {
           const provider = work.provider!;
           const ctx = work.ctx!;
@@ -523,7 +565,10 @@ export async function executePlan(
             if (!replacement) continue;
             result = replacement;
           } else {
-            try { result = await provider.rotate!(work.oldValue ?? '', ctx); }
+            try {
+              result = await provider.rotate!(work.oldValue ?? '', ctx);
+              providerProducedResult = true;
+            }
             catch (error) {
               if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'GUIDED_ROTATION_REQUIRED') throw error;
               // This code guarantees rotate rejected before mutation, even for
@@ -602,7 +647,14 @@ export async function executePlan(
           if (verified) await transition(work, 'verified', 'verified');
           work.ready = true;
         } catch (error) {
-          if (error instanceof JournalFailure || error instanceof RotationAbortedError) throw error;
+          if (error instanceof RotationAbortedError) {
+            aborted = true;
+            if (!providerProducedResult) throw error;
+            work.report.status = 'skipped';
+            warn(work, 'Rotation interrupted by the operator; completing delivery and activation of already prepared values.');
+            continue;
+          }
+          if (error instanceof JournalFailure) throw error;
           if (work.atomicRoll && work.result) {
             work.ready = true;
             warn(work, 'URGENT: Rolled credential preparation could not finish; attempting delivery because the old key is already revoked.');
@@ -707,6 +759,18 @@ export async function executePlan(
         log.info('Service variables written.', { serviceKey: key });
       }
       for (const work of works) if (work.unwritten?.size) await valueUnwritten(work);
+      // Early preservation can fail before a fallback prompt, then final batched
+      // delivery can succeed. Keep that history in the journal, but report the
+      // final delivery state so a recovered value is never declared lost.
+      for (const work of works) if (work.recoveryMessage && [...work.services].every(key => work.delivered?.has(key))) {
+        work.report.warnings = work.report.warnings.filter(warning => warning !== work.recoveryMessage);
+        if (work.report.error === work.recoveryMessage) {
+          delete work.report.error;
+          work.report.status = 'written';
+        }
+        work.recoveryMessage = undefined;
+        warn(work, 'The previously unwritten rolled replacement is now staged for every consumer; no value was lost.');
+      }
       for (const work of works) if (work.ready && work.report.status !== 'failed') work.report.status = 'written';
 
       async function revokeOld(work: StepWork): Promise<void> {
@@ -715,6 +779,10 @@ export async function executePlan(
         const result = work.result!;
         if (work.oldRevoked) { await transition(work, 'revoked', 'revoked'); return; }
         if (revoke === 'never') return;
+        if (aborted) {
+          warn(work, 'Cancellation blocks old-key revocation; the old key is retained.');
+          return;
+        }
         if (blockedBySealed(work)) return;
         if (!result.oldKeyRef || !work.provider!.revoke) {
           warn(work, 'Old key could not be identified or revoked automatically; revoke it manually after confirming every consumer.');
@@ -818,12 +886,14 @@ export async function executePlan(
       }
     }
     report.finishedAt = now().toISOString();
-    await journal('plan-end', { data: { dryRun, steps: report.steps } });
+    if (aborted) for (const work of works) if (work.result) {
+      warn(work, 'Rotation interrupted: delivery and activation attempts for prepared values finished; no further provider mutations or replacement prompts were started.');
+    }
+    await journal('plan-end', { data: { dryRun, aborted, steps: report.steps } });
     return sanitize(report, true);
   } catch (error) {
     if (error instanceof RotationAbortedError) {
-      // Cancellation must bypass cleanup and emergency host delivery as well:
-      // after Ctrl-C no provider or host may be mutated again.
+      // No provider result exists yet: cancel all delivery as well as creation.
       for (const work of works) {
         if (['pending', 'created', 'verified'].includes(work.report.status)) {
           work.ready = false;

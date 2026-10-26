@@ -8,7 +8,7 @@ import { startMcpServer } from '../mcp/server.js';
 import { confirmAction, confirmRotation, hasInteractiveTerminal, promptSecret, revealSecret, type PromptIO } from './prompts.js';
 import { createRuntime, type KeysentryRuntime, type PlanFilters, type RuntimeOptions } from './runtime.js';
 import { hostIdSchema, tierSchema } from './schemas.js';
-import { CliError } from './errors.js';
+import { CliError, RotationInterruptedError } from './errors.js';
 import { serviceLabel } from './display.js';
 
 export { createRuntime } from './runtime.js';
@@ -216,7 +216,18 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if (error.exitCode === 0) return 0;
       diagnostic('Invalid command or option. Run keysentry --help for usage.');
     } else if (error instanceof RotationAbortedError) {
-      diagnostic('aborted, no further changes');
+      if (error instanceof RotationInterruptedError && error.report.steps.some(step => step.newFingerprint && step.status !== 'skipped')) {
+        const report = error.report;
+        const staged = report.deployments.filter(deployment => deployment.state !== 'skipped');
+        diagnostic('Rotation interrupted. New provider mutations and replacement prompts stopped; delivery and deployment of prepared values finished.');
+        diagnostic(summary(report, runtime!.paths.journal));
+        diagnostic(`Staged services: ${staged.map(deployment => deployment.serviceKey).join(', ') || '(none)'}`);
+        diagnostic(`Redeployed services: ${staged.filter(deployment => deployment.deploymentId !== null).map(deployment => `${deployment.serviceKey} (${deployment.state})`).join(', ') || '(none)'}`);
+        diagnostic(`Staged-but-not-deployed services: ${staged.filter(deployment => deployment.state !== 'success').map(deployment => deployment.serviceKey).join(', ') || '(none)'}`);
+        const lost = report.steps.filter(step => step.error?.includes('ROLLED VALUE LOST')).map(step => step.clusterId);
+        diagnostic(`Rolled values lost: ${lost.join(', ') || '(none)'}`);
+        if (program.opts().json) emit({ aborted: true, report });
+      } else diagnostic('aborted, no further changes');
     } else {
       // Only local fixed errors are surfaced; arbitrary adapters can include unregistered secrets.
       diagnostic(error instanceof CliError ? error.message : 'Command failed. Check configuration, enabled hosts, and the redacted rotation journal.');

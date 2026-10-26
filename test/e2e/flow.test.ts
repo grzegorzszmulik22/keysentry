@@ -77,7 +77,7 @@ describe('breach-night CLI and monitoring flow', () => {
     expect(guided.revoked).toHaveLength(0); expect(automatic.revoked).toHaveLength(0); expect(input.isRaw).toBe(false);
   });
 
-  it('stops further host mutations when the human cancels an atomic recovery reveal', async () => {
+  it('deploys already written services when the human cancels an atomic recovery reveal', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'keysentry-recovery-abort-e2e-')); directories.push(cwd);
     const host = new FakeHost('railway'); host.pendingPolls = 0;
     const provider = new FakeProvider('cloudflare', 'atomic-roll', 'cf-f9G7k6R2a4D0p8W5b3H1j9C6e2M4x7U8-');
@@ -93,9 +93,9 @@ describe('breach-night CLI and monitoring flow', () => {
       diagnostics.push(line);
       if (line.includes('Type SHOW')) { prompts++; writesAtCancel = host.writes.length; queueMicrotask(() => input.write('\x03')); }
     } })).toBe(1);
-    expect(diagnostics.join('\n')).toContain('aborted, no further changes');
+    expect(diagnostics.join('\n')).toMatch(/interrupted|aborted/i);
     expect(prompts).toBe(1); expect(writesAtCancel).toBeGreaterThanOrEqual(0);
-    expect(host.writes).toHaveLength(writesAtCancel); expect(host.redeploys).toHaveLength(0);
+    expect(host.writes).toHaveLength(writesAtCancel); expect(host.redeploys).toEqual(['second']);
     expect(provider.keys.size).toBe(2); expect(input.isRaw).toBe(false);
   });
 
