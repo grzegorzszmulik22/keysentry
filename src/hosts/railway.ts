@@ -210,7 +210,7 @@ export function createRailwayHost(options: RailwayHostOptions): HostAdapter {
       const data = await graphql(variablesQuery, variableScope(service));
       const variables: RawVariable[] = [];
       for (const [name, value] of Object.entries(object(data.variables))) {
-        if (value === null || value === '') variables.push({ name, sealed: true });
+        if (value === null || value === undefined) variables.push({ name, sealed: true });
         else if (typeof value === 'string') variables.push({ name, value, sealed: false });
         else throw new Error('Railway returned an invalid variable value');
       }
@@ -249,8 +249,8 @@ export function createRailwayHost(options: RailwayHostOptions): HostAdapter {
     async deploymentStatus(_service, deploymentId) {
       const data = await graphql(deploymentQuery, { id: deploymentId });
       const status = nonemptyString(object(data.deployment).status);
-      if (status === 'SUCCESS' || status === 'SKIPPED') return 'success';
-      if (status === 'FAILED' || status === 'CRASHED' || status === 'REMOVED') return 'failed';
+      if (status === 'SUCCESS' || status === 'SLEEPING') return 'success';
+      if (status === 'FAILED' || status === 'CRASHED' || status === 'REMOVED' || status === 'SKIPPED') return 'failed';
       return 'pending';
     },
   };

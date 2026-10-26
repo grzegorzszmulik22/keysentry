@@ -26,7 +26,7 @@ function nonemptyString(value: unknown): string {
   return value;
 }
 
-export function createRenderHost({ apiKey, http }: RenderHostOptions): HostAdapter {
+export function createRenderHost({ apiKey, http, log }: RenderHostOptions): HostAdapter {
   async function request(method: HttpRequest['method'], path: string, body?: Record<string, unknown>): Promise<unknown> {
     const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
     const req: HttpRequest = { method, url: `${BASE_URL}${path}`, headers };
@@ -94,7 +94,18 @@ export function createRenderHost({ apiKey, http }: RenderHostOptions): HostAdapt
     },
 
     async redeploy(service): Promise<string> {
-      const deployment = record(await request('POST', `${servicePath(service)}/deploys`, { clearCache: 'do_not_clear' }));
+      const path = `${servicePath(service)}/deploys`;
+      const liveDeployments = await request('GET', `${path}?limit=1&status=live`);
+      if (!Array.isArray(liveDeployments)) invalidResponse();
+      const body: Record<string, unknown> = { clearCache: 'do_not_clear' };
+      if (liveDeployments.length > 0) {
+        // Reuse the live code so rotating a secret cannot publish newer branch commits.
+        const liveDeployment = record(record(liveDeployments[0]).deploy);
+        body.commitId = nonemptyString(record(liveDeployment.commit).id);
+      } else {
+        log.warn('Render has no live deployment; starting an unpinned deployment of the latest branch commit.');
+      }
+      const deployment = record(await request('POST', path, body));
       return nonemptyString(deployment.id);
     },
 

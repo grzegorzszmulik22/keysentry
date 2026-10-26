@@ -19,7 +19,7 @@ function credentialPair(ctx: ProviderContext, secretValue?: string): CredentialP
     throw new Error(candidates.length > 1 ? 'AWS access key ID is ambiguous.' : 'AWS access key ID is missing.');
   }
   const secretName = accessIdVar.replace(/_ACCESS_KEY_ID$/, '_SECRET_ACCESS_KEY');
-  // Revoke has no oldValue argument: use only the current, matching sibling secret.
+  // Revoke uses the matching sibling pair selected by the caller, including the old pair for cleanup.
   const secretAccessKey = secretValue ?? siblings[secretName];
   if (!secretAccessKey) throw new Error('AWS secret access key is missing.');
   const sessionToken = siblings[accessIdVar.replace(/_ACCESS_KEY_ID$/, '_SESSION_TOKEN')];
@@ -85,6 +85,11 @@ export const awsProvider: ProviderAdapter = {
       const { credentials } = credentialPair(ctx, value);
       const response = await query(ctx, 'sts', credentials, { Action: 'GetCallerIdentity', Version: '2011-06-15' });
       status = response.status;
+      if (status === 403) {
+        const error = child(parseResponse(response, 'ErrorResponse'), 'Error');
+        // The engine retries this signal only while verifying a newly created replacement.
+        if (stringField(error, 'Code') === 'InvalidClientTokenId') return { ok: false, status, error: 'propagating' };
+      }
       // GetCallerIdentity needs no read grant; a 403 is not evidence of a valid restricted key.
       if (status < 200 || status >= 300) return { ok: false, status, error: `AWS verification failed (HTTP ${status}).` };
       const result = child(parseResponse(response, 'GetCallerIdentityResponse'), 'GetCallerIdentityResult');
@@ -118,6 +123,7 @@ export const awsProvider: ProviderAdapter = {
       newKeyRef: newId,
       oldRevoked: false,
       companions: { [accessIdVar]: newId },
+      notes: 'verification may need up to ~30 s',
     };
   },
   async revoke(keyRef, ctx) {

@@ -71,10 +71,14 @@ export async function detectUsage(ctx: DetectorContext, opts: UsageOptions = {})
         .filter(bucket => Date.parse(bucket.hour) >= at.getTime() - 30 * DAY && bucket.hour <= hour);
 
       const cumulative = sample.cumulativeCostUsd !== undefined;
+      let elapsedHours = 1;
       if (cumulative) {
         const total = amount(sample.cumulativeCostUsd);
         const previous = ctx.state.cumulativeTotals[key];
-        const reset = previous !== undefined && total < previous.costUsd;
+        const elapsed = previous ? at.getTime() - Date.parse(previous.at) : 0;
+        // A long gap cannot establish a reliable hourly rate. Start another
+        // zero-delta series just as when the provider resets its counter.
+        const reset = previous !== undefined && (total < previous.costUsd || elapsed > 7 * DAY);
         if (reset) history = [];
         costUsd = previous && !reset ? total - previous.costUsd : 0;
         requests = requests === undefined ? undefined
@@ -85,6 +89,12 @@ export async function detectUsage(ctx: DetectorContext, opts: UsageOptions = {})
           for (const [model, cost] of Object.entries(currentModels)) {
             byModel[model] = Math.max(0, cost - (previous.byModel?.[model] ?? 0));
           }
+          elapsedHours = Math.max(1, Math.floor(at.getTime() / HOUR) - Math.floor(Date.parse(previous.at) / HOUR));
+          // Estimate each crossed hour equally, retaining partial-hour deltas
+          // already recorded before the gap. Request counts may be fractional.
+          costUsd /= elapsedHours;
+          if (requests !== undefined) requests /= elapsedHours;
+          for (const model of Object.keys(byModel)) byModel[model] = byModel[model]! / elapsedHours;
         }
         ctx.state.cumulativeTotals[key] = {
           costUsd: total, at: timestamp,
@@ -93,29 +103,38 @@ export async function detectUsage(ctx: DetectorContext, opts: UsageOptions = {})
         };
       }
 
-      const past = history.filter(bucket => bucket.hour < hour);
-      const previousHour = history.find(bucket => bucket.hour === hour);
-      const bucket: UsageBucket = {
-        hour, costUsd: cumulative ? (previousHour?.costUsd ?? 0) + costUsd : costUsd,
-        ...(requests !== undefined ? { requests: cumulative ? (previousHour?.requests ?? 0) + requests : requests } : {}),
-        byModel: cumulative ? { ...(previousHour?.byModel ?? {}) } : { ...byModel },
-      };
-      if (cumulative) addModels(bucket.byModel!, byModel);
-      history = [...past, bucket].sort((a, b) => a.hour.localeCompare(b.hour));
+      // Evaluate against the history known before this poll: inferred gap
+      // buckets must not normalize their own spike or make a new model known.
+      const past = history.filter(entry => entry.hour < hour);
+      const buckets = new Map(history.map(bucket => [bucket.hour, bucket]));
+      for (let offset = elapsedHours - 1; offset >= 0; offset--) {
+        const bucketHour = new Date(Date.parse(hour) - offset * HOUR).toISOString();
+        const previousHour = buckets.get(bucketHour);
+        const bucket: UsageBucket = {
+          hour: bucketHour, costUsd: cumulative ? (previousHour?.costUsd ?? 0) + costUsd : costUsd,
+          ...(requests !== undefined ? { requests: cumulative ? (previousHour?.requests ?? 0) + requests : requests } : {}),
+          byModel: cumulative ? { ...(previousHour?.byModel ?? {}) } : { ...byModel },
+        };
+        if (cumulative) addModels(bucket.byModel!, byModel);
+        buckets.set(bucketHour, bucket);
+      }
+      history = [...buckets.values()].sort((a, b) => a.hour.localeCompare(b.hour));
       ctx.state.usageHistory[key] = history;
 
+      const bucket = buckets.get(hour)!;
       const baselineBuckets = past.filter(entry => Date.parse(entry.hour) >= at.getTime() - 7 * DAY);
       const costs = baselineBuckets.map(entry => entry.costUsd);
       const baseline = median(costs);
       const mad = median(costs.map(cost => Math.abs(cost - baseline)));
       const p95 = quantile([...costs].sort((a, b) => a - b), 0.95);
-      const threshold = costs.length < 24 ? floor : Math.max(floor, baseline + 8 * mad, 5 * p95);
+      const hasBaseline = costs.length >= 24;
+      const threshold = hasBaseline ? Math.max(floor, baseline + 8 * mad, 5 * p95) : floor;
       const budget = opts.hourlyBudgets?.[cluster.id] ?? opts.hourlyBudgets?.[key];
       const exceededBudget = budget !== undefined && bucket.costUsd > amount(budget);
-      const anomalousSpend = bucket.costUsd > threshold;
+      const anomalousSpend = hasBaseline && bucket.costUsd > threshold;
       const knownModels = new Set(past.flatMap(entry => Object.keys(entry.byModel ?? {})));
-      const newModels = Object.entries(bucket.byModel ?? {})
-        .filter(([model, cost]) => cost > 1 && !knownModels.has(model));
+      const newModels = hasBaseline ? Object.entries(bucket.byModel ?? {})
+        .filter(([model, cost]) => cost > 1 && !knownModels.has(model)) : [];
       if (!anomalousSpend && !exceededBudget && newModels.length === 0) continue;
 
       const confidence = exceededBudget || (anomalousSpend && costs.length >= 24 && bucket.costUsd > 20 * baseline)

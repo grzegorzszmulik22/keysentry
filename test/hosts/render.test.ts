@@ -118,14 +118,109 @@ describe('Render host', () => {
     expect(http.calls[0]?.url).toBe(`${base}/services/srv-one/env-vars/API_KEY`);
   });
 
-  it('starts one deployment without clearing the cache', async () => {
-    const http = new FakeHttp().on('POST', /\/services\/srv-one\/deploys$/, () => json(201, { id: 'dep-one' }));
-    expect(await hostFor(http).redeploy(service)).toBe('dep-one');
-    expect(http.calls).toEqual([{
-      method: 'POST', url: `${base}/services/srv-one/deploys`,
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clearCache: 'do_not_clear' }),
-    }]);
+  it('redeploys the latest live commit without clearing the cache or deploying branch HEAD', async () => {
+    const warnings: string[] = [];
+    const http = new FakeHttp()
+      .on('GET', /\/services\/srv%2Fone\/deploys\?limit=1&status=live$/, () => json(200, [
+        { cursor: 'live-cursor', deploy: { id: 'dep-live', status: 'live', commit: { id: 'live-commit-id' } } },
+      ]))
+      .on('POST', /\/services\/srv%2Fone\/deploys$/, () => json(201, { id: 'dep-one' }));
+    const host = createRenderHost({ apiKey, http, log: { ...silentLogger, warn: (message) => warnings.push(message) } });
+
+    expect(await host.redeploy({ ...service, serviceId: 'srv/one' })).toBe('dep-one');
+    expect(http.calls).toEqual([
+      {
+        method: 'GET', url: `${base}/services/srv%2Fone/deploys?limit=1&status=live`,
+        headers: { Authorization: `Bearer ${apiKey}` },
+      },
+      {
+        method: 'POST', url: `${base}/services/srv%2Fone/deploys`,
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clearCache: 'do_not_clear', commitId: 'live-commit-id' }),
+      },
+    ]);
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns and starts one unpinned deployment when no live deployment exists', async () => {
+    const warnings: string[] = [];
+    const http = new FakeHttp()
+      .on('GET', /\/services\/srv-one\/deploys\?limit=1&status=live$/, () => json(200, []))
+      .on('POST', /\/services\/srv-one\/deploys$/, () => json(201, { id: 'dep-first' }));
+    const host = createRenderHost({ apiKey, http, log: { ...silentLogger, warn: (message) => warnings.push(message) } });
+
+    expect(await host.redeploy(service)).toBe('dep-first');
+    expect(http.calls).toEqual([
+      {
+        method: 'GET', url: `${base}/services/srv-one/deploys?limit=1&status=live`,
+        headers: { Authorization: `Bearer ${apiKey}` },
+      },
+      {
+        method: 'POST', url: `${base}/services/srv-one/deploys`,
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clearCache: 'do_not_clear' }),
+      },
+    ]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/no live deployment/i);
+    expect(warnings[0]).toMatch(/branch|unpinned|latest/i);
+    expect(warnings[0]).not.toContain(apiKey);
+  });
+
+  it.each([
+    { response: null },
+    { response: {} },
+    { response: [null] },
+    { response: [{ deploy: null }] },
+    { response: [{ deploy: {} }] },
+    { response: [{ deploy: { commit: null } }] },
+    { response: [{ deploy: { commit: {} } }] },
+    { response: [{ deploy: { commit: { id: '' } } }] },
+  ])(
+    'does not deploy after a malformed live-deployment lookup: %j', async ({ response }) => {
+      const http = new FakeHttp()
+        .on('GET', /\/deploys\?limit=1&status=live$/, () => json(200, response))
+        .on('POST', /\/deploys$/, () => json(201, { id: 'unexpected' }));
+
+      await expect(hostFor(http).redeploy(service)).rejects.toThrow(/Render/i);
+      expect(http.calls).toHaveLength(1);
+      expect(http.calls[0]?.method).toBe('GET');
+    },
+  );
+
+  it.each(['http', 'transport', 'json'] as const)('sanitizes a %s live-deployment lookup failure without deploying', async (failure) => {
+    const marker = 'test-private-lookup-marker';
+    const http = new FakeHttp()
+      .on('GET', /\/deploys\?limit=1&status=live$/, () => {
+        if (failure === 'transport') throw new Error(`${apiKey} ${marker}`);
+        return failure === 'http' ? json(403, { error: marker }) : text(200, marker);
+      })
+      .on('POST', /\/deploys$/, () => json(201, { id: 'unexpected' }));
+
+    const error = await hostFor(http).redeploy(service).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toMatch(/Render/i);
+    expect(String(error)).not.toContain(marker);
+    expect(String(error)).not.toContain(apiKey);
+    expect(http.calls).toHaveLength(1);
+    expect(http.calls[0]?.method).toBe('GET');
+  });
+
+  it('does not retry a failed pinned deployment with an unpinned deployment', async () => {
+    const marker = 'test-private-deployment-marker';
+    const http = new FakeHttp()
+      .on('GET', /\/deploys\?limit=1&status=live$/, () => json(200, [
+        { cursor: 'live-cursor', deploy: { id: 'dep-live', status: 'live', commit: { id: 'live-commit-id' } } },
+      ]))
+      .on('POST', /\/deploys$/, () => json(403, { error: `${apiKey} ${marker}` }));
+
+    const error = await hostFor(http).redeploy(service).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toMatch(/Render/i);
+    expect(String(error)).not.toContain(marker);
+    expect(String(error)).not.toContain(apiKey);
+    expect(http.calls).toHaveLength(2);
+    expect(JSON.parse(http.calls[1]?.body ?? '{}')).toEqual({ clearCache: 'do_not_clear', commitId: 'live-commit-id' });
   });
 
   it.each([

@@ -29,8 +29,8 @@ describe('CLI configuration', () => {
     expect(config.hosts.map(host => host.id)).toEqual(['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
     expect(config.disabledHosts).toEqual([]);
     expect(config.providerCtx.credentials).toEqual({ OPENAI_ADMIN_KEY: 'openai-management-token', OPENROUTER_PROVISIONING_KEY: 'router-management-token' });
-    expect(config.rotation).toEqual({ dryRun: true, revoke: 'after-deploy', redeploy: true, deployTimeoutMs: 600_000, pollIntervalMs: 5_000 });
-    expect(config.monitor.policy.autoExecute).toBe(false);
+    expect(config.rotation).toEqual({ dryRun: true, revoke: 'after-deploy', redeploy: true, revokeUnconfirmed: false, acceptUnplannedSealed: false, allowGenerate: true, verifyRetries: 4, deployTimeoutMs: 600_000, pollIntervalMs: 5_000 });
+    expect(config.monitor.policy).toMatchObject({ autoExecute: false, autoContain: false, containCooldownMinutes: 60, revokeUnconfirmedOnHighConfidence: true });
     expect(config.monitor.intervalMs).toBe(300_000);
     expect(config.settings.hosts.dotenv.roots).toEqual([cwd]);
     await config.hosts.find(host => host.id === 'vercel')!.listServices();
@@ -64,6 +64,62 @@ describe('CLI configuration', () => {
     expect(config.hosts.map(host => host.id)).toEqual(['dotenv']);
     expect(config.disabledHosts).toHaveLength(5);
     expect(config.disabledHosts.find(host => host.host === 'github-actions')?.reason).toMatch(/repos/i);
+  });
+
+  it('loads rotation safety settings and explicit containment policy from YAML', async () => {
+    const cwd = await directory();
+    await writeFile(join(cwd, 'keysentry.yaml'), [
+      'rotation:', '  revokeUnconfirmed: true', '  acceptUnplannedSealed: true',
+      '  allowGenerate: false', '  verifyRetries: 0',
+      'monitor:', '  autoContain: true', '  containCooldownMinutes: 17',
+      '  revokeUnconfirmedOnHighConfidence: false',
+    ].join('\n'));
+    const config = await loadConfig({ cwd, env: {}, http: new FakeHttp(), log: silentLogger });
+    expect(config.rotation).toMatchObject({ revokeUnconfirmed: true, acceptUnplannedSealed: true, allowGenerate: false, verifyRetries: 0 });
+    expect(config.monitor.policy).toMatchObject({ autoContain: true, containCooldownMinutes: 17, revokeUnconfirmedOnHighConfidence: false });
+  });
+
+  it('overrides containment and high-confidence revocation policy from the environment', async () => {
+    const cwd = await directory();
+    await writeFile(join(cwd, 'keysentry.yaml'), 'monitor:\n  autoContain: false\n  revokeUnconfirmedOnHighConfidence: true\n');
+    const config = await loadConfig({ cwd, env: {
+      KEYSENTRY_AUTO_CONTAIN: 'true', KEYSENTRY_REVOKE_UNCONFIRMED_ON_HIGH_CONFIDENCE: 'false',
+    }, http: new FakeHttp(), log: silentLogger });
+    expect(config.monitor.policy).toMatchObject({ autoContain: true, revokeUnconfirmedOnHighConfidence: false });
+    expect(config.settings.monitor).toMatchObject({ autoContain: true, revokeUnconfirmedOnHighConfidence: false });
+  });
+
+  it('refuses invalid containment environment booleans without echoing the value', async () => {
+    const cwd = await directory();
+    for (const name of ['KEYSENTRY_AUTO_CONTAIN', 'KEYSENTRY_REVOKE_UNCONFIRMED_ON_HIGH_CONFIDENCE']) {
+      const attempt = loadConfig({ cwd, env: { [name]: 'opaque-invalid-value' }, http: new FakeHttp(), log: silentLogger });
+      await expect(attempt).rejects.toThrow(`${name} must be true or false.`);
+      await expect(attempt).rejects.not.toThrow('opaque-invalid-value');
+    }
+  });
+
+  it('disables Fly with an explanatory message when its token has no org or apps', async () => {
+    const config = await loadConfig({ cwd: await directory(), env: { FLY_API_TOKEN: 'fly-management-token', FLY_APPS: ', ,' }, http: new FakeHttp(), log: silentLogger });
+    expect(config.hosts.some(host => host.id === 'fly')).toBe(false);
+    expect(config.disabledHosts.find(host => host.host === 'fly')?.reason).toMatch(/FLY_ORG.*FLY_APPS/);
+  });
+
+  it('enables Fly when its scope comes from YAML or the environment', async () => {
+    const cwd = await directory();
+    await writeFile(join(cwd, 'keysentry.yaml'), 'hosts:\n  fly:\n    org: team-from-yaml\n');
+    const yaml = await loadConfig({ cwd, env: { FLY_API_TOKEN: 'fly-management-token' }, http: new FakeHttp(), log: silentLogger });
+    expect(yaml.hosts.some(host => host.id === 'fly')).toBe(true);
+    await writeFile(join(cwd, 'keysentry.yaml'), '{}');
+    const environment = await loadConfig({ cwd, env: { FLY_API_TOKEN: 'fly-management-token', FLY_ORG: 'team-from-env' }, http: new FakeHttp(), log: silentLogger });
+    expect(environment.hosts.some(host => host.id === 'fly')).toBe(true);
+  });
+
+  it('rejects negative retry counts and containment cooldowns', async () => {
+    const cwd = await directory();
+    await writeFile(join(cwd, 'keysentry.yaml'), 'rotation:\n  verifyRetries: -1\n');
+    await expect(loadConfig({ cwd, env: {}, http: new FakeHttp(), log: silentLogger })).rejects.toThrow(/rotation.verifyRetries/);
+    await writeFile(join(cwd, 'keysentry.yaml'), 'monitor:\n  containCooldownMinutes: -1\n');
+    await expect(loadConfig({ cwd, env: {}, http: new FakeHttp(), log: silentLogger })).rejects.toThrow(/monitor.containCooldownMinutes/);
   });
 
   it('reports invalid YAML with line location and never echoes input', async () => {

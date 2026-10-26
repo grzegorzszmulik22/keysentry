@@ -90,6 +90,16 @@ describe('buildPlan', () => {
 });
 
 describe('renderRunbook', () => {
+  it('keeps reference consumers in the redeploy pass without instructing an overwrite', () => {
+    const source = consumer(web, 'OPENAI_API_KEY');
+    const reference = { ...consumer(service('worker'), 'MODEL_TOKEN'), reference: true };
+    const inv = inventory([cluster('shared', 'ai', [source, reference], 'auto')]);
+    const output = renderRunbook(fixedPlan(inv), inv);
+    expect(output).toContain('reference — redeploy only; do not overwrite');
+    expect(output).toContain('Leave reference variables unchanged');
+    expect(output.split('## One redeploy per service')[1]).toContain('railway/worker');
+  });
+
   it('renders a guided shared secret and one redeploy per affected service', () => {
     const inv = inventory([cluster('shared', 'payments', [consumer(web, 'STRIPE_KEY'), consumer(worker, 'BILLING_KEY')])]);
     const output = renderRunbook(fixedPlan(inv), inv);

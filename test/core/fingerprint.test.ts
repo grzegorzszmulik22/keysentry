@@ -65,18 +65,37 @@ describe('fingerprint', () => {
 
 describe('makeHint', () => {
   it.each([
-    ['sk-or-v1-abcdefgh1234', 'sk-or-v…1234'],
-    ['sk_live_abcdefgh1234', 'sk_live…1234'],
-    ['sk-ant-abcdefgh1234', 'sk-ant-…1234'],
-    ['ghp_abcdefghijkl1234', 'ghp_…1234'],
-    ['AKIAabcdefghijkl1234', 'AKIA…1234'],
-    ['randomvalueabcdefgh', 'rand…efgh'],
-    ['0123456789abcdef', '0123…cdef'],
+    ['sk-or-v1-abcdefghijkl1234', 'sk-or-v…1234'],
+    ['sk_live_abcdefghijkl1234', 'sk_live…1234'],
+    ['sk-ant-abcdefghijklm1234', 'sk-ant-…1234'],
+    ['ghp_abcdefghijklmnop1234', 'ghp_…1234'],
+    ['AKIAabcdefghijklmnop1234', 'AKIA…1234'],
+    ['arbitrary-prefix-abcdefgh', '…efgh'],
+    ['0123456789abcdefghijklmn', '…klmn'],
+    ['sk_live_abcdefgh1234', '…34'],
+    ['randomvalueabcdefgh', '…gh'],
+    ['0123456789abcdef', '…ef'],
+    ['0123456789abcdefghijklm', '…lm'],
   ])('returns a bounded hint for %s', (value, hint) => {
     expect(makeHint(value)).toBe(hint);
     expect(makeHint(value)!.split('…')[0]!.length).toBeLessThanOrEqual(7);
   });
-  it.each(['', 'short-value', '0123456789abcde'])('does not hint at short values', (value) => {
+  it.each(['', 'short-value', '0123456789abcde', 'redis://db'])('does not hint at short values', (value) => {
     expect(makeHint(value)).toBeNull();
+  });
+
+  it.each([
+    ['postgresql://alice:private-password@database.example.test:5432/db', 'postgresql://…test'],
+    ['mysql://private-user:private-password@db.example.org/data?password=another-private-password', 'mysql://….org'],
+    ['mongodb+srv://private-user:private-password@cluster.example.net/db', 'mongodb+srv://….net'],
+    ['redis://:private-password@cache.example.com:6379', 'redis://….com'],
+    ['rediss://private-user:private-password@localhost', 'rediss://…host'],
+    ['postgres://private-user:private-password@[::1]:5432/db', 'postgres://…::1]'],
+    ['postgresql://alice:private-password@', null],
+    [' postgresql://alice:private-password@', null],
+    ['\tpostgresql://alice:private-password@db.example.test/path?password=private-password\n', 'postgresql://…test'],
+    ['mongodb://alice:private-password@db1:27017,db2:27017/db', null],
+  ])('hints only at the scheme and parsed database host', (value, hint) => {
+    expect(makeHint(value!)).toBe(hint);
   });
 });

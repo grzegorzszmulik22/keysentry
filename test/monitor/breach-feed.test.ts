@@ -445,6 +445,81 @@ describe('breach feeds', () => {
     expect(await detectBreachFeeds(ctx, railwayFeeds)).toEqual([]);
   });
 
+  for (const mention of [
+    'We render updates that fly through github, railway, and vercel integrations.',
+    'Render and dotenv configuration were reviewed.',
+    'RAILWAY VERCEL RENDER FLY GITHUB',
+    'notrailway.com notrailway.app notvercel.com notrender.com notfly.io notgithub.com',
+    'not-railway.com not-railway.app not-vercel.com not-render.com not-fly.io not-github.com',
+    'railway.company railway.application vercel.company render.computer fly.iota github.company',
+    'railway.com.evil railway.app.evil vercel.com.evil render.com.evil fly.io.evil github.com.evil',
+    'Railway.com.evil Railway.app.evil Vercel.com.evil Render.com.evil Fly.io.evil GitHub.com.evil',
+    'railway.com_extra railway.app_extra vercel.com_extra render.com_extra fly.io_extra github.com_extra',
+    'railway.com-extra railway.app-extra vercel.com-extra render.com-extra fly.io-extra github.com-extra',
+    'RailwayTools VercelTools Fly.ioTools GitHubTools',
+  ]) {
+    it(`does not attribute hosts from ordinary words or deceptive domain names: ${mention}`, async () => {
+      let body = rssFeed();
+      const http = new FakeHttp().on('GET', feedUrl, () => text(200, body));
+      const ctx = context(http, ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+      expect(await detectBreachFeeds(ctx, feeds)).toEqual([]);
+      body = rssFeed(rssItem('unrelated-hosts', 'Security incident', `<description>${mention}</description>`));
+      expect(await detectBreachFeeds(ctx, feeds)).toEqual([]);
+    });
+  }
+
+  for (const [host, domain] of [
+    ['railway', 'railway.com'],
+    ['railway', 'railway.app'],
+    ['vercel', 'vercel.com'],
+    ['render', 'render.com'],
+    ['fly', 'fly.io'],
+    ['github-actions', 'github.com'],
+  ] as const) {
+    it(`attributes explicit ${domain} domain mentions with domain boundaries and case-insensitive matching`, async () => {
+      for (const mention of [domain, domain.toUpperCase(), `https://api.${domain}/advisory`, `(${domain}).`]) {
+        let body = rssFeed();
+        const http = new FakeHttp().on('GET', feedUrl, () => text(200, body));
+        const ctx = context(http, ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+        expect(await detectBreachFeeds(ctx, feeds)).toEqual([]);
+        body = rssFeed(rssItem('explicit-domain', 'Security incident', `<description>See ${mention}</description>`));
+        const signals = await detectBreachFeeds(ctx, feeds);
+        expect(signals.map(signal => signal.host)).toEqual([host]);
+        expect(signals[0]).toMatchObject({ confidence: 'medium', evidence: { count: 1 } });
+      }
+    });
+  }
+
+  for (const [host, product] of [
+    ['railway', 'Railway'],
+    ['vercel', 'Vercel'],
+    ['fly', 'Fly.io'],
+    ['github-actions', 'GitHub'],
+  ] as const) {
+    it(`attributes the capitalized product ${product} in advisory text`, async () => {
+      let body = rssFeed();
+      const http = new FakeHttp().on('GET', feedUrl, () => text(200, body));
+      const ctx = context(http, ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+      expect(await detectBreachFeeds(ctx, feeds)).toEqual([]);
+      body = rssFeed(rssItem('explicit-product', 'Security incident', `<description>Affected product: ${product}.</description>`));
+      const signals = await detectBreachFeeds(ctx, feeds);
+      expect(signals.map(signal => signal.host)).toEqual([host]);
+      expect(signals[0]).toMatchObject({ confidence: 'medium', evidence: { count: 1 } });
+    });
+  }
+
+  it('attributes every configured inventoried host without a host mention', async () => {
+    for (const host of ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv'] as const) {
+      let body = rssFeed();
+      const http = new FakeHttp().on('GET', feedUrl, () => text(200, body));
+      const ctx = context(http, ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+      const ownFeed = [{ url: feedUrl, host }];
+      expect(await detectBreachFeeds(ctx, ownFeed)).toEqual([]);
+      body = rssFeed(rssItem('own-host', 'Security incident'));
+      expect((await detectBreachFeeds(ctx, ownFeed)).map(signal => signal.host)).toEqual([host]);
+    }
+  });
+
   it('does not attribute a configured host absent from the inventory', async () => {
     let body = rssFeed();
     const http = new FakeHttp().on('GET', /\/rss$/, () => text(200, body));

@@ -96,6 +96,179 @@ describe('buildInventory', () => {
     expect(inventory.services).toEqual([service]);
   });
 
+  it('tracks service-name and shared Railway references before their sources without exposing values', () => {
+    const frontend = svc('railway', 'frontend-id');
+    const source = { ...svc('railway', 'api-id'), serviceName: 'API Main' };
+    const shared = { ...svc('railway', ''), serviceName: 'shared' };
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: frontend, vars: [
+        { name: 'MODEL_TOKEN', value: ' \t${{ API Main . OPENAI_API_KEY }}\n', sealed: false },
+        { name: 'SHARED_MODEL_TOKEN', value: '${{shared.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: source, vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
+      { service: shared, vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.findings).toHaveLength(4);
+    const cluster = inventory.clusters[0]!;
+    expect(cluster.consumers).toHaveLength(4);
+    expect(cluster.consumers.filter((consumer) => consumer.reference)).toEqual([
+      { service: frontend, varName: 'MODEL_TOKEN', fingerprint: cluster.fingerprint, hint: cluster.hint,
+        sealed: false, reference: true },
+      { service: frontend, varName: 'SHARED_MODEL_TOKEN', fingerprint: cluster.fingerprint, hint: cluster.hint,
+        sealed: false, reference: true },
+    ]);
+    expect(inventory.findings.filter((finding) => finding.reference)).toMatchObject([
+      { provider: 'openai', tier: 'ai', isSecret: true, confidence: 'high' },
+      { provider: 'openai', tier: 'ai', isSecret: true, confidence: 'high' },
+    ]);
+    const serialized = JSON.stringify(inventory);
+    expect(serialized).not.toContain(openaiValue);
+    expect(serialized).not.toContain('${{');
+  });
+
+  it('inherits the finalized source cluster classification through Railway reference chains', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'worker'), vars: [
+        { name: 'CLOUDFLARE_API_TOKEN', value: '${{alias.MODEL_TOKEN}}', sealed: false },
+      ] },
+      { service: svc('railway', 'alias'), vars: [
+        { name: 'MODEL_TOKEN', value: '${{source.API_KEY}}', sealed: false },
+      ] },
+      { service: svc('railway', 'source'), vars: [
+        { name: 'API_KEY', value: randomValue, sealed: false },
+        { name: 'AWS_SECRET_ACCESS_KEY', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(4);
+    expect(inventory.findings.filter((finding) => finding.reference)).toMatchObject([
+      { varName: 'CLOUDFLARE_API_TOKEN', provider: 'aws', tier: 'cloud', confidence: 'high' },
+      { varName: 'MODEL_TOKEN', provider: 'aws', tier: 'cloud', confidence: 'high' },
+    ]);
+  });
+
+  it('includes Railway references to sealed secrets in the sealed source cluster', () => {
+    const source = svc('railway', 'source');
+    const dependent = svc('railway', 'dependent');
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: dependent, vars: [
+        { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: source, vars: [{ name: 'OPENAI_API_KEY', sealed: true }] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]?.id).toBe('sealed:railway:proj1/production/source:OPENAI_API_KEY');
+    expect(inventory.clusters[0]?.consumers).toHaveLength(2);
+    expect(inventory.findings.find((finding) => finding.reference)).toMatchObject({
+      service: dependent, varName: 'MODEL_TOKEN', provider: 'openai', reference: true,
+      sealed: true, fingerprint: null, hint: null,
+    });
+  });
+
+  it.each([
+    ['another host', svc('vercel', 'source')],
+    ['another project', svc('railway', 'source', 'production', 'other-project')],
+    ['another environment', svc('railway', 'source', 'preview')],
+    ['different service-name case', { ...svc('railway', 'source-id'), serviceName: 'Source' }],
+  ])('does not resolve a Railway reference against %s', (_label, source) => {
+    const inventory = buildInventory([
+      { host: 'railway', services: [{ service: svc('railway', 'dependent'), vars: [
+        { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+      ] }] },
+      { host: source.host, services: [{ service: source, vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] }] },
+    ], key, now);
+
+    expect(inventory.findings).toHaveLength(1);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(1);
+    expect(inventory.findings.some((finding) => finding.reference)).toBe(false);
+  });
+
+  it('leaves missing, nonsecret, cyclic and interpolated Railway references unresolved', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'MISSING_SERVICE_TOKEN', value: '${{missing.OPENAI_API_KEY}}', sealed: false },
+        { name: 'MISSING_VAR_TOKEN', value: '${{source.NOT_PRESENT}}', sealed: false },
+        { name: 'CONFIG_TOKEN', value: '${{source.PORT}}', sealed: false },
+        { name: 'CYCLE_A', value: '${{source.CYCLE_B}}', sealed: false },
+        { name: 'SELF_TOKEN', value: '${{dependent.SELF_TOKEN}}', sealed: false },
+        { name: 'EMBEDDED_TOKEN', value: 'prefix-${{source.OPENAI_API_KEY}}', sealed: false },
+        { name: 'TWO_TOKENS', value: '${{source.OPENAI_API_KEY}}${{source.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: svc('railway', 'source'), vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+        { name: 'PORT', value: '3000', sealed: false },
+        { name: 'CYCLE_B', value: '${{dependent.CYCLE_A}}', sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.findings).toHaveLength(1);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(1);
+  });
+
+  it('does not resolve Railway references when the target service name is ambiguous', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: { ...svc('railway', 'first'), serviceName: 'source' }, vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+      { service: { ...svc('railway', 'second'), serviceName: 'source' }, vars: [
+        { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.findings).toHaveLength(2);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(2);
+  });
+
+  it('resolves references across repeated scans of the same Railway service', () => {
+    const source: HostScan = { host: 'railway', services: [{ service: svc('railway', 'source'), vars: [
+      { name: 'OPENAI_API_KEY', value: openaiValue, sealed: false },
+    ] }] };
+    const dependent: HostScan = { host: 'railway', services: [{ service: svc('railway', 'dependent'), vars: [
+      { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+    ] }] };
+    const inventory = buildInventory([source, dependent, source, dependent], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]?.consumers).toHaveLength(4);
+    expect(inventory.findings.filter((finding) => finding.reference)).toHaveLength(2);
+  });
+
+  it('leaves references unresolved when repeated target observations conflict', () => {
+    const source = svc('railway', 'source');
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'dependent'), vars: [
+        { name: 'MODEL_TOKEN', value: '${{source.OPENAI_API_KEY}}', sealed: false },
+      ] },
+      { service: source, vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
+      { service: source, vars: [{ name: 'OPENAI_API_KEY', value: randomValue, sealed: false }] },
+    ] }], key, now);
+
+    expect(inventory.findings).toHaveLength(2);
+    expect(inventory.findings.some((finding) => finding.reference)).toBe(false);
+  });
+
+  it('leaves conflicting reference definitions unresolved across repeated scans', () => {
+    const dependent = svc('railway', 'dependent');
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: '${{first.OPENAI_API_KEY}}', sealed: false }] },
+      { service: svc('railway', 'first'), vars: [{ name: 'OPENAI_API_KEY', value: openaiValue, sealed: false }] },
+      { service: dependent, vars: [{ name: 'MODEL_TOKEN', value: '${{second.API_KEY}}', sealed: false }] },
+      { service: svc('railway', 'second'), vars: [{ name: 'API_KEY', value: randomValue, sealed: false }] },
+    ] }], key, now);
+
+    expect(inventory.findings).toHaveLength(2);
+    expect(inventory.findings.some((finding) => finding.reference)).toBe(false);
+  });
+
   it('selects the provider, tier and method from the highest confidence consumer', () => {
     const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'api'), vars: [
       { name: 'API_KEY', value: randomValue, sealed: false },
@@ -118,6 +291,118 @@ describe('buildInventory', () => {
     expect(inventory.clusters[0]).toMatchObject({
       provider: 'cloudflare', tier: 'cloud', method: 'atomic-roll',
     });
+  });
+
+  it.each([
+    ['SESSION_SECRET', 'ENCRYPTION_KEY'],
+    ['ENCRYPTION_KEY', 'SESSION_SECRET'],
+  ])('keeps encryption-key guidance when %s and %s share a value', (firstName, secondName) => {
+    const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'api'), vars: [
+      { name: firstName, value: randomValue, sealed: false },
+      { name: secondName, value: randomValue, sealed: false },
+    ] }] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'encryption-key', tier: 'app', method: 'guided' });
+  });
+
+  it.each([
+    { names: ['CLOUDFLARE_API_TOKEN', 'ENCRYPTION_KEY'] },
+    { names: ['ENCRYPTION_KEY', 'CLOUDFLARE_API_TOKEN'] },
+    { names: ['AWS_SECRET_ACCESS_KEY', 'ENCRYPTION_KEY'] },
+    { names: ['ENCRYPTION_KEY', 'AWS_SECRET_ACCESS_KEY'] },
+    { names: ['JWT_SECRET', 'CLOUDFLARE_API_TOKEN', 'ENCRYPTION_KEY'] },
+    { names: ['CLOUDFLARE_API_TOKEN', 'ENCRYPTION_KEY', 'SESSION_SECRET'] },
+    { names: ['ENCRYPTION_KEY', 'SESSION_SECRET', 'CLOUDFLARE_API_TOKEN'] },
+  ])('forces encryption guidance for mixed direct consumers $names', ({ names }) => {
+    const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'source'), vars:
+      names.map((name) => ({ name, value: randomValue, sealed: false })),
+    }] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'encryption-key', tier: 'app', method: 'guided' });
+    expect(inventory.clusters[0]?.consumers).toHaveLength(names.length);
+  });
+
+  it.each([
+    { names: ['JWT_SECRET', 'DISCORD_CLIENT_SECRET'] },
+    { names: ['DISCORD_CLIENT_SECRET', 'JWT_SECRET'] },
+    { names: ['JWT_SECRET', 'API_KEY'] },
+    { names: ['API_KEY', 'JWT_SECRET'] },
+    { names: ['JWT_SECRET', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET'] },
+    { names: ['JWT_SECRET', 'SESSION_SECRET', 'DISCORD_CLIENT_SECRET'] },
+    { names: ['DISCORD_CLIENT_SECRET', 'JWT_SECRET', 'SESSION_SECRET'] },
+    { names: ['DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'JWT_SECRET'] },
+    { names: ['SESSION_SECRET', 'JWT_SECRET', 'DISCORD_CLIENT_SECRET'] },
+    { names: ['SESSION_SECRET', 'DISCORD_CLIENT_SECRET', 'JWT_SECRET'] },
+  ])('requires guided unknown handling for app and unknown consumers $names', ({ names }) => {
+    const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'source'), vars:
+      names.map((name) => ({ name, value: randomValue, sealed: false })),
+    }] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'unknown', tier: 'unknown', method: 'guided' });
+  });
+
+  it.each([
+    { names: ['JWT_SECRET', 'API_KEY', 'CLOUDFLARE_API_TOKEN'] },
+    { names: ['API_KEY', 'CLOUDFLARE_API_TOKEN', 'JWT_SECRET'] },
+    { names: ['CLOUDFLARE_API_TOKEN', 'JWT_SECRET', 'API_KEY'] },
+  ])('retains stronger known-provider evidence for mixed consumers $names', ({ names }) => {
+    const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'source'), vars:
+      names.map((name) => ({ name, value: randomValue, sealed: false })),
+    }] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'cloudflare', tier: 'cloud', method: 'atomic-roll' });
+  });
+
+  it('keeps generation available when every direct secret consumer is an app secret', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'alias'), vars: [
+        { name: 'ENCRYPTION_KEY', value: '${{source.JWT_SECRET}}', sealed: false },
+        { name: 'DISCORD_CLIENT_SECRET', value: '${{source.SESSION_SECRET}}', sealed: false },
+      ] },
+      { service: svc('railway', 'source'), vars: [
+        { name: 'JWT_SECRET', value: randomValue, sealed: false },
+        { name: 'SESSION_SECRET', value: randomValue, sealed: false },
+        { name: 'PORT', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters).toHaveLength(1);
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'app-secret', tier: 'app', method: 'generate' });
+    expect(inventory.findings).toHaveLength(4);
+    expect(inventory.findings.filter((finding) => finding.reference)).toMatchObject([
+      { varName: 'ENCRYPTION_KEY', provider: 'app-secret', confidence: 'medium' },
+      { varName: 'DISCORD_CLIENT_SECRET', provider: 'app-secret', confidence: 'medium' },
+    ]);
+  });
+
+  it('lets references inherit encryption guidance after mixed direct classification', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [
+      { service: svc('railway', 'alias'), vars: [
+        { name: 'SESSION_SECRET', value: '${{source.AWS_SECRET_ACCESS_KEY}}', sealed: false },
+      ] },
+      { service: svc('railway', 'source'), vars: [
+        { name: 'AWS_SECRET_ACCESS_KEY', value: randomValue, sealed: false },
+        { name: 'ENCRYPTION_KEY', value: randomValue, sealed: false },
+      ] },
+    ] }], key, now);
+
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'encryption-key', tier: 'app', method: 'guided' });
+    expect(inventory.findings.find((finding) => finding.reference)).toMatchObject({
+      provider: 'encryption-key', tier: 'app', confidence: 'medium',
+    });
+  });
+
+  it('preserves recognized provider value shapes under encryption and app variable names', () => {
+    const inventory = buildInventory([{ host: 'railway', services: [{ service: svc('railway', 'source'), vars: [
+      { name: 'ENCRYPTION_KEY', value: openaiValue, sealed: false },
+      { name: 'JWT_SECRET', value: openaiValue, sealed: false },
+    ] }] }], key, now);
+
+    expect(inventory.clusters[0]).toMatchObject({ provider: 'openai', tier: 'ai', method: 'auto' });
   });
 
   it('does not preserve variable payloads or unsafe scan error messages in serialized output', () => {

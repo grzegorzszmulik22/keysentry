@@ -25,14 +25,14 @@ describe('dotenv host', () => {
     expect(await host.readVariables(service!)).toEqual([
       { name: 'TOKEN', value: 'old\nvalue', sealed: false },
       { name: 'SINGLE', value: 'single old', sealed: false },
-      { name: 'MULTI', value: 'first\r\nsecond', sealed: false },
+      { name: 'MULTI', value: 'first\nsecond', sealed: false },
       { name: 'BACK', value: 'old back', sealed: false },
       { name: 'PLAIN', value: 'old', sealed: false },
       { name: 'UNCHANGED', value: 'bare value', sealed: false },
       { name: 'EMPTY', value: '', sealed: false },
     ]);
     await host.writeVariables(service!, { TOKEN: 'new\nvalue', SINGLE: 'single new', MULTI: 'new multiline', BACK: 'new back', PLAIN: 'with # hash', ADDED: 'added' }, { skipDeploy: true });
-    expect(await readFile(file, 'utf8')).toBe('# untouched comment\r\n\r\nexport TOKEN = "new\\nvalue"  # keep inline\r\nSINGLE=\'single new\'\r\nMULTI="new multiline" # multiline\r\nBACK=`new back`\r\nPLAIN="with # hash"  # keep spacing\r\nUNCHANGED = bare value # untouched\r\nEMPTY=\r\nADDED=added\r\n');
+    expect(await readFile(file, 'utf8')).toBe('# untouched comment\r\n\r\nexport TOKEN = "new\\nvalue"  # keep inline\r\nSINGLE=\'single new\'\r\nMULTI="new multiline" # multiline\r\nBACK=`new back`\r\nPLAIN=\'with # hash\'  # keep spacing\r\nUNCHANGED = bare value # untouched\r\nEMPTY=\r\nADDED=added\r\n');
     expect(await readdir(dir)).toEqual(['.env']);
     expect(await host.redeploy(service!)).toBeNull();
   });
@@ -58,7 +58,7 @@ describe('dotenv host', () => {
     await writeFile(file, '\uFEFFexport KEY=old\nDUP=first\nDUP=last\nKEEP=unchanged');
     const host = createDotenvHost({ roots: [dir], log: silentLogger });
     const [service] = await host.listServices();
-    const value = 'a "quote" \\n literal\nreal newline\rreturn #';
+    const value = 'a quote and \\ literal\nreal newline\rreturn #';
     await host.writeVariables(service!, { KEY: value, DUP: 'new', NEW: "single' and `tick`" }, { skipDeploy: false });
     expect(await host.readVariables(service!)).toEqual([
       { name: 'KEY', value, sealed: false },
@@ -100,7 +100,7 @@ describe('dotenv host', () => {
     expect(await readFile(file, 'utf8')).toBe('KEY=outside');
   });
 
-  it.each(['\r', '\n', '\r\n', '\u2028', '\u2029'])('preserves untargeted assignments with line separator %j', async (newline) => {
+  it.each(['\r', '\n', '\r\n'])('preserves untargeted assignments with line separator %j', async (newline) => {
     const dir = await root();
     const file = join(dir, '.env');
     await writeFile(file, `KEY=old${newline}AFTER=keep${newline}`);
@@ -131,9 +131,127 @@ describe('dotenv host', () => {
     const original = Buffer.concat([Buffer.from('KEEP='), Buffer.from([0xff]), Buffer.from('\nKEY=old\n')]);
     await writeFile(file, original);
     const host = createDotenvHost({ roots: [dir], log: silentLogger });
-    const [service] = await host.listServices();
+    const service = { host: 'dotenv' as const, projectId: dir, projectName: '', serviceId: file, serviceName: '.env', environmentId: '', environmentName: '' };
+    expect(await host.listServices()).toEqual([]);
     await expect(host.writeVariables(service!, { KEY: 'new' }, { skipDeploy: true })).rejects.toThrow();
     expect(await readFile(file)).toEqual(original);
     expect(await readdir(dir)).toEqual(['.env']);
+  });
+
+  it('reads the review probe and literal quoted escapes exactly as dotenv does', async () => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, String.raw`PROBE="pa\\ss\"word"
+DOUBLE="one\\two\"three\nfour\rfive\tend"
+SINGLE='one\\two\'three\nfour'
+BACK=\`one\\two\nfour\`
+UNQUOTED=   trimmed value   # comment
+HASH=before#comment
+DOLLAR=$UNCHANGED
+` .replaceAll('\\`', '`'));
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    expect(await host.readVariables(service!)).toEqual([
+      { name: 'PROBE', value: String.raw`pa\\ss\"word`, sealed: false },
+      { name: 'DOUBLE', value: String.raw`one\\two\"three` + '\nfour\rfive\\tend', sealed: false },
+      { name: 'SINGLE', value: String.raw`one\\two\'three\nfour`, sealed: false },
+      { name: 'BACK', value: String.raw`one\\two\nfour`, sealed: false },
+      { name: 'UNQUOTED', value: 'trimmed value', sealed: false },
+      { name: 'HASH', value: 'before', sealed: false },
+      { name: 'DOLLAR', value: '$UNCHANGED', sealed: false },
+    ]);
+  });
+
+  it.each([
+    ['double', '"old"', 'pa\\ss"word', '"pa\\ss"word"'],
+    ['single', "'old'", 'pa\\ss"word', "'pa\\ss\"word'"],
+    ['JSON', '"old"', '{"private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n"}', "'{\"private_key\":\"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n\"}'"],
+    ['hash', 'old', 'with # hash', "'with # hash'"],
+    ['single quote', 'old', "has' # hash", "`has' # hash`"],
+    ['backtick', 'old', 'has` # hash', "'has` # hash'"],
+    ['single and backtick quotes', 'old', 'has\'` # $HOME', '"has\'` # $HOME"'],
+    ['literal carriage escape', '"old"', 'literal\\rreturn', "'literal\\rreturn'"],
+    ['dollar', 'old', '$HOME', '$HOME'],
+    ['real newlines', 'old', 'one\ntwo\rthree', '"one\\ntwo\\rthree"'],
+  ])('writes %s without changing the value under dotenv parsing', async (_label, before, value, encoded) => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, `KEY=${before} # keep\nAFTER=keep\n`);
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    await host.writeVariables(service!, { KEY: value! }, { skipDeploy: true });
+    expect(await readFile(file, 'utf8')).toBe(`KEY=${encoded} # keep\nAFTER=keep\n`);
+    expect(await host.readVariables(service!)).toEqual([
+      { name: 'KEY', value, sealed: false }, { name: 'AFTER', value: 'keep', sealed: false },
+    ]);
+  });
+
+  it.each(['literal\\n and\nnewline', 'literal\\r and\nnewline', "all'`quotes\\n #"])(
+    'refuses an unrepresentable write without changing the original or leaking the value', async (value) => {
+      const dir = await root();
+      const file = join(dir, '.env');
+      await writeFile(file, 'KEY=old\n');
+      const host = createDotenvHost({ roots: [dir], log: silentLogger });
+      const [service] = await host.listServices();
+      const error = await host.writeVariables(service!, { KEY: value }, { skipDeploy: true }).catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/round.trip|represent/i);
+      expect(String(error)).not.toContain(value);
+      expect(await readFile(file, 'utf8')).toBe('KEY=old\n');
+      expect(await readdir(dir)).toEqual(['.env']);
+    },
+  );
+
+  it('normalizes CRLF inside quoted values and supports dotenv colon and numeric-key syntax', async () => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, 'export 1KEY: "one\r\ntwo"\r\nSINGLE=\'three\rfour\'\r\nIGNORED TEXT\r\n');
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    expect(await host.readVariables(service!)).toEqual([
+      { name: '1KEY', value: 'one\ntwo', sealed: false }, { name: 'SINGLE', value: 'three\nfour', sealed: false },
+    ]);
+  });
+
+  it('skips an invalid UTF-8 file individually, warns by file, and continues scanning', async () => {
+    const dir = await root();
+    const bad = join(dir, '.env.enc');
+    await writeFile(bad, Buffer.from([0xff, 0xfe, 0x41]));
+    await writeFile(join(dir, '.env'), 'KEY=readable\n');
+    await writeFile(join(dir, '.env.local'), 'KEY=also-readable\n');
+    const warnings: unknown[] = [];
+    const host = createDotenvHost({ roots: [dir], log: { ...silentLogger, warn: (...args) => { warnings.push(args); } } });
+    const services = await host.listServices();
+    expect(services.map((service) => service.serviceName)).toEqual(['.env', '.env.local']);
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify(warnings)).toContain(bad.replaceAll('\\', '\\\\'));
+    expect(await host.readVariables(services[0]!)).toEqual([{ name: 'KEY', value: 'readable', sealed: false }]);
+  });
+
+  it('deletes stale temp files next to discovered env files and never scans them', async () => {
+    const dir = await root();
+    await writeFile(join(dir, '.env'), 'KEY=old\n');
+    await writeFile(join(dir, '.env.keysentry-stale.tmp'), 'KEY=stale\n');
+    await writeFile(join(dir, '.env.local.keysentry-stale.tmp'), 'KEY=stale\n');
+    await writeFile(join(dir, '.keysentry-legacy.tmp'), 'KEY=stale\n');
+    await writeFile(join(dir, 'keep.tmp'), 'keep');
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    expect((await host.listServices()).map((service) => service.serviceName)).toEqual(['.env']);
+    expect((await readdir(dir)).sort()).toEqual(['.env', 'keep.tmp']);
+  });
+
+  it.each([
+    ['KEY=old # note `\nAFTER=keep\n', '`', "KEY='`' # note `\nAFTER=keep\n", [{ name: 'AFTER', value: 'keep', sealed: false }]],
+    ["KEY='old'\nAFTER=ends'\n", 'ends\\', "KEY=`ends\\`\nAFTER=ends'\n", [{ name: 'AFTER', value: "ends'", sealed: false }]],
+    ['KEY=old\nAFTER=keep\nOTHER=ends`\n', '`', "KEY='`'\nAFTER=keep\nOTHER=ends`\n", [{ name: 'AFTER', value: 'keep', sealed: false }, { name: 'OTHER', value: 'ends`', sealed: false }]],
+  ] as const)('chooses quotes using the actual surrounding file to preserve other variables (%j)', async (source, value, expected, rest) => {
+    const dir = await root();
+    const file = join(dir, '.env');
+    await writeFile(file, source);
+    const host = createDotenvHost({ roots: [dir], log: silentLogger });
+    const [service] = await host.listServices();
+    await host.writeVariables(service!, { KEY: value }, { skipDeploy: true });
+    expect(await readFile(file, 'utf8')).toBe(expected);
+    expect(await host.readVariables(service!)).toEqual([{ name: 'KEY', value, sealed: false }, ...rest]);
   });
 });

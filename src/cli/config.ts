@@ -49,12 +49,19 @@ export const configSchema = z.object({
   rotation: z.object({
     revoke: z.enum(['after-deploy', 'immediately', 'never']).default('after-deploy'),
     redeploy: z.boolean().default(true),
+    revokeUnconfirmed: z.boolean().default(false),
+    acceptUnplannedSealed: z.boolean().default(false),
+    allowGenerate: z.boolean().default(true),
+    verifyRetries: z.number().int().nonnegative().default(4),
     deployTimeoutMs: positive.int().default(600_000),
     pollIntervalMs: positive.int().default(5_000),
   }).strict().default({}),
   monitor: z.object({
     interval: positive.default(300),
     autoExecute: z.boolean().default(false),
+    autoContain: z.boolean().default(false),
+    containCooldownMinutes: z.number().finite().nonnegative().default(60),
+    revokeUnconfirmedOnHighConfidence: z.boolean().default(true),
     cooldownMinutes: z.number().finite().nonnegative().default(60),
     maxAutoRotationsPerDay: z.number().int().nonnegative().default(10),
     rules: z.object({
@@ -167,6 +174,8 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
   dotenv.roots = envList(env, 'KEYSENTRY_DOTENV_ROOTS') ?? dotenv.roots;
   dotenv.roots = dotenv.roots.map(root => resolve(cwd, root));
   settings.monitor.autoExecute = envBoolean(env, 'KEYSENTRY_AUTO_EXECUTE') ?? settings.monitor.autoExecute;
+  settings.monitor.autoContain = envBoolean(env, 'KEYSENTRY_AUTO_CONTAIN') ?? settings.monitor.autoContain;
+  settings.monitor.revokeUnconfirmedOnHighConfidence = envBoolean(env, 'KEYSENTRY_REVOKE_UNCONFIRMED_ON_HIGH_CONFIDENCE') ?? settings.monitor.revokeUnconfirmedOnHighConfidence;
   const webhook = envValue(env, 'KEYSENTRY_WEBHOOK_URL');
   if (webhook) settings.monitor.webhooks = [webhook];
   // Validate again after environment overrides (notably repository names/URLs).
@@ -200,7 +209,11 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
   enable('railway', railway.enabled, railwayType === 'account' ? accountToken : projectToken, 'Set RAILWAY_TOKEN or RAILWAY_PROJECT_TOKEN.', token => createRailwayHost({ ...railway, token, tokenType: railwayType, http, log }));
   enable('vercel', vercel.enabled, envValue(env, 'VERCEL_TOKEN'), 'Set VERCEL_TOKEN.', token => createVercelHost({ ...vercel, token, http, log }));
   enable('render', settings.hosts.render.enabled, envValue(env, 'RENDER_API_KEY'), 'Set RENDER_API_KEY.', apiKey => createRenderHost({ apiKey, http, log }));
-  enable('fly', fly.enabled, envValue(env, 'FLY_API_TOKEN'), 'Set FLY_API_TOKEN.', token => createFlyHost({ ...fly, token, http, log }));
+  const flyToken = envValue(env, 'FLY_API_TOKEN');
+  const flyScoped = Boolean(fly.org || fly.apps?.length);
+  enable('fly', fly.enabled, flyScoped ? flyToken : undefined,
+    flyToken && !flyScoped ? 'Fly disabled: set FLY_ORG or FLY_APPS when FLY_API_TOKEN is configured.' : 'Set FLY_API_TOKEN.',
+    token => createFlyHost({ ...fly, token, http, log }));
   enable('github-actions', github.enabled, github.repos.length ? envValue(env, 'GITHUB_TOKEN') : undefined,
     github.repos.length ? 'Set GITHUB_TOKEN.' : 'Configure hosts.github.repos or GITHUB_REPOS.', token => createGithubActionsHost({ token, repos: github.repos, http, log }));
   if (dotenv.enabled === false) disabledHosts.push({ host: 'dotenv', reason: 'Disabled in configuration.' });
@@ -208,6 +221,9 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
 
   const policy = defaultPolicy();
   policy.autoExecute = settings.monitor.autoExecute;
+  policy.autoContain = settings.monitor.autoContain;
+  policy.containCooldownMinutes = settings.monitor.containCooldownMinutes;
+  policy.revokeUnconfirmedOnHighConfidence = settings.monitor.revokeUnconfirmedOnHighConfidence;
   policy.cooldownMinutes = settings.monitor.cooldownMinutes;
   policy.maxAutoRotationsPerDay = settings.monitor.maxAutoRotationsPerDay;
   for (const kind of Object.keys(policy.rules) as (keyof Policy['rules'])[]) {

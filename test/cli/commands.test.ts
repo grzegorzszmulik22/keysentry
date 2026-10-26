@@ -1,11 +1,12 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from '../../src/cli/index.js';
 import { createRuntime } from '../../src/cli/runtime.js';
 import { createMonitorState, defaultPolicy } from '../../src/monitor/index.js';
 import { getProvider } from '../../src/providers/index.js';
+import { createDotenvHost } from '../../src/hosts/index.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
 
@@ -147,6 +148,16 @@ describe('CLI commands', () => {
     expect(f.host.writes).toHaveLength(0); expect((await f.runtime.pendingActions())[0]?.status).toBe('pending');
   });
 
+  it('reports successful approval of pending containment as executed', async () => {
+    const f = await fixture(); const inv = await f.runtime.scan(); const state = createMonitorState();
+    state.pendingActions.push({ id: 'approve-cap', createdAt: new Date().toISOString(), signalId: 'usage-signal', action: 'cap', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
+    await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
+    expect(await runCli(['approve', 'approve-cap', '--json'], f.io)).toBe(0);
+    expect(f.provider.capped).toEqual([f.key.ref]);
+    expect(JSON.parse(f.output.at(-1)!).action.status).toBe('executed');
+    expect(await f.runtime.pendingActions()).toEqual([]);
+  });
+
   it('rejects invalid selectors and command arguments without echoing their values', async () => {
     const f = await fixture(); const secret = 'opaque-value-supplied-as-an-unknown-option';
     expect(await runCli([`--${secret}`], f.io)).toBe(1);
@@ -223,7 +234,9 @@ describe('CLI commands', () => {
     const runtime = await createRuntime({ cwd, env: {}, http: new FakeHttp(), hosts: [host], providers: id => id === 'github' ? provider : getProvider(id), log: silentLogger, feeds: [] });
     const inv = await runtime.scan(); const replacement = provider.issue('human');
     const report = await runtime.rotate(await runtime.plan(), { execute: true, prompt: async () => replacement.value });
-    expect(report.steps[0]?.status).toBe('deployed');
+    expect(report.steps[0]?.status).toBe('written');
+    expect(report.deployments[0]?.state).toBe('unconfirmed');
+    expect(provider.revoked).toHaveLength(0);
     const state = JSON.parse(await readFile(runtime.paths.monitor, 'utf8'));
     expect(state.keyRefs[inv.clusters[0]!.id]).toBe(replacement.ref);
     expect(state.keyRefs[report.steps[0]!.newFingerprint!]).toBe(replacement.ref);
@@ -245,7 +258,7 @@ describe('CLI commands', () => {
     expect(f.provider.revoked).toHaveLength(0);
   });
 
-  it('blocks automatic and manual rotation after a partial scan loses a known consumer', async () => {
+  it('keeps canary detection running while blocking a shared cluster on a failed host', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'keysentry-partial-command-')); directories.push(cwd);
     const railway = new FakeHost('railway'); const vercel = new FakeHost('vercel');
     const provider = new FakeProvider('openrouter', 'auto', 'sk-or-v1-0123456789abcdef');
@@ -258,12 +271,142 @@ describe('CLI commands', () => {
     state.canaries.push({ id: 'canary-partial', provider: 'openrouter', keyRef: decoy.ref, service, varName: 'DECOY_KEY', createdAt: new Date().toISOString() });
     await writeFile(runtime.paths.monitor, JSON.stringify(state)); provider.spend(decoy.ref, 0.001);
     vercel.listServices = async () => { throw new Error('upstream inaccessible'); };
-    await expect(runtime.monitorOnce()).rejects.toThrow(/scan.*failed/i);
+    const poll = await runtime.monitorOnce();
+    expect(poll.signals.some(signal => signal.kind === 'canary_triggered')).toBe(true);
+    expect((await runtime.inventory()).clusters[0]?.consumers).toHaveLength(2);
     const plan = await runtime.plan();
     await expect(runtime.rotate(plan, { execute: true })).rejects.toThrow(/scan.*failed/i);
     expect(provider.keys.size).toBe(2); expect(provider.revoked).toHaveLength(0); expect(provider.capped).toHaveLength(0);
     expect(railway.writes).toHaveLength(0); expect(vercel.writes).toHaveLength(0);
-    expect(JSON.parse(await readFile(runtime.paths.monitor, 'utf8')).canaries[0].triggeredAt).toBeUndefined();
+    expect(JSON.parse(await readFile(runtime.paths.monitor, 'utf8')).canaries[0].triggeredAt).toBeDefined();
+  });
+
+  it('executes an unaffected plan with a partial-scan warning', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-unaffected-command-')); directories.push(cwd);
+    const railway = new FakeHost('railway'); railway.pendingPolls = 0;
+    const vercel = new FakeHost('vercel');
+    const provider = new FakeProvider('openrouter', 'auto', 'sk-or-v1-0123456789abcdef');
+    const key = provider.issue(); railway.addService('api', { OPENROUTER_API_KEY: key.value });
+    vercel.addService('web', { STRIPE_SECRET_KEY: `sk_live_${'B'.repeat(40)}` });
+    const warnings: string[] = [];
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [railway, vercel], providers: id => id === provider.id ? provider : getProvider(id), http: new FakeHttp(), log: { ...silentLogger, warn: message => warnings.push(message) }, feeds: [] });
+    await runtime.scan();
+    vercel.listServices = async () => { throw new Error('upstream inaccessible'); };
+    await runtime.scan();
+    const plan = await runtime.plan({ hosts: ['railway'] });
+    const report = await runtime.rotate(plan, { execute: true });
+    expect(report.steps[0]?.status).toBe('revoked');
+    expect(provider.revoked).toEqual([key.ref]);
+    expect(warnings.some(warning => /outside this plan|unaffected/i.test(warning))).toBe(true);
+  });
+
+  it('retains a known shared consumer when its host credentials become unavailable', async () => {
+    const f = await fixture();
+    await writeFile(join(f.cwd, '.env'), `OPENROUTER_API_KEY=${f.key.value}\n`);
+    const dotenv = createDotenvHost({ roots: [f.cwd], log: silentLogger });
+    const makeRuntime = (hosts?: NonNullable<Parameters<typeof createRuntime>[0]>['hosts']) => createRuntime({ cwd: f.cwd, env: {}, ...(hosts ? { hosts } : {}), providers: id => id === f.provider.id ? f.provider : getProvider(id), http: new FakeHttp(), log: silentLogger, feeds: [] });
+    const connected = await makeRuntime([f.host, dotenv]);
+    expect((await connected.scan()).clusters[0]?.consumers).toHaveLength(3);
+    const disconnected = await makeRuntime();
+    const inventory = await disconnected.scan();
+    expect(inventory.clusters[0]?.consumers).toHaveLength(3);
+    expect(inventory.errors.some(error => error.host === 'railway')).toBe(true);
+    await expect(disconnected.rotate(await disconnected.plan(), { execute: true })).rejects.toThrow(/scan.*failed/i);
+    expect(f.provider.revoked).toHaveLength(0);
+  });
+
+  it('forwards explicit safety overrides to the dry run', async () => {
+    const f = await fixture();
+    const rotate = f.runtime.rotate;
+    const received: unknown[] = [];
+    f.runtime.rotate = async (plan, opts) => { received.push(opts); return rotate(plan, opts); };
+    expect(await runCli(['rotate', '--no-generate', '--revoke-unconfirmed', '--accept-unplanned-sealed'], f.io)).toBe(0);
+    expect(received[0]).toMatchObject({ allowGenerate: false, revokeUnconfirmed: true, acceptUnplannedSealed: true });
+    expect(f.host.writes).toHaveLength(0);
+  });
+
+  it('skips generated application secrets with --no-generate', async () => {
+    const f = await fixture();
+    const original = 'e5ce1c5590aa97cf6f1e6caee65c29326c8289eb667dd46b43e9e5d7c769c8b4';
+    f.host.addService('session', { SESSION_SECRET: original });
+    expect(await runCli(['rotate', '--tier', 'app', '--execute', '--yes', '--no-generate', '--json'], f.io)).toBe(0);
+    expect(JSON.parse(f.output.at(-1)!).report.steps[0]?.status).toBe('skipped');
+    expect(f.host.peek('session', 'SESSION_SECRET') === original).toBe(true);
+    expect(f.host.writes).toHaveLength(0);
+  });
+
+  it('requires the sealed-consumer override before revoking a selectively planned key', async () => {
+    const f = await fixture();
+    f.host.addService('sealed', { OPENROUTER_API_KEY: f.key.value }, ['OPENROUTER_API_KEY']);
+    const inv = await f.runtime.scan();
+    const cluster = inv.clusters.find(item => item.fingerprint !== null)!;
+    expect(await runCli(['rotate', '--cluster', cluster.id, '--execute', '--yes', '--json'], f.io)).toBe(0);
+    expect(f.provider.revoked).toHaveLength(0);
+    const refreshed = await f.runtime.inventory();
+    const current = refreshed.clusters.find(item => item.fingerprint !== null)!;
+    expect(await runCli(['rotate', '--cluster', current.id, '--execute', '--yes', '--accept-unplanned-sealed', '--json'], f.io)).toBe(0);
+    expect(f.provider.revoked).toHaveLength(1);
+  });
+
+  it('wires emergency reveal for an atomic roll whose replacement cannot be delivered', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-reveal-command-')); directories.push(cwd);
+    const host = new FakeHost('railway'); host.pendingPolls = 0;
+    const provider = new FakeProvider('cloudflare', 'atomic-roll', 'cf-f9G7k6R2a4D0p8W5b3H1j9C6e2M4x7U8-');
+    const old = provider.issue(); host.addService('api', { CLOUDFLARE_API_TOKEN: old.value }); host.failWritesFor.add('api');
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [host], providers: id => id === provider.id ? provider : getProvider(id), http: new FakeHttp(), log: silentLogger, feeds: [], sleep: async () => {} });
+    expect((await runtime.scan()).clusters[0]?.provider).toBe('cloudflare');
+    const output: string[] = []; const errors: string[] = []; let reveals = 0;
+    expect(await runCli(['rotate', '--execute', '--yes'], { runtime, output: line => output.push(line), error: line => errors.push(line), reveal: async (info, value) => {
+      reveals++; expect(info.provider).toBe('cloudflare'); expect(info.reason).toMatch(/unwritten/i);
+      expect(provider.refOf(value) !== null).toBe(true);
+      expect(output.some(line => line.includes(value)) || errors.some(line => line.includes(value))).toBe(false);
+    } })).toBe(1);
+    expect(reveals).toBe(1);
+    const stored = await readFile(join(runtime.paths.dir, 'rotation-report.json'), 'utf8');
+    expect([...provider.keys.values()].some(key => stored.includes(key.value))).toBe(false);
+  });
+
+  it('includes provider notes in the human summary', async () => {
+    const f = await fixture(); const rotate = f.provider.rotate.bind(f.provider);
+    f.provider.rotate = async (value, ctx) => ({ ...await rotate(value, ctx), notes: 'Provider migration notice: review scopes in the dashboard.' });
+    expect(await runCli(['rotate', '--execute', '--yes'], f.io)).toBe(0);
+    expect(f.output.at(-1)).toContain('Provider migration notice: review scopes in the dashboard.');
+  });
+
+  it('uses project/service/environment labels in human reports and previews', async () => {
+    const f = await fixture();
+    expect(await runCli(['scan'], f.io)).toBe(0);
+    expect(f.output.at(-1)).toContain('railway:proj1/one@production');
+    expect(await runCli(['rotate', '--execute', '--yes'], f.io)).toBe(0);
+    expect(f.errors.join('\n')).toContain('railway:proj1/two@production');
+    expect(f.errors.join('\n')).not.toContain('railway:proj1/production/two');
+  });
+
+  it('shows dotenv files relative to their scan root in reports and runbooks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-label-command-')); directories.push(cwd);
+    await writeFile(join(cwd, '.env'), `OPENROUTER_API_KEY=sk-or-v1-${'D'.repeat(48)}\n`);
+    const host = createDotenvHost({ roots: [cwd], log: silentLogger });
+    const runtime = await createRuntime({ cwd, env: {}, hosts: [host], http: new FakeHttp(), log: silentLogger, feeds: [] });
+    await runtime.scan();
+    const report = await runtime.report();
+    const runbook = await runtime.runbook(await runtime.plan());
+    for (const text of [report, runbook]) {
+      expect(text).toContain(`dotenv:${basename(cwd)}/.env`);
+      expect(text.includes(join(cwd, '.env'))).toBe(false);
+      expect(text.includes(`dotenv:${cwd}`)).toBe(false);
+    }
+  });
+
+  it('keeps encryption-key classifications and reference consumers through persistence', async () => {
+    const f = await fixture();
+    f.host.addService('encrypted', { ENCRYPTION_KEY: '9f7e3d2a6c4b8e019f7e3d2a6c4b8e01' });
+    const inv = await f.runtime.scan();
+    expect(inv.clusters.find(cluster => cluster.provider === 'encryption-key')?.method).toBe('guided');
+    const plan = await f.runtime.plan();
+    const step = plan.steps[0]!;
+    step.consumers[0]!.reference = true;
+    await writeFile(join(f.runtime.paths.plans, `${plan.id}.json`), JSON.stringify(plan));
+    expect((await f.runtime.loadPlan(plan.id)).steps[0]?.consumers[0]?.reference).toBe(true);
   });
 
   it('loads --cwd and --config through normal CLI wiring and prints safe YAML errors', async () => {

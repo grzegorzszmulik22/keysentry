@@ -7,17 +7,18 @@ import {
   scanHosts, serviceKey, statePaths, writeJsonAtomic,
 } from '../core/index.js';
 import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
-import { executePlan, type RotateOptions } from '../rotate/index.js';
+import { executePlan, type EngineDeps, type RotateOptions } from '../rotate/index.js';
 import {
   approve, createCanary, createFileMonitorStateStore, dismiss, listCanaries, removeCanary,
-  runMonitorOnce, type BreachFeed, type DetectorContext, type MonitorState, type MonitorStateStore,
+  runMonitorOnce, type BreachFeed, type DetectorContext, type MonitorState, type MonitorStateStore, type RotateExecutor,
 } from '../monitor/index.js';
 import type {
   GuidedPrompt, HostAdapter, HostId, HttpClient, Inventory, Logger, Policy, ProviderAdapter,
-  ProviderId, Redactor, RotationPlan, RotationReport,
+  ProviderId, Redactor, RotationPlan, RotationReport, ServiceRef,
 } from '../types.js';
 import { loadConfig } from './config.js';
 import { inventorySchema, planIdSchema, planSchema } from './schemas.js';
+import { humanizeServices, serviceLabel } from './display.js';
 
 export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
 export interface RuntimeOptions {
@@ -25,11 +26,14 @@ export interface RuntimeOptions {
   hosts?: HostAdapter[]; providers?: (id: ProviderId) => ProviderAdapter;
   policy?: Policy; feeds?: BreachFeed[]; fingerprintKey?: Buffer;
   prompt?: (p: GuidedPrompt) => Promise<string | null>; log?: Logger;
+  reveal?: EngineDeps['reveal'];
   verbose?: boolean; json?: boolean; sleep?: (ms: number) => Promise<void>; now?: () => Date;
 }
 export interface ExecutionOptions {
   execute?: boolean; prompt?: (p: GuidedPrompt) => Promise<string | null>;
   revoke?: RotateOptions['revoke']; redeploy?: boolean;
+  revokeUnconfirmed?: boolean; acceptUnplannedSealed?: boolean; allowGenerate?: boolean; verifyRetries?: number;
+  reveal?: EngineDeps['reveal'];
 }
 
 /** Register opaque and even short secrets as well as the core's recognizable patterns. */
@@ -54,7 +58,19 @@ function outputRedactor(): Redactor {
 
 export async function createRuntime(options: RuntimeOptions = {}) {
   const redactor = outputRedactor();
-  const log = options.log ?? createLogger({ redactor, level: options.verbose ? 'debug' : 'info', json: options.json });
+  const knownServices = new Map<string, ServiceRef>();
+  const remember = (services: ServiceRef[]) => { for (const service of services) knownServices.set(serviceKey(service), service); };
+  const humanize = (text: string) => humanizeServices(text, [...knownServices.values()]);
+  const baseLog = options.log ?? createLogger({ redactor, level: options.verbose ? 'debug' : 'info', json: options.json });
+  const logValue = (input: unknown): unknown => {
+    if (typeof input === 'string') return humanize(input);
+    if (Array.isArray(input)) return input.map(logValue);
+    if (input && typeof input === 'object') return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, logValue(value)]));
+    return input;
+  };
+  const log: Logger = Object.fromEntries((['info', 'warn', 'error', 'debug'] as const).map(level => [level,
+    (message: string, data?: Record<string, unknown>) => baseLog[level](humanize(message), data === undefined ? undefined : logValue(data) as Record<string, unknown>),
+  ])) as unknown as Logger;
   const config = await loadConfig({ ...options, redactor, log });
   if (options.policy) config.monitor.policy = options.policy;
   if (options.feeds) config.monitor.feeds = options.feeds;
@@ -98,14 +114,48 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   async function scan(): Promise<Inventory> {
     const inventory = await scanHosts(hosts, fingerprintKey, log);
+    if (!options.hosts) inventory.errors.push(...config.disabledHosts.map(item => ({ host: item.host, message: item.reason })));
+    // Retain only fingerprint metadata for unavailable hosts. Dropping a known
+    // consumer would let a later partial scan understate a shared key's scope.
+    const failedHosts = new Set(inventory.errors.map(error => error.host));
+    if (failedHosts.size) {
+      const previous = inventorySchema.safeParse(await loadInventory(config.cwd));
+      if (previous.success) {
+        const consumerKey = (consumer: Inventory['findings'][number] | Inventory['clusters'][number]['consumers'][number]) => `${serviceKey(consumer.service)}\0${consumer.varName}`;
+        const services = new Set(inventory.services.map(serviceKey));
+        for (const service of previous.data.services) if (failedHosts.has(service.host) && !services.has(serviceKey(service))) {
+          inventory.services.push(service); services.add(serviceKey(service));
+        }
+        const findings = new Set(inventory.findings.map(consumerKey));
+        const scannedLocations = new Set(findings);
+        for (const finding of previous.data.findings) if (failedHosts.has(finding.service.host) && !findings.has(consumerKey(finding))) {
+          inventory.findings.push(finding); findings.add(consumerKey(finding));
+        }
+        const clusters = new Map(inventory.clusters.map(cluster => [cluster.id, cluster]));
+        for (const old of previous.data.clusters) {
+          const missing = old.consumers.filter(consumer => failedHosts.has(consumer.service.host) && !scannedLocations.has(consumerKey(consumer)));
+          if (!missing.length) continue;
+          const current = clusters.get(old.id);
+          if (!current) {
+            const retained = { ...old, consumers: missing };
+            inventory.clusters.push(retained); clusters.set(retained.id, retained);
+          } else {
+            const present = new Set(current.consumers.map(consumerKey));
+            for (const consumer of missing) if (!present.has(consumerKey(consumer))) {
+              current.consumers.push(consumer); present.add(consumerKey(consumer));
+            }
+          }
+        }
+      }
+    }
     const state = await stateStore.load();
     // Decoys are monitored separately. Never rotate one into a fully privileged production key.
     const decoys = new Set(state.canaries.map(canary => `${serviceKey(canary.service)}\0${canary.varName}`));
     const realConsumer = (consumer: Inventory['findings'][number] | Inventory['clusters'][number]['consumers'][number]) => !decoys.has(`${serviceKey(consumer.service)}\0${consumer.varName}`);
     inventory.findings = inventory.findings.filter(realConsumer);
     inventory.clusters = inventory.clusters.map(cluster => ({ ...cluster, consumers: cluster.consumers.filter(realConsumer) })).filter(cluster => cluster.consumers.length > 0);
-    if (!options.hosts) inventory.errors.push(...config.disabledHosts.map(item => ({ host: item.host, message: item.reason })));
     const clean = safe(inventorySchema.parse(inventory));
+    remember(clean.services);
     await saveInventory(clean, config.cwd);
     return clean;
   }
@@ -115,6 +165,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     if (!stored) return scan();
     const result = inventorySchema.safeParse(stored);
     if (!result.success) throw new CliError('Invalid inventory file; run scan to rebuild it.');
+    remember(result.data.services);
     return safe(result.data);
   }
 
@@ -129,16 +180,25 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const stored = await readJson(join(paths.plans, `${id}.json`));
     const result = planSchema.safeParse(stored);
     if (!result.success) throw new CliError('Saved plan is missing or invalid; create a new plan.');
+    remember(result.data.services);
     return safe(result.data);
   }
 
   async function execute(rotationPlan: RotationPlan, inv: Inventory, opts: ExecutionOptions): Promise<RotationReport> {
-    if (opts.execute === true) assertCompleteScan(inv);
+    remember(rotationPlan.services);
+    if (opts.execute === true) assertPlanScan(rotationPlan, inv);
     const report = await executePlan(rotationPlan, inv, {
       hosts: hostMap, providers, providerCtx: config.providerCtx, journal,
       prompt: opts.prompt ?? options.prompt ?? (async () => null), fingerprintKey, redactor, log,
       sleep: options.sleep, now: options.now,
-    }, { ...config.rotation, dryRun: opts.execute !== true, ...(opts.revoke ? { revoke: opts.revoke } : {}), ...(opts.redeploy !== undefined ? { redeploy: opts.redeploy } : {}) });
+      reveal: opts.reveal ?? options.reveal,
+    }, { ...config.rotation, dryRun: opts.execute !== true,
+      ...(opts.revoke ? { revoke: opts.revoke } : {}), ...(opts.redeploy !== undefined ? { redeploy: opts.redeploy } : {}),
+      ...(opts.revokeUnconfirmed !== undefined ? { revokeUnconfirmed: opts.revokeUnconfirmed } : {}),
+      ...(opts.acceptUnplannedSealed !== undefined ? { acceptUnplannedSealed: opts.acceptUnplannedSealed } : {}),
+      ...(opts.allowGenerate !== undefined ? { allowGenerate: opts.allowGenerate } : {}),
+      ...(opts.verifyRetries !== undefined ? { verifyRetries: opts.verifyRetries } : {}),
+    });
     await writeJsonAtomic(join(paths.dir, 'rotation-report.json'), safe(report));
     return report;
   }
@@ -163,14 +223,22 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     return { inventory: inv, hosts, providers: providerList(), providerCtx: config.providerCtx, state, fingerprintKey, log, clock: options.now };
   }
 
-  function assertCompleteScan(inv: Inventory): void {
-    if (inv.errors.some(error => hostMap[error.host])) {
-      throw new CliError('Enabled host scans failed; execution is blocked because consumers may be missing. Run scan successfully before retrying.');
+  function assertPlanScan(rotationPlan: RotationPlan, inv: Inventory): void {
+    const failed = new Set(inv.errors.map(error => error.host));
+    if (!failed.size) return;
+    const selected = new Set(rotationPlan.steps.map(step => step.clusterId));
+    const consumers = [...rotationPlan.steps.flatMap(step => step.consumers), ...inv.clusters.filter(cluster => selected.has(cluster.id)).flatMap(cluster => cluster.consumers)];
+    if (consumers.some(consumer => failed.has(consumer.service.host))) {
+      throw new CliError('Host scans failed for consumers in this plan; execution is blocked. Run scan successfully before retrying.');
     }
+    log.warn('Host scans failed outside this plan; proceeding with unaffected consumers. Unscanned copies may exist.');
   }
 
-  async function unattended(rotationPlan: RotationPlan, inv: Inventory): Promise<RotationReport> {
-    const report = await execute(rotationPlan, inv, { execute: true, prompt: async () => null });
+  async function unattended(rotationPlan: RotationPlan, inv: Inventory, opts: Parameters<RotateExecutor>[1]): Promise<RotationReport> {
+    const report = await execute(rotationPlan, inv, { execute: true, prompt: async () => null,
+      revoke: 'after-deploy', redeploy: true, acceptUnplannedSealed: false,
+      revokeUnconfirmed: opts.revokeUnconfirmed, allowGenerate: false, reveal: async () => {},
+    });
     // Engine 'deployed' means new-key verification, all writes and activation succeeded,
     // while monitor's completion contract accepts 'verified'/'revoked'. Preserve the
     // exact engine report on disk and every warning about manual old-key revocation.
@@ -179,12 +247,10 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   async function monitorOnce() {
     const inv = await scan();
-    // A partial refresh can hide another copy of a shared credential. Do not
-    // run containment or rotation against that incomplete consumer set.
-    assertCompleteScan(inv);
+    if (inv.errors.length) log.warn('Host scans failed or are disabled; monitoring continues on partial inventory. Clusters on unavailable hosts require remediation.');
     const ctx = { ...detector(inv, await stateStore.load()), state: stateStore as MonitorStateStore,
       ...config.monitor, policy: config.monitor.policy, notifier: config.monitor.notifier,
-      rotate: (rotationPlan: RotationPlan) => unattended(rotationPlan, inv),
+      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => unattended(rotationPlan, inv, opts),
     };
     const result = await runMonitorOnce(ctx);
     await scan();
@@ -208,7 +274,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const inv = await inventory();
     const state = await stateStore.load();
     return { ...detector(inv, state), policy: config.monitor.policy, notifier: config.monitor.notifier,
-      rotate: (rotationPlan: RotationPlan) => unattended(rotationPlan, inv),
+      rotate: (rotationPlan: RotationPlan, opts: Parameters<RotateExecutor>[1]) => unattended(rotationPlan, inv, opts),
       saveState: () => stateStore.save(state),
     };
   }
@@ -216,8 +282,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   async function plant(opts: { host: HostId; service: string; varName?: string; execute?: boolean }) {
     const host = hostMap[opts.host];
     if (!host) throw new CliError('Requested host is not enabled.');
-    const services = (await host.listServices()).filter(service => [serviceKey(service), service.serviceId, service.serviceName].includes(opts.service));
-    if (services.length !== 1) throw new CliError('Service must identify exactly one service; use its full service key from scan.');
+    const services = (await host.listServices()).filter(service => [serviceKey(service), serviceLabel(service), service.serviceId, service.serviceName].includes(opts.service));
+    if (services.length !== 1) throw new CliError('Service must identify exactly one service; use its full project/service label from scan.');
     const inv = await inventory();
     await host.readVariables(services[0]!);
     if (JSON.stringify(safe(services[0])) !== JSON.stringify(services[0]) || opts.varName && safe(opts.varName) !== opts.varName) {
@@ -254,7 +320,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   return {
-    config, paths, redactor, providers, safe, scan, inventory, plan, loadPlan, rotate, monitorOnce, monitor,
+    config, paths, redactor, providers, safe, humanize, scan, inventory, plan, loadPlan, rotate, monitorOnce, monitor,
     createCanary: plant, drill: readiness,
     async init() {
       await stateStore.save(await stateStore.load());
@@ -263,8 +329,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw new CliError('Unable to create sample configuration.'); }
       return { stateDirectory: paths.dir, configPath: config.configPath, configCreated: created };
     },
-    async report() { return redactor.redact(renderBlastRadius(await inventory())); },
-    async runbook(rotationPlan: RotationPlan) { return redactor.redact(renderRunbook(rotationPlan, await inventory())); },
+    async report() { return redactor.redact(humanize(renderBlastRadius(await inventory()))); },
+    async runbook(rotationPlan: RotationPlan) { remember(rotationPlan.services); return redactor.redact(humanize(renderRunbook(rotationPlan, await inventory()))); },
     async canaries() { return safe(listCanaries(await stateStore.load())); },
     async removeCanary(id: string, execute = false) {
       const state = await stateStore.load();

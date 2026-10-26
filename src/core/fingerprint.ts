@@ -70,6 +70,17 @@ export function fingerprint(value: string, key: Buffer): string {
 
 export function makeHint(value: string): string | null {
   if (value.length < 16) return null;
-  const prefix = PREFIXES.find((candidate) => value.startsWith(candidate)) ?? value.slice(0, 4);
+  // Never derive a suffix from URL text: it may be part of a password, query
+  // credential, or malformed authority. Only the parsed database host is safe.
+  const text = value.trim();
+  if (/^(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?):/i.test(text)) {
+    try {
+      const url = new URL(text);
+      if (!url.hostname) return null;
+      return `${url.protocol}//…${url.hostname.slice(-4)}`;
+    } catch { return null; }
+  }
+  if (value.length < 24) return `…${value.slice(-2)}`;
+  const prefix = PREFIXES.find((candidate) => value.startsWith(candidate)) ?? '';
   return `${prefix.slice(0, 7)}…${value.slice(-4)}`;
 }

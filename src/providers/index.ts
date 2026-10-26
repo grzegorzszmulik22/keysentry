@@ -14,12 +14,13 @@ import {
   privateKeyProvider, cryptoWalletProvider, unknownProvider,
 } from './guided.js';
 import { appSecretProvider } from './app-secret.js';
+import { encryptionKeyProvider } from './encryption-key.js';
 
-export { openaiProvider, OPENAI_MODEL_PRICES, type OpenAIModelPrice } from './openai.js';
+export { openaiProvider, OpenAIGuidedRotationRequiredError, OPENAI_MODEL_PRICES, type OpenAIModelPrice } from './openai.js';
 export { anthropicProvider, ANTHROPIC_MODEL_PRICES } from './anthropic.js';
 export { openrouterProvider, createCanaryKey } from './openrouter.js';
 export { stripeProvider } from './stripe.js';
-export { resendProvider } from './resend.js';
+export { resendProvider, ResendGuidedRotationRequiredError } from './resend.js';
 export { cloudflareProvider } from './cloudflare.js';
 export { githubProvider } from './github.js';
 export { awsProvider } from './aws.js';
@@ -31,6 +32,7 @@ export {
   privateKeyProvider, cryptoWalletProvider, unknownProvider, type GuidedProviderId,
 } from './guided.js';
 export { appSecretProvider } from './app-secret.js';
+export { encryptionKeyProvider } from './encryption-key.js';
 
 const providers: Record<ProviderId, ProviderAdapter> = {
   openai: openaiProvider,
@@ -50,6 +52,7 @@ const providers: Record<ProviderId, ProviderAdapter> = {
   'private-key': privateKeyProvider,
   'crypto-wallet': cryptoWalletProvider,
   'app-secret': appSecretProvider,
+  'encryption-key': encryptionKeyProvider,
   unknown: unknownProvider,
 };
 
@@ -72,6 +75,7 @@ export const PROVIDER_CREDENTIALS: Record<ProviderId, string[]> = {
   'private-key': [],
   'crypto-wallet': [],
   'app-secret': [],
+  'encryption-key': [],
   unknown: [],
 };
 

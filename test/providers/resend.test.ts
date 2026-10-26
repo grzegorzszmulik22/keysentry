@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { resendProvider } from '../../src/providers/resend.js';
+import { ResendGuidedRotationRequiredError, resendProvider } from '../../src/providers/resend.js';
 import type { ProviderContext } from '../../src/types.js';
 import { FakeHttp, json, silentLogger, text } from '../helpers/fake-http.js';
 
@@ -10,6 +10,18 @@ const context = (http: FakeHttp, admin = secret()): ProviderContext => ({
   credentials: { RESEND_ADMIN_KEY: admin },
   log: silentLogger,
 });
+
+const hint = (value: string) => `${value.slice(0, 7)}...${value.slice(-4)}`;
+function rotationHttp(value: string, permission: 'full_access' | 'sending_access' = 'full_access', domainId: string | null = null) {
+  return new FakeHttp()
+    .on('GET', /^https:\/\/api\.resend\.com\/domains$/, request => {
+      expect(request.headers?.Authorization === `Bearer ${value}`).toBe(true);
+      return json(permission === 'sending_access' ? 403 : 200, { data: [] });
+    })
+    .on('GET', /^https:\/\/api\.resend\.com\/api-keys$/, () => json(200, { data: [{
+      id: 'old-id', redacted_value: hint(value), permission, domain_id: domainId,
+    }], has_more: false }));
+}
 
 async function failure(operation: Promise<unknown>): Promise<string> {
   try {
@@ -75,7 +87,7 @@ describe('resendProvider', () => {
     const oldValue = secret();
     const newValue = secret();
     const admin = secret();
-    const http = new FakeHttp().on('POST', /^https:\/\/api\.resend\.com\/api-keys$/, (request) => {
+    const http = rotationHttp(oldValue).on('POST', /^https:\/\/api\.resend\.com\/api-keys$/, (request) => {
       expect(request.headers?.Authorization === `Bearer ${admin}`).toBe(true);
       expect(request.headers?.['Content-Type']).toBe('application/json');
       const body = JSON.parse(request.body ?? '{}') as Record<string, unknown>;
@@ -94,7 +106,83 @@ describe('resendProvider', () => {
     expect(result.notes).toMatch(/manually/i);
     expect(result.notes?.includes(oldValue)).not.toBe(true);
     expect(result.notes?.includes(newValue)).not.toBe(true);
-    expect(http.calls.length).toBe(1);
+    expect(http.calls.map(call => call.method)).toEqual(['GET', 'GET', 'POST']);
+    expect(http.calls[1]?.headers?.Authorization === `Bearer ${admin}`).toBe(true);
+  });
+
+  it.each(['sending_access', 'full_access'] as const)('preserves %s and a detected domain restriction', async (permission) => {
+    const oldValue = secret();
+    const newValue = secret();
+    const http = rotationHttp(oldValue, permission, 'domain_old').on('POST', /\/api-keys$/, request => {
+      const body = JSON.parse(request.body!) as Record<string, unknown>;
+      expect(body.permission).toBe(permission);
+      expect(body.domain_id).toBe('domain_old');
+      return json(201, { id: 'replacement-id', token: newValue });
+    });
+    const result = await resendProvider.rotate!(oldValue, context(http));
+    expect(result.newValue === newValue).toBe(true);
+    expect(http.calls.filter(call => call.method === 'POST')).toHaveLength(1);
+  });
+
+  it('preserves explicitly unrestricted sending access without adding domain access fields', async () => {
+    const oldValue = secret();
+    const newValue = secret();
+    const http = rotationHttp(oldValue, 'sending_access').on('POST', /\/api-keys$/, request => {
+      const body = JSON.parse(request.body!) as Record<string, unknown>;
+      expect(body.permission).toBe('sending_access');
+      expect(Object.hasOwn(body, 'domain_id')).toBe(false);
+      return json(201, { id: 'replacement-id', token: newValue });
+    });
+    expect((await resendProvider.rotate!(oldValue, context(http))).newValue === newValue).toBe(true);
+  });
+
+  it.each(['sending_access', 'full_access'] as const)('requires guided rotation when %s domain scope is unknown or ambiguous', async (permission) => {
+    const oldValue = secret();
+    const matched = { id: 'old-id', redacted_value: hint(oldValue), permission, domain_id: 'domain_old' };
+    for (const response of [
+      json(200, { data: [{ id: 'old-id', name: 'old key' }] }),
+      json(200, { data: [{ ...matched, domain_id: undefined }] }),
+      json(200, { data: [{ ...matched, domain_id: '' }] }),
+      json(200, { data: [{ ...matched, domain_id: oldValue }] }),
+      json(200, { data: [{ ...matched, permission: 'unknown' }] }),
+      json(200, { data: [{ ...matched, redacted_value: `...${oldValue.slice(-4)}` }] }),
+      json(200, { data: [{ ...matched, redacted_value: `re_...${oldValue.slice(-1)}` }], has_more: false }),
+      json(200, { data: [{ ...matched, redacted_value: `re_...${oldValue.slice(-4)}` }], has_more: false }),
+      json(200, { data: [{ ...matched, redacted_value: `${oldValue.slice(0, 7)}...${oldValue.slice(-3)}` }], has_more: false }),
+      json(200, { data: [matched, { ...matched, id: 'another-id' }] }),
+      json(200, { data: [matched], has_more: true }),
+      json(403, { message: oldValue }),
+      text(200, oldValue),
+    ]) {
+      const http = new FakeHttp()
+        .on('GET', /\/domains$/, () => json(permission === 'sending_access' ? 403 : 200, { data: [] }))
+        .on('GET', /\/api-keys$/, () => response)
+        .on('POST', /\/api-keys$/, () => json(201, { id: 'replacement-id', token: secret() }));
+      let error: unknown;
+      try { await resendProvider.rotate!(oldValue, context(http)); } catch (cause) { error = cause; }
+      expect(error instanceof ResendGuidedRotationRequiredError).toBe(true);
+      expect(error).toMatchObject({ name: 'ResendGuidedRotationRequiredError', code: 'GUIDED_ROTATION_REQUIRED', provider: 'resend' });
+      expect(String(error).includes(oldValue)).toBe(false);
+      expect(http.calls.every(call => call.method === 'GET')).toBe(true);
+    }
+  });
+
+  it.each([401, 429, 500])('never creates a replacement when old-key verification returns HTTP %s', async (status) => {
+    const oldValue = secret();
+    const http = new FakeHttp().on('GET', /\/domains$/, () => json(status, { message: oldValue }))
+      .on('POST', /\/api-keys$/, () => json(201, { id: 'replacement-id', token: secret() }));
+    expect(await failure(resendProvider.rotate!(oldValue, context(http)))).toMatch(/verif/i);
+    expect(http.calls.map(call => call.method)).toEqual(['GET']);
+  });
+
+  it('never creates a replacement when the old-key verification response is malformed', async () => {
+    const oldValue = secret();
+    for (const response of [text(200, oldValue), json(200, null), json(200, { data: 'invalid' })]) {
+      const http = new FakeHttp().on('GET', /\/domains$/, () => response)
+        .on('POST', /\/api-keys$/, () => json(201, { id: 'replacement-id', token: secret() }));
+      expect(await failure(resendProvider.rotate!(oldValue, context(http)))).toMatch(/verif/i);
+      expect(http.calls.map(call => call.method)).toEqual(['GET']);
+    }
   });
 
   it('requires the management credential before creating a key', async () => {
@@ -107,24 +195,27 @@ describe('resendProvider', () => {
 
   it.each([401, 403, 500])('sanitizes HTTP %s rotation failures', async (status) => {
     const admin = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () => json(status, { message: admin }));
-    const message = await failure(resendProvider.rotate!(secret(), context(http, admin)));
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () => json(status, { message: admin }));
+    const message = await failure(resendProvider.rotate!(oldValue, context(http, admin)));
     expect(message.length > 0).toBe(true);
     expect(message.includes(admin)).toBe(false);
   });
 
   it('sanitizes transport rotation failures', async () => {
     const admin = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () => { throw new Error(admin); });
-    const message = await failure(resendProvider.rotate!(secret(), context(http, admin)));
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () => { throw new Error(admin); });
+    const message = await failure(resendProvider.rotate!(oldValue, context(http, admin)));
     expect(message.length > 0).toBe(true);
     expect(message.includes(admin)).toBe(false);
   });
 
   it('sanitizes JSON parse failures after creation', async () => {
     const newValue = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () => text(200, newValue));
-    const message = await failure(resendProvider.rotate!(secret(), context(http)));
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () => text(200, newValue));
+    const message = await failure(resendProvider.rotate!(oldValue, context(http)));
     expect(message.length > 0).toBe(true);
     expect(message.includes(newValue)).toBe(false);
   });
@@ -132,15 +223,17 @@ describe('resendProvider', () => {
   it.each([{ id: 'replacement-id' }, { token: '' }, { token: 'placeholder', id: '' }])(
     'rejects a malformed create response',
     async (response) => {
-      const http = new FakeHttp().on('POST', /\/api-keys$/, () => json(200, response));
-      expect((await failure(resendProvider.rotate!(secret(), context(http)))).length > 0).toBe(true);
+      const oldValue = secret();
+      const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () => json(200, response));
+      expect((await failure(resendProvider.rotate!(oldValue, context(http)))).length > 0).toBe(true);
     },
   );
 
   it('refuses to return a secret as a key reference', async () => {
     const value = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () => json(200, { token: value, id: value }));
-    const message = await failure(resendProvider.rotate!(secret(), context(http)));
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () => json(200, { token: value, id: value }));
+    const message = await failure(resendProvider.rotate!(oldValue, context(http)));
     expect(message.length > 0).toBe(true);
     expect(message.includes(value)).toBe(false);
   });
@@ -148,11 +241,12 @@ describe('resendProvider', () => {
   it('rejects a creation id that echoes another configured credential', async () => {
     const otherCredential = randomBytes(32).toString('hex');
     const newValue = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () =>
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () =>
       json(201, { token: newValue, id: `key-${otherCredential}` }));
     const ctx = context(http);
     ctx.credentials.OTHER_ADMIN_KEY = otherCredential;
-    const message = await failure(resendProvider.rotate!(secret(), ctx));
+    const message = await failure(resendProvider.rotate!(oldValue, ctx));
     expect(message.length > 0).toBe(true);
     expect(message.includes(otherCredential)).toBe(false);
     expect(message.includes(newValue)).toBe(false);
@@ -160,9 +254,10 @@ describe('resendProvider', () => {
 
   it('rejects an unrelated full token returned as a creation id', async () => {
     const foreignToken = secret();
-    const http = new FakeHttp().on('POST', /\/api-keys$/, () =>
+    const oldValue = secret();
+    const http = rotationHttp(oldValue).on('POST', /\/api-keys$/, () =>
       json(201, { token: secret(), id: foreignToken }));
-    const message = await failure(resendProvider.rotate!(secret(), context(http)));
+    const message = await failure(resendProvider.rotate!(oldValue, context(http)));
     expect(message.length > 0).toBe(true);
     expect(message.includes(foreignToken)).toBe(false);
   });

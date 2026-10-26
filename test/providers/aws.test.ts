@@ -60,6 +60,38 @@ describe('AWS provider', () => {
     expect(result.error).toBeTruthy();
   });
 
+  it.each([['plain', ''], ['namespace-prefixed', 'sts:']] as const)('reports a propagating key for STS InvalidClientTokenId in %s XML', async (_kind, prefix) => {
+    const value = secret();
+    const body = `<${prefix}ErrorResponse xmlns:sts="https://sts.amazonaws.com/doc/2011-06-15/">`
+      + `<${prefix}Error><${prefix}Type>Sender</${prefix}Type><${prefix}Code>InvalidClientTokenId</${prefix}Code>`
+      + `<${prefix}Message>${value}</${prefix}Message></${prefix}Error>`
+      + `<${prefix}RequestId>request-id</${prefix}RequestId></${prefix}ErrorResponse>`;
+    const http = new FakeHttp().on('POST', /^https:\/\/sts\.amazonaws\.com\/$/, () => text(403, body));
+
+    const result = await awsProvider.verify(value, context(http, { AWS_ACCESS_KEY_ID: accessId() }));
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(403);
+    expect(result.error === 'propagating').toBe(true);
+    expect(JSON.stringify(result).includes(value)).toBe(false);
+  });
+
+  it.each([
+    [401, '<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>'],
+    [403, '<ErrorResponse><Error><Code>AccessDenied</Code><Message>InvalidClientTokenId</Message></Error></ErrorResponse>'],
+    [403, '<ErrorResponse><Error><Code>SignatureDoesNotMatch</Code></Error></ErrorResponse>'],
+    [403, '<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error>'],
+    [403, '<ErrorResponse><Message>InvalidClientTokenId</Message></ErrorResponse>'],
+  ] as const)('does not report propagation for unrelated or malformed STS HTTP %i errors', async (status, body) => {
+    const http = new FakeHttp().on('POST', /^https:\/\/sts\.amazonaws\.com\/$/, () => text(status, body));
+
+    const result = await awsProvider.verify(secret(), context(http, { AWS_ACCESS_KEY_ID: accessId() }));
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(status);
+    expect(result.error === 'propagating').toBe(false);
+  });
+
   it('fails verification without a sibling access ID before sending any request', async () => {
     const http = new FakeHttp();
     const result = await awsProvider.verify(secret(), context(http));
@@ -103,6 +135,7 @@ describe('AWS provider', () => {
     expect(result.oldKeyRef === oldId).toBe(true);
     expect(result.newKeyRef === newId).toBe(true);
     expect(result.oldRevoked).toBe(false);
+    expect(result.notes).toBe('verification may need up to ~30 s');
     expect(Object.keys(result.companions ?? {})).toEqual(['DEPLOY_AWS_ACCESS_KEY_ID']);
     expect(result.companions?.DEPLOY_AWS_ACCESS_KEY_ID === newId).toBe(true);
     expect(http.calls.length).toBe(1);
@@ -164,7 +197,7 @@ describe('AWS provider', () => {
     expect(Object.keys(result.companions ?? {})).toEqual(['AWS_ACCESS_KEY_ID']);
   });
 
-  it('revokes by form body signed only with the new sibling credentials', async () => {
+  it('revokes the old key by form body signed only with the new sibling credentials', async () => {
     vi.useFakeTimers().setSystemTime(now);
     const oldId = accessId();
     const newId = accessId();
@@ -193,6 +226,35 @@ describe('AWS provider', () => {
     expect(request.headers?.authorization?.includes(`Credential=${newId}/20250102/us-east-1/iam/aws4_request`)).toBe(true);
     expect(request.url.includes(oldId)).toBe(false);
     expect(request.url.includes(newValue)).toBe(false);
+  });
+
+  it('cleans up an unused new key by signing with the old sibling credentials', async () => {
+    vi.useFakeTimers().setSystemTime(now);
+    const oldId = accessId();
+    const oldValue = secret();
+    const unusedNewId = accessId();
+    const unusedNewValue = secret();
+    const http = new FakeHttp().on('POST', /^https:\/\/iam\.amazonaws\.com\/$/, () => text(200,
+      '<DeleteAccessKeyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata>'
+      + '<RequestId>request-id</RequestId></ResponseMetadata></DeleteAccessKeyResponse>'));
+    const ctx = context(http, { DEPLOY_ACCESS_KEY_ID: oldId, DEPLOY_SECRET_ACCESS_KEY: oldValue });
+    ctx.credentials.AWS_ACCESS_KEY_ID = unusedNewId;
+    ctx.credentials.AWS_SECRET_ACCESS_KEY = unusedNewValue;
+
+    await awsProvider.revoke!(unusedNewId, ctx);
+
+    expect(http.calls.length).toBe(1);
+    const request = http.calls[0]!;
+    const parameters = new URLSearchParams(request.body);
+    expect(parameters.get('Action')).toBe('DeleteAccessKey');
+    expect(parameters.get('AccessKeyId') === unusedNewId).toBe(true);
+    const expected = signAwsRequest({ method: 'POST', url: 'https://iam.amazonaws.com/',
+      headers: { 'content-type': 'application/x-www-form-urlencoded; charset=utf-8' }, body: request.body },
+    { accessKeyId: oldId, secretAccessKey: oldValue }, { region: 'us-east-1', service: 'iam', now });
+    expect(request.headers?.authorization === expected.headers?.authorization).toBe(true);
+    expect(request.headers?.authorization?.includes(`Credential=${oldId}/20250102/us-east-1/iam/aws4_request`)).toBe(true);
+    expect(request.url.includes(oldValue)).toBe(false);
+    expect(request.url.includes(unusedNewValue)).toBe(false);
   });
 
   it('refuses revoke when the current sibling secret is missing, without using admin credentials', async () => {

@@ -6,6 +6,17 @@ import { credential, ensureOk, matchHint, readJson, request, safeIdentity, verif
 const BASE = 'https://api.openai.com/v1';
 const PROVIDER = 'OpenAI';
 
+/** A user key's permissions cannot safely be recreated by creating a service account. */
+export class OpenAIGuidedRotationRequiredError extends Error {
+  readonly code = 'GUIDED_ROTATION_REQUIRED';
+  readonly provider = 'openai';
+
+  constructor() {
+    super('OpenAI user-owned keys require guided rotation to preserve their permissions.');
+    this.name = 'OpenAIGuidedRotationRequiredError';
+  }
+}
+
 export interface OpenAIModelPrice {
   inputPerMillionUsd: number;
   outputPerMillionUsd: number;
@@ -160,20 +171,20 @@ async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationR
   const oldKeyRef = await resolveKeyRef(oldValue, ctx);
   if (!oldKeyRef) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
   const { projectId, serviceAccountId } = parseRef(oldKeyRef, ctx);
+  if (!serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
   const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
   const data = await adminJson(ctx, {
-    method: 'POST', url: serviceAccountId ? `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys` : accountPath,
+    method: 'POST', url: `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys`,
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}` }),
   });
-  const key = object(data) ? (serviceAccountId ? data : data.api_key) : undefined;
+  const key = object(data) ? data : undefined;
   if (!object(key) || typeof key.value !== 'string'
     || key.value.trim().length === 0 || key.value === oldValue) {
     throw new Error('OpenAI did not return a new service-account key.');
   }
   const newValue = key.value;
-  const accountId = serviceAccountId ?? referenceId(object(data) ? data.id : undefined, ctx, [oldValue, newValue]);
   const keyId = referenceId(key.id, ctx, [oldValue, newValue]);
-  return { newValue, oldKeyRef, newKeyRef: `${projectId}/${keyId}/sa-key:${accountId}`, oldRevoked: false };
+  return { newValue, oldKeyRef, newKeyRef: `${projectId}/${keyId}/sa-key:${serviceAccountId}`, oldRevoked: false };
 }
 
 async function revoke(keyRef: string, ctx: ProviderContext): Promise<void> {
@@ -252,9 +263,9 @@ export const openaiProvider: ProviderAdapter = {
   guidance: () => ({
     url: 'https://platform.openai.com/api-keys',
     steps: [
-      'Select the project and create a new API key or project service account.',
+      'Select the same project and create a replacement API key with the same owner and permissions as the previous key.',
       'Update every consumer, redeploy, and verify the new key before deleting the old key.',
-      'Automatic rotation needs OPENAI_ADMIN_KEY with access to project keys and service accounts.',
+      'Automatic rotation supports service-account keys in the same account and needs OPENAI_ADMIN_KEY; user-owned keys require guided rotation.',
       'Usage cost is an estimate from OPENAI_MODEL_PRICES; update the table for current models and pricing.',
     ],
   }),

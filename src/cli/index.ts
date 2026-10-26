@@ -4,10 +4,11 @@ import { Command, CommanderError, InvalidArgumentError } from 'commander';
 import { createRedactor, renderBlastRadius } from '../core/index.js';
 import type { GuidedPrompt, Inventory, RotationReport } from '../types.js';
 import { startMcpServer } from '../mcp/server.js';
-import { confirmRotation, promptSecret } from './prompts.js';
+import { confirmRotation, promptSecret, revealSecret } from './prompts.js';
 import { createRuntime, type KeysentryRuntime, type PlanFilters, type RuntimeOptions } from './runtime.js';
 import { hostIdSchema, tierSchema } from './schemas.js';
 import { CliError } from './errors.js';
+import { serviceLabel } from './display.js';
 
 export { createRuntime } from './runtime.js';
 export type { KeysentryRuntime, RuntimeOptions } from './runtime.js';
@@ -54,8 +55,8 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   const output = options.output ?? ((line: string) => process.stdout.write(`${line}\n`));
   const errorOutput = options.error ?? ((line: string) => process.stderr.write(`${line}\n`));
   const redact = (text: string) => (runtime?.redactor ?? initialRedactor).redact(text);
-  const write = (text: string) => output(redact(text));
-  const diagnostic = (text: string) => errorOutput(redact(text));
+  const write = (text: string) => output(redact(runtime?.humanize(text) ?? text));
+  const diagnostic = (text: string) => errorOutput(redact(runtime?.humanize(text) ?? text));
   const program = new Command();
   program.name('keysentry').description('Local-first secret inventory, breach response, rotation, and monitoring.')
     .version('0.1.0').option('--cwd <path>', 'Project directory', options.cwd ?? process.cwd())
@@ -107,33 +108,45 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     .option('--yes', 'Confirm execution without a terminal prompt')
     .option('--revoke <policy>', 'after-deploy, immediately, or never')
     .option('--no-redeploy', 'Leave activation to the operator')
+    .option('--revoke-unconfirmed', 'Revoke old keys even when consumer activation is unconfirmed')
+    .option('--accept-unplanned-sealed', 'Accept sealed consumers outside this plan that may use the old key')
+    .option('--no-generate', 'Skip generated application secrets')
     .action(async (opts, command: Command) => {
       const rt = await getRuntime();
       if (opts.revoke && !['after-deploy', 'immediately', 'never'].includes(opts.revoke)) throw new CliError('Invalid revocation policy; use after-deploy, immediately, or never.');
       if (opts.plan && (opts.tier || opts.cluster || opts.host)) throw new CliError('Select a saved plan or filters.');
       const rotationPlan = opts.plan ? await rt.loadPlan(opts.plan) : await rt.plan(filters(opts));
       const redeploy = command.getOptionValueSource('redeploy') === 'cli' ? opts.redeploy as boolean : undefined;
-      const preview = await rt.rotate(rotationPlan, { revoke: opts.revoke, redeploy });
+      const rotationOptions = { revoke: opts.revoke, redeploy,
+        revokeUnconfirmed: command.getOptionValueSource('revokeUnconfirmed') === 'cli' ? opts.revokeUnconfirmed as boolean : undefined,
+        acceptUnplannedSealed: command.getOptionValueSource('acceptUnplannedSealed') === 'cli' ? opts.acceptUnplannedSealed as boolean : undefined,
+        allowGenerate: command.getOptionValueSource('generate') === 'cli' ? opts.generate as boolean : undefined,
+      };
+      const preview = await rt.rotate(rotationPlan, rotationOptions);
       if (!opts.execute) { emit({ report: preview, journal: rt.paths.journal }, `${preview.diff.join('\n')}\n${summary(preview, rt.paths.journal)}`); reportExit(preview); return; }
       diagnostic(`Rotation preview (${rotationPlan.steps.length} secret clusters):\n${preview.diff.join('\n')}`);
       if (rotationPlan.steps.length && !opts.yes && !await (options.confirm ?? (count => confirmRotation(count, diagnostic)))(rotationPlan.steps.length)) {
         emit({ cancelled: true, report: preview, journal: rt.paths.journal }, 'Rotation cancelled. No host or provider changes.'); return;
       }
       const prompt = options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic));
-      const report = await rt.rotate(rotationPlan, { execute: true, revoke: opts.revoke, redeploy, prompt });
+      const reveal = options.reveal ?? ((info, value) => revealSecret(info, value, diagnostic));
+      const report = await rt.rotate(rotationPlan, { ...rotationOptions, execute: true, prompt, reveal });
       emit({ preview, report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report);
     });
 
   const canary = program.command('canary').description('Manage low-budget OpenRouter decoys');
-  canary.command('create').requiredOption('--host <id>', 'Destination host').requiredOption('--service <id>', 'Full service key or unique service ID/name')
+  canary.command('create').requiredOption('--host <id>', 'Destination host').requiredOption('--service <id>', 'Project/service label or unique service ID/name')
     .option('--provider <id>', 'Canary provider', 'openrouter').option('--var <name>', 'Destination variable name')
     .option('--execute', 'Create and plant the canary').action(async opts => {
       if (opts.provider !== 'openrouter') throw new CliError('Canaries currently support OpenRouter only.');
       const host = hostIdSchema.safeParse(opts.host); if (!host.success) throw new CliError('Invalid host.');
       const rt = await getRuntime(); const result = await rt.createCanary({ host: host.data, service: opts.service, varName: opts.var, execute: opts.execute });
-      emit({ dryRun: !opts.execute, canary: result }, result ? `Canary ${result.id} planted in ${result.service.serviceName}:${result.varName}.` : 'Dry run: would plant a $0.01 OpenRouter canary. Pass --execute to plant it.');
+      emit({ dryRun: !opts.execute, canary: result }, result ? `Canary ${result.id} planted in ${serviceLabel(result.service)}:${result.varName}.` : 'Dry run: would plant a $0.01 OpenRouter canary. Pass --execute to plant it.');
     });
-  canary.command('list').action(async () => { const rt = await getRuntime(); emit(await rt.canaries()); });
+  canary.command('list').action(async () => {
+    const rt = await getRuntime(); const canaries = await rt.canaries();
+    emit(canaries, canaries.length ? canaries.map(canary => `${canary.id}: ${serviceLabel(canary.service)}:${canary.varName}`).join('\n') : 'No canaries configured.');
+  });
   canary.command('remove <id>').option('--execute', 'Revoke the canary and remove monitoring metadata').action(async (id, opts) => {
     const rt = await getRuntime(); emit(await rt.removeCanary(id, opts.execute), opts.execute ? 'Canary revoked; inert host variable remains.' : 'Dry run: would revoke the canary. Pass --execute to remove it.');
   });
@@ -152,9 +165,15 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
     });
   program.command('actions').description('List pending monitor actions').action(async () => { const rt = await getRuntime(); emit(await rt.pendingActions()); });
-  program.command('approve <id>').description('Explicitly approve and execute exactly this pending rotation action').action(async id => {
+  program.command('approve <id>').description('Explicitly approve and execute exactly this pending rotation or containment action').action(async id => {
     const rt = await getRuntime(); const report = await rt.approve(id);
-    emit({ report, journal: rt.paths.journal }, report ? summary(report, rt.paths.journal) : 'Action did not execute; inspect actions and journal.'); if (report) reportExit(report); else exitCode = 1;
+    if (report) { emit({ report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report); }
+    else {
+      const action = (await rt.monitorStatus()).pendingActions.find(action => action.id === id);
+      const executed = action?.status === 'executed';
+      emit({ action, journal: rt.paths.journal }, executed ? 'Containment action executed.' : 'Action did not execute; inspect actions and journal.');
+      if (!executed) exitCode = 1;
+    }
   });
   program.command('dismiss <id>').description('Dismiss a pending monitor action').action(async id => { const rt = await getRuntime(); emit(await rt.dismiss(id)); });
   program.command('drill').description('Time a full dry run and explain readiness from 0 to 100').action(async () => {

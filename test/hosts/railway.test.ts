@@ -107,7 +107,7 @@ describe('Railway host', () => {
     }
   });
 
-  it('reads unrendered variables and marks null or empty values as sealed', async () => {
+  it('reads unrendered variables and preserves empty strings as readable values', async () => {
     const http = queuedHttp({ data: { variables: {
       API_KEY: 'private-value-kept-in-memory', DATABASE_URL: '${{Postgres.DATABASE_URL}}', SEALED: null, EMPTY: '',
     } } });
@@ -116,10 +116,20 @@ describe('Railway host', () => {
     expect(await host.readVariables(service)).toEqual([
       { name: 'API_KEY', value: 'private-value-kept-in-memory', sealed: false },
       { name: 'DATABASE_URL', value: '${{Postgres.DATABASE_URL}}', sealed: false },
-      { name: 'SEALED', sealed: true }, { name: 'EMPTY', sealed: true },
+      { name: 'SEALED', sealed: true }, { name: 'EMPTY', value: '', sealed: false },
     ]);
     expect(body(http.calls[0]!).query).toContain('unrendered: true');
     expect(body(http.calls[0]!).variables).toEqual({ projectId: 'p1', environmentId: 'e1', serviceId: 's1' });
+  });
+
+  it('marks an existing variable with an unavailable value as sealed', async () => {
+    const http = new FakeHttp().on('POST', endpointPattern, () => ({
+      ...json(200, {}),
+      json: <T>() => ({ data: { variables: { UNAVAILABLE: undefined } } }) as T,
+    }));
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    expect(await host.readVariables(service)).toEqual([{ name: 'UNAVAILABLE', sealed: true }]);
   });
 
   it('uses null service scope for shared variables rather than an empty service id', async () => {
@@ -338,9 +348,9 @@ describe('Railway host', () => {
   });
 
   it.each([
-    ['SUCCESS', 'success'], ['SKIPPED', 'success'], ['FAILED', 'failed'], ['CRASHED', 'failed'], ['REMOVED', 'failed'],
+    ['SUCCESS', 'success'], ['SKIPPED', 'failed'], ['FAILED', 'failed'], ['CRASHED', 'failed'], ['REMOVED', 'failed'],
     ['BUILDING', 'pending'], ['DEPLOYING', 'pending'], ['QUEUED', 'pending'],
-    ['SLEEPING', 'pending'], ['WAITING', 'pending'], ['UNKNOWN_FUTURE_STATUS', 'pending'],
+    ['SLEEPING', 'success'], ['WAITING', 'pending'], ['UNKNOWN_FUTURE_STATUS', 'pending'],
   ])('maps deployment status %s to %s', async (status, expected) => {
     const http = queuedHttp({ data: { deployment: { status } } });
     const host = createRailwayHost({ token, http, log: silentLogger });

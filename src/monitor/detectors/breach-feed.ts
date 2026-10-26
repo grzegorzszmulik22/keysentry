@@ -31,13 +31,15 @@ const MAX_FEED_BYTES = 16 * 1024 * 1024;
 const SECURITY_TITLE = /\b(?:security[\s-]+(?:incident|disclosure|advisory|notice|update)|(?:data[\s-]+)?breach|compromis(?:e|ed)|unauthori[sz]ed[\s-]+access|credentials?[\s-]+(?:leak|exposure))\b/i;
 const SECURITY_PHRASE = /\b(?:rotate[\s-]+(?:all|your)[\s-]+(?:environment[\s-]+variables|secrets|keys|credentials)|unauthori[sz]ed[\s-]+(?:third[\s-]+party|access)|(?:may[\s-]+have|have[\s-]+been)[\s-]+(?:accessed|exposed|compromised))\b/i;
 const HIGH_CONFIDENCE_TITLE = /\b(?:security[\s-]+(?:incident|disclosure)|breach)\b/i;
-const HOST_MENTIONS: Record<HostId, RegExp> = {
-  railway: /\brailway\b/i,
-  vercel: /\bvercel\b/i,
-  render: /\brender\b/i,
-  fly: /\bfly(?:\.io)?\b/i,
-  'github-actions': /\bgithub\b/i,
-  dotenv: /\bdotenv\b/i,
+// Domain mentions may include subdomains or a sentence-ending period, but never another domain's label.
+// Product names are case-sensitive and cannot match inside domain names or identifiers.
+const HOST_MENTIONS: Record<HostId, RegExp[]> = {
+  railway: [/(?<![\w-])railway\.(?:com|app)(?![\w-]|\.[\w-])/i, /(?<![\w.-])Railway(?![\w-]|\.[\w-])/],
+  vercel: [/(?<![\w-])vercel\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Vercel(?![\w-]|\.[\w-])/],
+  render: [/(?<![\w-])render\.com(?![\w-]|\.[\w-])/i],
+  fly: [/(?<![\w-])fly\.io(?![\w-]|\.[\w-])/i],
+  'github-actions': [/(?<![\w-])github\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])GitHub(?![\w-]|\.[\w-])/],
+  dotenv: [],
 };
 
 type Row = Record<string, unknown>;
@@ -141,7 +143,8 @@ export async function detectBreachFeeds(
         const texts = [title, ...descriptions];
         if (!SECURITY_TITLE.test(title) && !texts.some(text => SECURITY_PHRASE.test(text))) continue;
         const searchable = texts.join(' ');
-        const hosts = ctx.inventory.hosts.filter(host => host === feed.host || HOST_MENTIONS[host].test(searchable));
+        const hosts = ctx.inventory.hosts.filter(host => host === feed.host
+          || HOST_MENTIONS[host].some(pattern => pattern.test(searchable)));
         if (hosts.length === 0) continue;
         for (const host of hosts) {
           const advisory = advisories.get(host) ?? { itemIds: new Set<string>(), confidence: 'medium' };

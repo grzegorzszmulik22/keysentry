@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { buildInventory, buildPlan, createRedactor } from '../../src/core/index.js';
@@ -34,6 +34,15 @@ function fixture() {
 }
 
 describe('stdio MCP server tools', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  it('uses readable service labels in tool reports and runbooks', async () => {
+    const { runtime } = fixture(); const handlers = createToolHandlers(runtime);
+    const blast = await handlers.blast_radius({});
+    expect(blast.structuredContent?.report).toContain('railway:proj1/api@production');
+    const plan = await handlers.plan_rotation({});
+    expect(plan.structuredContent?.runbook).toContain('railway:proj1/api@production');
+    expect(plan.structuredContent?.runbook).not.toContain('railway:proj1/production/api');
+  });
   it('lists the six tools and calls blast_radius over the SDK in-memory transport', async () => {
     const { runtime, oldKey } = fixture();
     const server = createMcpServer(runtime);
@@ -63,15 +72,130 @@ describe('stdio MCP server tools', () => {
     }
   });
 
-  it.each([
-    [{}, false], [{ execute: true }, false], [{ confirm: 'ROTATE' }, false],
-    [{ execute: true, confirm: 'rotate' }, false], [{ execute: true, confirm: 'ROTATE' }, true],
-  ])('requires both explicit execution guards: %j', async (args, execute) => {
+  it.each([undefined, '', 'true', '0'])('refuses MCP execution without the exact environment opt-in: %j', async (setting) => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', setting);
     const { runtime } = fixture();
-    const result = await createToolHandlers(runtime).rotate(args);
-    expect(result.isError).not.toBe(true);
+    const result = await createToolHandlers(runtime).rotate({ execute: true, confirm: 'ROTATE' });
+    expect(result.isError).toBe(true);
+    expect(runtime.rotate).not.toHaveBeenCalled();
+    expect(result.structuredContent).toMatchObject({ executionRefused: true });
+    expect(JSON.stringify(result)).toMatch(/keysentry rotate --plan plan-\d{14}-[a-f0-9]{4} --execute/);
+  });
+
+  it('returns a plan ID/hash from dry runs and executes the saved snapshot without rebuilding', async () => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime, inventory } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({ revoke: 'never', allowGenerate: false });
+    expect(preview.isError).not.toBe(true);
+    expect(preview.structuredContent).toMatchObject({ planId: expect.any(String), planHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    const { planId, planHash } = preview.structuredContent!;
+    const reviewed = structuredClone(vi.mocked(runtime.rotate).mock.calls[0]![0]);
+    inventory.clusters[0]!.consumers[0]!.varName = 'CHANGED_AFTER_REVIEW';
+    const executed = await handlers.rotate({ execute: true, planId, planHash });
+    expect(executed.isError).not.toBe(true);
+    expect(runtime.plan).toHaveBeenCalledTimes(1);
+    expect(runtime.rotate).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runtime.rotate).mock.calls[1]![0]).toEqual(reviewed);
+    expect(vi.mocked(runtime.rotate).mock.calls[1]![1]).toMatchObject({
+      execute: true, revoke: 'never', redeploy: true, revokeUnconfirmed: false,
+      acceptUnplannedSealed: false, allowGenerate: false, verifyRetries: 4,
+    });
+    expect(vi.mocked(runtime.rotate).mock.calls[1]![1].reveal).toBeTypeOf('function');
+  });
+
+  it('checks the execution environment again after a successful dry run and names that plan for the terminal', async () => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({});
+    const { planId, planHash } = preview.structuredContent!;
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', undefined);
+    const result = await handlers.rotate({ execute: true, planId, planHash });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain(`keysentry rotate --plan ${planId} --execute`);
+    expect(runtime.plan).toHaveBeenCalledTimes(1);
     expect(runtime.rotate).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(runtime.rotate).mock.calls[0]?.[1].execute).toBe(execute);
+  });
+
+  it('requires a previous dry run in this session, its exact hash, and unchanged options', async () => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const missing = await handlers.rotate({ execute: true });
+    expect(missing.isError).toBe(true);
+    expect(runtime.plan).not.toHaveBeenCalled();
+    const preview = await handlers.rotate({});
+    const { planId, planHash } = preview.structuredContent!;
+    for (const args of [
+      { planId, planHash: '0'.repeat(64) },
+      { planId: 'plan-20260101000000-ffff', planHash },
+      { planId, planHash, revoke: 'never' },
+      { planId, planHash, allowGenerate: false },
+      { planId, planHash, clusterIds: [] },
+    ]) {
+      expect((await handlers.rotate({ execute: true, ...args })).isError).toBe(true);
+    }
+    expect(runtime.plan).toHaveBeenCalledTimes(1);
+    expect(runtime.rotate).toHaveBeenCalledTimes(1);
+    expect((await createToolHandlers(runtime).rotate({ execute: true, planId, planHash })).isError).toBe(true);
+  });
+
+  it.each([
+    { revoke: 'immediately' }, { redeploy: false },
+    { revokeUnconfirmed: true }, { acceptUnplannedSealed: true },
+  ])('refuses unsafe MCP execution options even when enabled: %j', async (unsafe) => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({});
+    const { planId, planHash } = preview.structuredContent!;
+    const result = await handlers.rotate({ execute: true, planId, planHash, ...unsafe });
+    expect(result.isError).toBe(true);
+    expect(runtime.rotate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['plan', 'provider'])('keeps atomic-roll execution in the human terminal when identified by the %s', async (source) => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime, inventory, provider } = fixture();
+    const atomicProvider = new FakeProvider('openai', 'atomic-roll', 'sk-proj-');
+    const providerRotate = vi.spyOn(source === 'provider' ? atomicProvider : provider, 'rotate');
+    if (source === 'plan') inventory.clusters[0]!.method = 'atomic-roll';
+    else runtime.providers = () => atomicProvider;
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({});
+    expect(preview.isError).not.toBe(true);
+    const { planId, planHash } = preview.structuredContent!;
+    const result = await handlers.rotate({ execute: true, planId, planHash });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ executionRefused: true, planId });
+    expect(JSON.stringify(result)).toContain(`keysentry rotate --plan ${planId} --execute`);
+    expect(JSON.stringify(result)).toContain('atomic-roll');
+    expect(runtime.rotate).toHaveBeenCalledTimes(1);
+    expect(runtime.plan).toHaveBeenCalledTimes(1);
+    expect(providerRotate).not.toHaveBeenCalled();
+  });
+
+  it('binds the hash to all plan consumers and execution options', async () => {
+    const { runtime, inventory } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const first = await handlers.rotate({});
+    const second = await handlers.rotate({ revoke: 'never' });
+    inventory.clusters[0]!.consumers[0]!.service.environmentName = 'staging';
+    const third = await handlers.rotate({});
+    expect(first.structuredContent!.planHash).not.toBe(second.structuredContent!.planHash);
+    expect(first.structuredContent!.planHash).not.toBe(third.structuredContent!.planHash);
+  });
+
+  it('consumes execution approval before starting so the same plan cannot be replayed', async () => {
+    vi.stubEnv('KEYSENTRY_MCP_ALLOW_EXECUTE', '1');
+    const { runtime } = fixture();
+    const handlers = createToolHandlers(runtime);
+    const preview = await handlers.rotate({});
+    const { planId, planHash } = preview.structuredContent!;
+    expect((await handlers.rotate({ execute: true, planId, planHash })).isError).not.toBe(true);
+    expect((await handlers.rotate({ execute: true, planId, planHash })).isError).toBe(true);
+    expect(runtime.rotate).toHaveBeenCalledTimes(2);
   });
 
   it('returns guided instructions while its execution prompt always skips', async () => {
@@ -88,7 +212,7 @@ describe('stdio MCP server tools', () => {
         steps: [{ clusterId: plan.steps[0]!.clusterId, status: 'skipped', warnings: [] }], deployments: [], diff: [],
       };
     });
-    const result = await createToolHandlers(runtime).rotate({ execute: true, confirm: 'ROTATE' });
+    const result = await createToolHandlers(runtime).rotate({});
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       guidedInstructions: [{ provider: 'anthropic', guidance: { steps: ['Create a new key', 'Paste it'] } }],

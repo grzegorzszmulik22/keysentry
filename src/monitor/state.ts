@@ -10,6 +10,8 @@ export interface Canary {
   createdAt: string; triggeredAt?: string;
 }
 export interface LastVerify { at: string; ok: boolean; status?: number; fingerprint: string }
+/** Only the minimum signal provenance needed by a later human approval is persisted. */
+export interface MonitorPendingAction extends PendingAction { highConfidence?: boolean }
 export interface MonitorState {
   version: 1;
   usageHistory: Record<string, UsageBucket[]>;
@@ -22,8 +24,10 @@ export interface MonitorState {
   seenGithubAlerts: Record<string, string>;
   lastVerify: Record<string, LastVerify>;
   cooldowns: Record<string, string>;
-  pendingActions: PendingAction[];
+  containCooldowns: Record<string, string>;
+  pendingActions: MonitorPendingAction[];
   autoRotations: Record<string, number>;
+  autoContainments: Record<string, number>;
 }
 export interface MonitorStateStore {
   load(): Promise<MonitorState>;
@@ -32,7 +36,8 @@ export interface MonitorStateStore {
 
 export function createMonitorState(): MonitorState {
   return { version: 1, usageHistory: {}, cumulativeTotals: {}, keyRefs: {}, canaries: [],
-    feedBaselines: {}, seenFeedItems: {}, seenGithubAlerts: {}, lastVerify: {}, cooldowns: {}, pendingActions: [], autoRotations: {} };
+    feedBaselines: {}, seenFeedItems: {}, seenGithubAlerts: {}, lastVerify: {}, cooldowns: {}, containCooldowns: {},
+    pendingActions: [], autoRotations: {}, autoContainments: {} };
 }
 
 /** Provider namespace prevents unrelated providers' key references from colliding. */
@@ -68,10 +73,12 @@ const schema = z.object({
   seenFeedItems: z.record(safeText,date), seenGithubAlerts:z.record(safeText,date),
   lastVerify: z.record(safeText,z.object({at:date,ok:z.boolean(),status:z.number().int().optional(),fingerprint:safeText})),
   cooldowns:z.record(safeText,date),
+  containCooldowns:z.record(safeText,date).default({}),
   pendingActions:z.array(z.object({id:safeText,createdAt:date,signalId:safeText,
     action:z.enum(['alert','cap','rotate','breach-mode']),clusterIds:z.array(safeText),
-    status:z.enum(['pending','approved','executed','dismissed','failed']),note:safeText.optional()})),
+    status:z.enum(['pending','approved','executed','dismissed','failed']),note:safeText.optional(),highConfidence:z.boolean().optional()})),
   autoRotations:z.record(z.string().regex(/^\d{4}-\d{2}-\d{2}$/),z.number().int().nonnegative()),
+  autoContainments:z.record(z.string().regex(/^\d{4}-\d{2}-\d{2}$/),z.number().int().nonnegative()).default({}),
 });
 
 function snapshot(state: unknown): MonitorState {

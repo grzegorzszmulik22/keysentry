@@ -8,7 +8,7 @@ const providers: [ProviderId, RotationMethod][] = [
   ['resend', 'auto'], ['cloudflare', 'atomic-roll'], ['github', 'guided'], ['aws', 'auto'],
   ['supabase', 'guided'], ['database', 'guided'], ['slack', 'guided'], ['sendgrid', 'guided'],
   ['twilio', 'guided'], ['google', 'guided'], ['private-key', 'guided'], ['crypto-wallet', 'guided'],
-  ['app-secret', 'generate'], ['unknown', 'guided'],
+  ['app-secret', 'generate'], ['encryption-key', 'guided'], ['unknown', 'guided'],
 ];
 
 describe('provider registry', () => {
@@ -29,8 +29,14 @@ describe('provider registry', () => {
       openrouter: ['OPENROUTER_PROVISIONING_KEY'], stripe: [], resend: ['RESEND_ADMIN_KEY'],
       cloudflare: ['CLOUDFLARE_ADMIN_TOKEN'], github: [], aws: [], supabase: [], database: [],
       slack: [], sendgrid: [], twilio: [], google: [], 'private-key': [], 'crypto-wallet': [],
-      'app-secret': [], unknown: [],
+      'app-secret': [], 'encryption-key': [], unknown: [],
     });
+  });
+
+  it('requires data migration before replacing an encryption key', () => {
+    const adapter = getProvider('encryption-key');
+    expect(adapter.rotate).toBeUndefined();
+    expect(adapter.guidance().steps[0]).toBe('Replacing a data-encryption key requires re-encrypting existing data first; never swap the variable on its own.');
   });
 
   it('rejects unsupported runtime input without echoing it', () => {

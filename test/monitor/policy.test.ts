@@ -29,6 +29,9 @@ describe('monitor policy', () => {
     expect(policy.autoExecute).toBe(false);
     expect(policy.cooldownMinutes).toBe(60);
     expect(policy.maxAutoRotationsPerDay).toBe(10);
+    expect(policy.autoContain).toBe(false);
+    expect(policy.containCooldownMinutes).toBe(60);
+    expect(policy.revokeUnconfirmedOnHighConfidence).toBe(true);
     expect(policy.rules).toMatchObject({
       canary_triggered: { action: 'rotate', scope: 'service', minConfidence: 'medium' },
       leak_detected: { action: 'rotate', scope: 'cluster' },
@@ -46,11 +49,52 @@ describe('monitor policy', () => {
     expect(decisions[0]).toMatchObject({ action: 'alert', automatic: false, reason: 'min-confidence' });
   });
 
-  it('leaves default rotations pending and permits immediate containment', () => {
+  it('leaves default rotations and containment pending', () => {
     const inv = inventory([cluster('a', [svc('railway', 'one')])]);
     const state = createMonitorState();
     expect(decide(signal(), inv, defaultPolicy(), state)[0]).toMatchObject({ action: 'rotate', automatic: false });
-    expect(decide(signal({ kind: 'usage_anomaly' }), inv, defaultPolicy(), state)[0]).toMatchObject({ action: 'cap', automatic: true });
+    expect(decide(signal({ kind: 'usage_anomaly' }), inv, defaultPolicy(), state)[0]).toMatchObject({ action: 'cap', automatic: false });
+  });
+
+  it('uses independent containment opt-in, cooldown and daily capacity', () => {
+    const inv = inventory([cluster('a', [svc('railway', 'one')])]);
+    const state = createMonitorState();
+    const policy = defaultPolicy();
+    policy.autoExecute = true;
+    const hit = signal({ kind: 'usage_anomaly' });
+    expect(decide(hit, inv, policy, state)[0]).toMatchObject({ automatic: false });
+    policy.autoContain = true;
+    policy.autoExecute = false;
+    state.autoRotations['2026-10-26'] = 10;
+    expect(decide(hit, inv, policy, state)[0]).toMatchObject({ action: 'cap', automatic: true });
+    state.containCooldowns.a = '2026-10-26T11:30:00.000Z';
+    expect(decide(hit, inv, policy, state)[0]).toMatchObject({ automatic: false, reason: 'cooldown' });
+    delete state.containCooldowns.a;
+    state.autoContainments['2026-10-26'] = 10;
+    expect(decide(hit, inv, policy, state)[0]).toMatchObject({ automatic: false, reason: 'daily-cap' });
+    expect(decide({ ...hit, at: '2026-10-27T00:00:00.000Z' }, inv, policy, state)[0]).toMatchObject({ automatic: true });
+  });
+
+  it.each(['rotate', 'cap', 'breach-mode'] as const)('alerts for failed-host consumers while other %s targets proceed', action => {
+    const one = svc('railway', 'one');
+    const inv = inventory([cluster('shared', [one, svc('vercel', 'unavailable')]), cluster('safe', [one])]);
+    inv.errors = [{ host: 'vercel', message: 'Scan failed.' }];
+    const policy = defaultPolicy();
+    policy.autoExecute = policy.autoContain = true;
+    policy.rules.leak_detected.action = action;
+    const decisions = decide(signal({ clusterIds: ['shared', 'safe'] }), inv, policy, createMonitorState());
+    expect(decisions.find(d => d.clusterIds.includes('shared'))).toMatchObject({ action: 'alert', automatic: false, reason: 'incomplete-scan' });
+    expect(decisions.find(d => d.clusterIds.includes('safe'))).toMatchObject({ action, automatic: true });
+  });
+
+  it.each(['rotate', 'breach-mode'] as const)('excludes generated secrets from a %s plan and alerts', action => {
+    const one = svc('railway', 'one');
+    const generated = { ...cluster('generated', [one]), method: 'generate' as const };
+    const policy = defaultPolicy(); policy.autoExecute = true;
+    policy.rules.canary_triggered.action = action;
+    const decisions = decide(signal({ kind: 'canary_triggered', serviceKeys: [serviceKey(one)] }), inventory([generated, cluster('safe', [one])]), policy, createMonitorState());
+    expect(decisions.find(d => d.clusterIds.includes('generated'))).toMatchObject({ action: 'alert', automatic: false, reason: 'generate-disabled' });
+    expect(decisions.find(d => d.clusterIds.includes('safe'))).toMatchObject({ action, automatic: true });
   });
 
   it('expands a canary service only to clusters consumed in that service', () => {

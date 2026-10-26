@@ -16,6 +16,7 @@ export interface EngineDeps {
   log: Logger;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
+  reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<void>;
 }
 
 export interface RotateOptions {
@@ -24,6 +25,10 @@ export interface RotateOptions {
   redeploy: boolean;
   deployTimeoutMs: number;
   pollIntervalMs: number;
+  revokeUnconfirmed: boolean;
+  acceptUnplannedSealed: boolean;
+  allowGenerate: boolean;
+  verifyRetries: number;
 }
 
 interface ServiceWork {
@@ -34,7 +39,7 @@ interface ServiceWork {
   vars: Record<string, string>;
   steps: Set<StepWork>;
   written: boolean;
-  deploymentSucceeded: boolean;
+  activation: 'pending' | 'success' | 'failed' | 'unconfirmed' | 'skipped';
 }
 
 interface StepWork {
@@ -49,6 +54,11 @@ interface StepWork {
   oldRevoked?: boolean;
   result?: RotationResult;
   ready: boolean;
+  guided?: boolean;
+  atomicRoll?: boolean;
+  unwritten?: Set<string>;
+  delivered?: Set<string>;
+  revealed?: boolean;
 }
 
 class JournalFailure extends Error {
@@ -63,6 +73,10 @@ export async function executePlan(
   const dryRun = opts?.dryRun !== false;
   const redeploy = opts?.redeploy ?? true;
   const revoke = opts?.revoke ?? 'after-deploy';
+  const revokeUnconfirmed = opts?.revokeUnconfirmed === true;
+  const acceptUnplannedSealed = opts?.acceptUnplannedSealed === true;
+  const allowGenerate = opts?.allowGenerate !== false;
+  const verifyRetries = Number.isInteger(opts?.verifyRetries) && opts.verifyRetries >= 0 ? opts.verifyRetries : 4;
   const timeout = Number.isFinite(opts?.deployTimeoutMs) && opts.deployTimeoutMs >= 0 ? opts.deployTimeoutMs : 600_000;
   const interval = Number.isFinite(opts?.pollIntervalMs) && opts.pollIntervalMs > 0 ? opts.pollIntervalMs : 5_000;
   const now = deps.now ?? (() => new Date());
@@ -117,6 +131,20 @@ export async function executePlan(
     return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
   });
   const services = new Map<string, ServiceWork>();
+  const plannedLocations = new Set(plan.steps.flatMap(step => step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`)));
+  const referenceLocations = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
+    .filter(c => c.reference).map(c => `${serviceKey(c.service)}\0${c.varName}`));
+  function blockedBySealed(work: StepWork): boolean {
+    if (acceptUnplannedSealed) return false;
+    const names = new Set(work.step.consumers.map(c => c.varName));
+    const locations = [...new Set(inv.findings.filter(f => f.sealed
+      && !plannedLocations.has(`${serviceKey(f.service)}\0${f.varName}`)
+      && (f.provider === work.step.provider || names.has(f.varName)))
+      .map(f => `${f.service.host}/${f.service.serviceName}:${f.varName}`))];
+    if (locations.length === 0) return false;
+    warn(work, `Old key retained: unplanned sealed consumers may still use it: ${locations.join(', ')}.`);
+    return true;
+  }
   async function journal(event: JournalEntry['event'], fields: Omit<JournalEntry, 'event' | 'at' | 'planId'> = {}): Promise<void> {
     try {
       await deps.journal.append(sanitize({ at: now().toISOString(), planId: plan.id, event, ...fields }, true));
@@ -151,7 +179,7 @@ export async function executePlan(
     if (work.step.provider !== 'aws') return values;
     // AWS's adapter prefers the standard pair. An unrelated AWS_* pair must not
     // override the custom pair belonging to the consumer being rotated.
-    const secretName = work.step.consumers[0]!.varName;
+    const secretName = work.step.consumers.find(c => !c.reference)!.varName;
     const prefix = secretName.replace(/_SECRET_ACCESS_KEY$/, '');
     return Object.fromEntries(Object.entries(values).filter(([name]) =>
       !/_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)$/.test(name)
@@ -159,14 +187,15 @@ export async function executePlan(
   }
   async function cleanupUnused(work: StepWork): Promise<void> {
     const result = work.result!;
-    if (result.oldRevoked) return;
+    if (work.atomicRoll || result.oldRevoked) return;
     if (!result.newKeyRef || result.newKeyRef === result.oldKeyRef || !work.provider!.revoke
       || inv.clusters.some(cluster => cluster.fingerprint === work.report.newFingerprint)) {
       warn(work, 'Unused replacement cannot be cleaned up automatically; revoke it manually.');
       return;
     }
     try {
-      await work.provider!.revoke!(result.newKeyRef, work.newCtx!);
+      // A not-yet-propagated AWS key cannot sign its own cleanup request.
+      await work.provider!.revoke!(result.newKeyRef, work.ctx!);
       await journal('revoked', { clusterId: work.step.clusterId, data: { keyRef: result.newKeyRef, cleanup: true } });
     } catch (error) {
       if (error instanceof JournalFailure) throw error;
@@ -179,7 +208,7 @@ export async function executePlan(
     if (cached) return cached;
     const service: ServiceWork = {
       service: ref, host: deps.hosts[ref.host], variables: [], readFailed: false,
-      vars: Object.create(null) as Record<string, string>, steps: new Set(), written: false, deploymentSucceeded: false,
+      vars: Object.create(null) as Record<string, string>, steps: new Set(), written: false, activation: 'pending',
     };
     services.set(key, service);
     try {
@@ -192,264 +221,488 @@ export async function executePlan(
     } catch { service.readFailed = true; }
     return service;
   }
-  await journal('plan-start', { data: { dryRun, steps: works.length } });
-
-  // Preflight the entire plan before creating credentials, checking secondary copies too.
-  for (const work of works) {
-    const cluster = inv.clusters.find(candidate => candidate.id === work.step.clusterId);
-    const locations = new Set(work.step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`));
-    if (!cluster || locations.size === 0 || cluster.consumers.some(c => !locations.has(`${serviceKey(c.service)}\0${c.varName}`))
-      || work.step.consumers.some(c => !cluster.consumers.some(original => serviceKey(original.service) === serviceKey(c.service) && original.varName === c.varName))) {
-      work.report.status = 'skipped';
-      warn(work, 'Plan does not cover the inventory cluster completely; rebuild the plan.');
-      continue;
-    }
-    let stale = false;
-    let unreadable = false;
-    for (const consumer of work.step.consumers) {
-      const service = await readService(consumer.service);
-      if (service.readFailed) { unreadable = true; continue; }
-      const variable = service.variables.find(candidate => candidate.name === consumer.varName);
-      if (!variable) { stale = true; continue; }
-      const value = variable.sealed ? undefined : variable.value;
-      if (consumer.fingerprint !== null && (value === undefined || fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
-        stale = true;
+  // Retain a rolled result through failures in journaling, logging, or backoff.
+  // Emergency recovery is deliberately independent of those failing facilities.
+  async function recoverRolledValues(): Promise<void> {
+    const rolled = works.filter(work => work.atomicRoll && work.result);
+    for (const [key, service] of services) {
+      const pending = rolled.filter(work => work.services.has(key) && !work.delivered?.has(key));
+      if (pending.length === 0) continue;
+      const payload: Record<string, string> = Object.create(null);
+      const expected = new Map<StepWork, Record<string, string>>();
+      // Include previously delivered rolls so recovery never replaces one with a
+      // conflicting older batch. Incompatible values require human recovery.
+      for (const work of rolled) {
+        const additions: Record<string, string> = Object.create(null);
+        const direct = work.step.consumers.filter(c => !c.reference && serviceKey(c.service) === key);
+        if (direct.length > 0) Object.assign(additions, work.result!.companions);
+        for (const c of direct) additions[c.varName] = work.result!.newValue;
+        expected.set(work, additions);
+        for (const [name, value] of Object.entries(additions)) if (!referenceLocations.has(`${key}\0${name}`)) payload[name] = value;
       }
-      if (cluster.fingerprint !== null && value !== undefined && fingerprint(value, deps.fingerprintKey) !== cluster.fingerprint) stale = true;
-      if (value !== undefined && work.oldValue === undefined) {
-        work.oldValue = value;
-        work.contextService = serviceKey(consumer.service);
+      for (const work of rolled) for (const c of work.step.consumers) {
+        if (!c.reference && serviceKey(c.service) === key && !referenceLocations.has(`${key}\0${c.varName}`)) payload[c.varName] = work.result!.newValue;
+      }
+      let written = Object.keys(payload).length === 0;
+      for (let attempt = 0; !written && attempt < 4; attempt++) {
+        try { await service.host!.writeVariables(service.service, payload, { skipDeploy: true }); written = true; }
+        catch { /* fixed recovery diagnostic below; never expose adapter errors */ }
+        if (!written && attempt < 3) try { await sleep(1_000 * 2 ** attempt); } catch { /* still retry */ }
+      }
+      if (written) for (const work of pending) {
+        if (Object.entries(expected.get(work)!).every(([name, value]) => !referenceLocations.has(`${key}\0${name}`) && payload[name] === value)) {
+          work.delivered ??= new Set();
+          work.delivered.add(key);
+        }
       }
     }
-    if (unreadable) { await fail(work, 'Unable to read every consumer service; no credentials were changed.'); continue; }
-    if (stale) {
-      work.report.status = 'skipped';
-      warn(work, 'Stale inventory: a consumer value changed or is missing; scan again before rotating.');
-      continue;
-    }
-    if (work.step.provider === 'aws') {
-      const names = new Set(work.step.consumers.map(consumer => consumer.varName));
-      const secretName = work.step.consumers[0]!.varName;
-      const idName = secretName.replace(/_SECRET_ACCESS_KEY$/, '_ACCESS_KEY_ID');
-      const accessIds = [...work.services].map(key => siblingValues(services.get(key)!)[idName]);
-      if (names.size !== 1 || !secretName.endsWith('_SECRET_ACCESS_KEY') || accessIds.some(id => !id || id !== accessIds[0])) {
-        await fail(work, 'AWS credential pair names or access key IDs are missing or inconsistent across consumers; rotate complete matching pairs.');
+    for (const work of rolled) {
+      const missing = [...work.services].filter(key => !work.delivered?.has(key));
+      if (missing.length === 0) {
+        try { warn(work, `URGENT: Rolled replacement was preserved after execution stopped; confirm activation or manually restart/deploy: ${[...work.services].join(', ')}.`); }
+        catch { /* a broken logger must not undo successful recovery */ }
         continue;
       }
-    }
-    work.contextService ??= serviceKey(work.step.consumers[0]!.service);
-    work.ctx = {
-      ...deps.providerCtx,
-      credentials: { ...deps.providerCtx.credentials },
-      siblingVars: providerSiblings(work, { ...deps.providerCtx.siblingVars, ...siblingValues(services.get(work.contextService)!) }),
-      log: safeLogger(deps.providerCtx.log),
-    };
-    work.ready = true;
-    for (const consumer of work.step.consumers) {
-      report.diff.push(`${serviceKey(consumer.service)}: ${consumer.varName}: ${consumer.hint ?? work.step.hint ?? '(sealed)'} → (new)`);
+      if (work.revealed) continue;
+      const reason = 'URGENT: ROLLED VALUE UNWRITTEN after execution failure; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.';
+      work.report.status = 'failed';
+      work.report.error = reason;
+      try { warn(work, reason); } catch { /* a broken logger must not suppress reveal */ }
+      if (deps.reveal) try {
+        await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason }, work.result!.newValue);
+        work.revealed = true;
+      } catch { /* preserve the original fixed execution error */ }
+      try { await journal('failed', { clusterId: work.step.clusterId, data: {
+        phase: 'value-unwritten', serviceKeys: missing, newFingerprint: work.report.newFingerprint, oldRevoked: true,
+      } }); } catch { /* journal failure is already being propagated */ }
     }
   }
+  try {
+    await journal('plan-start', { data: { dryRun, steps: works.length } });
 
-  if (dryRun) {
-    for (const [key, service] of services) {
-      if (!works.some(work => work.ready && work.services.has(key))) continue;
-      if (redeploy && service.host?.capabilities.redeploy) report.diff.push(`Redeploy ${key}`);
-      report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
-    }
-  } else {
+    // Preflight the entire plan before creating credentials, checking secondary copies too.
     for (const work of works) {
-      if (!work.ready) continue;
-      work.ready = false;
-      try {
-        const provider = deps.providers(work.step.provider);
-        work.provider = provider;
-        const ctx = work.ctx!;
-        const needsGuidance = work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate
-          || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll'));
-        let result: RotationResult;
-        if (needsGuidance) {
-          if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
-          const value = await deps.prompt({
-            clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint,
-            guidance: provider.guidance(), consumers: work.step.consumers,
-          });
-          if (value === null) { work.report.status = 'skipped'; continue; }
-          register(value);
-          // Resolve these independently: a pasted replacement must never become the OLD ref.
-          const oldKeyRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, ctx) : null;
-          result = { newValue: value, oldKeyRef, newKeyRef: null, oldRevoked: false };
-        } else {
-          result = await provider.rotate!(work.oldValue ?? '', ctx);
-          register(result.newValue);
+      const cluster = inv.clusters.find(candidate => candidate.id === work.step.clusterId);
+      const locations = new Set(work.step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`));
+      if (!cluster || locations.size === 0 || cluster.consumers.some(c => !locations.has(`${serviceKey(c.service)}\0${c.varName}`))
+        || work.step.consumers.some(c => !cluster.consumers.some(original => serviceKey(original.service) === serviceKey(c.service)
+          && original.varName === c.varName && !!original.reference === !!c.reference))) {
+        work.report.status = 'skipped';
+        warn(work, 'Plan does not cover the inventory cluster completely; rebuild the plan.');
+        continue;
+      }
+      let stale = false;
+      let unreadable = false;
+      for (const consumer of work.step.consumers) {
+        const service = await readService(consumer.service);
+        if (service.readFailed) { unreadable = true; continue; }
+        const variable = service.variables.find(candidate => candidate.name === consumer.varName);
+        if (!variable) { stale = true; continue; }
+        // A reference contains a template, not the rendered secret fingerprint.
+        if (consumer.reference) continue;
+        const value = variable.sealed ? undefined : variable.value;
+        if (consumer.fingerprint !== null && (value === undefined || fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
+          stale = true;
         }
-        // No log or journal call may precede registering every returned value.
-        for (const [name, value] of Object.entries(result.companions ?? {})) register(value, classify(name, value).isSecret);
-        work.result = result;
-        work.oldRevoked = result.oldRevoked;
-        if (work.step.provider === 'aws') {
-          const idName = work.step.consumers[0]!.varName.replace(/_SECRET_ACCESS_KEY$/, '_ACCESS_KEY_ID');
-          const oldId = ctx.siblingVars?.[idName];
-          const newId = result.companions?.[idName];
-          for (const id of [oldId, newId]) if (id && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(id) && !sensitiveValues.has(id)) publicKeyRefs.add(id);
+        if (cluster.fingerprint !== null && value !== undefined && fingerprint(value, deps.fingerprintKey) !== cluster.fingerprint) stale = true;
+        if (value !== undefined && work.oldValue === undefined) {
+          work.oldValue = value;
+          work.contextService = serviceKey(consumer.service);
         }
-        work.report.newFingerprint = fingerprint(result.newValue, deps.fingerprintKey);
-        work.report.oldKeyRef = result.oldKeyRef;
-        work.report.newKeyRef = result.newKeyRef;
-        const newSiblings = { ...ctx.siblingVars, ...result.companions };
-        for (const consumer of work.step.consumers) if (serviceKey(consumer.service) === work.contextService) newSiblings[consumer.varName] = result.newValue;
-        // Verification and cleanup must authenticate paired credentials using the NEW companions.
-        const newCtx: ProviderContext = { ...ctx, siblingVars: providerSiblings(work, newSiblings) };
-        work.newCtx = newCtx;
-        await transition(work, 'created', 'created');
-        log.info('Replacement credential created.', { clusterId: work.step.clusterId });
-        if (result.oldRevoked) warn(work, 'Provider rolled the credential atomically; the old key is already revoked.');
-        if (result.newValue.length === 0 || inv.clusters.some(cluster => cluster.fingerprint === work.report.newFingerprint)) {
-          await fail(work, 'Replacement is empty or reuses an inventoried credential; rotation stopped.');
-          await cleanupUnused(work);
+      }
+      if (unreadable) { await fail(work, 'Unable to read every consumer service; no credentials were changed.'); continue; }
+      if (stale) {
+        work.report.status = 'skipped';
+        warn(work, 'Stale inventory: a consumer value changed or is missing; scan again before rotating.');
+        continue;
+      }
+      if (work.step.provider === 'aws') {
+        const writable = work.step.consumers.filter(consumer => !consumer.reference);
+        const names = new Set(writable.map(consumer => consumer.varName));
+        const secretName = writable[0]?.varName ?? '';
+        const idName = secretName.replace(/_SECRET_ACCESS_KEY$/, '_ACCESS_KEY_ID');
+        const accessIds = writable.map(c => siblingValues(services.get(serviceKey(c.service))!)[idName]);
+        if (names.size !== 1 || !secretName.endsWith('_SECRET_ACCESS_KEY') || accessIds.some(id => !id || id !== accessIds[0])) {
+          await fail(work, 'AWS credential pair names or access key IDs are missing or inconsistent across consumers; rotate complete matching pairs.');
           continue;
         }
-        let verified = false;
-        try { verified = (await provider.verify(result.newValue, newCtx)).ok; } catch { /* fixed diagnostic below */ }
-        if (!verified) {
-          await fail(work, 'New credential verification failed; no consumer was changed.');
-          await cleanupUnused(work);
+      }
+      work.contextService ??= serviceKey(work.step.consumers[0]!.service);
+      work.ctx = {
+        ...deps.providerCtx,
+        credentials: { ...deps.providerCtx.credentials },
+        siblingVars: providerSiblings(work, { ...deps.providerCtx.siblingVars, ...siblingValues(services.get(work.contextService)!) }),
+        log: safeLogger(deps.providerCtx.log),
+      };
+      work.ready = true;
+      for (const consumer of work.step.consumers) {
+        if (consumer.reference) {
+          report.diff.push(`Redeploy reference ${serviceKey(consumer.service)}: ${consumer.varName}`);
           continue;
         }
-        if (needsGuidance && provider.resolveKeyRef) {
-          try { result.newKeyRef = await provider.resolveKeyRef(result.newValue, newCtx); } catch { warn(work, 'The new key reference could not be resolved for future monitoring.'); }
-          work.report.newKeyRef = result.newKeyRef;
-        }
-        await transition(work, 'verified', 'verified');
-        work.ready = true;
-      } catch (error) {
-        if (error instanceof JournalFailure) throw error;
-        await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.');
+        report.diff.push(`${serviceKey(consumer.service)}: ${consumer.varName}: ${consumer.hint ?? work.step.hint ?? '(sealed)'} → (new)`);
       }
     }
 
-    function populateBatches(): Set<StepWork> {
-      const conflicts = new Set<StepWork>();
-      for (const service of services.values()) { service.vars = Object.create(null) as Record<string, string>; service.steps.clear(); }
+    if (dryRun) {
+      for (const [key, service] of services) {
+        if (!works.some(work => work.ready && work.services.has(key))) continue;
+        if (redeploy && service.host?.capabilities.redeploy) report.diff.push(`Redeploy ${key}`);
+        report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
+      }
+    } else {
+      // Resolve effective methods before any provider mutation: sealed/missing-rotate
+      // fallbacks can require a person even when the plan labels them automatic.
       for (const work of works) {
         if (!work.ready) continue;
-        const result = work.result!;
-        for (const consumer of work.step.consumers) {
-          const service = services.get(serviceKey(consumer.service))!;
-          const additions = { ...result.companions, [consumer.varName]: result.newValue };
-          if (result.companions && Object.hasOwn(result.companions, consumer.varName) && result.companions[consumer.varName] !== result.newValue) conflicts.add(work);
-          for (const [name, value] of Object.entries(additions)) {
-            if (Object.hasOwn(service.vars, name) && service.vars[name] !== value) {
-              conflicts.add(work);
-              for (const owner of service.steps) {
-                if (owner.step.consumers.some(c => serviceKey(c.service) === serviceKey(consumer.service) && c.varName === name)
-                  || Object.hasOwn(owner.result?.companions ?? {}, name)) conflicts.add(owner);
-              }
+        try {
+          const provider = deps.providers(work.step.provider);
+          work.provider = provider;
+          work.guided = work.step.provider === 'encryption-key' || work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate
+            || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll'));
+          work.atomicRoll = !work.guided && (work.step.method === 'atomic-roll' || provider.method === 'atomic-roll');
+          if (work.atomicRoll && blockedBySealed(work)) {
+            work.report.status = 'skipped';
+            work.ready = false;
+          } else if (work.step.provider !== 'encryption-key' && !allowGenerate && (work.step.method === 'generate' || provider.method === 'generate')) {
+            work.report.status = 'skipped';
+            work.ready = false;
+            warn(work, 'self-generated secret: rotate it deliberately; sessions signed with it become invalid');
+          }
+        } catch { work.ready = false; await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.'); }
+      }
+      const preparation = [
+        ...works.filter(work => work.ready && work.guided),
+        ...works.filter(work => work.ready && !work.guided && !work.atomicRoll),
+        ...works.filter(work => work.ready && work.atomicRoll),
+      ];
+      function invalidGuidedValue(work: StepWork, value: string): boolean {
+        if (work.step.provider !== 'unknown' && work.step.consumers.some(c => !c.reference && classify(c.varName, value).provider !== work.step.provider)) return true;
+        const text = value.trim();
+        if (!text || (work.oldValue !== undefined && text !== work.oldValue.trim() && work.oldValue.trim().startsWith(text))) return true;
+        const pem = /-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----/.exec(text);
+        if (pem && !text.includes(`-----END ${pem[1]}-----`)) return true;
+        const oldPem = work.oldValue && /-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----/.exec(work.oldValue);
+        if (oldPem && (!pem || !text.includes(`-----END ${pem![1]}-----`))) return true;
+        // Name-based classification alone can accept a truncated service-account JSON.
+        if (work.oldValue && /^[\s]*[\[{]/.test(work.oldValue)) {
+          let wasJson = false;
+          try { JSON.parse(work.oldValue); wasJson = true; } catch { /* not JSON */ }
+          if (wasJson) try { JSON.parse(value); } catch { return true; }
+        }
+        return false;
+      }
+      for (const work of preparation) {
+        work.ready = false;
+        try {
+          const provider = work.provider!;
+          const ctx = work.ctx!;
+          let result: RotationResult;
+          if (work.guided) {
+            if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
+            const value = await deps.prompt({
+              clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint,
+              guidance: provider.guidance(), consumers: work.step.consumers,
+            });
+            if (value === null) { work.report.status = 'skipped'; continue; }
+            register(value);
+            if (invalidGuidedValue(work, value)) {
+              work.report.status = 'skipped';
+              warn(work, 'Pasted replacement has a different provider or is incomplete/truncated; no consumer was changed.');
+              continue;
             }
-            service.vars[name] = value;
+            // Resolve these independently: a pasted replacement must never become the OLD ref.
+            const oldKeyRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, ctx) : null;
+            result = { newValue: value, oldKeyRef, newKeyRef: null, oldRevoked: false };
+          } else {
+            result = await provider.rotate!(work.oldValue ?? '', ctx);
+            // Save before invoking any injected registration/logging/journal code.
+            work.result = result;
+            work.atomicRoll ||= result.oldRevoked;
+            work.oldRevoked = result.oldRevoked || work.atomicRoll;
+            register(result.newValue);
           }
-          service.steps.add(work);
+          // No log or journal call may precede registering every returned value.
+          for (const [name, value] of Object.entries(result.companions ?? {})) register(value, classify(name, value).isSecret);
+          work.result = result;
+          work.atomicRoll ||= result.oldRevoked;
+          work.oldRevoked = result.oldRevoked || work.atomicRoll;
+          if (result.notes) warn(work, result.notes);
+          if (work.step.provider === 'aws') {
+            const idName = work.step.consumers.find(c => !c.reference)!.varName.replace(/_SECRET_ACCESS_KEY$/, '_ACCESS_KEY_ID');
+            const oldId = ctx.siblingVars?.[idName];
+            const newId = result.companions?.[idName];
+            for (const id of [oldId, newId]) if (id && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(id) && !sensitiveValues.has(id)) publicKeyRefs.add(id);
+          }
+          work.report.newFingerprint = fingerprint(result.newValue, deps.fingerprintKey);
+          work.report.oldKeyRef = result.oldKeyRef;
+          work.report.newKeyRef = result.newKeyRef;
+          const newSiblings = { ...ctx.siblingVars, ...result.companions };
+          for (const consumer of work.step.consumers) if (!consumer.reference && serviceKey(consumer.service) === work.contextService) newSiblings[consumer.varName] = result.newValue;
+          // Verification uses new companions; cleanup authenticates using the old context.
+          const newCtx: ProviderContext = { ...ctx, siblingVars: providerSiblings(work, newSiblings) };
+          work.newCtx = newCtx;
+          await transition(work, 'created', 'created');
+          log.info('Replacement credential created.', { clusterId: work.step.clusterId });
+          if (work.oldRevoked) warn(work, 'Provider rolled the credential atomically; the old key is already revoked.');
+          if (result.newValue.length === 0 || inv.clusters.some(cluster => cluster.fingerprint === work.report.newFingerprint)) {
+            if (work.atomicRoll) warn(work, 'URGENT: Rolled replacement is empty or reuses an inventoried credential; attempting delivery because the old key is already revoked.');
+            else {
+              await fail(work, 'Replacement is empty or reuses an inventoried credential; rotation stopped.');
+              await cleanupUnused(work);
+              continue;
+            }
+          }
+          let verified = false;
+          for (let attempt = 0; attempt <= verifyRetries; attempt++) {
+            let definitive = false;
+            try {
+              const verification = await provider.verify(result.newValue, newCtx);
+              verified = verification.ok;
+              definitive = verification.status === 401;
+            } catch { /* fixed diagnostic below */ }
+            if (verified || definitive || attempt === verifyRetries) break;
+            await sleep(2_000 * 2 ** attempt);
+          }
+          if (!verified) {
+            if (work.atomicRoll) warn(work, 'URGENT: Rolled credential verification failed; writing it anyway because the old key is already revoked.');
+            else {
+              await fail(work, 'New credential verification failed; no consumer was changed.');
+              await cleanupUnused(work);
+              continue;
+            }
+          }
+          if (work.guided && provider.resolveKeyRef) {
+            try { result.newKeyRef = await provider.resolveKeyRef(result.newValue, newCtx); } catch { warn(work, 'The new key reference could not be resolved for future monitoring.'); }
+            work.report.newKeyRef = result.newKeyRef;
+          }
+          if (verified) await transition(work, 'verified', 'verified');
+          work.ready = true;
+        } catch (error) {
+          if (error instanceof JournalFailure) throw error;
+          if (work.atomicRoll && work.result) {
+            work.ready = true;
+            warn(work, 'URGENT: Rolled credential preparation could not finish; attempting delivery because the old key is already revoked.');
+            continue;
+          }
+          await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.');
         }
       }
-      return conflicts;
-    }
-    const conflicts = populateBatches();
-    for (const work of conflicts) {
-      work.ready = false;
-      await fail(work, 'Conflicting replacement values target the same service variable; no values for this step were written.');
-      await cleanupUnused(work);
-    }
-    if (conflicts.size > 0) populateBatches();
-    for (const [key, service] of services) {
-      if (service.steps.size === 0) continue;
-      try { await service.host!.writeVariables(service.service, service.vars, { skipDeploy: true }); }
-      catch {
-        for (const work of service.steps) await fail(work, 'A consumer service write failed; the old key will be retained.');
-        await journal('failed', { serviceKey: key, data: { phase: 'write', partialWritePossible: true } });
-        continue;
+
+      function populateBatches(): Set<StepWork> {
+        const conflicts = new Set<StepWork>();
+        for (const service of services.values()) { service.vars = Object.create(null) as Record<string, string>; service.steps.clear(); }
+        for (const work of works) {
+          if (!work.ready) continue;
+          const result = work.result!;
+          for (const key of work.services) {
+            const service = services.get(key)!;
+            service.steps.add(work);
+            const additions = additionsFor(work, key);
+            if (work.step.consumers.some(c => !c.reference && serviceKey(c.service) === key
+              && Object.hasOwn(result.companions ?? {}, c.varName) && result.companions![c.varName] !== result.newValue)) conflicts.add(work);
+            for (const [name, value] of Object.entries(additions)) {
+              if (referenceLocations.has(`${key}\0${name}`)) { conflicts.add(work); continue; }
+              if (Object.hasOwn(service.vars, name) && service.vars[name] !== value) {
+                conflicts.add(work);
+                for (const owner of service.steps) {
+                  if (Object.hasOwn(additionsFor(owner, key), name)) conflicts.add(owner);
+                }
+              }
+              service.vars[name] = value;
+            }
+          }
+        }
+        return conflicts;
       }
-      service.written = true;
-      for (const work of service.steps) await journal('written', {
-        clusterId: work.step.clusterId, serviceKey: key,
-        data: { newFingerprint: work.report.newFingerprint, variableNames: Object.keys(service.vars) },
+      const conflicts = populateBatches();
+      for (const work of conflicts) {
+        if (work.atomicRoll) {
+          warn(work, 'URGENT: A write conflict affects a rolled credential; preserving its replacement and retrying delivery.');
+          continue;
+        }
+        work.ready = false;
+        await fail(work, 'Conflicting replacement values target the same service variable; no values for this step were written.');
+        await cleanupUnused(work);
+      }
+      if (conflicts.size > 0) populateBatches();
+      // Primary rolled values take precedence over companions of other rolls.
+      for (const work of works) if (work.ready && work.atomicRoll) for (const c of work.step.consumers) {
+        const key = serviceKey(c.service);
+        if (!c.reference && !referenceLocations.has(`${key}\0${c.varName}`)) services.get(key)!.vars[c.varName] = work.result!.newValue;
+      }
+      function additionsFor(work: StepWork, key: string): Record<string, string> {
+        const additions: Record<string, string> = Object.create(null);
+        const direct = work.step.consumers.filter(c => !c.reference && serviceKey(c.service) === key);
+        if (direct.length > 0) Object.assign(additions, work.result!.companions);
+        for (const c of direct) additions[c.varName] = work.result!.newValue;
+        return additions;
+      }
+      async function valueUnwritten(work: StepWork): Promise<void> {
+        const locations = [...work.unwritten!].map(key => {
+          const service = services.get(key)!.service;
+          return `${service.host}/${service.serviceName}`;
+        });
+        const reason = `URGENT: ROLLED VALUE UNWRITTEN at ${locations.join(', ')}; the old key is already revoked. Paste the replacement manually and restart/deploy these services.`;
+        warn(work, reason);
+        // The shared journal event union has no value-unwritten event; record it as
+        // an explicit failure phase without ever serializing the replacement.
+        work.report.status = 'failed';
+        work.report.error = clean(reason);
+        if (deps.reveal) {
+          try {
+            await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: clean(reason) }, work.result!.newValue);
+            work.revealed = true;
+          } catch { warn(work, 'URGENT: Manual replacement reveal failed; the rolled credential still needs manual recovery.'); }
+        }
+        await journal('failed', { clusterId: work.step.clusterId, data: {
+          phase: 'value-unwritten', serviceKeys: [...work.unwritten!], newFingerprint: work.report.newFingerprint, oldRevoked: true,
+        } });
+      }
+      for (const [key, service] of services) {
+        if (service.steps.size === 0) continue;
+        const atomics = [...service.steps].filter(work => work.atomicRoll && Object.keys(additionsFor(work, key)).length > 0);
+        // A companion must never replace its own atomic primary value. Other
+        // incompatible atomic additions remain visible as unwritten recovery work.
+        const mismatched = atomics.filter(work => Object.entries(additionsFor(work, key)).some(([name, value]) => service.vars[name] !== value));
+        let written = Object.keys(service.vars).length === 0;
+        const attempts = atomics.length > 0 ? 4 : 1;
+        for (let attempt = 0; !written && attempt < attempts; attempt++) {
+          try {
+            await service.host!.writeVariables(service.service, service.vars, { skipDeploy: true });
+            written = true;
+          } catch { /* retry atomically rolled credentials before giving up */ }
+          if ((!written || mismatched.length > 0) && attempt < attempts - 1) {
+            await sleep(1_000 * 2 ** attempt);
+            // Conflicting atomic outputs cannot all inhabit one variable, but still
+            // retry the surviving batch before handing recovery to a human.
+            if (mismatched.length > 0) written = false;
+          }
+        }
+        for (const work of atomics) if (!written || mismatched.includes(work)) {
+          work.unwritten ??= new Set();
+          work.unwritten.add(key);
+        }
+        if (!written) {
+          for (const work of service.steps) if (!work.atomicRoll) await fail(work, 'A consumer service write failed; the old key will be retained.');
+          await journal('failed', { serviceKey: key, data: { phase: 'write', partialWritePossible: true } });
+          continue;
+        }
+        service.written = true;
+        for (const work of service.steps) if (work.atomicRoll && !mismatched.includes(work)) {
+          work.delivered ??= new Set();
+          work.delivered.add(key);
+        }
+        for (const work of service.steps) await journal('written', {
+          clusterId: work.step.clusterId, serviceKey: key,
+          data: { newFingerprint: work.report.newFingerprint, variableNames: Object.keys(service.vars) },
+        });
+        log.info('Service variables written.', { serviceKey: key });
+      }
+      for (const work of works) if (work.unwritten?.size) await valueUnwritten(work);
+      for (const work of works) if (work.ready && work.report.status !== 'failed') work.report.status = 'written';
+
+      async function revokeOld(work: StepWork): Promise<void> {
+        if (!work.ready || work.report.status === 'failed' || ![...work.services].every(key => services.get(key)!.written)) return;
+        if (work.report.status === 'revoked') return;
+        const result = work.result!;
+        if (work.oldRevoked) { await transition(work, 'revoked', 'revoked'); return; }
+        if (revoke === 'never') return;
+        if (blockedBySealed(work)) return;
+        if (!result.oldKeyRef || !work.provider!.revoke) {
+          warn(work, 'Old key could not be identified or revoked automatically; revoke it manually after confirming every consumer.');
+          return;
+        }
+        try {
+          const contextService = services.get(work.contextService!)!;
+          const ctx: ProviderContext = { ...work.ctx!, siblingVars: providerSiblings(work, { ...work.ctx!.siblingVars, ...contextService.vars }) };
+          await work.provider!.revoke!(result.oldKeyRef, ctx);
+          work.oldRevoked = true;
+          await transition(work, 'revoked', 'revoked');
+          log.info('Old credential revoked.', { clusterId: work.step.clusterId });
+        } catch (error) {
+          if (error instanceof JournalFailure) throw error;
+          await fail(work, 'Old credential revocation failed; check the provider before retrying.');
+        }
+      }
+      if (revoke === 'immediately') for (const work of works) await revokeOld(work);
+
+      async function deployService(key: string, service: ServiceWork): Promise<void> {
+        if (service.steps.size === 0) return;
+        let deploymentId: string | null = null;
+        let state: ServiceWork['activation'] = 'failed';
+        let timedOut = false;
+        if (!service.written) state = 'skipped';
+        else if (!redeploy || !service.host!.capabilities.redeploy) state = 'unconfirmed';
+        else try {
+          deploymentId = await service.host!.redeploy(service.service);
+          await journal('redeploy', { serviceKey: key, data: { deploymentId } });
+          if (deploymentId === null) state = 'unconfirmed';
+          else {
+            const start = now().getTime();
+            let waited = 0;
+            while (true) {
+              const polled = await service.host!.deploymentStatus(service.service, deploymentId);
+              if (polled !== 'pending') { state = polled; break; }
+              const elapsed = Math.max(0, now().getTime() - start, waited);
+              if (elapsed >= timeout) { timedOut = true; break; }
+              const delay = Math.min(interval, timeout - elapsed);
+              await sleep(delay);
+              waited += delay;
+            }
+          }
+        } catch (error) { if (error instanceof JournalFailure) throw error; }
+        service.activation = state;
+        report.deployments.push({ serviceKey: key, deploymentId, state });
+        await journal('deploy-result', { serviceKey: key, data: { deploymentId, state, timedOut } });
+        if (state === 'failed') for (const work of service.steps) {
+          warn(work, `Consumer deployment failed: ${service.service.host}/${service.service.serviceName} (${key})${timedOut ? ' (timed out)' : ''}; activation failed.`);
+          await fail(work, timedOut ? 'Consumer deployment timed out.' : 'Consumer deployment failed.');
+          if (work.oldRevoked) {
+            warn(work, 'The old credential may already be revoked; restore service using the replacement.');
+          }
+        }
+        if (state === 'unconfirmed') for (const work of service.steps) {
+          warn(work, `Consumer activation unconfirmed: ${service.service.host}/${service.service.serviceName} (${key}) requires a manual restart/next deploy.`);
+        }
+      }
+      // Fixed worker count bounds both starting deployments and polling them.
+      const deploymentServices = [...services];
+      let nextService = 0;
+      let deploymentStopped = false;
+      const deploymentTasks = Array.from({ length: Math.min(8, deploymentServices.length) }, async () => {
+        while (!deploymentStopped && nextService < deploymentServices.length) {
+          const [key, service] = deploymentServices[nextService++]!;
+          try { await deployService(key, service); }
+          catch (error) { deploymentStopped = true; throw error; }
+        }
       });
-      log.info('Service variables written.', { serviceKey: key });
-    }
-    for (const work of works) if (work.ready && work.report.status !== 'failed') work.report.status = 'written';
-
-    async function revokeOld(work: StepWork): Promise<void> {
-      if (!work.ready || work.report.status === 'failed' || ![...work.services].every(key => services.get(key)!.written)) return;
-      if (work.report.status === 'revoked') return;
-      const result = work.result!;
-      if (result.oldRevoked) { await transition(work, 'revoked', 'revoked'); return; }
-      if (revoke === 'never') return;
-      if (!result.oldKeyRef || !work.provider!.revoke) {
-        warn(work, 'Old key could not be identified or revoked automatically; revoke it manually after confirming every consumer.');
-        return;
-      }
-      try {
-        const contextService = services.get(work.contextService!)!;
-        const ctx: ProviderContext = { ...work.ctx!, siblingVars: providerSiblings(work, { ...work.ctx!.siblingVars, ...contextService.vars }) };
-        await work.provider!.revoke!(result.oldKeyRef, ctx);
-        work.oldRevoked = true;
-        await transition(work, 'revoked', 'revoked');
-        log.info('Old credential revoked.', { clusterId: work.step.clusterId });
-      } catch (error) {
-        if (error instanceof JournalFailure) throw error;
-        await fail(work, 'Old credential revocation failed; check the provider before retrying.');
-      }
-    }
-    if (revoke === 'immediately') for (const work of works) await revokeOld(work);
-
-    for (const [key, service] of services) {
-      if (service.steps.size === 0) continue;
-      if (!service.written || !redeploy || !service.host!.capabilities.redeploy) {
-        service.deploymentSucceeded = service.written && !service.host!.capabilities.redeploy;
-        report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
-        continue;
-      }
-      let deploymentId: string | null = null;
-      let state: 'success' | 'failed' | 'skipped' = 'failed';
-      let timedOut = false;
-      try {
-        deploymentId = await service.host!.redeploy(service.service);
-        await journal('redeploy', { serviceKey: key, data: { deploymentId } });
-        if (deploymentId === null) state = 'skipped';
-        else {
-          const start = now().getTime();
-          let waited = 0;
-          while (true) {
-            const polled = await service.host!.deploymentStatus(service.service, deploymentId);
-            if (polled !== 'pending') { state = polled; break; }
-            const elapsed = Math.max(0, now().getTime() - start, waited);
-            if (elapsed >= timeout) { timedOut = true; break; }
-            const delay = Math.min(interval, timeout - elapsed);
-            await sleep(delay);
-            waited += delay;
+      const deploymentResults = await Promise.allSettled(deploymentTasks);
+      for (const result of deploymentResults) if (result.status === 'rejected') throw result.reason;
+      for (const work of works) {
+        if (!work.ready || work.report.status === 'failed') continue;
+        const deployed = [...work.services].every(key => services.get(key)!.activation === 'success');
+        const activatedOrUnconfirmed = [...work.services].every(key => ['success', 'unconfirmed'].includes(services.get(key)!.activation));
+        if (deployed) {
+          if (work.report.status !== 'revoked') work.report.status = 'deployed';
+          if (revoke === 'after-deploy' || work.oldRevoked) await revokeOld(work);
+        } else {
+          if (work.oldRevoked) warn(work, 'URGENT: Activation remains unconfirmed and the old key is already revoked; complete the listed manual restarts/next deploys.');
+          else if (revoke === 'after-deploy' && revokeUnconfirmed && activatedOrUnconfirmed) {
+            warn(work, 'Revoking the old key despite unconfirmed activation because revokeUnconfirmed is enabled; complete the listed manual restarts/next deploys.');
+            await journal('deploy-result', { clusterId: work.step.clusterId, data: { state: 'unconfirmed', revokeUnconfirmed: true } });
+            await revokeOld(work);
+          } else if (!work.oldRevoked && work.report.status !== 'revoked') {
+            warn(work, 'Activation is unconfirmed; the old key is retained for the services needing a manual restart/next deploy.');
           }
         }
-      } catch (error) { if (error instanceof JournalFailure) throw error; }
-      service.deploymentSucceeded = state === 'success';
-      report.deployments.push({ serviceKey: key, deploymentId, state });
-      await journal('deploy-result', { serviceKey: key, data: { deploymentId, state, timedOut } });
-      if (state === 'failed') for (const work of service.steps) {
-        await fail(work, timedOut ? 'Consumer deployment timed out.' : 'Consumer deployment failed.');
-        if (work.oldRevoked) {
-          warn(work, 'The old credential may already be revoked; restore service using the replacement.');
-        }
       }
     }
-    for (const work of works) {
-      if (!work.ready || work.report.status === 'failed') continue;
-      const deployed = [...work.services].every(key => services.get(key)!.deploymentSucceeded);
-      if (deployed) {
-        if (work.report.status !== 'revoked') work.report.status = 'deployed';
-        if (revoke === 'after-deploy' || work.result!.oldRevoked) await revokeOld(work);
-      } else {
-        warn(work, 'A required deployment was not confirmed; the old key is retained unless it was already revoked.');
-      }
-    }
+    report.finishedAt = now().toISOString();
+    await journal('plan-end', { data: { dryRun, steps: report.steps } });
+    return sanitize(report, true);
+  } catch (error) {
+    await recoverRolledValues();
+    throw error;
   }
-  report.finishedAt = now().toISOString();
-  await journal('plan-end', { data: { dryRun, steps: report.steps } });
-  return sanitize(report, true);
 }

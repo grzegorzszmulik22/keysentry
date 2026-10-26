@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { buildPlan } from '../core/plan.js';
-import type { Notifier, PendingAction, Policy, RotationPlan, RotationReport } from '../types.js';
+import type { Notifier, Policy, RotationPlan, RotationReport, Signal } from '../types.js';
 import { findProvider, isSafeKeyRef, now, resolveClusterKeyRef, type DetectorContext } from './context.js';
 import { decide, type Decision } from './policy.js';
+import { usageKey, type MonitorPendingAction } from './state.js';
 
-export type RotateExecutor = (plan: RotationPlan) => Promise<RotationReport>;
+export type RotateExecutor = (plan: RotationPlan, opts: { revokeUnconfirmed: boolean; allowGenerate: false }) => Promise<RotationReport>;
 export interface ActionContext extends DetectorContext {
   policy: Policy;
   notifier: Notifier;
@@ -22,24 +23,37 @@ async function notify(ctx: ActionContext, title: string, body: string): Promise<
   catch { ctx.log.warn('Unable to deliver a monitor notification.'); }
 }
 
+function highConfidence(signal: Signal): boolean {
+  return signal.confidence === 'high'
+    && ['canary_triggered','leak_detected','revoked_upstream'].includes(signal.kind);
+}
+
 async function pend(decision: Decision, ctx: ActionContext): Promise<void> {
   const ids = [...new Set(decision.clusterIds)].sort();
   let pending = ctx.state.pendingActions.find(action => action.status === 'pending' && action.action === decision.action
     && [...action.clusterIds].sort().join('\0') === ids.join('\0'));
   if (!pending) {
     pending = {id:`action-${randomUUID()}`,createdAt:now(ctx).toISOString(),signalId:decision.signalId,
-      action:decision.action,clusterIds:ids,status:'pending',note:decision.reason ?? 'Approval required.'};
+      action:decision.action,clusterIds:ids,status:'pending',note:decision.reason ?? 'Approval required.',
+      highConfidence:highConfidence(decision.signal)};
     ctx.state.pendingActions.push(pending);
+    await save(ctx);
+  } else if(highConfidence(decision.signal) && !pending.highConfidence) {
+    pending.highConfidence=true;
     await save(ctx);
   }
   await notify(ctx,'keysentry: action pending',`${pending.action} requested for ${ids.length} secret cluster(s). Approve action ${pending.id}.`);
 }
 
-async function rotateClusters(ids: string[], ctx: ActionContext, automatic: boolean, pending: PendingAction): Promise<RotationReport|undefined> {
+async function rotateClusters(ids: string[], ctx: ActionContext, automatic: boolean, pending: MonitorPendingAction): Promise<RotationReport|undefined> {
   const plan = buildPlan(ctx.inventory,{clusterIds:ids});
   if (plan.steps.length !== ids.length || ids.length === 0) {
     pending.status='failed';pending.note='Selected clusters are missing from the current inventory.';
     await save(ctx);await notify(ctx,'keysentry: rotation failed',pending.note);return;
+  }
+  if (plan.steps.some(step=>step.method==='generate')) {
+    pending.status='failed';pending.note='The monitor cannot generate secrets; human remediation is required.';
+    await save(ctx);await notify(ctx,'keysentry: monitor alert',pending.note);return;
   }
   const at = now(ctx).toISOString();
   pending.status='approved';
@@ -63,7 +77,10 @@ async function rotateClusters(ids: string[], ctx: ActionContext, automatic: bool
     throw new Error('Unable to save monitor actions.');
   }
   let report: RotationReport;
-  try { report=await ctx.rotate(plan); }
+  try { report=await ctx.rotate(plan, {
+    revokeUnconfirmed:pending.highConfidence === true && ctx.policy.revokeUnconfirmedOnHighConfidence,
+    allowGenerate:false,
+  }); }
   catch {
     pending.status='failed';pending.note='Rotation executor failed; inspect the rotation journal.';
     await save(ctx);await notify(ctx,'keysentry: rotation failed',pending.note);return;
@@ -92,39 +109,63 @@ async function rotateClusters(ids: string[], ctx: ActionContext, automatic: bool
   return report;
 }
 
+async function containClusters(ids: string[], ctx: ActionContext, automatic: boolean, pending: MonitorPendingAction, signal?: Signal): Promise<void> {
+  const incomplete: string[]=[];
+  pending.status='approved';
+  for(const id of ids) {
+    const cluster=ctx.inventory.clusters.find(cluster=>cluster.id===id);
+    const provider=cluster ? findProvider(ctx,cluster.provider):undefined;
+    if(!cluster || !provider?.cap) { incomplete.push(id);continue; }
+    let ref: string|null;
+    try { ref=await resolveClusterKeyRef(cluster,ctx); }
+    catch { incomplete.push(id);ctx.log.warn('Unable to resolve a monitored key for containment.');continue; }
+    if(!ref) { incomplete.push(id);continue; }
+    // Resolution may discover that another cluster is the same provider key.
+    // Recheck after that await and reserve synchronously before the provider call.
+    if(automatic && signal) {
+      const eligible=decide({...signal,at:now(ctx).toISOString()},ctx.inventory,ctx.policy,ctx.state)
+        .some(decision=>decision.automatic && decision.action==='cap' && decision.clusterIds.includes(id));
+      if(!eligible) { incomplete.push(id);continue; }
+    }
+    const at=now(ctx).toISOString();
+    const previousVerify=ctx.state.lastVerify[id];
+    ctx.state.containCooldowns[id]=at;
+    ctx.state.containCooldowns[usageKey(cluster.provider,ref)]=at;
+    if(automatic) ctx.state.autoContainments[at.slice(0,10)]=(ctx.state.autoContainments[at.slice(0,10)] ?? 0)+1;
+    // Preserve the locally intended revocation, so it cannot masquerade as an upstream event.
+    ctx.state.lastVerify[id]={at,ok:false,fingerprint:cluster.fingerprint ?? id};
+    try { await save(ctx); }
+    catch {
+      pending.status='pending';pending.note='Reservation could not be saved; containment did not start.';
+      if(previousVerify) ctx.state.lastVerify[id]=previousVerify; else delete ctx.state.lastVerify[id];
+      throw new Error('Unable to save monitor actions.');
+    }
+    try { await provider.cap(ref,ctx.providerCtx); }
+    catch {
+      if(previousVerify) ctx.state.lastVerify[id]=previousVerify; else delete ctx.state.lastVerify[id];
+      incomplete.push(id);ctx.log.warn('Unable to contain a monitored key.');
+    }
+  }
+  pending.status=incomplete.length ? 'pending':'executed';
+  pending.note=incomplete.length ? 'Some keys could not be contained; approval or human remediation is required.' : 'Containment completed.';
+  if(incomplete.length) pending.clusterIds=incomplete;
+  await save(ctx);
+  await notify(ctx,`keysentry: containment ${pending.status}`,`${ids.length-incomplete.length} secret cluster(s) contained. ${pending.note}${incomplete.length ? ` Approve action ${pending.id}.`:''}`);
+}
+
 async function executeCurrent(decision: Decision, ctx: ActionContext): Promise<void> {
   if (decision.action==='alert') {
-    await notify(ctx,'keysentry: monitor alert',`${decision.signal.kind}: ${decision.clusterIds.length} secret cluster(s) implicated.`);
+    const note=decision.reason==='incomplete-scan' ? ' Automatic action excluded because a consumer host failed to scan.'
+      : decision.reason==='generate-disabled' ? ' The monitor cannot generate secrets; human remediation is required.' : '';
+    await notify(ctx,'keysentry: monitor alert',`${decision.signal.kind}: ${decision.clusterIds.length} secret cluster(s) implicated.${note}`);
     return;
   }
-  if (decision.action==='cap') {
-    const failed:string[]=[];
-    for(const id of decision.clusterIds) {
-      const cluster=ctx.inventory.clusters.find(cluster=>cluster.id===id);
-      const provider=cluster ? findProvider(ctx,cluster.provider):undefined;
-      if (!cluster || !provider?.cap) { failed.push(id);continue; }
-      const previousVerify=ctx.state.lastVerify[id];
-      try {
-        const ref=await resolveClusterKeyRef(cluster,ctx);
-        if(!ref) { failed.push(id);continue; }
-        // Preserve the locally intended revocation, so it cannot masquerade as an upstream event.
-        ctx.state.lastVerify[id]={at:now(ctx).toISOString(),ok:false,fingerprint:cluster.fingerprint ?? id};
-        await save(ctx);
-        await provider.cap(ref,ctx.providerCtx);
-      } catch {
-        if(previousVerify) ctx.state.lastVerify[id]=previousVerify; else delete ctx.state.lastVerify[id];
-        failed.push(id);ctx.log.warn('Unable to contain a monitored key.');
-      }
-    }
-    await save(ctx);
-    if(failed.length) await notify(ctx,'keysentry: containment unavailable',`${failed.length} secret cluster(s) could not be contained; review provider access.`);
-    await notify(ctx,'keysentry: containment',`${decision.clusterIds.length-failed.length} secret cluster(s) contained.`);
-    return;
-  }
-  if (!decision.automatic || !ctx.policy.autoExecute) { await pend(decision,ctx);return; }
-  const pending:PendingAction={id:`action-${randomUUID()}`,createdAt:now(ctx).toISOString(),signalId:decision.signalId,
-    action:decision.action,clusterIds:[...decision.clusterIds],status:'approved'};
+  const enabled=decision.action==='cap' ? ctx.policy.autoContain : ctx.policy.autoExecute;
+  if (!decision.automatic || !enabled) { await pend(decision,ctx);return; }
+  const pending:MonitorPendingAction={id:`action-${randomUUID()}`,createdAt:now(ctx).toISOString(),signalId:decision.signalId,
+    action:decision.action,clusterIds:[...decision.clusterIds],status:'approved',highConfidence:highConfidence(decision.signal)};
   ctx.state.pendingActions.push(pending);
+  if(decision.action==='cap') { await containClusters(decision.clusterIds,ctx,true,pending,decision.signal);return; }
   await rotateClusters(decision.clusterIds,ctx,true,pending);
 }
 
@@ -144,7 +185,8 @@ export async function executeDecisions(decisions: readonly Decision[], ctx: Acti
 export async function approve(actionId: string, ctx: ActionContext): Promise<RotationReport|undefined> {
   const pending=ctx.state.pendingActions.find(action=>action.id===actionId);
   if(!pending || pending.status!=='pending') throw new Error('No pending monitor action with this identifier.');
-  if(pending.action!=='rotate' && pending.action!=='breach-mode') throw new Error('Only rotation actions can be approved.');
+  if(pending.action==='cap') { await containClusters([...new Set(pending.clusterIds)],ctx,false,pending);return; }
+  if(pending.action!=='rotate' && pending.action!=='breach-mode') throw new Error('Only rotation or containment actions can be approved.');
   return rotateClusters([...new Set(pending.clusterIds)],ctx,false,pending);
 }
 

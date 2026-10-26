@@ -23,6 +23,10 @@ const liveOptions: RotateOptions = {
   redeploy: true,
   deployTimeoutMs: 1_000,
   pollIntervalMs: 10,
+  revokeUnconfirmed: false,
+  acceptUnplannedSealed: false,
+  allowGenerate: true,
+  verifyRetries: 4,
 };
 
 function memoryJournal(): Journal & { entries: JournalEntry[] } {
@@ -656,14 +660,14 @@ describe('executePlan', () => {
     expect(host.writes).toHaveLength(1);
     expect(redeploy).toHaveBeenCalledTimes(mode === 'disabled' ? 0 : 1);
     expect(status).not.toHaveBeenCalled();
-    expect(report.deployments).toEqual([expect.objectContaining({ deploymentId: null, state: 'skipped' })]);
+    expect(report.deployments).toEqual([expect.objectContaining({ deploymentId: null, state: 'unconfirmed' })]);
     expect(stepFor(report, old.value).status).not.toBe('revoked');
     expect(provider.revoked).toEqual([]);
     expect(provider.keys.get(old.ref)?.active).toBe(true);
     expect(stepFor(report, old.value).warnings.join(' ')).toMatch(/deploy|confirm/i);
   });
 
-  it('allows after-deploy revocation when deployment does not apply to the host', async () => {
+  it('retains the old key when a host needs a manual restart', async () => {
     const provider = new FakeProvider('openai', 'auto', 'sk-proj-');
     const old = provider.issue();
     const host = new FakeHost('dotenv', { redeploy: false });
@@ -677,8 +681,9 @@ describe('executePlan', () => {
     expect(host.writes).toHaveLength(1);
     expect(redeploy).not.toHaveBeenCalled();
     expect(status).not.toHaveBeenCalled();
-    expect(stepFor(report, old.value).status).toBe('revoked');
-    expect(provider.revoked).toEqual([old.ref]);
+    expect(stepFor(report, old.value).status).toBe('written');
+    expect(provider.revoked).toEqual([]);
+    expect(report.deployments[0]?.state).toBe('unconfirmed');
   });
 
   it.each(['read', 'provider-lookup', 'rotate', 'verify-throws'] as const)('isolates a %s failure and lets an independent service finish', async failure => {

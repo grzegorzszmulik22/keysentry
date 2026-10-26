@@ -54,13 +54,15 @@ function environment(value: unknown): EnvironmentEntry {
   };
 }
 
-function assertUnambiguous(entries: EnvironmentEntry[]): void {
+function ambiguousKeys(entries: EnvironmentEntry[]): Set<string> {
   const keys = new Set<string>();
+  const ambiguous = new Set<string>();
   for (const entry of entries) {
     // Branch-specific duplicates cannot be represented by the shared ServiceRef contract.
-    if (keys.has(entry.key)) throw new Error('Vercel returned ambiguous variables for this target');
+    if (keys.has(entry.key)) ambiguous.add(entry.key);
     keys.add(entry.key);
   }
+  return ambiguous;
 }
 
 export function createVercelHost(opts: VercelHostOptions): HostAdapter {
@@ -128,9 +130,15 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
 
     async readVariables(service) {
       const entries = (await environments(service)).filter((entry) => entry.type !== 'system' && entry.target.includes(service.environmentId));
-      assertUnambiguous(entries);
+      const ambiguous = ambiguousKeys(entries);
+      if (ambiguous.size > 0) {
+        opts.log.warn('Vercel skipped ambiguous variables for this target; update branch overrides in Vercel', {
+          projectId: service.projectId, target: service.environmentId, keys: [...ambiguous],
+        });
+      }
       const variables: RawVariable[] = [];
       for (const entry of entries) {
+        if (ambiguous.has(entry.key)) continue;
         if (entry.type === 'sensitive' || entry.type === 'secret' || entry.visibility === 'secret') {
           variables.push({ name: entry.key, sealed: true });
           continue;
@@ -155,7 +163,10 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
         throw new Error('Vercel system variables are managed and cannot be changed');
       }
       const entries = allEntries.filter((entry) => requestedKeys.has(entry.key) && entry.target.includes(service.environmentId));
-      assertUnambiguous(entries);
+      const ambiguous = ambiguousKeys(entries);
+      if (ambiguous.size > 0) {
+        throw new Error(`Vercel cannot write ambiguous variable ${[...ambiguous][0]} for target ${service.environmentId}; update branch overrides in Vercel`);
+      }
       for (const [key, value] of changes) {
         const existing = entries.find((entry) => entry.key === key);
         if (existing !== undefined) {
@@ -172,12 +183,21 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
 
     async redeploy(service) {
       if (service.environmentId !== 'production') return null;
-      const response = object(await request('GET', '/v6/deployments', {
-        projectId: service.projectId, target: 'production', state: 'READY', limit: '1',
-      }));
-      if (!Array.isArray(response.deployments)) return invalidResponse();
-      if (response.deployments.length === 0) throw new Error('Vercel has no ready production deployment to redeploy');
-      const previousId = identifier(object(response.deployments[0]).uid);
+      const project = object(await request('GET', `/v9/projects/${encodeURIComponent(service.projectId)}`));
+      const production = project.targets == null ? undefined : object(project.targets).production;
+      const servingId = production == null ? undefined : object(production).id;
+      let previousId = servingId == null ? undefined : identifier(servingId);
+      if (previousId === undefined) {
+        opts.log.warn('Vercel serving production deployment is unavailable; falling back to the latest READY production deployment, which may undo a rollback', {
+          projectId: service.projectId,
+        });
+        const response = object(await request('GET', '/v6/deployments', {
+          projectId: service.projectId, target: 'production', state: 'READY', limit: '1',
+        }));
+        if (!Array.isArray(response.deployments)) return invalidResponse();
+        if (response.deployments.length === 0) throw new Error('Vercel has no ready production deployment to redeploy');
+        previousId = identifier(object(response.deployments[0]).uid);
+      }
       const deployment = object(await request('POST', '/v13/deployments', { forceNew: '1' }, {
         name: service.projectName, deploymentId: previousId, target: 'production',
       }));

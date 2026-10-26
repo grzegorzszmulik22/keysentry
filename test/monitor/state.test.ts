@@ -39,6 +39,19 @@ describe('monitor state', () => {
     expect((await store.load()).feedBaselines).toEqual({});
   });
 
+  it('round trips containment limits and defaults them for legacy state', async () => {
+    const state=createMonitorState();
+    state.containCooldowns['openrouter:key_1']='2026-10-26T12:00:00.000Z';
+    state.autoContainments['2026-10-26']=1;
+    const store=createMemoryMonitorStateStore(state);
+    expect((await store.load()).containCooldowns).toEqual(state.containCooldowns);
+    expect((await store.load()).autoContainments).toEqual(state.autoContainments);
+    const {containCooldowns,autoContainments,...legacy}=state;
+    await store.save(legacy as never);
+    expect((await store.load()).containCooldowns).toEqual({});
+    expect((await store.load()).autoContainments).toEqual({});
+  });
+
   it('expires old hourly buckets even for keys no longer inventoried',()=>{
     const state=createMonitorState();
     state.usageHistory.orphan=[{hour:'2026-01-01T00:00:00.000Z',costUsd:1}];

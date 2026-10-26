@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { openaiProvider } from '../../src/providers/openai.js';
+import { OpenAIGuidedRotationRequiredError, openaiProvider } from '../../src/providers/openai.js';
 import type { ProviderContext } from '../../src/types.js';
 import { FakeHttp, json, silentLogger, text } from '../helpers/fake-http.js';
 
@@ -110,7 +110,7 @@ describe('OpenAI provider', () => {
     ]);
   });
 
-  it('creates a new service account for a user-owned key without revoking it during creation', async () => {
+  it('requires guided rotation for user-owned keys without creating a service account', async () => {
     const value = secret();
     const newValue = secret();
     const admin = secret();
@@ -121,12 +121,27 @@ describe('OpenAI provider', () => {
         expect(JSON.parse(req.body!).name).toMatch(/^keysentry-\d{4}-\d\d-\d\dT/);
         return json(200, { id: 'svc_acct_new', api_key: { id: 'key_new', value: newValue } });
       });
-    const result = await openaiProvider.rotate!(value, context(http, admin));
-    expect(result.newValue === newValue).toBe(true);
-    expect(result.oldKeyRef).toBe('proj_one/key_old');
-    expect(result.newKeyRef).toBe('proj_one/key_new/sa-key:svc_acct_new');
-    expect(result.oldRevoked).toBe(false);
-    expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
+    let error: unknown;
+    try { await openaiProvider.rotate!(value, context(http, admin)); } catch (cause) { error = cause; }
+    expect(error instanceof OpenAIGuidedRotationRequiredError).toBe(true);
+    expect(error).toMatchObject({ name: 'OpenAIGuidedRotationRequiredError', code: 'GUIDED_ROTATION_REQUIRED', provider: 'openai' });
+    expect(String(error)).toMatch(/user|permission|guided/i);
+    expect(String(error).includes(value)).toBe(false);
+    expect(http.calls.every(call => call.method === 'GET')).toBe(true);
+  });
+
+  it('still resolves and revokes user-owned keys when rotation is guided', async () => {
+    const value = secret();
+    const http = oneKey(new FakeHttp(), value, false).on('DELETE',
+      /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/api_keys\/key_old$/,
+      () => json(200, { deleted: true }));
+    const ctx = context(http);
+    const keyRef = await openaiProvider.resolveKeyRef!(value, ctx);
+    expect(keyRef).toBe('proj_one/key_old');
+    await openaiProvider.revoke!(keyRef!, ctx);
+    expect(http.calls.filter(call => call.method === 'DELETE').map(call => call.url)).toEqual([
+      'https://api.openai.com/v1/organization/projects/proj_one/api_keys/key_old',
+    ]);
   });
 
   it('does not create a key when the old project cannot be resolved', async () => {
@@ -137,19 +152,15 @@ describe('OpenAI provider', () => {
 
   it('rejects malformed or unchanged replacement keys without exposing them', async () => {
     const value = secret();
-    for (const serviceAccount of [true, false]) {
-      for (const replacement of [undefined, '', '   ', value]) {
-        const http = oneKey(new FakeHttp(), value, serviceAccount).on('POST',
-          serviceAccount ? /\/service_accounts\/svc_acct_old\/api_keys$/ : /\/service_accounts$/,
-          () => json(200, serviceAccount ? { id: 'key_new', value: replacement }
-            : { id: 'svc_acct_new', api_key: { id: 'key_new', value: replacement } }));
-        let message = '';
-        try { await openaiProvider.rotate!(value, context(http)); } catch (error) { message = String(error); }
-        expect(message).toMatch(/new service-account key/i);
-        expect(message.includes(value)).toBe(false);
-        expect(http.calls.filter(call => call.method === 'POST')).toHaveLength(1);
-        expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
-      }
+    for (const replacement of [undefined, '', '   ', value]) {
+      const http = oneKey(new FakeHttp(), value).on('POST', /\/service_accounts\/svc_acct_old\/api_keys$/,
+        () => json(200, { id: 'key_new', value: replacement }));
+      let message = '';
+      try { await openaiProvider.rotate!(value, context(http)); } catch (error) { message = String(error); }
+      expect(message).toMatch(/new service-account key/i);
+      expect(message.includes(value)).toBe(false);
+      expect(http.calls.filter(call => call.method === 'POST')).toHaveLength(1);
+      expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
     }
   });
 

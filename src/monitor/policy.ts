@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { serviceKey } from '../core/service-key.js';
 import type { ActionKind, HostId, Inventory, Policy, PolicyRule, Signal } from '../types.js';
-import type { MonitorState } from './state.js';
+import { usageKey, type MonitorState } from './state.js';
 
 export interface Decision {
   id: string;
   signalId: string;
   action: ActionKind;
   clusterIds: string[];
-  /** A rotation is permitted to execute without a pending human approval. */
+  /** A destructive action is permitted to execute without a pending human approval. */
   automatic: boolean;
   reason?: string;
   signal: Signal;
@@ -19,6 +19,9 @@ const CONFIDENCE = { low: 0, medium: 1, high: 2 } as const;
 export function defaultPolicy(): Policy {
   return {
     autoExecute: false,
+    autoContain: false,
+    containCooldownMinutes: 60,
+    revokeUnconfirmedOnHighConfidence: true,
     cooldownMinutes: 60,
     maxAutoRotationsPerDay: 10,
     rules: {
@@ -59,7 +62,7 @@ function expandScope(signal: Signal, inv: Inventory, scope: PolicyRule['scope'])
 /** Pure policy evaluation. The action executor reserves cooldown/capacity before any rotation call. */
 export function decide(signal: Signal, inv: Inventory, policy: Policy, state: MonitorState): Decision[] {
   const rule = policy.rules[signal.kind];
-  const clusterIds = expandScope(signal, inv, rule.scope);
+  let clusterIds = expandScope(signal, inv, rule.scope);
   const decision = (ids: string[], automatic: boolean, reason?: string, action: ActionKind = rule.action): Decision => ({
     id: `decision-${randomUUID()}`,
     signalId: signal.id,
@@ -74,29 +77,43 @@ export function decide(signal: Signal, inv: Inventory, policy: Policy, state: Mo
   }
   if (rule.action === 'alert') return [decision(clusterIds, false)];
   if (clusterIds.length === 0) return [decision([], false, 'no-targets', 'alert')];
-  if (rule.action === 'cap') return [decision(clusterIds, true)];
-  if (!policy.autoExecute) return [decision(clusterIds, false, 'auto-execute-disabled')];
+  const decisions: Decision[] = [];
+  const failedHosts = new Set(inv.errors.map(error => error.host));
+  const incomplete = inv.clusters.filter(cluster => clusterIds.includes(cluster.id)
+    && cluster.consumers.some(consumer => failedHosts.has(consumer.service.host))).map(cluster => cluster.id);
+  if (incomplete.length) decisions.push(decision(incomplete, false, 'incomplete-scan', 'alert'));
+  clusterIds = clusterIds.filter(id => !incomplete.includes(id));
+  const containment = rule.action === 'cap';
+  if (!containment) {
+    const generated = inv.clusters.filter(cluster => clusterIds.includes(cluster.id) && cluster.method === 'generate').map(cluster => cluster.id);
+    if (generated.length) decisions.push(decision(generated, false, 'generate-disabled', 'alert'));
+    clusterIds = clusterIds.filter(id => !generated.includes(id));
+  }
+  if (!clusterIds.length) return decisions;
+  const enabled = containment ? policy.autoContain : policy.autoExecute;
+  if (!enabled) return [...decisions, decision(clusterIds, false, containment ? 'auto-contain-disabled' : 'auto-execute-disabled')];
 
   const timestamp = Date.parse(signal.at);
-  if (!Number.isFinite(timestamp)) return [decision(clusterIds, false, 'invalid-time')];
-  const cooldownMs = Math.max(0, policy.cooldownMinutes) * 60_000;
+  if (!Number.isFinite(timestamp)) return [...decisions, decision(clusterIds, false, 'invalid-time')];
+  const cooldownMs = Math.max(0, containment ? policy.containCooldownMinutes : policy.cooldownMinutes) * 60_000;
   const cooling: string[] = [];
   const eligible: string[] = [];
   for (const id of clusterIds) {
-    const last = state.cooldowns[id];
-    const lastAt = last === undefined ? NaN : Date.parse(last);
-    if (last !== undefined && (!Number.isFinite(lastAt) || timestamp - lastAt < cooldownMs)) cooling.push(id);
+    const cluster = inv.clusters.find(cluster => cluster.id === id)!;
+    const ref = state.keyRefs[id];
+    const last = containment ? [state.containCooldowns[id], ref ? state.containCooldowns[usageKey(cluster.provider, ref)] : undefined]
+      : [state.cooldowns[id]];
+    if (last.some(value => value !== undefined && (!Number.isFinite(Date.parse(value)) || timestamp - Date.parse(value) < cooldownMs))) cooling.push(id);
     else eligible.push(id);
   }
 
   const day = new Date(timestamp).toISOString().slice(0, 10);
-  const used = state.autoRotations[day] ?? 0;
+  const used = (containment ? state.autoContainments : state.autoRotations)[day] ?? 0;
   const remaining = Number.isFinite(policy.maxAutoRotationsPerDay) && Number.isFinite(used)
     ? Math.max(0, Math.floor(policy.maxAutoRotationsPerDay) - Math.max(0, used))
     : 0;
   const allowed = eligible.slice(0, remaining);
   const overflow = eligible.slice(remaining);
-  const decisions: Decision[] = [];
   if (allowed.length) decisions.push(decision(allowed, true));
   if (cooling.length) decisions.push(decision(cooling, false, 'cooldown'));
   if (overflow.length) decisions.push(decision(overflow, false, 'daily-cap'));

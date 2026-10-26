@@ -30,6 +30,7 @@ const DASHBOARD_HINTS: Record<ProviderId, string> = {
   'private-key': 'the issuing provider or key management system',
   'crypto-wallet': 'the wallet or custody provider; confirm the asset migration procedure before rotating',
   'app-secret': 'the application secret configuration',
+  'encryption-key': 'the application’s data-encryption key migration procedure',
   unknown: 'the issuing provider dashboard; identify the credential owner first',
 };
 
@@ -93,11 +94,13 @@ function serviceContext(service: ServiceRef, redactor: Redactor): string {
 }
 
 function renderConsumers(consumers: Consumer[], redactor: Redactor): string[] {
-  return consumers.map(consumer => `- ${code(`${serviceLabel(consumer.service)}:${consumer.varName}`, redactor)} (${serviceContext(consumer.service, redactor)})${consumer.sealed ? ' — sealed' : ''}`);
+  return consumers.map(consumer => `- ${code(`${serviceLabel(consumer.service)}:${consumer.varName}`, redactor)} (${serviceContext(consumer.service, redactor)})${consumer.sealed ? ' — sealed' : ''}${consumer.reference ? ' — reference — redeploy only; do not overwrite' : ''}`);
 }
 
 function instructions(step: PlanStep): string[] {
-  const stage = 'Stage the replacement in every consumer listed above, suppressing deployments until all plan steps are staged.';
+  const stage = step.consumers.some(consumer => consumer.reference)
+    ? 'Stage the replacement in directly stored variables, suppressing deployments until all plan steps are staged. Leave reference variables unchanged and include their services in the shared redeploy pass.'
+    : 'Stage the replacement in every consumer listed above, suppressing deployments until all plan steps are staged.';
   switch (step.method) {
     case 'auto':
       return [
@@ -110,18 +113,21 @@ function instructions(step: PlanStep): string[] {
       return [
         'Coordinate a maintenance window: the old key is invalidated immediately when the provider rolls it.',
         'Defer the irreversible roll until every guided task and all other replacements are prepared and verified.',
-        'During final staging, roll the key, verify the replacement, and immediately write it to every consumer listed above; stop on verification failure.',
+        step.consumers.some(consumer => consumer.reference)
+          ? 'During final staging, roll the key, verify the replacement, and immediately write it to every directly stored consumer variable; leave reference variables unchanged and stop on verification failure.'
+          : 'During final staging, roll the key, verify the replacement, and immediately write it to every consumer listed above; stop on verification failure.',
         'Proceed directly to the shared redeploy pass, prioritizing these consumers. The old key is already revoked; there is no later revoke step.',
       ];
     case 'generate':
       return [
-        'Generate a cryptographically random replacement in memory; account for session invalidation or encrypted data migration before changing it.',
+        'Generate a cryptographically random replacement in memory for this self-issued session or signing secret; plan for sessions and JWTs signed with the old secret to become invalid.',
         'Verify the replacement format and application compatibility; stop on failure.',
         stage,
         'After the shared redeploy pass, verify application health and retire the old secret last.',
       ];
     case 'guided':
       return [
+        ...(step.provider === 'encryption-key' ? ['Replacing a data-encryption key requires re-encrypting existing data first; never swap the variable on its own.'] : []),
         `Open ${DASHBOARD_HINTS[step.provider]} and create a replacement with the required permissions, keeping the old key active where supported.`,
         'Provide the replacement through the hidden prompt; never put its value in this runbook.',
         'Verify the replacement before changing consumers; stop on any verification failure and keep the old key.',

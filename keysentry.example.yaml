@@ -26,12 +26,22 @@ hosts:
 rotation:
   revoke: after-deploy
   redeploy: true
+  revokeUnconfirmed: false # --revoke-unconfirmed accepts unconfirmed activation
+  acceptUnplannedSealed: false # --accept-unplanned-sealed accepts unknown sealed copies
+  allowGenerate: true # --no-generate skips self-issued secret generation
+  verifyRetries: 4
   deployTimeoutMs: 600000
   pollIntervalMs: 5000
 
 monitor:
   interval: 300 # seconds
   autoExecute: false # rotations require approval unless explicitly enabled
+  autoContain: false # cap/disable requires approval; env: KEYSENTRY_AUTO_CONTAIN
+  containCooldownMinutes: 60
+  # High-confidence canary/leak/upstream revocation may kill a compromised old key
+  # before manual restart / next deployment is confirmed. This can break consumers.
+  # Env override: KEYSENTRY_REVOKE_UNCONFIRMED_ON_HIGH_CONFIDENCE=true|false
+  revokeUnconfirmedOnHighConfidence: true
   cooldownMinutes: 60
   maxAutoRotationsPerDay: 10 # clusters, per UTC day
   usage:
@@ -50,8 +60,7 @@ monitor:
       action: rotate
       scope: cluster
       minConfidence: high
-    # Cap/disable is immediate containment even with autoExecute: false.
-    # Use action: alert for observation-only monitoring.
+    # Cap/disable requires approval unless autoContain is explicitly enabled.
     usage_anomaly:
       action: cap
       scope: cluster

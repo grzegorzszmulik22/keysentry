@@ -37,7 +37,7 @@ export const appSecretProvider: ProviderAdapter = {
       oldKeyRef: null,
       newKeyRef: null,
       oldRevoked: false,
-      notes: 'Sessions and JWTs signed with the old secret become invalid after consumers switch to the new secret. Encryption keys require a separate data migration before replacement.',
+      notes: 'Sessions and JWTs signed with the old secret become invalid after consumers switch to the new secret.',
     };
   },
 
@@ -47,7 +47,6 @@ export const appSecretProvider: ProviderAdapter = {
       steps: [
         'Generate a fresh secret and update every consumer before redeploying each service.',
         'Sessions and JWTs signed with the old secret become invalid; plan for users to sign in again.',
-        'For encryption keys, migrate encrypted data with a compatible key rotation procedure before replacing the key.',
       ],
     };
   },
