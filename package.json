@@ -1,0 +1,40 @@
+{
+  "name": "keysentry",
+  "version": "0.1.0",
+  "description": "Breach-day key rotation and key monitoring: find every copy of every secret across your hosts, rotate in a safe order with one redeploy per service, verify, revoke, and rotate automatically on suspicious use.",
+  "type": "module",
+  "bin": {
+    "keysentry": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "skill",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/cli/index.ts"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "commander": "^12.1.0",
+    "fast-xml-parser": "^4.5.7",
+    "libsodium-wrappers": "^0.8.4",
+    "yaml": "^2.9.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers": "^0.7.14",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}
