@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { anthropicProvider } from '../../src/providers/anthropic.js';
+import { ANTHROPIC_MODEL_PRICES, anthropicProvider } from '../../src/providers/anthropic.js';
 import type { ProviderContext } from '../../src/types.js';
 import { FakeHttp, json, silentLogger, text } from '../helpers/fake-http.js';
 
@@ -139,13 +139,85 @@ describe('anthropic provider', () => {
     await expect(anthropicProvider.listKeys!({ http: new FakeHttp(), credentials: {}, log: silentLogger })).rejects.toThrow(/ANTHROPIC_ADMIN_KEY/);
   });
 
-  it('does not apply a related model price to an unknown model generation', async () => {
-    const http = new FakeHttp().on('GET', /\/usage_report\/messages\?/, () => json(200, {
-      data: [{ results: [{ model: 'claude-sonnet-4-unknown', uncached_input_tokens: 1_000_000, output_tokens: 0 }] }], has_more: false,
-    }));
-    await expect(anthropicProvider.usage!('apikey_one', {
+  it('prices every unknown-model token at the highest table rate and warns once per model per call', async () => {
+    const warnings: { message: string; data?: Record<string, unknown> }[] = [];
+    const http = new FakeHttp().on('GET', /\/usage_report\/messages\?/, req => {
+      if (!new URL(req.url).searchParams.has('page')) return json(200, {
+        data: [{ results: [
+          {
+            model: 'claude-sonnet-4-unknown', uncached_input_tokens: 1_000_000, output_tokens: 1_000_000,
+            cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 2_000_000,
+            cache_creation: { ephemeral_5m_input_tokens: 1_000_000, ephemeral_1h_input_tokens: 1_000_000 },
+          },
+          { model: 'claude-sonnet-4-20250514', uncached_input_tokens: 1_000_000 },
+        ] }], has_more: true, next_page: 'page_two',
+      });
+      return json(200, {
+        data: [{ results: [
+          { model: 'claude-sonnet-4-unknown', input_tokens: 1_000_000 },
+          { model: 'claude-future-1', output_tokens: 1_000_000 },
+        ] }], has_more: false,
+      });
+    });
+    const ctx = context(http);
+    ctx.log = { ...silentLogger, warn(message, data) { warnings.push({ message, data }); } };
+    const window = {
       from: new Date('2026-01-01T00:00:00Z'), to: new Date('2026-01-01T01:00:00Z'),
-    }, context(http))).rejects.toThrow(/price estimate/);
+    };
+    const usage = await anthropicProvider.usage!('apikey_one', window, ctx);
+    expect(usage.costUsd).toBe(528);
+    expect(usage.byModel).toEqual({
+      'claude-sonnet-4-unknown': 450, 'claude-sonnet-4-20250514': 3, 'claude-future-1': 75,
+    });
+    expect(warnings.map(warning => warning.data?.model)).toEqual(['claude-sonnet-4-unknown', 'claude-future-1']);
+    expect(warnings.every(warning => /highest|conservative/i.test(warning.message))).toBe(true);
+    await anthropicProvider.usage!('apikey_one', window, ctx);
+    expect(warnings.map(warning => warning.data?.model)).toEqual([
+      'claude-sonnet-4-unknown', 'claude-future-1', 'claude-sonnet-4-unknown', 'claude-future-1',
+    ]);
+  });
+
+  it('uses an edited table maximum for every fallback token category', async () => {
+    ANTHROPIC_MODEL_PRICES['claude-price-regression'] = {
+      input: 1, output: 2, cacheRead: 110, cacheWrite: 3, cacheWriteOneHour: 4,
+    };
+    try {
+      const http = new FakeHttp().on('GET', /\/usage_report\/messages\?/, () => json(200, {
+        data: [{ results: [{
+          model: 'claude-new-generation', input_tokens: 1_000_000, output_tokens: 1_000_000,
+          cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 2_000_000,
+          cache_creation: { ephemeral_5m_input_tokens: 1_000_000, ephemeral_1h_input_tokens: 1_000_000 },
+        }] }], has_more: false,
+      }));
+      const usage = await anthropicProvider.usage!('apikey_one', {
+        from: new Date('2026-01-01T00:00:00Z'), to: new Date('2026-01-01T01:00:00Z'),
+      }, context(http));
+      expect(usage.costUsd).toBe(550);
+      expect(usage.byModel).toEqual({ 'claude-new-generation': 550 });
+    } finally {
+      delete ANTHROPIC_MODEL_PRICES['claude-price-regression'];
+    }
+  });
+
+  it.each(['configured', 'unregistered'])('rejects a model containing a %s credential without logging it', async kind => {
+    const credential = kind === 'configured' ? randomBytes(24).toString('hex') : secret();
+    const model = `claude-${credential}`;
+    const warnings: unknown[] = [];
+    const http = new FakeHttp().on('GET', /\/usage_report\/messages\?/, () => json(200, {
+      data: [{ results: [{ model, input_tokens: 1_000_000 }] }], has_more: false,
+    }));
+    const ctx = context(http);
+    if (kind === 'configured') ctx.credentials.OTHER_SECRET = credential;
+    ctx.log = { ...silentLogger, warn(message, data) { warnings.push({ message, data }); } };
+    let message = '';
+    try {
+      await anthropicProvider.usage!('apikey_one', {
+        from: new Date('2026-01-01T00:00:00Z'), to: new Date('2026-01-01T01:00:00Z'),
+      }, ctx);
+    } catch (error) { message = String(error); }
+    expect(message.length > 0).toBe(true);
+    expect(message.includes(credential)).toBe(false);
+    expect(warnings.length).toBe(0);
   });
 
   it('rejects malformed usage windows before issuing a request', async () => {
@@ -203,7 +275,7 @@ describe('anthropic provider', () => {
   it('offers guided rotation and explains that containment disables consumers', () => {
     expect(anthropicProvider.method).toBe('guided');
     expect(anthropicProvider.rotate).toBeUndefined();
-    expect(anthropicProvider.guidance().url).toBe('https://console.anthropic.com/settings/keys');
+    expect(anthropicProvider.guidance().url).toBe('https://platform.claude.com/settings/keys');
     expect(anthropicProvider.guidance().steps.join(' ')).toMatch(/(break|interrupt|stop).*consumer/i);
   });
 });

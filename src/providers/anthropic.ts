@@ -135,16 +135,24 @@ function tokens(value: unknown): number {
   return value;
 }
 
-function modelPrice(model: unknown): { model: string; price: ModelPrice } {
-  if (typeof model !== 'string' || !/^claude-[a-z0-9][a-z0-9._-]{0,127}$/.test(model)) {
+function modelPrice(model: unknown, ctx: ProviderContext): { model: string; price: ModelPrice; fallback: boolean } {
+  const secrets = Object.values(ctx.credentials).filter((value): value is string => typeof value === 'string' && value.length > 0);
+  if (typeof model !== 'string' || !/^claude-[a-z0-9][a-z0-9._-]{0,127}$/.test(model)
+    || safeIdentity(model, '', secrets) !== model) {
     throw new Error('anthropic: missing or invalid usage model');
   }
   const entry = Object.entries(ANTHROPIC_MODEL_PRICES)
     .sort(([left], [right]) => right.length - left.length)
     .find(([name]) => model === name || model === `${name}-latest`
       || (model.startsWith(`${name}-`) && /^\d{8}$/.test(model.slice(name.length + 1))));
-  if (!entry) throw new Error('anthropic: usage model has no price estimate; update ANTHROPIC_MODEL_PRICES');
-  return { model, price: entry[1] };
+  if (entry) return { model, price: entry[1], fallback: false };
+  // Apply the single highest rate to every token category, including discounted cache tokens.
+  const rate = Math.max(...Object.values(ANTHROPIC_MODEL_PRICES).flatMap(price => Object.values(price)));
+  return {
+    model,
+    price: { input: rate, output: rate, cacheRead: rate, cacheWrite: rate, cacheWriteOneHour: rate },
+    fallback: true,
+  };
 }
 
 function estimate(result: JsonObject, price: ModelPrice): number {
@@ -172,6 +180,7 @@ async function usage(keyRef: string, window: { from: Date; to: Date }, ctx: Prov
   const to = window.to.toISOString();
   const byModel: Record<string, number> = {};
   const seen = new Set<string>();
+  const warnedModels = new Set<string>();
   let page: string | undefined;
   while (true) {
     const url = new URL(`${BASE_URL}/organizations/usage_report/messages`);
@@ -188,7 +197,11 @@ async function usage(keyRef: string, window: { from: Date; to: Date }, ctx: Prov
       if (!Array.isArray(bucket.results)) throw new Error('anthropic: invalid usage bucket');
       for (const resultValue of bucket.results) {
         const result = object(resultValue);
-        const { model, price } = modelPrice(result.model);
+        const { model, price, fallback } = modelPrice(result.model, ctx);
+        if (fallback && !warnedModels.has(model)) {
+          ctx.log.warn('anthropic: unknown usage model; estimating every token at the highest table rate', { model });
+          warnedModels.add(model);
+        }
         byModel[model] = (byModel[model] ?? 0) + estimate(result, price);
       }
     }
@@ -221,12 +234,12 @@ export const anthropicProvider: ProviderAdapter = {
   usage,
   guidance() {
     return {
-      url: 'https://console.anthropic.com/settings/keys',
+      url: 'https://platform.claude.com/settings/keys',
       steps: [
         'Create a replacement API key in the Anthropic Console.',
         'Update every consumer, redeploy, and verify the replacement before disabling the old key.',
         'Containment disables the key immediately and interrupts every consumer using it.',
-        'Usage cost is an estimate from ANTHROPIC_MODEL_PRICES; update the table for current pricing and models.',
+        'Usage cost is an estimate from ANTHROPIC_MODEL_PRICES; unknown models use its highest rate for every token category. Update the table for current pricing and models.',
       ],
     };
   },

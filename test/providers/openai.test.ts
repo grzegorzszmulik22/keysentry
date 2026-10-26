@@ -54,7 +54,7 @@ describe('OpenAI provider', () => {
         json(200, { data: [{ id: 'key_third', owner: { type: 'user', user: { id: 'user_third' } } }], has_more: false }));
     const keys = await openaiProvider.listKeys!(context(http, admin));
     expect(keys.map(key => key.keyRef)).toEqual([
-      'proj_one/key_first/sa:svc_acct_first', 'proj_one/key_second', 'proj_two/key_third',
+      'proj_one/key_first/sa-key:svc_acct_first', 'proj_one/key_second', 'proj_two/key_third',
     ]);
     expect(http.calls.every(call => call.headers?.Authorization === `Bearer ${admin}`)).toBe(true);
     expect(http.calls.every(call => !call.url.includes(admin))).toBe(true);
@@ -64,7 +64,7 @@ describe('OpenAI provider', () => {
   it('resolves using both nonempty redacted prefix and suffix and refuses ambiguous matches', async () => {
     const value = secret();
     expect(await openaiProvider.resolveKeyRef!(value, context(oneKey(new FakeHttp(), value))))
-      .toBe('proj_one/key_old/sa:svc_acct_old');
+      .toBe('proj_one/key_old/sa-key:svc_acct_old');
     const wrongSuffix = `${value.slice(0, -4)}zzzz`;
     expect(await openaiProvider.resolveKeyRef!(wrongSuffix, context(oneKey(new FakeHttp(), value)))).toBeNull();
     const wrongPrefix = `different-${value.slice(10)}`;
@@ -81,11 +81,40 @@ describe('OpenAI provider', () => {
     expect(await openaiProvider.resolveKeyRef!(value, context(ambiguous))).toBeNull();
   });
 
-  it('creates one new service account in the old project without revoking the old key', async () => {
+  it('creates a replacement key on the same service account and revokes only the old key', async () => {
     const value = secret();
     const newValue = secret();
     const admin = secret();
     const http = oneKey(new FakeHttp(), value).on('POST',
+      /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/service_accounts\/svc_acct_old\/api_keys$/, req => {
+        expect(req.headers?.Authorization === `Bearer ${admin}`).toBe(true);
+        expect(req.headers?.['Content-Type']).toBe('application/json');
+        const body = JSON.parse(req.body!) as Record<string, unknown>;
+        expect(Object.keys(body)).toEqual(['name']);
+        expect(body.name).toMatch(/^keysentry-\d{4}-\d\d-\d\dT/);
+        return json(200, { id: 'key_new', value: newValue });
+      }).on('DELETE',
+      /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/api_keys\/key_old$/,
+      () => json(200, { deleted: true }));
+    const ctx = context(http, admin);
+    const result = await openaiProvider.rotate!(value, ctx);
+    expect(result.newValue === newValue).toBe(true);
+    expect(result.oldKeyRef).toBe('proj_one/key_old/sa-key:svc_acct_old');
+    expect(result.newKeyRef).toBe('proj_one/key_new/sa-key:svc_acct_old');
+    expect(result.oldRevoked).toBe(false);
+    expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
+    await openaiProvider.revoke!(result.oldKeyRef!, ctx);
+    expect(http.calls.filter(call => call.method === 'POST' || call.method === 'DELETE').map(call => call.url)).toEqual([
+      'https://api.openai.com/v1/organization/projects/proj_one/service_accounts/svc_acct_old/api_keys',
+      'https://api.openai.com/v1/organization/projects/proj_one/api_keys/key_old',
+    ]);
+  });
+
+  it('creates a new service account for a user-owned key without revoking it during creation', async () => {
+    const value = secret();
+    const newValue = secret();
+    const admin = secret();
+    const http = oneKey(new FakeHttp(), value, false).on('POST',
       /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/service_accounts$/, req => {
         expect(req.headers?.Authorization === `Bearer ${admin}`).toBe(true);
         expect(req.headers?.['Content-Type']).toBe('application/json');
@@ -94,8 +123,8 @@ describe('OpenAI provider', () => {
       });
     const result = await openaiProvider.rotate!(value, context(http, admin));
     expect(result.newValue === newValue).toBe(true);
-    expect(result.oldKeyRef).toBe('proj_one/key_old/sa:svc_acct_old');
-    expect(result.newKeyRef).toBe('proj_one/key_new/sa:svc_acct_new');
+    expect(result.oldKeyRef).toBe('proj_one/key_old');
+    expect(result.newKeyRef).toBe('proj_one/key_new/sa-key:svc_acct_new');
     expect(result.oldRevoked).toBe(false);
     expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
   });
@@ -108,26 +137,32 @@ describe('OpenAI provider', () => {
 
   it('rejects malformed or unchanged replacement keys without exposing them', async () => {
     const value = secret();
-    for (const replacement of [undefined, '', '   ', value]) {
-      const http = oneKey(new FakeHttp(), value).on('POST', /\/service_accounts$/, () => json(200, {
-        id: 'svc_acct_new', api_key: { id: 'key_new', value: replacement },
-      }));
-      let message = '';
-      try { await openaiProvider.rotate!(value, context(http)); } catch (error) { message = String(error); }
-      expect(message.length > 0).toBe(true);
-      expect(message.includes(value)).toBe(false);
-      expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
+    for (const serviceAccount of [true, false]) {
+      for (const replacement of [undefined, '', '   ', value]) {
+        const http = oneKey(new FakeHttp(), value, serviceAccount).on('POST',
+          serviceAccount ? /\/service_accounts\/svc_acct_old\/api_keys$/ : /\/service_accounts$/,
+          () => json(200, serviceAccount ? { id: 'key_new', value: replacement }
+            : { id: 'svc_acct_new', api_key: { id: 'key_new', value: replacement } }));
+        let message = '';
+        try { await openaiProvider.rotate!(value, context(http)); } catch (error) { message = String(error); }
+        expect(message).toMatch(/new service-account key/i);
+        expect(message.includes(value)).toBe(false);
+        expect(http.calls.filter(call => call.method === 'POST')).toHaveLength(1);
+        expect(http.calls.some(call => call.method === 'DELETE')).toBe(false);
+      }
     }
   });
 
-  it('revokes service accounts and individual user keys through their distinct endpoints', async () => {
+  it('revokes only the referenced key for new and legacy service-account refs and user refs', async () => {
     const admin = secret();
     const http = new FakeHttp()
-      .on('DELETE', /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/service_accounts\/svc_acct_old$/, () => json(200, { deleted: true }))
+      .on('DELETE', /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/api_keys\/key_old$/, () => json(200, { deleted: true }))
       .on('DELETE', /^https:\/\/api\.openai\.com\/v1\/organization\/projects\/proj_one\/api_keys\/key_user$/, () => json(200, { deleted: true }));
+    await openaiProvider.revoke!('proj_one/key_old/sa-key:svc_acct_old', context(http, admin));
     await openaiProvider.revoke!('proj_one/key_old/sa:svc_acct_old', context(http, admin));
     await openaiProvider.revoke!('proj_one/key_user', context(http, admin));
-    expect(http.calls.length).toBe(2);
+    expect(http.calls.length).toBe(3);
+    expect(http.calls.every(call => /\/api_keys\/(?:key_old|key_user)$/.test(call.url))).toBe(true);
     expect(http.calls.every(call => call.headers?.Authorization === `Bearer ${admin}` && call.body === undefined)).toBe(true);
   });
 
@@ -182,13 +217,49 @@ describe('OpenAI provider', () => {
     expect(invalid.calls.length).toBe(1);
   });
 
-  it('fails estimates for unpriced models instead of reporting zero spend', async () => {
-    const http = new FakeHttp().on('GET', /^https:\/\/api\.openai\.com\/v1\/organization\/usage\/completions\?/, () => json(200, {
-      data: [{ results: [{ model: 'gpt-future', input_tokens: 1_000_000, output_tokens: 1_000_000 }] }], has_more: false,
-    }));
-    await expect(openaiProvider.usage!('proj_one/key_old', {
+  it('estimates unpriced models at the highest rate for all tokens and warns once per model across pages', async () => {
+    const warnings: { message: string; data?: Record<string, unknown> }[] = [];
+    const http = new FakeHttp().on('GET', /^https:\/\/api\.openai\.com\/v1\/organization\/usage\/completions\?/, req =>
+      json(200, new URL(req.url).searchParams.has('page')
+        ? { data: [{ results: [
+          { model: 'gpt-future', input_tokens: 500_000, input_cached_tokens: 500_000, output_tokens: 500_000, num_model_requests: 2 },
+          { model: 'gpt-other', input_tokens: 0, output_tokens: 1_000_000, num_model_requests: 1 },
+        ] }], has_more: false }
+        : { data: [{ results: [
+          { model: 'gpt-future', input_tokens: 1_000_000, input_cached_tokens: 400_000, output_tokens: 2_000_000, num_model_requests: 3 },
+          { model: 'gpt-4o-mini', input_tokens: 1_000_000, output_tokens: 0, num_model_requests: 4 },
+        ] }], has_more: true, next_page: 'page_two' }));
+    const ctx = context(http);
+    ctx.log = { ...silentLogger, warn: (message, data) => { warnings.push({ message, data }); } };
+    const sample = await openaiProvider.usage!('proj_one/key_old/sa-key:svc_acct_old', {
       from: new Date('2024-01-01T00:00:00Z'), to: new Date('2024-01-01T01:00:00Z'),
-    }, context(http))).rejects.toThrow(/price/i);
+    }, ctx);
+    expect(sample.costUsd).toBeCloseTo(300.15);
+    expect(sample.requests).toBe(10);
+    expect(sample.byModel).toEqual({ 'gpt-future': 240, 'gpt-other': 60, 'gpt-4o-mini': 0.15 });
+    expect(warnings).toHaveLength(2);
+    for (const model of ['gpt-future', 'gpt-other']) {
+      expect(warnings.filter(warning => JSON.stringify(warning).includes(model))).toHaveLength(1);
+    }
+  });
+
+  it('sanitizes secret-shaped unpriced model names in usage and warnings', async () => {
+    const admin = secret();
+    const upstreamSecret = secret();
+    const warnings: unknown[] = [];
+    const http = new FakeHttp().on('GET', /\/usage\/completions\?/, () => json(200, {
+      data: [{ results: [admin, upstreamSecret].map(model => ({ model, output_tokens: 1_000_000 })) }], has_more: false,
+    }));
+    const ctx = context(http, admin);
+    ctx.log = { ...silentLogger, warn: (...args) => { warnings.push(args); } };
+    const sample = await openaiProvider.usage!('proj_one/key_old', {
+      from: new Date('2024-01-01T00:00:00Z'), to: new Date('2024-01-01T01:00:00Z'),
+    }, ctx);
+    expect(sample.costUsd).toBe(120);
+    expect(sample.byModel).toEqual({ unknown: 120 });
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify({ sample, warnings }).includes(admin)).toBe(false);
+    expect(JSON.stringify({ sample, warnings }).includes(upstreamSecret)).toBe(false);
   });
 
   it('rejects invalid or looping cursors rather than silently returning incomplete key lists', async () => {

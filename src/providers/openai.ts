@@ -13,6 +13,7 @@ export interface OpenAIModelPrice {
 }
 
 /** Editable estimates, not billing data. Dated model variants inherit their base model's rates.
+ * Unpriced models use the table's highest rate for every token category.
  * Audio, image, batch and fine-tuning prices are not included. Update these rates before relying on estimates.
  */
 export const OPENAI_MODEL_PRICES: Record<string, OpenAIModelPrice> = {
@@ -59,12 +60,15 @@ function referenceId(value: unknown, ctx: ProviderContext, extra: string[] = [])
 
 function parseRef(value: string, ctx: ProviderContext): KeyRef {
   const parts = value.split('/');
-  if ((parts.length !== 2 && parts.length !== 3) || (parts.length === 3 && !parts[2]?.startsWith('sa:'))) {
+  // sa-key explicitly denotes key-only revocation. Legacy sa refs remain readable,
+  // but must also revoke only their key: the account may now own a replacement.
+  const account = parts.length === 3 ? /^(?:sa-key:|sa:)(.+)$/.exec(parts[2]!) : null;
+  if ((parts.length !== 2 && parts.length !== 3) || (parts.length === 3 && !account)) {
     throw new Error('Invalid OpenAI key reference.');
   }
   const projectId = referenceId(parts[0], ctx);
   const keyId = referenceId(parts[1], ctx);
-  const serviceAccountId = parts.length === 3 ? referenceId(parts[2]!.slice(3), ctx) : undefined;
+  const serviceAccountId = account ? referenceId(account[1], ctx) : undefined;
   return { projectId, keyId, serviceAccountId };
 }
 
@@ -129,7 +133,7 @@ async function keyRecords(ctx: ProviderContext): Promise<KeyRecord[]> {
       if (owner?.type === 'service_account') {
         const account = object(owner.service_account) ? owner.service_account : undefined;
         const accountId = referenceId(account?.id, ctx);
-        keyRef += `/sa:${accountId}`;
+        keyRef += `/sa-key:${accountId}`;
       }
       if (seenRefs.has(keyRef)) continue;
       seenRefs.add(keyRef);
@@ -155,26 +159,27 @@ async function resolveKeyRef(value: string, ctx: ProviderContext): Promise<strin
 async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationResult> {
   const oldKeyRef = await resolveKeyRef(oldValue, ctx);
   if (!oldKeyRef) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
-  const { projectId } = parseRef(oldKeyRef, ctx);
+  const { projectId, serviceAccountId } = parseRef(oldKeyRef, ctx);
+  const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
   const data = await adminJson(ctx, {
-    method: 'POST', url: `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`,
+    method: 'POST', url: serviceAccountId ? `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys` : accountPath,
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}` }),
   });
-  if (!object(data) || !object(data.api_key) || typeof data.api_key.value !== 'string'
-    || data.api_key.value.trim().length === 0 || data.api_key.value === oldValue) {
+  const key = object(data) ? (serviceAccountId ? data : data.api_key) : undefined;
+  if (!object(key) || typeof key.value !== 'string'
+    || key.value.trim().length === 0 || key.value === oldValue) {
     throw new Error('OpenAI did not return a new service-account key.');
   }
-  const newValue = data.api_key.value;
-  const accountId = referenceId(data.id, ctx, [oldValue, newValue]);
-  const keyId = referenceId(data.api_key.id, ctx, [oldValue, newValue]);
-  return { newValue, oldKeyRef, newKeyRef: `${projectId}/${keyId}/sa:${accountId}`, oldRevoked: false };
+  const newValue = key.value;
+  const accountId = serviceAccountId ?? referenceId(object(data) ? data.id : undefined, ctx, [oldValue, newValue]);
+  const keyId = referenceId(key.id, ctx, [oldValue, newValue]);
+  return { newValue, oldKeyRef, newKeyRef: `${projectId}/${keyId}/sa-key:${accountId}`, oldRevoked: false };
 }
 
 async function revoke(keyRef: string, ctx: ProviderContext): Promise<void> {
-  const { projectId, keyId, serviceAccountId } = parseRef(keyRef, ctx);
-  const suffix = serviceAccountId ? `service_accounts/${encodeURIComponent(serviceAccountId)}` : `api_keys/${encodeURIComponent(keyId)}`;
+  const { projectId, keyId } = parseRef(keyRef, ctx);
   const response = await request(ctx, {
-    method: 'DELETE', url: `${BASE}/organization/projects/${encodeURIComponent(projectId)}/${suffix}`, headers: headers(ctx),
+    method: 'DELETE', url: `${BASE}/organization/projects/${encodeURIComponent(projectId)}/api_keys/${encodeURIComponent(keyId)}`, headers: headers(ctx),
   }, PROVIDER);
   ensureOk(response, PROVIDER);
 }
@@ -203,6 +208,7 @@ async function usage(keyRef: string, window: { from: Date; to: Date }, ctx: Prov
   let costUsd = 0;
   let requests = 0;
   const byModel: Record<string, number> = Object.create(null) as Record<string, number>;
+  const warnedModels = new Set<string>();
   for (const bucket of buckets) {
     if (!object(bucket) || !Array.isArray(bucket.results)) throw new Error('OpenAI returned invalid usage buckets.');
     for (const row of bucket.results) {
@@ -212,8 +218,17 @@ async function usage(keyRef: string, window: { from: Date; to: Date }, ctx: Prov
       const output = count(row.output_tokens);
       const cached = Math.min(input, count(row.input_cached_tokens));
       requests += count(row.num_model_requests);
-      const price = priceFor(model);
-      if (!price) throw new Error('OpenAI usage model has no price estimate; update OPENAI_MODEL_PRICES.');
+      let price = priceFor(model);
+      if (!price) {
+        const rate = Math.max(...Object.values(OPENAI_MODEL_PRICES).flatMap(entry => [
+          entry.inputPerMillionUsd, entry.outputPerMillionUsd, entry.cachedInputPerMillionUsd ?? entry.inputPerMillionUsd,
+        ]));
+        price = { inputPerMillionUsd: rate, outputPerMillionUsd: rate, cachedInputPerMillionUsd: rate };
+        if (!warnedModels.has(model)) {
+          ctx.log.warn('OpenAI usage model has no price estimate; using the highest table rate.', { model, ratePerMillionUsd: rate });
+          warnedModels.add(model);
+        }
+      }
       const cost = ((input - cached) * price.inputPerMillionUsd
         + cached * (price.cachedInputPerMillionUsd ?? price.inputPerMillionUsd)
         + output * price.outputPerMillionUsd) / 1_000_000;

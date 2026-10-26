@@ -1,5 +1,4 @@
 import type { HostAdapter, HttpClient, Logger, RawVariable, ServiceRef } from '../types.js';
-import { requestJson } from './http.js';
 
 export interface RailwayHostOptions {
   token: string;
@@ -42,7 +41,18 @@ const variablesQuery = `query KeysentryVariables($projectId: String!, $environme
 const upsertMutation = `mutation KeysentryVariablesUpsert($input: VariableCollectionUpsertInput!) {
   variableCollectionUpsert(input: $input)
 }`;
-const deployMutation = `mutation KeysentryDeploy($serviceId: String!, $environmentId: String!) {
+const latestDeploymentQuery = `query KeysentryLatestDeployment($projectId: String!, $serviceId: String!, $environmentId: String!) {
+  deployments(first: 1, input: { projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId }) {
+    edges { node { id status } }
+  }
+}`;
+const redeployMutation = `mutation KeysentryRedeploy($id: String!) {
+  deploymentRedeploy(id: $id) { id status }
+}`;
+const triggerDeployMutation = `mutation KeysentryTriggerDeploy($environmentId: String!, $projectId: String!, $serviceId: String!) {
+  environmentTriggersDeploy(input: { environmentId: $environmentId, projectId: $projectId, serviceId: $serviceId })
+}`;
+const legacyDeployMutation = `mutation KeysentryDeploy($serviceId: String!, $environmentId: String!) {
   serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId)
 }`;
 const deploymentQuery = `query KeysentryDeployment($id: String!) {
@@ -51,6 +61,28 @@ const deploymentQuery = `query KeysentryDeployment($id: String!) {
 
 type Data = Record<string, unknown>;
 interface NamedEntity { id: string; name: string }
+
+// Only a sanitized marker escapes GraphQL parsing; upstream diagnostics may contain secrets.
+class RailwaySchemaError extends Error {}
+
+function isSchemaError(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const { extensions, message } = value as Data;
+  if (extensions !== null && typeof extensions === 'object' && !Array.isArray(extensions)) {
+    const { code } = extensions as Data;
+    if (typeof code === 'string') return code === 'GRAPHQL_VALIDATION_FAILED';
+  }
+  // Some GraphQL servers omit extensions.code on standard schema validation failures.
+  return typeof message === 'string' && (
+    /^Cannot query field "[^"]+" on type "[^"]+"\./.test(message)
+    || /^Unknown argument "[^"]+" on field "[^"]+"\./.test(message)
+    || /^Unknown type "[^"]+"\./.test(message)
+    || /^Field "[^"]+" is not defined by type "[^"]+"\./.test(message)
+    || /^Variable "\$[^"]+" of type "[^"]+" used in position expecting type "[^"]+"\./.test(message)
+    || /^Field "[^"]+" argument "[^"]+" of type "[^"]+" is required, but it was not provided\./.test(message)
+    || /^Field "[^"]+" of required type "[^"]+" was not provided\./.test(message)
+  );
+}
 
 function object(value: unknown): Data {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -80,15 +112,31 @@ export function createRailwayHost(options: RailwayHostOptions): HostAdapter {
   };
 
   async function graphql(query: string, variables: Data = {}): Promise<Data> {
-    const response = object(await requestJson<unknown>(http, 'Railway', {
+    const response = await http.request({
       method: 'POST', url: endpoint, headers, body: JSON.stringify({ query, variables }),
-    }));
+    }).catch(() => { throw new Error('Railway request failed'); });
+    const ok = response.status >= 200 && response.status < 300;
+    const httpError = () => new Error(`Railway request failed (HTTP ${response.status})`);
+    // Validation can use HTTP 400. Inspect that body for schema errors without treating other HTTP failures as retryable.
+    if (!ok && response.status !== 400) throw httpError();
+    let payload: unknown;
+    try {
+      payload = response.text.trim() ? response.json<unknown>() : undefined;
+    } catch {
+      throw ok ? new Error('Railway returned invalid JSON') : httpError();
+    }
+    const data = object(payload);
     // An upstream GraphQL message can echo credentials or submitted variable values.
     // Reject partial data too, and never expose the upstream message or extensions.
-    if ('errors' in response && (!Array.isArray(response.errors) || response.errors.length > 0)) {
+    if ('errors' in data && (!Array.isArray(data.errors) || data.errors.length > 0)) {
+      if (Array.isArray(data.errors) && data.errors.length > 0 && data.errors.every(isSchemaError)) {
+        throw new RailwaySchemaError('Railway GraphQL request failed');
+      }
+      if (!ok) throw httpError();
       throw new Error('Railway GraphQL request failed');
     }
-    return object(response.data);
+    if (!ok) throw httpError();
+    return object(data.data);
   }
 
   async function listConnection(
@@ -176,13 +224,32 @@ export function createRailwayHost(options: RailwayHostOptions): HostAdapter {
     },
     async redeploy(service) {
       if (service.serviceId === '') return null;
-      const data = await graphql(deployMutation, { serviceId: service.serviceId, environmentId: service.environmentId });
-      return nonemptyString(data.serviceInstanceDeployV2);
+      const scope = { projectId: service.projectId, serviceId: service.serviceId, environmentId: service.environmentId };
+      let latest: Data;
+      try {
+        latest = await graphql(latestDeploymentQuery, scope);
+      } catch (error) {
+        if (!(error instanceof RailwaySchemaError)) throw error;
+        // This compatibility path is limited to a failed read, so a failed deploy can never cause a second deploy.
+        const data = await graphql(legacyDeployMutation, { serviceId: service.serviceId, environmentId: service.environmentId });
+        return nonemptyString(data.serviceInstanceDeployV2);
+      }
+      const { edges } = object(latest.deployments);
+      if (!Array.isArray(edges)) throw new Error('Railway returned an invalid response');
+      if (edges.length > 0) {
+        const id = nonemptyString(object(object(edges[0]).node).id);
+        const data = await graphql(redeployMutation, { id });
+        return nonemptyString(object(data.deploymentRedeploy).id);
+      }
+      const data = await graphql(triggerDeployMutation, scope);
+      if (data.environmentTriggersDeploy !== true) throw new Error('Railway deployment trigger failed');
+      options.log.warn('Railway deployment triggered without a deployment ID; status polling is unavailable.');
+      return null;
     },
     async deploymentStatus(_service, deploymentId) {
       const data = await graphql(deploymentQuery, { id: deploymentId });
       const status = nonemptyString(object(data.deployment).status);
-      if (status === 'SUCCESS') return 'success';
+      if (status === 'SUCCESS' || status === 'SKIPPED') return 'success';
       if (status === 'FAILED' || status === 'CRASHED' || status === 'REMOVED') return 'failed';
       return 'pending';
     },

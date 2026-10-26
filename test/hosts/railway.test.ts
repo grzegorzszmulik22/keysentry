@@ -160,24 +160,193 @@ describe('Railway host', () => {
     } });
   });
 
-  it('starts one service deployment and returns its deployment id', async () => {
-    const http = queuedHttp({ data: { serviceInstanceDeployV2: 'deployment-1' } });
+  it('redeploys the latest deployment in the exact service scope and returns the new deployment id', async () => {
+    const http = queuedHttp(
+      { data: { deployments: { edges: [{ node: { id: 'previous-deployment', status: 'SUCCESS' } }] } } },
+      { data: { deploymentRedeploy: { id: 'deployment-1', status: 'QUEUED' } } },
+    );
     const host = createRailwayHost({ token, http, log: silentLogger });
 
     expect(await host.redeploy(service)).toBe('deployment-1');
-    expect(http.calls).toHaveLength(1);
-    expect(body(http.calls[0]!).query).toContain('serviceInstanceDeployV2');
-    expect(body(http.calls[0]!).variables).toEqual({ serviceId: 's1', environmentId: 'e1' });
+    expect(http.calls).toHaveLength(2);
+    const lookup = body(http.calls[0]!);
+    expect(lookup.query.replace(/\s+/g, ' ')).toContain(
+      'deployments(first: 1, input: { projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId }) { edges { node { id status } } }',
+    );
+    expect(lookup.query).toContain('$projectId: String!');
+    expect(lookup.query).toContain('$serviceId: String!');
+    expect(lookup.query).toContain('$environmentId: String!');
+    expect(lookup.variables).toEqual({ projectId: 'p1', serviceId: 's1', environmentId: 'e1' });
+    const redeploy = body(http.calls[1]!);
+    expect(redeploy.query).toContain('$id: String!');
+    expect(redeploy.query.replace(/\s+/g, ' ')).toContain('deploymentRedeploy(id: $id) { id status }');
+    expect(redeploy.variables).toEqual({ id: 'previous-deployment' });
+  });
+
+  it('triggers an initial service deployment and warns that status polling is unavailable', async () => {
+    const http = queuedHttp(
+      { data: { deployments: { edges: [] } } },
+      { data: { environmentTriggersDeploy: true } },
+    );
+    const warnings: string[] = [];
+    const host = createRailwayHost({ token, http, log: { ...silentLogger, warn: (message) => warnings.push(message) } });
+
+    expect(await host.redeploy(service)).toBeNull();
+    expect(http.calls).toHaveLength(2);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+    expect(body(http.calls[0]!).variables).toEqual({ projectId: 'p1', serviceId: 's1', environmentId: 'e1' });
+    const trigger = body(http.calls[1]!);
+    expect(trigger.query.replace(/\s+/g, ' ')).toContain(
+      'environmentTriggersDeploy(input: { environmentId: $environmentId, projectId: $projectId, serviceId: $serviceId })',
+    );
+    expect(trigger.query).toContain('$environmentId: String!');
+    expect(trigger.query).toContain('$projectId: String!');
+    expect(trigger.query).toContain('$serviceId: String!');
+    expect(trigger.variables).toEqual({ projectId: 'p1', serviceId: 's1', environmentId: 'e1' });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/status polling is unavailable/i);
   });
 
   it.each([
-    ['SUCCESS', 'success'], ['FAILED', 'failed'], ['CRASHED', 'failed'], ['REMOVED', 'failed'],
+    { message: `Schema rejected ${token}`, extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } },
+    { message: 'Cannot query field "deployments" on type "Query".' },
+    { message: 'Unknown argument "input" on field "Query.deployments".' },
+    { message: 'Unknown type "DeploymentListInput".' },
+    { message: 'Field "projectId" is not defined by type "DeploymentListInput".' },
+    { message: 'Variable "$projectId" of type "String!" used in position expecting type "ID!".' },
+    { message: 'Field "deployments" argument "workspaceId" of type "String!" is required, but it was not provided.' },
+    { message: 'Field "DeploymentListInput.workspaceId" of required type "String!" was not provided.' },
+  ])('uses the legacy mutation only after a lookup schema error: %j', async (schemaError) => {
+    const http = queuedHttp(
+      { errors: [schemaError] },
+      { data: { serviceInstanceDeployV2: 'legacy-deployment' } },
+    );
+    const warnings: string[] = [];
+    const host = createRailwayHost({ token, http, log: { ...silentLogger, warn: (message) => warnings.push(message) } });
+
+    expect(await host.redeploy(service)).toBe('legacy-deployment');
+    expect(http.calls).toHaveLength(2);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+    expect(body(http.calls[0]!).variables).toEqual({ projectId: 'p1', serviceId: 's1', environmentId: 'e1' });
+    const fallback = body(http.calls[1]!);
+    expect(fallback.query).toContain('$serviceId: String!');
+    expect(fallback.query).toContain('$environmentId: String!');
+    expect(fallback.query.replace(/\s+/g, ' ')).toContain(
+      'serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId)',
+    );
+    expect(fallback.variables).toEqual({ serviceId: 's1', environmentId: 'e1' });
+    expect(warnings.join(' ')).not.toContain(token);
+  });
+
+  it('recognizes a lookup schema error returned with HTTP 400', async () => {
+    let request = 0;
+    const http = new FakeHttp().on('POST', endpointPattern, () => ++request === 1
+      ? json(400, { errors: [{ message: 'Cannot query field "deployments" on type "Query".' }] })
+      : json(200, { data: { serviceInstanceDeployV2: 'legacy-deployment' } }));
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    expect(await host.redeploy(service)).toBe('legacy-deployment');
+    expect(http.calls).toHaveLength(2);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+    expect(body(http.calls[1]!).query).toContain('serviceInstanceDeployV2');
+    expect(body(http.calls[1]!).variables).toEqual({ serviceId: 's1', environmentId: 'e1' });
+  });
+
+  it.each([
+    [{ message: 'Access denied', extensions: { code: 'FORBIDDEN' } }],
+    [{ message: 'Cannot query field "deployments" on type "Query".', extensions: { code: 'FORBIDDEN' } }],
+    [{ message: 'Deployment lookup failed', extensions: { code: 'INTERNAL_SERVER_ERROR' } }],
+    [
+      { message: 'Cannot query field "deployments" on type "Query".' },
+      { message: 'Access denied', extensions: { code: 'FORBIDDEN' } },
+    ],
+  ])('does not deploy after a non-schema lookup error: %j', async (...errors) => {
+    const http = queuedHttp({ errors });
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    await expect(host.redeploy(service)).rejects.toThrow('Railway');
+    expect(http.calls).toHaveLength(1);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+  });
+
+  it.each([401, 403, 500])('does not treat a schema-shaped HTTP %s failure as a compatibility issue', async (status) => {
+    const http = new FakeHttp().on('POST', endpointPattern, () => json(status, {
+      errors: [{ message: 'Cannot query field "deployments" on type "Query".' }],
+    }));
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    await expect(host.redeploy(service)).rejects.toThrow(`HTTP ${status}`);
+    expect(http.calls).toHaveLength(1);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+  });
+
+  it.each(['http', 'invalid-json', 'transport'] as const)('does not deploy after a %s lookup failure', async (failure) => {
+    const http = new FakeHttp().on('POST', endpointPattern, () => {
+      if (failure === 'transport') throw new Error(token);
+      return failure === 'http' ? text(401, token) : text(200, token);
+    });
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    const error = await host.redeploy(service).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain(token);
+    expect(http.calls).toHaveLength(1);
+    expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+  });
+
+  it.each([null, {}, { edges: null }, { edges: [{ node: null }] }, { edges: [{ node: { id: '' } }] }])(
+    'rejects a malformed deployment lookup without triggering a deploy: %j', async (deployments) => {
+      const http = queuedHttp({ data: { deployments } });
+      const host = createRailwayHost({ token, http, log: silentLogger });
+
+      await expect(host.redeploy(service)).rejects.toThrow('Railway');
+      expect(http.calls).toHaveLength(1);
+      expect(body(http.calls[0]!).query).toContain('deployments(first: 1');
+    },
+  );
+
+  it.each(['redeploy', 'trigger', 'legacy'] as const)('never retries a %s mutation schema error through another mutation', async (path) => {
+    const http = queuedHttp(
+      path === 'legacy' ? { errors: [{ extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } }] }
+        : { data: { deployments: { edges: path === 'trigger' ? [] : [{ node: { id: 'previous', status: 'SUCCESS' } }] } } },
+      { errors: [{ extensions: { code: 'GRAPHQL_VALIDATION_FAILED' }, message: token }] },
+    );
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    const error = await host.redeploy(service).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain(token);
+    expect(http.calls).toHaveLength(2);
+    expect(body(http.calls[1]!).query).toContain(path === 'redeploy' ? 'deploymentRedeploy'
+      : path === 'trigger' ? 'environmentTriggersDeploy' : 'serviceInstanceDeployV2');
+  });
+
+  it.each([
+    ['redeploy', { deploymentRedeploy: { id: '' } }],
+    ['trigger', { environmentTriggersDeploy: false }],
+    ['legacy', { serviceInstanceDeployV2: null }],
+  ] as const)('rejects an unsuccessful %s mutation result', async (path, data) => {
+    const http = queuedHttp(
+      path === 'legacy' ? { errors: [{ extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } }] }
+        : { data: { deployments: { edges: path === 'trigger' ? [] : [{ node: { id: 'previous', status: 'SUCCESS' } }] } } },
+      { data },
+    );
+    const host = createRailwayHost({ token, http, log: silentLogger });
+
+    await expect(host.redeploy(service)).rejects.toThrow('Railway');
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ['SUCCESS', 'success'], ['SKIPPED', 'success'], ['FAILED', 'failed'], ['CRASHED', 'failed'], ['REMOVED', 'failed'],
     ['BUILDING', 'pending'], ['DEPLOYING', 'pending'], ['QUEUED', 'pending'],
+    ['SLEEPING', 'pending'], ['WAITING', 'pending'], ['UNKNOWN_FUTURE_STATUS', 'pending'],
   ])('maps deployment status %s to %s', async (status, expected) => {
     const http = queuedHttp({ data: { deployment: { status } } });
     const host = createRailwayHost({ token, http, log: silentLogger });
 
     expect(await host.deploymentStatus(service, 'deployment-1')).toBe(expected);
+    expect(body(http.calls[0]!).query).toContain('deployment(id: $id) { status }');
     expect(body(http.calls[0]!).variables).toEqual({ id: 'deployment-1' });
   });
 
