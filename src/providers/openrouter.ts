@@ -1,0 +1,153 @@
+import type { ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult } from '../types.js';
+import { credential, ensureOk, readJson, request, safeIdentity, verifyRead } from './shared.js';
+
+const BASE = 'https://openrouter.ai/api/v1';
+const PROVIDER = 'OpenRouter';
+const PAGE_SIZE = 100;
+
+type Row = Record<string, unknown>;
+
+function record(value: unknown): Row | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Row : undefined;
+}
+
+function secretValues(ctx: ProviderContext, extra: string[] = []): string[] {
+  return [...Object.values(ctx.credentials).filter((value): value is string => typeof value === 'string'), ...extra];
+}
+
+function keyRef(value: unknown, ctx: ProviderContext, extra: string[] = []): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)
+      || safeIdentity(value, '', secretValues(ctx, extra)) !== value) {
+    throw new Error(`${PROVIDER} returned an invalid key reference`);
+  }
+  return value;
+}
+
+function headers(ctx: ProviderContext): Record<string, string> {
+  return { Authorization: `Bearer ${credential(ctx, 'OPENROUTER_PROVISIONING_KEY')}`, 'Content-Type': 'application/json' };
+}
+
+async function keyRows(ctx: ProviderContext): Promise<Row[]> {
+  const auth = headers(ctx);
+  const rows: Row[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (true) {
+    // Include disabled keys so a capped key or exhausted canary remains observable.
+    const query = `?include_disabled=true${offset === 0 ? '' : `&offset=${offset}`}`;
+    const response = await request(ctx, { method: 'GET', url: `${BASE}/keys${query}`, headers: auth }, PROVIDER);
+    ensureOk(response, PROVIDER);
+    const payload = record(readJson<unknown>(response, PROVIDER));
+    if (!Array.isArray(payload?.data)) throw new Error(`${PROVIDER} returned an invalid key list`);
+    for (const entry of payload.data) {
+      const row = record(entry);
+      if (!row) throw new Error(`${PROVIDER} returned an invalid key list`);
+      const ref = keyRef(row.hash, ctx);
+      if (seen.has(ref)) throw new Error(`${PROVIDER} returned duplicate key references`);
+      seen.add(ref);
+      rows.push(row);
+    }
+    if (payload.data.length < PAGE_SIZE) return rows;
+    offset += payload.data.length;
+  }
+}
+
+async function oldKey(value: string, ctx: ProviderContext): Promise<Row | null> {
+  const response = await request(ctx, { method: 'GET', url: `${BASE}/key`, headers: { Authorization: `Bearer ${value}` } }, PROVIDER);
+  if (response.status === 401 || response.status === 403) return null;
+  ensureOk(response, PROVIDER);
+  const payload = record(readJson<unknown>(response, PROVIDER));
+  const label = record(payload?.data)?.label;
+  if (typeof label !== 'string' || label.length === 0) return null;
+  const matches = (await keyRows(ctx)).filter((row) => row.label === label);
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+async function createKey(ctx: ProviderContext, name: string, limit: number | null | undefined): Promise<{ value: string; keyRef: string }> {
+  const body: { name: string; limit?: number | null } = { name };
+  if (limit !== undefined) body.limit = limit;
+  const response = await request(ctx, { method: 'POST', url: `${BASE}/keys`, headers: headers(ctx), body: JSON.stringify(body) }, PROVIDER);
+  ensureOk(response, PROVIDER);
+  const payload = record(readJson<unknown>(response, PROVIDER));
+  if (typeof payload?.key !== 'string' || payload.key.length === 0) throw new Error(`${PROVIDER} returned an invalid new key`);
+  return { value: payload.key, keyRef: keyRef(record(payload.data)?.hash, ctx, [payload.key]) };
+}
+
+/** Create a decoy key whose maximum provider spend is one cent. */
+export function createCanaryKey(ctx: ProviderContext, name: string): Promise<{ value: string; keyRef: string }> {
+  return createKey(ctx, name, 0.01);
+}
+
+export const openrouterProvider: ProviderAdapter = {
+  id: 'openrouter',
+  method: 'auto',
+
+  verify(value, ctx) {
+    return verifyRead(ctx, { method: 'GET', url: `${BASE}/key`, headers: { Authorization: `Bearer ${value}` } }, PROVIDER, (payload) => {
+      const label = record(record(payload)?.data)?.label;
+      return safeIdentity(label, 'OpenRouter key', secretValues(ctx, [value]));
+    });
+  },
+
+  async resolveKeyRef(value, ctx) {
+    const row = await oldKey(value, ctx);
+    return row ? keyRef(row.hash, ctx, [value]) : null;
+  },
+
+  async listKeys(ctx): Promise<ProviderKeyInfo[]> {
+    return (await keyRows(ctx)).map((row) => {
+      const secrets = secretValues(ctx);
+      const name = safeIdentity(row.name, '', secrets);
+      const hint = safeIdentity(row.label, '', secrets);
+      const createdAt = typeof row.created_at === 'string' && !Number.isNaN(Date.parse(row.created_at)) ? row.created_at : undefined;
+      const limit = row.limit;
+      if (limit !== undefined && limit !== null && (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0)) {
+        throw new Error(`${PROVIDER} returned an invalid spending limit`);
+      }
+      return {
+        keyRef: keyRef(row.hash, ctx),
+        ...(name ? { name } : {}),
+        ...(hint ? { hint } : {}),
+        ...(createdAt ? { createdAt } : {}),
+        ...(typeof row.disabled === 'boolean' ? { disabled: row.disabled } : {}),
+        ...(limit !== undefined ? { limitUsd: limit as number | null } : {}),
+      };
+    });
+  },
+
+  async rotate(value, ctx): Promise<RotationResult> {
+    credential(ctx, 'OPENROUTER_PROVISIONING_KEY');
+    const previous = await oldKey(value, ctx);
+    if (!previous) throw new Error(`${PROVIDER} could not identify the old key; no replacement was created`);
+    const previousRef = keyRef(previous.hash, ctx, [value]);
+    const limit = previous.limit;
+    if (limit !== undefined && limit !== null && (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0)) {
+      throw new Error(`${PROVIDER} returned an invalid spending limit`);
+    }
+    const created = await createKey(ctx, `keysentry-${new Date().toISOString()}`, limit as number | null | undefined);
+    return { newValue: created.value, oldKeyRef: previousRef, newKeyRef: created.keyRef, oldRevoked: false };
+  },
+
+  async revoke(ref, ctx) {
+    const response = await request(ctx, { method: 'DELETE', url: `${BASE}/keys/${encodeURIComponent(keyRef(ref, ctx))}`, headers: headers(ctx) }, PROVIDER);
+    ensureOk(response, PROVIDER);
+  },
+
+  async cap(ref, ctx) {
+    const response = await request(ctx, { method: 'PATCH', url: `${BASE}/keys/${encodeURIComponent(keyRef(ref, ctx))}`, headers: headers(ctx), body: JSON.stringify({ disabled: true }) }, PROVIDER);
+    ensureOk(response, PROVIDER);
+  },
+
+  async usage(ref, window, ctx) {
+    keyRef(ref, ctx);
+    const row = (await keyRows(ctx)).find((entry) => entry.hash === ref);
+    if (!row || typeof row.usage !== 'number' || !Number.isFinite(row.usage) || row.usage < 0) {
+      throw new Error(`${PROVIDER} did not return a valid cumulative usage counter`);
+    }
+    return { keyRef: ref, from: window.from.toISOString(), to: window.to.toISOString(), costUsd: 0, cumulativeCostUsd: row.usage };
+  },
+
+  guidance() {
+    return { url: 'https://openrouter.ai/settings/keys', steps: ['Create a new key with the same spending limit.', 'Update every consumer and verify the replacement key.', 'Delete the old key after its consumers have redeployed.'] };
+  },
+};
