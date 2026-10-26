@@ -105,6 +105,8 @@ export type ProviderId =
   | 'private-key'
   | 'crypto-wallet'
   | 'app-secret'
+  /** Data-encryption keys (ENCRYPTION_KEY, *_ENCRYPTION_KEY, MASTER_KEY…): replacing one needs a data migration. */
+  | 'encryption-key'
   | 'unknown';
 
 /** Damage class; also the default rotation order (index 0 first). */
@@ -136,6 +138,11 @@ export interface Consumer {
   /** Human hint: prefix (≤ 7 chars) + "…" + last 4 chars, only when value length ≥ 16; else null. */
   hint: string | null;
   sealed: boolean;
+  /**
+   * The service receives this value through a host reference (e.g. Railway `${{api.OPENAI_API_KEY}}`) rather than
+   * holding its own copy: it must be redeployed when the referenced variable changes, but never written to.
+   */
+  reference?: boolean;
 }
 
 export interface SecretFinding extends Consumer, Classification {}
@@ -294,7 +301,11 @@ export interface RotationReport {
   startedAt: string;
   finishedAt: string;
   steps: StepReport[];
-  deployments: { serviceKey: string; deploymentId: string | null; state: DeployState | 'skipped' }[];
+  /**
+   * skipped: service not written. unconfirmed: written, but activation can't be confirmed (host without redeploy,
+   * next-deploy targets, null deployment id, manual restart needed).
+   */
+  deployments: { serviceKey: string; deploymentId: string | null; state: DeployState | 'skipped' | 'unconfirmed' }[];
   /** Human-readable diff of planned writes (names and hints only). */
   diff: string[];
 }
@@ -351,6 +362,18 @@ export interface Policy {
   /** No automatic re-rotation of the same cluster within this window. */
   cooldownMinutes: number;
   maxAutoRotationsPerDay: number;
+  /**
+   * If false (default), `cap` (provider-side disable) also waits for human approval like rotations do. Containment
+   * can break consumers (Anthropic cap = deactivate), so it is opt-in.
+   */
+  autoContain: boolean;
+  /** No repeated automatic containment of the same key within this window. */
+  containCooldownMinutes: number;
+  /**
+   * For high-confidence signals (canary, leak, upstream revocation): revoke the old key even when some consumer's
+   * activation cannot be confirmed (next-deploy targets, manual restarts). A leaked key must die; default true.
+   */
+  revokeUnconfirmedOnHighConfidence: boolean;
 }
 
 export interface PendingAction {
