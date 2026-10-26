@@ -16,6 +16,8 @@ export interface MonitorState {
   cumulativeTotals: Record<string, CumulativeTotal>;
   keyRefs: Record<string, string>;
   canaries: Canary[];
+  /** Keyed feed URL fingerprints mapped to the first successful poll time. */
+  feedBaselines: Record<string, string>;
   seenFeedItems: Record<string, string>;
   seenGithubAlerts: Record<string, string>;
   lastVerify: Record<string, LastVerify>;
@@ -30,7 +32,7 @@ export interface MonitorStateStore {
 
 export function createMonitorState(): MonitorState {
   return { version: 1, usageHistory: {}, cumulativeTotals: {}, keyRefs: {}, canaries: [],
-    seenFeedItems: {}, seenGithubAlerts: {}, lastVerify: {}, cooldowns: {}, pendingActions: [], autoRotations: {} };
+    feedBaselines: {}, seenFeedItems: {}, seenGithubAlerts: {}, lastVerify: {}, cooldowns: {}, pendingActions: [], autoRotations: {} };
 }
 
 /** Provider namespace prevents unrelated providers' key references from colliding. */
@@ -62,6 +64,7 @@ const schema = z.object({
   cumulativeTotals: z.record(safeText,z.object({costUsd:amount,requests:amount.optional(),byModel:amounts.optional(),at:date})),
   keyRefs: z.record(safeText,safeText),
   canaries: z.array(z.object({id:safeText,provider:z.literal('openrouter'),keyRef:safeText,service,varName:safeText,createdAt:date,triggeredAt:date.optional()})),
+  feedBaselines: z.record(safeText,date).default({}),
   seenFeedItems: z.record(safeText,date), seenGithubAlerts:z.record(safeText,date),
   lastVerify: z.record(safeText,z.object({at:date,ok:z.boolean(),status:z.number().int().optional(),fingerprint:safeText})),
   cooldowns:z.record(safeText,date),

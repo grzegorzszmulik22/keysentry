@@ -1,0 +1,68 @@
+# Credentials belong in environment variables, never in this file.
+# Environment scope settings override matching YAML settings.
+hosts:
+  railway:
+    enabled: true
+    # projectIds: [project-id]
+    # tokenType: project
+  vercel:
+    enabled: true
+    targets: [production, preview]
+    # teamId: team-id
+  render:
+    enabled: true
+  fly:
+    enabled: true
+    # Supply FLY_ORG or configure app names:
+    # apps: [example-app]
+  github:
+    enabled: true
+    repos: [] # owner/repo for repository Actions secrets
+  dotenv:
+    enabled: true
+    roots: [.] # resolved from --cwd
+    includeTemplates: false
+
+rotation:
+  revoke: after-deploy
+  redeploy: true
+  deployTimeoutMs: 600000
+  pollIntervalMs: 5000
+
+monitor:
+  interval: 300 # seconds
+  autoExecute: false # rotations require approval unless explicitly enabled
+  cooldownMinutes: 60
+  maxAutoRotationsPerDay: 10 # clusters, per UTC day
+  usage:
+    floorUsd: 2
+    hourlyBudgets: {} # cluster ID or provider:keyRef => hourly USD limit
+  rules:
+    canary_triggered:
+      action: rotate
+      scope: service
+      minConfidence: medium
+    leak_detected:
+      action: rotate
+      scope: cluster
+      minConfidence: high
+    revoked_upstream:
+      action: rotate
+      scope: cluster
+      minConfidence: high
+    # Cap/disable is immediate containment even with autoExecute: false.
+    # Use action: alert for observation-only monitoring.
+    usage_anomaly:
+      action: cap
+      scope: cluster
+      minConfidence: medium
+    host_breach_advisory:
+      action: alert
+      scope: host
+      minConfidence: medium
+  # Uncomment to disable external advisory RSS/Atom polling:
+  # feeds: []
+  # Enable GitHub secret-scanning monitoring with explicit alert repositories:
+  # github:
+  #   repos: [owner/repo]
+  # Supply webhook credentials via KEYSENTRY_WEBHOOK_URL.

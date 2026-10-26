@@ -1,7 +1,7 @@
 import type { Inventory, Notifier, Policy, Signal } from '../types.js';
 import { executeDecisions, type ActionContext, type RotateExecutor } from './actions.js';
 import { now, type DetectorContext } from './context.js';
-import { detectBreachFeeds, type BreachFeed } from './detectors/breach-feed.js';
+import { detectBreachFeeds, type BreachFeed, type BreachFeedOptions } from './detectors/breach-feed.js';
 import { detectCanaries } from './detectors/canary.js';
 import { detectGithubLeaks, type GithubOptions } from './detectors/github-leaks.js';
 import { detectRevoked } from './detectors/revoked.js';
@@ -17,6 +17,7 @@ export interface MonitorContext extends Omit<DetectorContext,'state'> {
   notifier: Notifier;
   rotate: RotateExecutor;
   feeds?: readonly BreachFeed[];
+  breachFeedOptions?: BreachFeedOptions;
   github?: GithubOptions;
   usageOptions?: UsageOptions;
 }
@@ -39,7 +40,7 @@ async function poll(ctx: MonitorContext): Promise<{signals:Signal[];decisions:De
   const decisions:Decision[]=[];
   const detectors: Array<() => Promise<Signal[]>> = [
     ()=>detectCanaries(detector), ()=>detectUsage(detector,ctx.usageOptions),
-    ()=>detectBreachFeeds(detector,ctx.feeds),
+    ()=>detectBreachFeeds(detector,ctx.feeds,ctx.breachFeedOptions),
     ()=>ctx.github ? detectGithubLeaks(detector,ctx.github):Promise.resolve([]),
     ()=>detectRevoked(detector),
   ];
@@ -62,10 +63,12 @@ async function poll(ctx: MonitorContext): Promise<{signals:Signal[];decisions:De
         }
       } else if(signal.kind==='host_breach_advisory' || signal.kind==='leak_detected') {
         const feed=signal.kind==='host_breach_advisory';
-        const key=feed ? signal.evidence.itemId:signal.evidence.alertId;
-        if(typeof key==='string') {
-          const target=feed ? state.seenFeedItems:state.seenGithubAlerts;
-          const original=feed ? before.feeds:before.github;
+        const ids=feed ? signal.evidence.itemIds:[signal.evidence.alertId];
+        const keys=Array.isArray(ids) ? [...new Set(ids.filter((id):id is string=>typeof id==='string'))]:[];
+        const target=feed ? state.seenFeedItems:state.seenGithubAlerts;
+        const original=feed ? before.feeds:before.github;
+        const sources:Array<{remaining:number;ack:()=>void}>=[];
+        for(const key of keys) {
           if(original[key]) target[key]=original[key]; else delete target[key];
           const groupKey=`${signal.kind}:${key}`;
           let group=sourceGroups.get(groupKey);
@@ -74,9 +77,9 @@ async function poll(ctx: MonitorContext): Promise<{signals:Signal[];decisions:De
             sourceGroups.set(groupKey,group);
           }
           group.remaining++;
-          const source=group;
-          acknowledgments.set(signal,()=>{if(--source.remaining===0) source.ack();});
+          sources.push(group);
         }
+        acknowledgments.set(signal,()=>{for(const source of sources) if(--source.remaining===0) source.ack();});
       } else if(signal.kind==='revoked_upstream') {
         const observed=signal.clusterIds.map(id=>[id,state.lastVerify[id]] as const);
         for(const id of signal.clusterIds) {

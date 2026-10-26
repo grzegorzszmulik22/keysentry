@@ -29,6 +29,16 @@ describe('monitor state', () => {
     await expect(store.save({...state,version:2} as never)).rejects.toThrow('Invalid monitor state');
   });
 
+  it('persists feed baselines and loads legacy state without a baseline', async () => {
+    const state = createMonitorState();
+    state.feedBaselines = { 'feed-fingerprint': '2026-10-26T12:00:00.000Z' };
+    const store = createMemoryMonitorStateStore(state);
+    expect((await store.load()).feedBaselines).toEqual({ 'feed-fingerprint': '2026-10-26T12:00:00.000Z' });
+    const { feedBaselines, ...legacy } = state;
+    await store.save(legacy as never);
+    expect((await store.load()).feedBaselines).toEqual({});
+  });
+
   it('expires old hourly buckets even for keys no longer inventoried',()=>{
     const state=createMonitorState();
     state.usageHistory.orphan=[{hour:'2026-01-01T00:00:00.000Z',costUsd:1}];

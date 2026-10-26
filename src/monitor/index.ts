@@ -7,7 +7,7 @@ export { createCanary, listCanaries, removeCanary } from './canary.js';
 export type { CreateCanaryOptions } from './canary.js';
 export { detectCanaries } from './detectors/canary.js';
 export { detectBreachFeeds, DEFAULT_BREACH_FEEDS } from './detectors/breach-feed.js';
-export type { BreachFeed } from './detectors/breach-feed.js';
+export type { BreachFeed, BreachFeedOptions } from './detectors/breach-feed.js';
 export { detectGithubLeaks } from './detectors/github-leaks.js';
 export type { GithubOptions } from './detectors/github-leaks.js';
 export { detectRevoked } from './detectors/revoked.js';

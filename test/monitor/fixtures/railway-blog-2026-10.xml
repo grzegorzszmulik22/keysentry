@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+    <channel>
+        <title>Railway Blog</title>
+        <link>https://blog.railway.com</link>
+        <description>A series of posts ranging from deployment tutorials to deep engineering adventures to how the team works and builds Railway.</description>
+        <lastBuildDate>Mon, 26 Oct 2026 17:53:25 GMT</lastBuildDate>
+        <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
+        <generator>https://github.com/jpmonette/feed</generator>
+        <language>en</language>
+        <copyright>Copyright (c) 2026 Railway Corp.</copyright>
+        <item>
+            <title><![CDATA[Preliminary Report: Oct 21st Security Incident]]></title>
+            <link>https://blog.railway.com/p/preliminary-report-october-security-incident</link>
+            <guid>https://blog.railway.com/p/preliminary-report-october-security-incident</guid>
+            <pubDate>Thu, 22 Oct 2026 23:31:37 GMT</pubDate>
+            <description><![CDATA[Preliminary report detailing Railway's October 21st security incident.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/f22327a1-2304-49a1-bc08-27912ecb9ff0-blog-preliminary-report-oct-21st-security-incident.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure Recommendation: Check for Unexpected Anthropic Usage]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-recommendation-check-for-unexpected-anthropic-usage</link>
+            <guid>https://blog.railway.com/p/security-disclosure-recommendation-check-for-unexpected-anthropic-usage</guid>
+            <pubDate>Thu, 22 Oct 2026 00:46:00 GMT</pubDate>
+            <description><![CDATA[Learn how to Security Disclosure Recommendation: Check for Unexpected Anthropic Usage]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure Recommendation: Rotate PostgreSQL Database Credentials]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-recommendation-rotate-postgresql-database-credentials</link>
+            <guid>https://blog.railway.com/p/security-disclosure-recommendation-rotate-postgresql-database-credentials</guid>
+            <pubDate>Thu, 22 Oct 2026 00:45:42 GMT</pubDate>
+            <description><![CDATA[Learn how to rotate PostgreSQL Database Credentials]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure: Wednesday October 21st]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-wednesday-october-21st</link>
+            <guid>https://blog.railway.com/p/security-disclosure-wednesday-october-21st</guid>
+            <pubDate>Wed, 21 Oct 2026 20:44:02 GMT</pubDate>
+            <description><![CDATA[Railway detected anomalous activity involving systems that store customer environment variables and recommends your immediate attention]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/011ecc20-b745-400f-94cc-b4a75dead6db-blog-security-disclosure-wednesday-october-21st.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[The Best Declarative Deploy Configs in 2026]]></title>
+            <link>https://blog.railway.com/p/declarative-deploy-configs</link>
+            <guid>https://blog.railway.com/p/declarative-deploy-configs</guid>
+            <pubDate>Wed, 14 Oct 2026 20:03:47 GMT</pubDate>
+            <description><![CDATA[A comparison of declarative deployment config systems across cloud providers.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/2d80145f-a699-4834-9fca-4a938fbc5128-blog-the-best-declarative-deploy-configs-in-2026.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[Railway Agent now available in Slack and Discord]]></title>
+            <link>https://blog.railway.com/p/railway-agent-slack-discord</link>
+            <guid>https://blog.railway.com/p/railway-agent-slack-discord</guid>
+            <pubDate>Mon, 05 Oct 2026 21:40:00 GMT</pubDate>
+            <description><![CDATA[Railway Agent is now available in Slack and Discord, here's how to get started and some example use cases.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/f42b1f9c-1603-47b4-8621-3e99e67dcf2b-blog-railway-agent-now-available-in-slack-and-discord.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[The Best Secrets Management Platforms for Cloud Apps in 2026]]></title>
+            <link>https://blog.railway.com/p/best-secrets-management-2026</link>
+            <guid>https://blog.railway.com/p/best-secrets-management-2026</guid>
+            <pubDate>Mon, 25 May 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[The seven jobs of a real secrets manager, when your PaaS handles it for you, and which dedicated tools earn their keep across multi-platform stacks.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+        </item>
+<item>
+            <title><![CDATA[Incident Report: December 16th, 2025]]></title>
+            <link>https://blog.railway.com/p/incident-report-december-16-2025</link>
+            <guid>https://blog.railway.com/p/incident-report-december-16-2025</guid>
+            <pubDate>Tue, 16 Dec 2025 00:00:00 GMT</pubDate>
+            <description><![CDATA[We recently experienced an incident caused by the exploitation of a newly disclosed vulnerability in certain Next.js versions.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/8c86f6d8e363dbc9c2690b2bedb7111a65186679c97ba99120b37c8724a29331.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[Upgrading 3 Million Variables to Envelope Encryption]]></title>
+            <link>https://blog.railway.com/p/envelope-encryption</link>
+            <guid>https://blog.railway.com/p/envelope-encryption</guid>
+            <pubDate>Tue, 16 Apr 2024 00:00:00 GMT</pubDate>
+            <description><![CDATA[The path to bare metal was blocked by KMS. This is the story of how we rid ourselves of that dependency by migrating more than three million variables to envelope encryption.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/d2d0b09bbe1108b1aea0bed4755ae3c40c11c796271fe196d3d564ba044274c3.png" length="0" type="image/png"/>
+        </item>
+</channel></rss>
