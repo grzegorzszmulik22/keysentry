@@ -221,9 +221,9 @@ export async function executePlan(
     } catch { service.readFailed = true; }
     return service;
   }
-  // Retain a rolled result through failures in journaling, logging, or backoff.
-  // Emergency recovery is deliberately independent of those failing facilities.
-  async function recoverRolledValues(): Promise<void> {
+  // Deliver earlier rolls before a late human prompt or after execution stops.
+  // Emergency recovery is deliberately independent of failing injected facilities.
+  async function preserveRolledValues(reason: 'execution-failure' | 'guided-fallback'): Promise<void> {
     const rolled = works.filter(work => work.atomicRoll && work.result);
     for (const [key, service] of services) {
       const pending = rolled.filter(work => work.services.has(key) && !work.delivered?.has(key));
@@ -259,17 +259,25 @@ export async function executePlan(
     for (const work of rolled) {
       const missing = [...work.services].filter(key => !work.delivered?.has(key));
       if (missing.length === 0) {
+        if (reason === 'guided-fallback') {
+          for (const key of work.services) await journal('written', { clusterId: work.step.clusterId, serviceKey: key, data: {
+            phase: 'before-guided-fallback', newFingerprint: work.report.newFingerprint, oldRevoked: true,
+          } });
+          continue;
+        }
         try { warn(work, `URGENT: Rolled replacement was preserved after execution stopped; confirm activation or manually restart/deploy: ${[...work.services].join(', ')}.`); }
         catch { /* a broken logger must not undo successful recovery */ }
         continue;
       }
       if (work.revealed) continue;
-      const reason = 'URGENT: ROLLED VALUE UNWRITTEN after execution failure; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.';
+      const message = reason === 'guided-fallback'
+        ? 'URGENT: ROLLED VALUE UNWRITTEN before guided rotation; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.'
+        : 'URGENT: ROLLED VALUE UNWRITTEN after execution failure; the old key is already revoked. Paste the replacement manually and restart/deploy the affected services.';
       work.report.status = 'failed';
-      work.report.error = reason;
-      try { warn(work, reason); } catch { /* a broken logger must not suppress reveal */ }
+      work.report.error = message;
+      try { warn(work, message); } catch { /* a broken logger must not suppress reveal */ }
       if (deps.reveal) try {
-        await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason }, work.result!.newValue);
+        await deps.reveal({ clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint, reason: message }, work.result!.newValue);
         work.revealed = true;
       } catch { /* preserve the original fixed execution error */ }
       try { await journal('failed', { clusterId: work.step.clusterId, data: {
@@ -392,6 +400,28 @@ export async function executePlan(
         }
         return false;
       }
+      async function guidedReplacement(work: StepWork, permissionsFallback = false): Promise<RotationResult | null> {
+        const provider = work.provider!;
+        if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
+        const value = await deps.prompt({
+          clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint,
+          guidance: provider.guidance(), consumers: work.step.consumers,
+        });
+        if (value === null) {
+          work.report.status = 'skipped';
+          if (permissionsFallback) warn(work, "automatic rotation would change this key's permissions; rotate it by hand");
+          return null;
+        }
+        register(value);
+        if (invalidGuidedValue(work, value)) {
+          work.report.status = 'skipped';
+          warn(work, 'Pasted replacement has a different provider or is incomplete/truncated; no consumer was changed.');
+          return null;
+        }
+        // A pasted replacement must never become the OLD ref.
+        const oldKeyRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, work.ctx!) : null;
+        return { newValue: value, oldKeyRef, newKeyRef: null, oldRevoked: false };
+      }
       for (const work of preparation) {
         work.ready = false;
         try {
@@ -399,23 +429,26 @@ export async function executePlan(
           const ctx = work.ctx!;
           let result: RotationResult;
           if (work.guided) {
-            if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
-            const value = await deps.prompt({
-              clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint,
-              guidance: provider.guidance(), consumers: work.step.consumers,
-            });
-            if (value === null) { work.report.status = 'skipped'; continue; }
-            register(value);
-            if (invalidGuidedValue(work, value)) {
-              work.report.status = 'skipped';
-              warn(work, 'Pasted replacement has a different provider or is incomplete/truncated; no consumer was changed.');
-              continue;
-            }
-            // Resolve these independently: a pasted replacement must never become the OLD ref.
-            const oldKeyRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, ctx) : null;
-            result = { newValue: value, oldKeyRef, newKeyRef: null, oldRevoked: false };
+            const replacement = await guidedReplacement(work);
+            if (!replacement) continue;
+            result = replacement;
           } else {
-            result = await provider.rotate!(work.oldValue ?? '', ctx);
+            try { result = await provider.rotate!(work.oldValue ?? '', ctx); }
+            catch (error) {
+              if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'GUIDED_ROTATION_REQUIRED') throw error;
+              // This code guarantees rotate rejected before mutation, even for
+              // an adapter or stale plan that advertised an atomic roll.
+              work.guided = true;
+              work.atomicRoll = false;
+              const atomicRollsAlreadyRan = works.some(previous => previous.atomicRoll && previous.result);
+              if (atomicRollsAlreadyRan) await preserveRolledValues('guided-fallback');
+              await journal('created', { clusterId: work.step.clusterId, data: {
+                phase: 'guided-fallback', code: 'GUIDED_ROTATION_REQUIRED', atomicRollsAlreadyRan,
+              } });
+              const replacement = await guidedReplacement(work, true);
+              if (!replacement) continue;
+              result = replacement;
+            }
             // Save before invoking any injected registration/logging/journal code.
             work.result = result;
             work.atomicRoll ||= result.oldRevoked;
@@ -702,7 +735,7 @@ export async function executePlan(
     await journal('plan-end', { data: { dryRun, steps: report.steps } });
     return sanitize(report, true);
   } catch (error) {
-    await recoverRolledValues();
+    await preserveRolledValues('execution-failure');
     throw error;
   }
 }
