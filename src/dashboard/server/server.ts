@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { ASSETS } from '../generated/assets.js';
 import { apiRoute, bodyDigest, validateApi } from './api.js';
 import type { DashboardApi } from './api.js';
-import { createPasskeyGate, PasskeyGateError } from './passkey-gate.js';
+import { createPasskeyGate, PasskeyGateError, REGISTER_IN_TERMINAL } from './passkey-gate.js';
 import type { PasskeyStore } from './passkey-gate.js';
 import { createSession, sameToken } from './session.js';
 import { checkRequest, CSP, DashboardError, json, readJson, securityHeaders } from './security.js';
@@ -11,19 +11,36 @@ import { checkRequest, CSP, DashboardError, json, readJson, securityHeaders } fr
 export interface DashboardOptions {
   api: DashboardApi;
   readOnly: boolean;
-  /** Supply encrypted persistent storage when enrollment or changes are available. */
+  /** Share the encrypted passkey store used by terminal registration. */
   passkeys?: PasskeyStore;
   idleMs?: number;
   open?: (url: string) => void;
   now?: () => number;
+  /** Receives only fixed, value-free operational error classes. */
+  onError?: (errorClass: string) => void;
 }
 
 const START_PAGE = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>keysentry</title><body><p>Open keysentry from your terminal with keysentry ui.</p></body></html>';
 const unavailablePasskeys: PasskeyStore = {
   list: async () => [],
-  add: async () => { throw new DashboardError(409, 'Connect passkey storage before registering a passkey.'); },
+  add: async () => { throw new DashboardError(409, 'Register passkeys from your terminal.'); },
   update: async () => { throw new DashboardError(409, 'Connect passkey storage before using a passkey.'); },
 };
+
+function operationalError(error: unknown): { status: 500 | 503; errorClass: string } {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+  // Older state-store writers use this fixed diagnostic rather than a code.
+  if (code === 'STATE_BUSY' || (error instanceof Error && error.message === "keysentry's saved state is busy. Try again when the other operation finishes.")) {
+    return { status: 503, errorClass: 'STATE_BUSY' };
+  }
+  if (code === 'VAULT_UNAVAILABLE') return { status: 503, errorClass: 'VAULT_UNAVAILABLE' };
+  if (error instanceof Error && error.message === 'The vault is busy in another keysentry process. Try again after it finishes.') {
+    return { status: 503, errorClass: 'VAULT_BUSY' };
+  }
+  // Never forward arbitrary names, codes, messages or stacks from handlers/storage.
+  const known = ['STATE_LOCKED', 'STATE_CORRUPT', 'VAULT_LOCKED', 'VAULT_READ_ONLY'] as const;
+  return { status: 500, errorClass: known.find(value => value === code) ?? 'ERROR' };
+}
 
 export async function startDashboard(opts: DashboardOptions): Promise<{ url: string; port: number; close(): Promise<void> }> {
   validateApi(opts.api);
@@ -90,11 +107,14 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
         const csrf = req.headers['x-csrf-token'];
         if (typeof csrf !== 'string' || !sameToken(csrf, session.csrf)) throw new DashboardError(403, 'Reload the dashboard before making this change.');
       }
-      const builtIn = ['passkey/challenge', 'passkey/register/options', 'passkey/register/finish'].includes(name);
+      const builtIn = name === 'passkey/challenge';
       const route = apiRoute(opts.api, name);
       if (!builtIn && !route) throw new DashboardError(404, 'This action is not available.');
       if (req.method !== (builtIn ? 'POST' : route!.method)) throw new DashboardError(405, 'Use the method provided for this action.');
-      if (opts.readOnly && (builtIn || route!.mutating)) throw new DashboardError(403, 'This dashboard is read-only. Open keysentry from a human terminal to make changes.');
+      if (opts.readOnly && (builtIn || route!.mutating)) {
+        if ((await passkeys.list()).length === 0) throw new DashboardError(403, REGISTER_IN_TERMINAL);
+        throw new DashboardError(403, 'This dashboard is read-only. Open keysentry from a human terminal to make changes.');
+      }
       const body = req.method === 'POST' ? await readJson(req) : undefined;
       const proof = req.headers['x-passkey-assertion'];
       if (Array.isArray(proof)) throw new DashboardError(403, 'Confirm this action with your passkey.');
@@ -104,16 +124,8 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
           throw new DashboardError(400, 'Choose an action and its JSON body digest.');
         }
         const action = apiRoute(opts.api, input.route);
-        if (input.route !== 'passkey/register/options' && (!action || action.method !== 'POST' || !action.mutating)) throw new DashboardError(400, 'Choose an action that requires a passkey.');
+        if (!action || action.method !== 'POST' || !action.mutating) throw new DashboardError(400, 'Choose an action that requires a passkey.');
         json(res, 200, await gate.challenge(session.id, input.route, input.bodyDigest)); return;
-      }
-      if (name === 'passkey/register/options') {
-        if ((await passkeys.list()).length > 0) await gate.verify(session.id, name, bodyDigest(body), proof);
-        json(res, 200, await gate.registrationOptions(session.id)); return;
-      }
-      if (name === 'passkey/register/finish') {
-        await gate.registrationFinish(session.id, body);
-        json(res, 200, { registered: true }); return;
       }
       if (route!.mutating) await gate.verify(session.id, name, bodyDigest(body), proof);
       const result = await route!.handler(body, { session: session.id });
@@ -121,18 +133,39 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
     } catch (error) {
       if (res.headersSent || res.destroyed) { res.destroy(); return; }
       if (error instanceof DashboardError || error instanceof PasskeyGateError) json(res, error.status, { error: error.message });
-      else json(res, 400, { error: 'The request could not be completed. Try again from keysentry.' });
+      else {
+        const { status, errorClass } = operationalError(error);
+        try { opts.onError?.(errorClass); } catch { /* Reporting must not interrupt the fixed response. */ }
+        if (status === 503) res.setHeader('Retry-After', '2');
+        json(res, status, { error: 'The request could not be completed. Try again from keysentry.' });
+      }
     }
   }
 
   // Node can otherwise send implicit responses without the dashboard's security headers.
-  server.on('checkContinue', (req, res) => { securityHeaders(res); json(res, 417, { error: 'Send the request without an expectation header.' }); req.resume(); });
-  server.on('checkExpectation', (req, res) => { securityHeaders(res); json(res, 417, { error: 'Send the request without an expectation header.' }); req.resume(); });
-  server.on('connect', (_req, socket) => {
-    socket.end(`HTTP/1.1 405 Method Not Allowed\r\nContent-Security-Policy: ${CSP}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nPermissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=(self)\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Use GET or POST for this request."}`);
+  const refuseExpectation = (req: IncomingMessage, res: ServerResponse) => {
+    securityHeaders(res);
+    try {
+      checkRequest(req, port);
+      json(res, 417, { error: 'Send the request without an expectation header.' });
+    } catch (error) {
+      if (error instanceof DashboardError) json(res, error.status, { error: error.message });
+      else json(res, 500, { error: 'The request could not be completed. Try again from keysentry.' });
+    }
+    req.resume();
+  };
+  server.on('checkContinue', refuseExpectation);
+  server.on('checkExpectation', refuseExpectation);
+  server.on('connect', (req, socket) => {
+    try { checkRequest(req, port); }
+    catch {
+      socket.end(`HTTP/1.1 403 Forbidden\r\nContent-Security-Policy: ${CSP}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nPermissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=()\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Send this request from the local dashboard."}`);
+      return;
+    }
+    socket.end(`HTTP/1.1 405 Method Not Allowed\r\nContent-Security-Policy: ${CSP}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nPermissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=()\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Use GET or POST for this request."}`);
   });
   server.on('clientError', (_error, socket) => {
-    if (socket.writable) socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Security-Policy: ${CSP}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nPermissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=(self)\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Send a valid HTTP request."}`);
+    if (socket.writable) socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Security-Policy: ${CSP}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nPermissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=()\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Send a valid HTTP request."}`);
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);

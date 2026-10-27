@@ -1,6 +1,6 @@
 import { get, post, postWithPasskey, type DashboardSession } from '../api.js';
 import { confirmAction, emptyState, table } from '../components.js';
-import { actions, el, field, input, lifetime, message, paragraph, scrollTable, status, taskButton } from './components-b.js';
+import { actions, el, field, fieldError, input, lifetime, message, paragraph, scrollTable, status, taskButton } from './components-b.js';
 
 type NotifyChannelKind = 'telegram' | 'discord' | 'slack' | 'ntfy' | 'webhook' | 'resend' | 'smtp' | 'console';
 interface Channel { id: string; kind: NotifyChannelKind; label: string; lastSuccessAt: string | null }
@@ -43,6 +43,8 @@ export async function renderNotifications(session: DashboardSession): Promise<HT
           message(feedback, 'Channel removed', 'keysentry will no longer send notifications to this channel.', 'ok');
         } else message(feedback, 'Channel unchanged', 'The channel was not removed. Refresh the page and try again.', 'attention');
       }, session.readOnly);
+      const duplicate = data.channels.some(item => item.id !== channel.id && item.label === channel.label && item.kind === channel.kind);
+      remove.setAttribute('aria-label', `Remove ${channel.label} (${channel.kind})${duplicate ? `, ${channel.id}` : ''}`);
       return [channel.label, kinds[channel.kind]?.label ?? channel.kind, channel.lastSuccessAt ? new Date(channel.lastSuccessAt).toLocaleString() : 'No successful delivery yet', remove];
     }), 'Notification channels')));
   };
@@ -71,7 +73,8 @@ export async function renderNotifications(session: DashboardSession): Promise<HT
     clearSecrets(); fields = []; config.replaceChildren();
     for (const definition of kinds[kind.value as NotifyChannelKind].fields) {
       const control = input(definition.name, definition.secret ? 'password' : 'text', definition.value ?? '');
-      control.required = !definition.optional; control.autocomplete = 'off'; control.disabled = session.readOnly;
+      control.required = !definition.optional; control.autocomplete = definition.secret ? 'one-time-code' : 'off'; control.disabled = session.readOnly;
+      if (definition.secret) { control.setAttribute('autocapitalize', 'off'); control.setAttribute('spellcheck', 'false'); }
       if (definition.name === 'port') { control.inputMode = 'numeric'; control.pattern = '465|587'; }
       fields.push({ definition, control }); config.append(field(definition.label, control));
     }
@@ -83,7 +86,7 @@ export async function renderNotifications(session: DashboardSession): Promise<HT
     for (const item of fields) if (item.control.value || !item.definition.optional) settings[item.definition.name] = item.control.value;
     const body = { kind: kind.value as NotifyChannelKind, label: label.value.trim(), settings };
     clearSecrets();
-    if (!body.label) { message(feedback, 'Choose a channel label', 'Enter a short name you will recognize.', 'attention'); return; }
+    if (!body.label) { fieldError(label, 'Enter a short name you will recognize.'); message(feedback, 'Choose a channel label', 'Enter a short name you will recognize.', 'attention'); return; }
     // The shared helper snapshots canonical request bytes before its first await.
     // Release the screen's temporary credential copies while the passkey prompt is open.
     const request = postWithPasskey('notifications/add', body);

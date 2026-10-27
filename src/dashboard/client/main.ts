@@ -1,6 +1,6 @@
-import { fetchSession, registerPasskey } from './api.js';
+import { fetchSession, passkeyRegistrationNotice } from './api.js';
 import type { DashboardSession } from './api.js';
-import { button, emptyState, notice } from './components.js';
+import { emptyState, notice } from './components.js';
 import { createRouter } from './router.js';
 import { registerScreensA } from './screens/a.js';
 import { registerScreensB } from './screens/b.js';
@@ -37,11 +37,12 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   if (session.readOnly) {
     const readOnly = notice('info', 'Read-only', 'This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.'); readOnly.classList.add('read-only-notice');
     sessionNotice = readOnly;
-  } else if (session.passkeys === 0) {
-    const enrollment = notice('info', 'Register a passkey', 'Changes require a passkey with user verification. Register one on this device before making a change.');
-    const status = document.createElement('p'); status.setAttribute('role', 'status');
-    const control = button('Register passkey', () => { control.disabled = true; void registerPasskey().then(() => { session.passkeys++; enrollment.replaceChildren(notice('ok', 'Passkey registered', 'Your passkey will be requested when you choose a change.')); }).catch(() => { status.textContent = 'Passkey registration was not completed. Try again.'; }).finally(() => { control.disabled = false; }); });
-    enrollment.append(control, status); sessionNotice = enrollment;
+  }
+  if (session.passkeys === 0) {
+    if (sessionNotice) {
+      const instruction = document.createElement('p'); instruction.textContent = passkeyRegistrationNotice;
+      sessionNotice.append(instruction);
+    } else sessionNotice = notice('info', 'Register a passkey', passkeyRegistrationNotice);
   }
   content.append(main); body.append(nav, content); shell.append(skip, header, body); root.replaceChildren(shell);
   const router = createRouter(main, {}, route => {

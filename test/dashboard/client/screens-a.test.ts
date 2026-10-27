@@ -6,7 +6,7 @@ import { disposeComponents } from '../../../src/dashboard/client/components.js';
 import { registerScreensA } from '../../../src/dashboard/client/screens/a.js';
 import { boot } from '../../../src/dashboard/client/main.js';
 
-const api = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), postWithPasskey: vi.fn(), fetchSession: vi.fn(), registerPasskey: vi.fn() }));
+const api = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), postWithPasskey: vi.fn(), fetchSession: vi.fn(), passkeyRegistrationNotice: 'Register a passkey with keysentry passkey register in your terminal, then reload this page.' }));
 vi.mock('../../../src/dashboard/client/api.js', () => api);
 
 const secret = 'fixture-secret-must-stay-out-of-dom';
@@ -30,12 +30,12 @@ function fixtures(): Record<string, unknown> {
         inGitHistory: false, armed: false, state: 'attention', stateText: 'Rotate by hand', value: secret },
     ] },
     platforms: { platforms: [
-      { host: 'railway', name: 'Railway', connected: true, source: 'vault', roles: ['read', 'write'],
+      { host: 'railway', name: 'Railway', connected: true, source: 'vault', availableRoles: ['read', 'write'], storedRoles: ['read', 'write'],
         tokens: [
           { name: 'RAILWAY_TOKEN', canReadValues: true, canWrite: true, scope: 'Account', recommended: false, howToCreate: 'https://railway.com/account/tokens', source: 'Railway account token documentation' },
           { name: 'RAILWAY_PROJECT_TOKEN', canReadValues: true, canWrite: true, scope: 'One project', recommended: true, howToCreate: 'https://railway.com/project/tokens', source: 'Railway project token documentation' },
         ], keysentryUses: { scan: 'read variables in the selected project', rotate: 'write approved replacement keys and redeploy' }, value: secret },
-      { host: 'fly', name: 'Fly', connected: false, roles: ['write'],
+      { host: 'fly', name: 'Fly', connected: false, availableRoles: ['write'], storedRoles: [],
         tokens: [{ name: 'FLY_API_TOKEN', canReadValues: false, canWrite: true, scope: 'One app', recommended: true, howToCreate: 'https://fly.io/docs/tokens/', source: 'Fly token documentation' }],
         keysentryUses: { scan: 'list secret names', rotate: 'write approved replacements' } },
     ] },
@@ -190,13 +190,33 @@ describe('Task 6a dashboard screens', () => {
     expect(platforms[0]!.querySelector<HTMLSelectElement>('[name="role"]')?.value).toBe('read');
   });
 
+  it('offers supported roles for an unconnected platform and adding a write token to a read connection', async () => {
+    const response = data.platforms as { platforms: { connected: boolean; availableRoles: string[]; storedRoles: string[] }[] };
+    response.platforms[0]!.storedRoles = ['read'];
+    const page = await open('connect'); const platforms = [...page.querySelectorAll<HTMLElement>('[data-platform]')];
+    expect([...platforms[0]!.querySelector<HTMLSelectElement>('[name="role"]')!.options].map(option => option.value)).toEqual(['read', 'write']);
+    expect(platforms[0]!.textContent).toContain('Stored roles: read.');
+    expect(platforms[1]!.querySelector<HTMLSelectElement>('[name="role"]')!.value).toBe('write');
+    expect(platforms[1]!.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false);
+  });
+
+  it('ties token validation errors to the affected input', async () => {
+    const page = await open('connect'); const form = page.querySelector<HTMLFormElement>('form')!;
+    const value = form.querySelector<HTMLInputElement>('[name="value"]')!; submit(form);
+    expect(value.getAttribute('aria-invalid')).toBe('true');
+    expect(document.getElementById(value.getAttribute('aria-describedby')!)?.textContent).toBe('Enter a token value.');
+    value.value = secret; value.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(value.getAttribute('aria-invalid')).not.toBe('true');
+  });
+
   it('stores a token only through the passkey helper and immediately clears the field and request object', async () => {
     let complete!: (value: { stored: true }) => void; let requestBody!: { name: string; role: string; value: string };
     let sent: unknown;
     api.postWithPasskey.mockImplementation((_route, body) => { sent = { ...body }; requestBody = body; return new Promise(resolve => { complete = resolve; }); });
     const page = await open('connect'); const form = page.querySelector<HTMLFormElement>('form')!;
     fill(form, 'name', 'RAILWAY_PROJECT_TOKEN'); fill(form, 'role', 'read'); const field = fill(form, 'value', secret);
-    expect(field.type).toBe('password'); expect(field.autocomplete).toBe('off'); submit(form);
+    expect(field.type).toBe('password'); expect(field.autocomplete).toBe('one-time-code');
+    expect(field.getAttribute('autocapitalize')).toBe('off'); expect(field.getAttribute('spellcheck')).toBe('false'); submit(form);
     expect(field.value).toBe(''); expect(requestBody.value).toBe(''); expect(sent).toEqual({ name: 'RAILWAY_PROJECT_TOKEN', role: 'read', value: secret });
     expect(api.postWithPasskey).toHaveBeenCalledTimes(1); expect(api.postWithPasskey.mock.calls[0]![0]).toBe('vault/store'); expect(api.post).not.toHaveBeenCalled();
     expect(form.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(true); submit(form); expect(api.postWithPasskey).toHaveBeenCalledTimes(1);
@@ -253,21 +273,18 @@ describe('Task 6a dashboard screens', () => {
     await vi.waitFor(check); app.router.navigate('network'); await vi.waitFor(() => expect(root.querySelector('h1')?.textContent).toBe('Network')); check(); app.destroy();
   });
 
-  it('keeps passkey enrollment below the page heading across navigation', async () => {
+  it('keeps the terminal passkey registration instruction below the heading across navigation', async () => {
     api.fetchSession.mockResolvedValue({ ...session, passkeys: 0 });
-    api.registerPasskey.mockResolvedValue(undefined);
     const root = document.createElement('div'); document.body.append(root);
     const app = await boot(root); routers.push(app.router);
     const check = () => {
       const main = root.querySelector('main')!;
-      expect(main.querySelector('h1')?.nextElementSibling?.textContent).toContain('Register a passkey');
-      expect(main.querySelector('button')?.textContent).toBe('Register passkey');
+      expect(main.querySelector('h1')?.nextElementSibling?.textContent).toContain(api.passkeyRegistrationNotice);
+      expect([...main.querySelectorAll('button')].some(control => control.textContent === 'Register passkey')).toBe(false);
     };
     check(); app.router.navigate('network');
     await vi.waitFor(() => expect(root.querySelector('h1')?.textContent).toBe('Network')); check();
-    clickText(root, 'Register passkey');
-    await vi.waitFor(() => expect(root.textContent).toContain('Passkey registered'));
-    expect(app.session.passkeys).toBe(1); app.destroy();
+    expect(app.session.passkeys).toBe(0); app.destroy();
   });
 
   it('offers a retry when a screen request fails without reflecting its error', async () => {

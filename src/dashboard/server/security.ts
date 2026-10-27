@@ -13,13 +13,19 @@ export function securityHeaders(res: ServerResponse): void {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Permissions-Policy', 'publickey-credentials-get=(self), publickey-credentials-create=(self)');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'publickey-credentials-get=(self), publickey-credentials-create=()');
 }
 
 /** Forwarded headers never participate in the local-origin decision. */
 export function checkRequest(req: IncomingMessage, port: number): void {
   if (req.headers.host !== `localhost:${port}` && req.headers.host !== `127.0.0.1:${port}`) {
     throw new DashboardError(403, 'Open keysentry using the local dashboard address.');
+  }
+  const site = req.headers['sec-fetch-site'];
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') {
+    throw new DashboardError(403, 'Send this request from the local dashboard.');
   }
   if (req.method === 'POST' && req.headers.origin !== `http://localhost:${port}`) {
     throw new DashboardError(403, 'Send this request from the local dashboard.');

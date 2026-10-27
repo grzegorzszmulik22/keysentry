@@ -1,6 +1,7 @@
 import { get, postWithPasskey, type DashboardSession } from '../api.js';
 import { button } from '../components.js';
-import { actions, el, field, input, lifetime, message, paragraph, status, taskButton } from './components-b.js';
+import { actions, clearFieldError, el, field, fieldError, input, lifetime, message, paragraph, status, taskButton } from './components-b.js';
+import { providerChoices, providerName } from './components-a.js';
 
 interface Settings {
   graceMinutes: number; rotateEveryDays: number; spendCapsUsd: Record<string, number>;
@@ -10,7 +11,7 @@ interface Settings {
 export async function renderSettings(session: DashboardSession): Promise<HTMLElement> {
   const root = el('div', undefined, 'screen-b'); const life = lifetime(root);
   const current = await get<Settings>('settings'); if (life.signal.aborted) return root;
-  const feedback = status(); const form = el('form', undefined, 'b-form'); form.addEventListener('submit', event => event.preventDefault());
+  const feedback = status(); const form = el('form', undefined, 'b-form'); form.noValidate = true; form.addEventListener('submit', event => event.preventDefault());
   const grace = input('graceMinutes', 'number', String(current.graceMinutes)); grace.min = '0'; grace.step = 'any'; grace.required = true;
   const rotate = input('rotateEveryDays', 'number', String(current.rotateEveryDays)); rotate.min = '1'; rotate.max = '36500'; rotate.step = '1'; rotate.required = true;
   const digest = el('select'); digest.name = 'digestDay';
@@ -21,30 +22,44 @@ export async function renderSettings(session: DashboardSession): Promise<HTMLEle
   const hints = input('showHints', 'checkbox'); hints.checked = current.showHints;
   for (const control of [grace, rotate, digest, hints]) control.disabled = session.readOnly;
   const capList = el('div', undefined, 'b-form');
-  const caps: { name: HTMLInputElement; amount: HTMLInputElement; row: HTMLElement }[] = [];
+  const caps: { name: HTMLSelectElement; amount: HTMLInputElement; row: HTMLElement }[] = [];
+  let nextCap = 0;
   const addCap = (name = '', amount = '') => {
     const row = el('div', undefined, 'b-cap-row');
-    const provider = input('spendCapKey', 'text', name); provider.required = true; provider.disabled = session.readOnly;
+    const provider = el('select'); provider.name = 'spendCapKey'; provider.required = true; provider.disabled = session.readOnly;
+    const placeholder = el('option', 'Choose a provider'); placeholder.value = ''; provider.append(placeholder);
+    for (const [id, label] of providerChoices()) { const option = el('option', label); option.value = id; provider.append(option); }
+    provider.value = name; const rowNumber = ++nextCap; provider.setAttribute('aria-label', `Provider for spend cap ${rowNumber}`);
     const value = input('spendCapUsd', 'number', amount); value.required = true; value.min = '0'; value.step = 'any'; value.disabled = session.readOnly;
     const item = { name: provider, amount: value, row }; caps.push(item);
     const remove = button('Remove cap', () => { const index = caps.indexOf(item); if (index >= 0) caps.splice(index, 1); row.remove(); }, 'secondary'); remove.disabled = session.readOnly;
-    row.append(field('Provider or key', provider), field('Spend cap (USD)', value), remove); capList.append(row);
+    const describe = () => {
+      const identity = provider.value ? `${providerName(provider.value)} (row ${rowNumber})` : `row ${rowNumber}`;
+      value.setAttribute('aria-label', `Spend cap for ${identity} (USD)`); remove.setAttribute('aria-label', `Remove spend cap for ${identity}`);
+    };
+    provider.addEventListener('change', describe); describe();
+    row.append(field('Provider', provider), field('Spend cap (USD)', value), remove); capList.append(row);
   };
   for (const [key, value] of Object.entries(current.spendCapsUsd)) addCap(key, String(value));
   const add = button('Add spend cap', () => addCap(), 'secondary'); add.disabled = session.readOnly;
   const save = taskButton('Save settings', feedback, async () => {
     if (life.signal.aborted) return;
+    for (const control of [grace, rotate, ...caps.flatMap(cap => [cap.name, cap.amount])]) clearFieldError(control);
     const graceMinutes = Number(grace.value); const rotateEveryDays = Number(rotate.value);
     const values: [string, number][] = []; const names = new Set<string>();
-    let valid = grace.value !== '' && Number.isFinite(graceMinutes) && graceMinutes >= 0 && Number.isSafeInteger(graceMinutes * 60)
-      && rotate.value !== '' && Number.isInteger(rotateEveryDays) && rotateEveryDays >= 1 && rotateEveryDays <= 36500;
+    const graceValid = grace.value !== '' && Number.isFinite(graceMinutes) && graceMinutes >= 0 && Number.isSafeInteger(graceMinutes * 60);
+    const rotateValid = rotate.value !== '' && Number.isInteger(rotateEveryDays) && rotateEveryDays >= 1 && rotateEveryDays <= 36500;
+    let valid = graceValid && rotateValid;
+    if (!graceValid) fieldError(grace, 'Use a nonnegative grace period in whole seconds.');
+    if (!rotateValid) fieldError(rotate, 'Use a whole rotation interval from 1 to 36500 days.');
     for (const cap of caps) {
       const name = cap.name.value.trim(); const amount = Number(cap.amount.value);
-      if (!name || names.has(name) || cap.amount.value === '' || !Number.isFinite(amount) || amount < 0) valid = false;
+      if (!name || names.has(name)) { valid = false; fieldError(cap.name, 'Choose a different provider for each spend cap.'); }
+      if (cap.amount.value === '' || !Number.isFinite(amount) || amount < 0) { valid = false; fieldError(cap.amount, 'Use a nonnegative spend cap.'); }
       names.add(name); values.push([name, amount]);
     }
     if (!valid || !form.reportValidity()) {
-      message(feedback, 'Review the numbers', 'Use a nonnegative grace period in whole seconds, a whole rotation interval from 1 to 36500 days, and nonnegative spend caps with unique names.', 'attention'); return;
+      message(feedback, 'Review the numbers', 'Use a nonnegative grace period in whole seconds, a whole rotation interval from 1 to 36500 days, and nonnegative spend caps with a different provider for each row.', 'attention'); return;
     }
     const body: Settings = { graceMinutes, rotateEveryDays, spendCapsUsd: Object.fromEntries(values), digestDay: digest.value as Settings['digestDay'], showHints: hints.checked };
     await postWithPasskey<Settings>('settings/update', body);

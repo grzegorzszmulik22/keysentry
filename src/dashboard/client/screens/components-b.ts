@@ -7,7 +7,24 @@ export function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string,
   return node;
 }
 export const paragraph = (text: string): HTMLParagraphElement => el('p', text);
+const errors = new WeakMap<HTMLElement, HTMLElement>();
+let errorId = 0;
+export function clearFieldError(control: HTMLElement): void {
+  const error = errors.get(control); if (!error) return;
+  const descriptions = (control.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(id => id && id !== error.id);
+  if (descriptions.length) control.setAttribute('aria-describedby', descriptions.join(' ')); else control.removeAttribute('aria-describedby');
+  control.removeAttribute('aria-invalid'); error.remove(); errors.delete(control);
+}
+export function fieldError(control: HTMLElement, text: string): void {
+  clearFieldError(control);
+  const error = el('span', text, 'b-field-error'); error.id = `dashboard-field-error-${++errorId}`;
+  control.setAttribute('aria-invalid', 'true');
+  control.setAttribute('aria-describedby', [control.getAttribute('aria-describedby'), error.id].filter(Boolean).join(' '));
+  control.insertAdjacentElement('afterend', error); errors.set(control, error);
+}
 export function field(label: string, control: HTMLElement): HTMLLabelElement {
+  control.addEventListener('invalid', () => fieldError(control, 'Review this field.'));
+  control.addEventListener('input', () => clearFieldError(control)); control.addEventListener('change', () => clearFieldError(control));
   const wrapper = el('label', undefined, 'b-field'); wrapper.append(el('span', label), control); return wrapper;
 }
 export function input(name: string, type: string, value?: string): HTMLInputElement {
@@ -32,7 +49,10 @@ export function taskButton(label: string, feedback: HTMLElement, run: () => Prom
   });
   control.disabled = disabledNow(); return control;
 }
-export function scrollTable(content: HTMLTableElement): HTMLElement { const wrapper = el('div', undefined, 'table-scroll'); wrapper.append(content); return wrapper; }
+export function scrollTable(content: HTMLTableElement): HTMLElement {
+  const wrapper = el('div', undefined, 'table-scroll'); wrapper.tabIndex = 0; wrapper.setAttribute('role', 'region');
+  wrapper.setAttribute('aria-label', content.caption?.textContent ?? 'Table'); wrapper.append(content); return wrapper;
+}
 export function section(title: string, ...nodes: Node[]): HTMLElement { const block = el('section', undefined, 'b-section'); block.append(el('h2', title), ...nodes); return block; }
 export function list(items: string[]): HTMLUListElement { const block = el('ul'); for (const item of items) block.append(el('li', item)); return block; }
 export function dateTime(value?: string | null): string {

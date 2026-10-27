@@ -19,7 +19,8 @@ export interface OverviewResponse {
 }
 
 export interface PlatformView {
-  host: string; name: string; connected: boolean; source?: 'vault' | 'env'; roles: ('read' | 'write')[];
+  host: string; name: string; connected: boolean; source?: 'vault' | 'env';
+  availableRoles: ('read' | 'write')[]; storedRoles: ('read' | 'write')[];
   tokens: {
     name: string; canReadValues: boolean; canWrite: boolean; scope: string;
     recommended: boolean; howToCreate: string; source: string;
@@ -58,6 +59,7 @@ const providers: Record<string, string> = {
   'app-secret': 'App secret', 'encryption-key': 'Encryption key', unknown: 'Unknown provider',
 };
 export function providerName(provider: string): string { return providers[provider] ?? provider; }
+export function providerChoices(): [string, string][] { return Object.entries(providers); }
 
 export function scrollTable(columns: string[], rows: (string | Node)[][], caption: string): HTMLElement {
   const wrapper = element('div', undefined, 'table-scroll');

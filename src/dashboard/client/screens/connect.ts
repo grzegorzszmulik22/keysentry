@@ -3,6 +3,7 @@ import type { DashboardSession } from '../api.js';
 import { button, emptyState } from '../components.js';
 import { documentationLink, element, section } from './components-a.js';
 import type { PlatformView } from './components-a.js';
+import { clearFieldError, fieldError } from './components-b.js';
 
 function tokenForm(platform: PlatformView, readOnly: boolean): HTMLFormElement {
   const form = element('form', undefined, 'screen-a-token-form'); form.autocomplete = 'off';
@@ -13,23 +14,32 @@ function tokenForm(platform: PlatformView, readOnly: boolean): HTMLFormElement {
   }
   const role = element('select'); role.name = 'role'; role.required = true;
   for (const value of ['read', 'write'] as const) {
-    if (!platform.roles.includes(value)) continue;
+    if (!platform.availableRoles.includes(value)) continue;
     const option = element('option', value === 'read' ? 'Read: scan and monitor' : 'Write: approved changes'); option.value = value; role.append(option);
   }
-  const value = element('input'); value.type = 'password'; value.name = 'value'; value.autocomplete = 'off'; value.required = true; value.spellcheck = false;
+  const value = element('input'); value.type = 'password'; value.name = 'value'; value.autocomplete = 'one-time-code'; value.required = true;
+  value.setAttribute('autocapitalize', 'off'); value.setAttribute('spellcheck', 'false');
   for (const [label, field] of [['Token name', name], ['Token role', role], ['Token value', value]] as const) {
     const wrapper = element('label', label); wrapper.append(field); form.append(wrapper);
     field.disabled = readOnly;
+    field.addEventListener('invalid', () => fieldError(field, field === value ? 'Enter a token value.' : 'Choose a token name and role.'));
+    field.addEventListener('input', () => clearFieldError(field)); field.addEventListener('change', () => clearFieldError(field));
   }
   const explanation = element('p', 'keysentry will store this token in your vault after passkey verification. The value is cleared from this form when you choose Store token.');
   const status = element('p'); status.setAttribute('role', 'status');
   const store = button('Store token'); store.type = 'submit';
+  store.setAttribute('aria-label', `Store ${platform.name} token`);
   store.disabled = readOnly || name.options.length === 0 || role.options.length === 0;
   let pending = false;
   form.addEventListener('submit', event => {
     event.preventDefault();
     if (readOnly || pending) { value.value = ''; return; }
-    if (!name.value || !value.value || !['read', 'write'].includes(role.value)) return;
+    if (!name.value || !value.value || !platform.availableRoles.includes(role.value as 'read' | 'write')) {
+      if (!name.value) fieldError(name, 'Choose a token name.');
+      if (!value.value) fieldError(value, 'Enter a token value.');
+      if (!platform.availableRoles.includes(role.value as 'read' | 'write')) fieldError(role, 'Choose an available token role.');
+      return;
+    }
     pending = true; store.disabled = true; status.textContent = 'Waiting for passkey verification.';
     const body = { name: name.value, role: role.value as 'read' | 'write', value: value.value };
     value.value = '';
@@ -55,7 +65,8 @@ export async function renderConnect(session: DashboardSession): Promise<HTMLElem
   if (!platforms.length) { page.append(emptyState('No platforms are available to connect in this project. Run keysentry in your project folder to review its configuration.')); return page; }
   for (const platform of platforms) {
     const block = section(platform.name); block.dataset.platform = platform.host;
-    block.append(element('p', platform.connected ? 'Connected' : 'Not connected', 'screen-a-state'));
+    block.append(element('p', platform.storedRoles.length ? 'Connected' : 'Not connected', 'screen-a-state'));
+    if (platform.storedRoles.length) block.append(element('p', `Stored roles: ${platform.storedRoles.join(', ')}.`));
     block.append(element('p', platform.source === 'vault' ? 'Stored in the vault.' : platform.source === 'env' ? 'Provided by an environment variable.' : 'No token stored.', 'screen-a-muted'));
     for (const token of [...platform.tokens].sort((a, b) => Number(b.recommended) - Number(a.recommended))) {
       const details = element('section', undefined, 'screen-a-token');

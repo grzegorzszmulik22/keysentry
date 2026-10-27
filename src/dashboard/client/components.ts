@@ -104,14 +104,14 @@ function scheduleClipboardClear(expectedDigest: string | undefined, generation: 
 /** Reveal is always an explicit confirmation followed by the shared passkey request. */
 export function maskedValue(input: { route?: string; body?: unknown; label?: string } = {}): HTMLElement {
   const block = document.createElement('div'); block.className = 'masked-value';
-  const output = document.createElement('span'); output.className = 'masked-value-output'; output.textContent = 'Hidden'; output.setAttribute('aria-live', 'polite');
+  const output = document.createElement('span'); output.className = 'masked-value-output'; output.textContent = 'Hidden';
   const actions = document.createElement('div'); actions.className = 'value-actions';
   const status = document.createElement('span'); status.setAttribute('role', 'status');
   let value = '';
   let disposed = false;
   let revealGeneration = 0;
   let confirmation: AbortController | undefined;
-  const hide = () => { ++revealGeneration; confirmation?.abort(); value = ''; output.textContent = 'Hidden'; status.textContent = ''; reveal.disabled = false; actions.replaceChildren(reveal); };
+  const hide = () => { ++revealGeneration; confirmation?.abort(); value = ''; output.textContent = 'Hidden'; status.textContent = 'Value hidden'; reveal.disabled = false; actions.replaceChildren(reveal); };
   const copy = button('Copy', () => {
     if (disposed) return;
     const copied = value;
@@ -141,7 +141,7 @@ export function maskedValue(input: { route?: string; body?: unknown; label?: str
         const result = await postWithPasskey<{ value: string }>(input.route ?? 'reveal', input.body ?? {});
         if (disposed || generation !== revealGeneration) { result.value = ''; return; }
         if (typeof result.value !== 'string') throw new Error();
-        value = result.value; output.textContent = value; status.textContent = ''; actions.replaceChildren(copy, button('Hide', hide, 'secondary'));
+        value = result.value; output.textContent = value; status.textContent = 'Value shown'; actions.replaceChildren(copy, button('Hide', hide, 'secondary'));
       } catch { if (!disposed && generation === revealGeneration) status.textContent = 'The value could not be revealed. Try again.'; }
       finally { if (!disposed && generation === revealGeneration) reveal.disabled = false; }
     })();

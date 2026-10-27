@@ -61,7 +61,7 @@ export async function renderRotate(session: DashboardSession): Promise<HTMLEleme
     for (const rotation of active) {
       const block = section(`Rotation ${rotation.planId}`, paragraph(`Status: ${rotation.status ?? 'In progress'}. Started ${dateTime(rotation.startedAt)}.`));
       block.dataset.planId = rotation.planId;
-      block.append(scrollTable(table(['Key', 'Status', 'Notes'], rotation.steps.map(step => [step.hint ?? 'Hint unavailable', step.status, step.warnings.join(' ')]), 'Rotation progress')));
+      block.append(scrollTable(table(['Key', 'Status', 'Notes'], rotation.steps.map(step => [step.hint ?? 'Hint unavailable', step.status, step.warnings.join(' ')]), `Rotation progress for ${rotation.planId}`)));
       const timeline = el('a', 'View timeline'); timeline.href = `#activity?id=${encodeURIComponent(rotation.planId)}`; block.append(timeline);
       if (rotation.deadline) block.append(clock(rotation));
       if (rotation.status === 'grace-pending' && rotation.deadline) {
@@ -76,6 +76,7 @@ export async function renderRotate(session: DashboardSession): Promise<HTMLEleme
         }), session.readOnly);
         graceControls.set(rotation.planId, [finish, undo]);
         const later = button('Later', () => message(feedback, 'Grace period continues', 'The grace deadline stays the same. Return here to review the rotation.'), 'secondary');
+        for (const control of [finish, undo, later]) control.setAttribute('aria-label', `${control.textContent} for rotation ${rotation.planId}`);
         block.append(paragraph('The old keys remain available during grace. Revoking early may remove the option to undo.'), actions(finish, undo, later));
       }
       progress.append(block);

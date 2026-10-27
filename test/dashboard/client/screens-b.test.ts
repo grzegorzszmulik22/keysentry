@@ -41,7 +41,7 @@ beforeEach(() => {
     'autopilot/eligibility': { eligible: [{ id: 'key-one', provider: 'openai', hint: 'sk-…abcd', needsAdoption: false }, { id: 'key-two', provider: 'openrouter', hint: null, needsAdoption: true }], ineligible: [{ id: 'manual-key', hint: null, reason: 'Rotate this key by hand.' }], lastDrillAt: new Date().toISOString() },
     activity: { verify: { ok: true }, entries: [{ at: '2026-10-27T12:00:00Z', kind: 'verified', summary: 'Verified the new key.', value: secret }] },
     notifications: { channels: [{ id: 'channel-one', kind: 'telegram', label: 'My phone', lastSuccessAt: null }], deviceKeyId: 'device-one' },
-    approvals: { pending: [{ id: 'approval-one', kind: 'rotate', summary: 'Rotate one key.', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString(), source: 'autopilot' }] },
+    approvals: { pending: [{ id: 'approval-one', kind: 'rotate', summary: 'Rotate one key.', changes, reviewHash: 'review-hash-one', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString(), source: 'autopilot' }] },
     settings,
   };
   api.get.mockReset().mockImplementation(async route => structuredClone(fixtures[route]));
@@ -213,7 +213,7 @@ describe('activity and approvals', () => {
   });
   it('approves and dismisses with the passkey helper', async () => {
     await open('approvals'); control('Approve').click(); await tick(); if (document.querySelector('dialog')) await accept('Approve');
-    expect(api.postWithPasskey).toHaveBeenCalledWith('approvals/approve', { id: 'approval-one' });
+    expect(api.postWithPasskey).toHaveBeenCalledWith('approvals/approve', { id: 'approval-one', reviewHash: 'review-hash-one' });
     await open('approvals'); control('Dismiss').click(); await tick(); if (document.querySelector('dialog')) await accept('Dismiss');
     expect(api.postWithPasskey).toHaveBeenCalledWith('approvals/dismiss', { id: 'approval-one' });
   });
@@ -222,9 +222,28 @@ describe('activity and approvals', () => {
     await open('approvals'); expect(outlet.textContent).toContain('Expired');
     expect([...outlet.querySelectorAll('button')].filter(item => !item.disabled && ['Approve', 'Dismiss'].includes(item.textContent!))).toHaveLength(0);
   });
+  it('repeats every reviewed change verbatim and binds the approval to its hash', async () => {
+    await open('approvals'); control('Approve').click(); await tick();
+    expect([...document.querySelectorAll('dialog li')].map(item => item.textContent)).toEqual(changes);
+    await accept('Approve');
+    expect(api.postWithPasskey).toHaveBeenCalledWith('approvals/approve', { id: 'approval-one', reviewHash: 'review-hash-one' });
+  });
+  it('distinguishes repeated approval summaries in headings and action names', async () => {
+    const data = fixtures.approvals as { pending: Record<string, unknown>[] };
+    data.pending.push({ ...data.pending[0], id: 'approval-two' }); await open('approvals');
+    const headings = [...outlet.querySelectorAll('section h2')].map(item => item.textContent);
+    const labels = [...outlet.querySelectorAll('button')].map(item => item.getAttribute('aria-label'));
+    expect(new Set(headings).size).toBe(headings.length); expect(new Set(labels).size).toBe(labels.length);
+  });
   it('keeps completed approvals completed after their former deadline', async () => {
     vi.useFakeTimers(); await open('approvals'); control('Approve').click(); await tick(); await accept('Approve');
     await vi.advanceTimersByTimeAsync(601_000); expect(outlet.textContent).toContain('Approved'); expect(outlet.textContent).not.toContain('Expired');
+  });
+  it('ties a missing timeline identifier to its input', async () => {
+    await open('activity'); control('Timeline').click(); await tick();
+    expect(field('id').getAttribute('aria-invalid')).toBe('true');
+    expect(document.getElementById(field('id').getAttribute('aria-describedby')!)?.textContent).toBe('Enter a plan or wave ID.');
+    expect(api.post).not.toHaveBeenCalled();
   });
 });
 
@@ -233,7 +252,9 @@ describe('notifications, settings and card', () => {
     let sent: unknown; api.postWithPasskey.mockImplementation(async (route, body) => { sent = structuredClone({ route, body }); return { id: 'new-channel' }; });
     await open('notifications'); expect(outlet.textContent).toContain('My phone');
     field('kind').value = 'telegram'; field('kind').dispatchEvent(new Event('change', { bubbles: true }));
-    expect(field('botToken').type).toBe('password'); field('botToken').value = secret; field('chatId').value = '123'; field('label').value = 'My phone';
+    expect(field('botToken').type).toBe('password');
+    expect(field('botToken').autocomplete).toBe('one-time-code'); expect(field('botToken').getAttribute('autocapitalize')).toBe('off');
+    expect(field('botToken').getAttribute('spellcheck')).toBe('false'); field('botToken').value = secret; field('chatId').value = '123'; field('label').value = 'My phone';
     control('Add channel').click(); await tick(); if (document.querySelector('dialog')) await accept('Add channel');
     expect(sent).toEqual({ route: 'notifications/add', body: { kind: 'telegram', label: 'My phone', settings: { botToken: secret, chatId: '123' } } });
     expect(api.postWithPasskey.mock.calls[0]?.[1].settings.botToken).toBe('');
@@ -252,6 +273,46 @@ describe('notifications, settings and card', () => {
     expect(api.postWithPasskey).not.toHaveBeenCalled(); field('graceMinutes').value = '20';
     control('Save settings').click(); await tick(); if (document.querySelector('dialog')) await accept('Save settings');
     expect(api.postWithPasskey).toHaveBeenCalledWith('settings/update', { ...settings, graceMinutes: 20 });
+  });
+  it('makes table regions focusable and names repeated row actions', async () => {
+    fixtures.notifications = { channels: [{ id: 'phone', kind: 'ntfy', label: 'Phone', lastSuccessAt: null }, { id: 'work', kind: 'ntfy', label: 'Work', lastSuccessAt: null }], deviceKeyId: 'device-one' };
+    await open('notifications');
+    const scroller = outlet.querySelector<HTMLElement>('.table-scroll')!;
+    expect(scroller.tabIndex).toBe(0); expect(scroller.getAttribute('aria-label')).toBe('Notification channels');
+    expect(control('Remove').getAttribute('aria-label')).toBe('Remove Phone (ntfy)');
+    expect([...outlet.querySelectorAll('button[aria-label]')].some(item => item.getAttribute('aria-label') === 'Remove Work (ntfy)')).toBe(true);
+  });
+  it('distinguishes notification removal controls even when channel labels and kinds match', async () => {
+    fixtures.notifications = { channels: [{ id: 'phone-one', kind: 'ntfy', label: 'Phone', lastSuccessAt: null }, { id: 'phone-two', kind: 'ntfy', label: 'Phone', lastSuccessAt: null }], deviceKeyId: 'device-one' };
+    await open('notifications'); const labels = [...outlet.querySelectorAll('button')].filter(item => item.textContent === 'Remove').map(item => item.getAttribute('aria-label'));
+    expect(labels).toEqual(['Remove Phone (ntfy), phone-one', 'Remove Phone (ntfy), phone-two']);
+  });
+  it.each(['telegram', 'discord', 'slack', 'ntfy', 'webhook', 'resend', 'smtp'])('marks all %s credentials as one-time secret fields', async kind => {
+    await open('notifications'); field('kind').value = kind; field('kind').dispatchEvent(new Event('change', { bubbles: true }));
+    const secrets = [...outlet.querySelectorAll<HTMLInputElement>('input[type="password"]')]; expect(secrets.length).toBeGreaterThan(0);
+    for (const control of secrets) {
+      expect(control.autocomplete).toBe('one-time-code'); expect(control.getAttribute('autocapitalize')).toBe('off'); expect(control.getAttribute('spellcheck')).toBe('false');
+    }
+  });
+  it('ties missing notification fields to inline validation messages', async () => {
+    await open('notifications'); control('Add channel').click(); await tick();
+    expect(field('botToken').getAttribute('aria-invalid')).toBe('true');
+    expect(document.getElementById(field('botToken').getAttribute('aria-describedby')!)?.textContent).toBe('Review this field.');
+    expect(api.postWithPasskey).not.toHaveBeenCalled();
+  });
+  it('offers provider choices and distinguishes spend-cap rows', async () => {
+    await open('settings'); control('Add spend cap').click();
+    const providers = [...outlet.querySelectorAll<HTMLSelectElement>('select[name="spendCapKey"]')];
+    expect(providers).toHaveLength(2); expect(providers[0]!.closest('label')?.querySelector('span')?.textContent).toBe('Provider');
+    expect([...providers[0]!.options].some(option => option.value === 'openrouter' && option.textContent === 'OpenRouter')).toBe(true);
+    expect(new Set(providers.map(item => item.getAttribute('aria-label'))).size).toBe(2);
+    expect(outlet.textContent).not.toContain('Provider or key');
+  });
+  it('connects validation errors to invalid settings and clears them on editing', async () => {
+    await open('settings'); const grace = field('graceMinutes'); grace.value = '-1'; control('Save settings').click(); await tick();
+    expect(grace.getAttribute('aria-invalid')).toBe('true');
+    expect(document.getElementById(grace.getAttribute('aria-describedby')!)?.textContent).toContain('grace');
+    grace.value = '15'; grace.dispatchEvent(new Event('input', { bubbles: true })); expect(grace.getAttribute('aria-invalid')).not.toBe('true');
   });
   it('renders the readiness SVG in a Blob URL img and keeps sharing opt-in', async () => {
     await open('card'); expect(api.post).toHaveBeenCalledWith('card', { platform: false, counts: false });

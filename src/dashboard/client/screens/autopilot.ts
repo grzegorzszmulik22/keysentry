@@ -1,7 +1,7 @@
 import { get, post, postWithPasskey } from '../api.js';
 import type { DashboardSession } from '../api.js';
 import { confirmAction, emptyState, table } from '../components.js';
-import { actions, dateTime, el, field, input, lifetime, list, message, numberInput, paragraph, scrollTable, section, status, taskButton, validNumber } from './components-b.js';
+import { actions, clearFieldError, dateTime, el, field, fieldError, input, lifetime, list, message, numberInput, paragraph, scrollTable, section, status, taskButton, validNumber } from './components-b.js';
 import { hostName, providerName } from './components-a.js';
 
 interface Autopilot {
@@ -63,14 +63,23 @@ export async function renderAutopilot(session: DashboardSession): Promise<HTMLEl
   const recent = () => { const at = Date.parse(lastDrillAt ?? ''); const age = Date.now() - at; return Number.isFinite(at) && age >= 0 && age < 86_400_000; };
   const drillNote = paragraph(''); let expiryTimer: number | undefined;
   const arm = taskButton('Arm autopilot', feedback, async () => {
+    for (const control of [grace, maxServices, validDays, ...chosen.values(), ...adoptions.values()]) clearFieldError(control);
     const armGeneration = coordination.offGeneration;
     const clusterIds = [...chosen].filter(([, choice]) => choice.checked).map(([id]) => id);
     const adopt = [...adoptions].filter(([id, choice]) => choice.checked && chosen.get(id)?.checked).map(([id]) => id);
     const graceMinutes = validNumber(grace, 0, Math.floor(Number.MAX_SAFE_INTEGER / 60), false);
     const maximum = validNumber(maxServices, 1); const days = validNumber(validDays, 1, 365);
     if (!recent()) { updateArm(); message(feedback, 'Run a drill first', 'Arming needs a drill from the last 24 hours.', 'attention'); return; }
-    if (!clusterIds.length || clusterIds.some(id => adoptions.has(id) && !adopt.includes(id))) { message(feedback, 'Review key choices', 'Choose at least one key. For each key that needs adoption, agree to rotate it now or leave it unselected.', 'attention'); return; }
-    if (graceMinutes === null || maximum === null || days === null) { message(feedback, 'Check the numbers', 'Use a nonnegative grace period, a positive whole number of services, and 1 to 365 days.', 'attention'); return; }
+    if (!clusterIds.length || clusterIds.some(id => adoptions.has(id) && !adopt.includes(id))) {
+      for (const id of clusterIds) if (adoptions.has(id) && !adopt.includes(id)) fieldError(adoptions.get(id)!, 'Agree to rotate this key now or leave it unselected.');
+      message(feedback, 'Review key choices', 'Choose at least one key. For each key that needs adoption, agree to rotate it now or leave it unselected.', 'attention'); return;
+    }
+    if (graceMinutes === null || maximum === null || days === null) {
+      if (graceMinutes === null) fieldError(grace, 'Use a nonnegative grace period.');
+      if (maximum === null) fieldError(maxServices, 'Use a positive whole number of services.');
+      if (days === null) fieldError(validDays, 'Use a whole number from 1 to 365 days.');
+      message(feedback, 'Check the numbers', 'Use a nonnegative grace period, a positive whole number of services, and 1 to 365 days.', 'attention'); return;
+    }
     const changes = [`keysentry will arm autopilot for ${clusterIds.length} ${clusterIds.length === 1 ? 'key' : 'keys'} for ${days} days, with up to ${maximum} services per wave and ${graceMinutes} minutes of grace.`];
     for (const id of adopt) { const key = eligibility.eligible.find(item => item.id === id)!; changes.push(`This rotates ${providerName(key.provider)} ${key.hint ?? '(hint unavailable)'} now so keysentry can rotate it automatically later.`); }
     if (!await confirmAction({ title: 'Arm autopilot', changes, button: 'Arm autopilot', signal: scope.signal }) || scope.signal.aborted || armGeneration !== coordination.offGeneration || coordination.turningOff) return;

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { PasskeyCredential } from '../../types.js';
-import { verifyAssertion, verifyRegistration } from '../../approvals/webauthn/index.js';
+import { verifyAssertion } from '../../approvals/webauthn/index.js';
 
 export interface PasskeyStore {
   list(): Promise<PasskeyCredential[]>;
@@ -15,17 +15,6 @@ export interface PasskeyRequestOptions {
   timeout: number;
   allowCredentials: { id: string; type: 'public-key' }[];
 }
-export interface PasskeyRegistrationOptions {
-  challenge: string;
-  rp: { id: 'localhost'; name: string };
-  user: { id: string; name: string; displayName: string };
-  pubKeyCredParams: { type: 'public-key'; alg: -7 | -8 | -257 }[];
-  authenticatorSelection: { userVerification: 'required'; residentKey: 'preferred' };
-  timeout: number;
-  attestation: 'none';
-  excludeCredentials: { id: string; type: 'public-key' }[];
-}
-
 export class PasskeyGateError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -36,8 +25,9 @@ export class PasskeyGateError extends Error {
 const LIFETIME_MS = 120_000;
 const MAX_PENDING = 100;
 const FRESH_PROOF = 'Use a fresh passkey to continue.';
+export const REGISTER_IN_TERMINAL = 'Register a passkey with keysentry passkey register in your terminal, then reload this page.';
 interface PendingBase { session: string; expires: number }
-type Pending = PendingBase & ({ kind: 'assertion'; route: string; digest: string } | { kind: 'registration'; credentialIds: string[] });
+type Pending = PendingBase & { route: string; digest: string };
 
 function reject(): never { throw new PasskeyGateError(403, FRESH_PROOF); }
 function object(value: unknown): Record<string, unknown> {
@@ -66,15 +56,13 @@ function wire(value: unknown): { id: string; response: Record<string, unknown>; 
   return { id, response, clientData, challenge: challenge.toString('base64url') };
 }
 
-/** Enrollment options consume the proof previously verified for passkey/register/options. */
+/** Authorize actions with passkeys registered through the human terminal command. */
 export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string; now?: () => number }) {
   if (!/^http:\/\/localhost:[1-9][0-9]{0,4}$/.test(opts.origin) || Number(opts.origin.split(':').at(-1)) > 65535) {
     throw new Error('Dashboard origin must be http://localhost with a port.');
   }
   const now = opts.now ?? Date.now;
   const pending = new Map<string, Pending>();
-  const enrollmentGrants = new Map<string, number>();
-  const userId = randomBytes(32).toString('base64url');
   let queue: Promise<unknown> = Promise.resolve();
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = queue.then(fn, fn);
@@ -84,11 +72,10 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
   function prune(): void {
     const time = now();
     for (const [key, entry] of pending) if (time >= entry.expires) pending.delete(key);
-    for (const [session, expires] of enrollmentGrants) if (time >= expires) enrollmentGrants.delete(session);
   }
-  function create(entry: Omit<PendingBase, 'expires'> & ({ kind: 'assertion'; route: string; digest: string } | { kind: 'registration'; credentialIds: string[] })): string {
+  function create(entry: Omit<Pending, 'expires'>): string {
     prune();
-    if (pending.size + enrollmentGrants.size >= MAX_PENDING) throw new PasskeyGateError(429, 'Complete a pending passkey prompt or try again in two minutes.');
+    if (pending.size >= MAX_PENDING) throw new PasskeyGateError(429, 'Complete a pending passkey prompt or try again in two minutes.');
     const challenge = randomBytes(32).toString('base64url');
     pending.set(challenge, { ...entry, expires: now() + LIFETIME_MS });
     return challenge;
@@ -104,7 +91,6 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
     return credential.rpId === 'localhost' && Array.isArray(credential.origins)
       && (credential.origins.includes(opts.origin) || credential.origins.includes('http://localhost'));
   }
-  function credentialIds(credentials: PasskeyCredential[]): string[] { return credentials.map(c => c.id).sort(); }
   function checkSession(session: string): void {
     if (typeof session !== 'string' || !session || session.length > 256) throw new PasskeyGateError(400, 'Open keysentry again from your terminal.');
   }
@@ -118,9 +104,9 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
           throw new PasskeyGateError(400, 'Choose an action and try again.');
         }
         const credentials = (await opts.passkeys.list()).filter(usable);
-        if (credentials.length === 0) throw new PasskeyGateError(403, 'Register a passkey before making a change.');
+        if (credentials.length === 0) throw new PasskeyGateError(403, REGISTER_IN_TERMINAL);
         return {
-          challenge: create({ kind: 'assertion', session, route, digest: bodyDigest }),
+          challenge: create({ session, route, digest: bodyDigest }),
           rpId: 'localhost', userVerification: 'required', timeout: LIFETIME_MS,
           allowCredentials: credentials.map(c => ({ id: c.id, type: 'public-key' })),
         };
@@ -129,10 +115,21 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
 
     verify(session: string, route: string, bodyDigest: string, header: string | undefined): Promise<void> {
       return serial(async () => {
-        const assertion = wire(parseJson(decode(header, 24_576)));
-        const entry = take(assertion.challenge, session);
-        if (entry.kind !== 'assertion' || entry.route !== route || entry.digest !== bodyDigest) return reject();
-        const credential = (await opts.passkeys.list()).find(c => c.id === assertion.id && usable(c));
+        // Consume any submitted challenge before an awaited storage operation can fail.
+        // Empty storage still takes precedence over a missing or invalid proof.
+        let assertion: ReturnType<typeof wire> | undefined;
+        let entry: Pending | undefined;
+        let invalid: unknown;
+        try {
+          assertion = wire(parseJson(decode(header, 24_576)));
+          entry = take(assertion.challenge, session);
+        } catch (error) { invalid = error; }
+        const credentials = await opts.passkeys.list();
+        if (credentials.length === 0) throw new PasskeyGateError(403, REGISTER_IN_TERMINAL);
+        if (invalid) throw invalid;
+        if (!assertion || !entry) return reject();
+        if (entry.route !== route || entry.digest !== bodyDigest) return reject();
+        const credential = credentials.find(c => c.id === assertion.id && usable(c));
         if (!credential || now() >= entry.expires) return reject();
         let result: ReturnType<typeof verifyAssertion>;
         try {
@@ -148,49 +145,6 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
         if (result.cloneWarning || now() >= entry.expires) return reject();
         await opts.passkeys.update({ ...credential, origins: [...credential.origins], signCount: result.signCount });
         if (now() >= entry.expires) return reject();
-        if (route === 'passkey/register/options') enrollmentGrants.set(session, entry.expires);
-      });
-    },
-
-    registrationOptions(session: string): Promise<PasskeyRegistrationOptions> {
-      return serial(async () => {
-        checkSession(session);
-        const credentials = await opts.passkeys.list();
-        prune();
-        const authorized = enrollmentGrants.has(session);
-        enrollmentGrants.delete(session);
-        if (credentials.length > 0 && !authorized) return reject();
-        for (const [key, entry] of pending) if (entry.kind === 'registration' && entry.session === session) pending.delete(key);
-        return {
-          challenge: create({ kind: 'registration', session, credentialIds: credentialIds(credentials) }),
-          rp: { id: 'localhost', name: 'keysentry' },
-          user: { id: userId, name: 'keysentry-local', displayName: 'keysentry local dashboard' },
-          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }, { type: 'public-key', alg: -257 }],
-          authenticatorSelection: { userVerification: 'required', residentKey: 'preferred' },
-          timeout: LIFETIME_MS, attestation: 'none',
-          excludeCredentials: credentials.filter(c => c.rpId === 'localhost').map(c => ({ id: c.id, type: 'public-key' })),
-        };
-      });
-    },
-
-    registrationFinish(session: string, body: unknown): Promise<void> {
-      return serial(async () => {
-        const registration = wire(body);
-        const entry = take(registration.challenge, session);
-        if (entry.kind !== 'registration') return reject();
-        const credentials = await opts.passkeys.list();
-        if (now() >= entry.expires || JSON.stringify(entry.credentialIds) !== JSON.stringify(credentialIds(credentials))) return reject();
-        let credential: PasskeyCredential;
-        try {
-          credential = verifyRegistration({
-            attestationObject: decode(registration.response.attestationObject, 65_536), clientDataJSON: registration.clientData,
-            expectedChallenge: Buffer.from(registration.challenge, 'base64url'), expectedOrigins: [opts.origin],
-            rpId: 'localhost', requireUserVerification: true,
-          });
-        } catch { return reject(); }
-        if (credential.id !== registration.id || now() >= entry.expires) return reject();
-        if (credentials.some(c => c.id === credential.id)) throw new PasskeyGateError(409, 'This passkey is already registered.');
-        await opts.passkeys.add({ ...credential, origins: [opts.origin, 'http://localhost'] });
       });
     },
   };

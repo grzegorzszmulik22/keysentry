@@ -18,16 +18,14 @@ function setup(initial: PasskeyCredential[] = []) {
 }
 
 describe('dashboard passkey gate', () => {
-  it('registers a UV passkey with localhost origins and consumes enrollment once', async () => {
-    const auth = createFakeAuthenticator();
+  it('exposes no registration ceremony and directs an empty store to the terminal', async () => {
     const { gate, credentials } = setup();
-    const options = await gate.registrationOptions('session');
-    expect(options.rp.id).toBe('localhost');
-    expect(options.authenticatorSelection.userVerification).toBe('required');
-    const response = auth.registration(options.challenge, origin);
-    await gate.registrationFinish('session', response);
-    expect(credentials[0]).toMatchObject({ id: auth.id, rpId: 'localhost', origins: [origin, 'http://localhost'] });
-    await expect(gate.registrationFinish('session', response)).rejects.toMatchObject({ status: 403 });
+    expect(gate).not.toHaveProperty('registrationOptions');
+    expect(gate).not.toHaveProperty('registrationFinish');
+    const expected = { status: 403, message: 'Register a passkey with keysentry passkey register in your terminal, then reload this page.' };
+    await expect(gate.challenge('session', 'rotate', digest)).rejects.toMatchObject(expected);
+    await expect(gate.verify('session', 'rotate', digest, undefined)).rejects.toMatchObject(expected);
+    expect(credentials).toHaveLength(0);
   });
 
   it('verifies a real P-256 assertion and persists its counter', async () => {
@@ -65,18 +63,27 @@ describe('dashboard passkey gate', () => {
     await expect(gate.verify('session', 'rotate', digest, auth.assertionHeader(options.challenge, origin))).rejects.toMatchObject({ status: 403 });
   });
 
-  it.each(['assertion', 'registration'])('rechecks %s expiry after slow credential storage', async ceremony => {
+  it('rechecks assertion expiry after slow credential storage', async () => {
     const auth = createFakeAuthenticator();
-    const state = setup(ceremony === 'assertion' ? [auth.credential()] : []);
-    const options = ceremony === 'assertion' ? await state.gate.challenge('session', 'rotate', digest) : await state.gate.registrationOptions('session');
+    const state = setup([auth.credential()]);
+    const options = await state.gate.challenge('session', 'rotate', digest);
     const list = state.store.list;
     state.store.list = async () => { state.advance(120_000); return list(); };
-    const action = ceremony === 'assertion'
-      ? state.gate.verify('session', 'rotate', digest, auth.assertionHeader(options.challenge, origin))
-      : state.gate.registrationFinish('session', auth.registration(options.challenge, origin));
-    await expect(action).rejects.toMatchObject({ status: 403 });
-    expect(state.credentials[0]?.signCount ?? 0).toBe(0);
-    if (ceremony === 'registration') expect(state.credentials).toHaveLength(0);
+    await expect(state.gate.verify('session', 'rotate', digest, auth.assertionHeader(options.challenge, origin))).rejects.toMatchObject({ status: 403 });
+    expect(state.credentials[0]?.signCount).toBe(0);
+  });
+
+  it('consumes a submitted proof even if credential storage fails', async () => {
+    const auth = createFakeAuthenticator();
+    const state = setup([auth.credential()]);
+    const options = await state.gate.challenge('session', 'rotate', digest);
+    const header = auth.assertionHeader(options.challenge, origin);
+    const list = state.store.list;
+    state.store.list = async () => { throw new Error('Storage is unavailable.'); };
+    await expect(state.gate.verify('session', 'rotate', digest, header)).rejects.toThrow('Storage is unavailable.');
+    state.store.list = list;
+    await expect(state.gate.verify('session', 'rotate', digest, header)).rejects.toMatchObject({ status: 403 });
+    expect(state.credentials[0]?.signCount).toBe(0);
   });
 
   it.each(['uv', 'origin', 'signature', 'counter'])('refuses an invalid %s and never updates a counter', async field => {
@@ -107,58 +114,6 @@ describe('dashboard passkey gate', () => {
     await expect(gate.challenge('session', 'rotate', digest)).rejects.toMatchObject({ status: 403 });
     const other = setup([{ ...auth.credential(), rpId: 'example.org' }]);
     await expect(other.gate.challenge('session', 'rotate', digest)).rejects.toMatchObject({ status: 403 });
-  });
-
-  it('refuses enrollment without UV, on wrong session, after expiry or changed credential set', async () => {
-    const auth = createFakeAuthenticator();
-    const state = setup();
-    let options = await state.gate.registrationOptions('session');
-    await expect(state.gate.registrationFinish('other', auth.registration(options.challenge, origin))).rejects.toMatchObject({ status: 403 });
-    options = await state.gate.registrationOptions('session');
-    await expect(state.gate.registrationFinish('session', auth.registration(options.challenge, origin, { uv: false }))).rejects.toMatchObject({ status: 403 });
-    options = await state.gate.registrationOptions('session');
-    state.advance(120_000);
-    await expect(state.gate.registrationFinish('session', auth.registration(options.challenge, origin))).rejects.toMatchObject({ status: 403 });
-    options = await state.gate.registrationOptions('session');
-    state.credentials.push(createFakeAuthenticator().credential());
-    await expect(state.gate.registrationFinish('session', auth.registration(options.challenge, origin))).rejects.toMatchObject({ status: 403 });
-  });
-
-  it('rejects duplicate enrollment and ID substitution', async () => {
-    const auth = createFakeAuthenticator();
-    const { gate } = setup([auth.credential()]);
-    let proof = await gate.challenge('session', 'passkey/register/options', digest);
-    await gate.verify('session', 'passkey/register/options', digest, auth.assertionHeader(proof.challenge, origin));
-    let options = await gate.registrationOptions('session');
-    await expect(gate.registrationFinish('session', auth.registration(options.challenge, origin))).rejects.toMatchObject({ status: 409 });
-    proof = await gate.challenge('session', 'passkey/register/options', digest);
-    await gate.verify('session', 'passkey/register/options', digest, auth.assertionHeader(proof.challenge, origin));
-    options = await gate.registrationOptions('session');
-    const wire = createFakeAuthenticator().registration(options.challenge, origin);
-    wire.id = auth.id; wire.rawId = auth.id;
-    await expect(gate.registrationFinish('session', wire)).rejects.toMatchObject({ status: 403 });
-  });
-
-  it('checks existing-passkey enrollment authorization atomically with issuing options', async () => {
-    const auth = createFakeAuthenticator();
-    const state = setup();
-    // The transport could have observed an empty store before another request added a key.
-    state.credentials.push(auth.credential());
-    await expect(state.gate.registrationOptions('session')).rejects.toMatchObject({ status: 403 });
-    const proof = await state.gate.challenge('session', 'passkey/register/options', digest);
-    await state.gate.verify('session', 'passkey/register/options', digest, auth.assertionHeader(proof.challenge, origin));
-    await expect(state.gate.registrationOptions('session')).resolves.toHaveProperty('challenge');
-    await expect(state.gate.registrationOptions('session')).rejects.toMatchObject({ status: 403 });
-  });
-
-  it('does not extend the original proof lifetime when granting enrollment options', async () => {
-    const auth = createFakeAuthenticator();
-    const state = setup([auth.credential()]);
-    const proof = await state.gate.challenge('session', 'passkey/register/options', digest);
-    state.advance(119_000);
-    await state.gate.verify('session', 'passkey/register/options', digest, auth.assertionHeader(proof.challenge, origin));
-    state.advance(1000);
-    await expect(state.gate.registrationOptions('session')).rejects.toMatchObject({ status: 403 });
   });
 
   it('bounds pending challenges and prunes expired entries', async () => {

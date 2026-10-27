@@ -2,6 +2,7 @@ export interface DashboardSession { csrf: string; readOnly: boolean; passkeys: n
 
 let session: DashboardSession | undefined;
 const requestError = 'The request could not be completed. Try again.';
+export const passkeyRegistrationNotice = 'Register a passkey with keysentry passkey register in your terminal, then reload this page.';
 
 export function configureSession(value: DashboardSession): void {
   session = { ...value };
@@ -83,13 +84,13 @@ function descriptors(value: unknown): PublicKeyCredentialDescriptor[] {
 
 function writable(): void {
   if (!session) throw new Error('Open keysentry again from your terminal.');
+  if (session.passkeys === 0) throw new Error(passkeyRegistrationNotice);
   if (session.readOnly) throw new Error('Changes are unavailable in this session.');
 }
 
-function credentialWire(credential: PublicKeyCredential, registration: boolean): Record<string, unknown> {
+function credentialWire(credential: PublicKeyCredential): Record<string, unknown> {
   const response = credential.response;
   const common = { id: credential.id, rawId: base64url(credential.rawId), type: credential.type };
-  if (registration) return { ...common, response: { clientDataJSON: base64url(response.clientDataJSON), attestationObject: base64url((response as AuthenticatorAttestationResponse).attestationObject) } };
   const assertion = response as AuthenticatorAssertionResponse;
   return { ...common, response: { clientDataJSON: base64url(response.clientDataJSON), authenticatorData: base64url(assertion.authenticatorData), signature: base64url(assertion.signature), userHandle: assertion.userHandle ? base64url(assertion.userHandle) : null } };
 }
@@ -111,33 +112,8 @@ export async function postWithPasskey<T = unknown>(route: string, body: unknown 
   } catch { throw new Error('Passkey verification was not completed. Try again.'); }
   if (!credential) throw new Error('Passkey verification was not completed.');
   let assertion: string;
-  try { assertion = base64url(new TextEncoder().encode(JSON.stringify(credentialWire(credential as PublicKeyCredential, false))).buffer); }
+  try { assertion = base64url(new TextEncoder().encode(JSON.stringify(credentialWire(credential as PublicKeyCredential))).buffer); }
   catch { throw new Error('Passkey verification was not completed. Try again.'); }
   return request<T>(name, 'POST', canonical, assertion);
 }
 
-/** Enrollment after the first passkey is itself authorized by a fresh assertion. */
-export async function registerPasskey(): Promise<void> {
-  writable();
-  const options = publicOptions(await (session!.passkeys > 0 ? postWithPasskey<WireOptions>('passkey/register/options', {}) : post<WireOptions>('passkey/register/options', {})));
-  let credential: Credential | null;
-  try {
-    const user = options.user as Record<string, unknown>;
-    const publicKey = {
-      ...options, challenge: decode(options.challenge),
-      rp: { id: 'localhost', name: 'keysentry' },
-      user: { id: decode(user.id), name: String(user.name), displayName: String(user.displayName) },
-      excludeCredentials: descriptors(options.excludeCredentials),
-      pubKeyCredParams: options.pubKeyCredParams as PublicKeyCredentialParameters[],
-      authenticatorSelection: { ...(options.authenticatorSelection as object), userVerification: 'required' },
-      attestation: 'none', timeout: 120_000,
-    } as PublicKeyCredentialCreationOptions;
-    credential = await navigator.credentials.create({ publicKey });
-  } catch { throw new Error('Passkey registration was not completed. Try again.'); }
-  if (!credential) throw new Error('Passkey registration was not completed.');
-  let wire: Record<string, unknown>;
-  try { wire = credentialWire(credential as PublicKeyCredential, true); }
-  catch { throw new Error('Passkey registration was not completed. Try again.'); }
-  await post('passkey/register/finish', wire);
-  session!.passkeys += 1;
-}

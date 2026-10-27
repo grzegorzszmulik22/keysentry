@@ -3,14 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash, webcrypto } from 'node:crypto';
 import { boot } from '../../../src/dashboard/client/main.js';
 import { createRouter } from '../../../src/dashboard/client/router.js';
-import { canonicalBody, configureSession, get, post, postWithPasskey, registerPasskey } from '../../../src/dashboard/client/api.js';
+import { canonicalBody, configureSession, get, post, postWithPasskey } from '../../../src/dashboard/client/api.js';
 import { button, confirmAction, disposeComponents, emptyState, keyTag, maskedValue, notice, table } from '../../../src/dashboard/client/components.js';
 
 const session = { csrf: 'session-csrf', readOnly: false, passkeys: 1 };
 const b64 = (value: string) => Buffer.from(value).toString('base64url');
 const bytes = (value: string) => new TextEncoder().encode(value).buffer;
 const assertion = () => ({ id: b64('credential'), rawId: bytes('credential'), type: 'public-key', response: { clientDataJSON: bytes('client'), authenticatorData: bytes('auth'), signature: bytes('signature'), userHandle: null } });
-const registration = () => ({ id: b64('credential'), rawId: bytes('credential'), type: 'public-key', response: { clientDataJSON: bytes('client'), attestationObject: bytes('attestation') } });
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 const tick = async () => { await new Promise(resolve => setTimeout(resolve, 0)); };
 
@@ -47,13 +46,25 @@ describe('dashboard shell and routing', () => {
     app.destroy();
   });
 
-  it('states read-only mode and offers first passkey registration only for writable sessions', async () => {
+  it('states read-only mode without offering browser passkey registration', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ...session, readOnly: true, passkeys: 0 })));
     const root = document.createElement('div'); document.body.append(root);
     const app = await boot(root);
     expect(root.textContent).toContain('Read-only');
     expect(root.textContent).toContain('To make changes, run keysentry ui in your own terminal.');
     expect([...root.querySelectorAll('button')].some(b => b.textContent === 'Register passkey')).toBe(false);
+    app.destroy();
+  });
+
+  it.each([false, true])('directs zero-passkey sessions to the terminal under the heading (readOnly=%s)', async readOnly => {
+    const fetcher = vi.fn().mockResolvedValue(reply({ ...session, readOnly, passkeys: 0 }));
+    vi.stubGlobal('fetch', fetcher);
+    const root = document.createElement('div'); document.body.append(root);
+    const app = await boot(root);
+    const message = 'Register a passkey with keysentry passkey register in your terminal, then reload this page.';
+    expect(root.querySelector('h1')?.nextElementSibling?.textContent).toContain(message);
+    expect([...root.querySelectorAll('button')].some(control => /register passkey/i.test(control.textContent ?? ''))).toBe(false);
+    expect(fetcher.mock.calls.some(call => String(call[0]).includes('passkey/register/'))).toBe(false);
     app.destroy();
   });
 
@@ -123,6 +134,21 @@ describe('dashboard API client', () => {
     expect(wire.response.signature).toBe(b64('signature')); expect(wire.response.userHandle).toBeNull();
   });
 
+  it('uses a terminal-registered credential ID longer than the old vault-name limit', async () => {
+    const rawId = new Uint8Array(1023).fill(17).buffer;
+    const id = Buffer.from(rawId).toString('base64url');
+    const credentials = { get: vi.fn(async options => {
+      expect(new Uint8Array(options.publicKey.allowCredentials[0].id)).toEqual(new Uint8Array(rawId));
+      return { ...assertion(), id, rawId };
+    }) };
+    Object.defineProperty(navigator, 'credentials', { configurable: true, value: credentials });
+    const fetcher = vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), allowCredentials: [{ type: 'public-key', id }] })).mockResolvedValueOnce(reply({ done: true }));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(postWithPasskey('rotate', {})).resolves.toEqual({ done: true });
+    const wire = JSON.parse(Buffer.from(fetcher.mock.calls[1]?.[1].headers['X-Passkey-Assertion'], 'base64url').toString());
+    expect(wire.id).toBe(id); expect(wire.rawId).toBe(id);
+  });
+
   it('never sends the action when the passkey prompt is cancelled', async () => {
     Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: vi.fn(async () => null) } });
     const fetcher = vi.fn().mockResolvedValue(reply({ challenge: b64('challenge'), rpId: 'localhost' })); vi.stubGlobal('fetch', fetcher);
@@ -133,31 +159,17 @@ describe('dashboard API client', () => {
   it('refuses mutations in read-only mode before making a request', async () => {
     configureSession({ ...session, readOnly: true }); const fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
     await expect(postWithPasskey('rotate', {})).rejects.toThrow('Changes are unavailable in this session.');
-    await expect(registerPasskey()).rejects.toThrow('Changes are unavailable in this session.');
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it('registers the first passkey with required user verification', async () => {
-    configureSession({ ...session, passkeys: 0 });
-    const create = vi.fn(async options => { expect(options.publicKey.challenge).toBeInstanceOf(Uint8Array); expect(options.publicKey.user.id).toBeInstanceOf(Uint8Array); expect(options.publicKey.authenticatorSelection.userVerification).toBe('required'); return registration(); });
-    Object.defineProperty(navigator, 'credentials', { configurable: true, value: { create } });
-    const fetcher = vi.fn().mockResolvedValueOnce(reply({ challenge: b64('create'), rp: { id: 'localhost', name: 'keysentry' }, user: { id: b64('user'), name: 'keysentry', displayName: 'keysentry' }, pubKeyCredParams: [{ type: 'public-key', alg: -7 }], authenticatorSelection: { userVerification: 'required' } })).mockResolvedValueOnce(reply({ registered: true })); vi.stubGlobal('fetch', fetcher);
-    await registerPasskey();
-    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/passkey/register/options', '/api/passkey/register/finish']);
-    expect(JSON.parse(fetcher.mock.calls[1]?.[1].body).response.attestationObject).toBe(b64('attestation'));
-  });
-
-  it('authorizes additional passkey enrollment with an existing passkey', async () => {
-    Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: vi.fn(async () => assertion()), create: vi.fn(async () => registration()) } });
-    const fetcher = vi.fn()
-      .mockResolvedValueOnce(reply({ challenge: b64('assert'), rpId: 'localhost' }))
-      .mockResolvedValueOnce(reply({ challenge: b64('create'), rp: { id: 'localhost', name: 'keysentry' }, user: { id: b64('user'), name: 'keysentry', displayName: 'keysentry' }, pubKeyCredParams: [{ type: 'public-key', alg: -7 }] }))
-      .mockResolvedValueOnce(reply({ registered: true })); vi.stubGlobal('fetch', fetcher);
-    await registerPasskey();
-    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/passkey/challenge', '/api/passkey/register/options', '/api/passkey/register/finish']);
-    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body).route).toBe('passkey/register/options');
-    expect(fetcher.mock.calls[1]?.[1].headers['X-Passkey-Assertion']).toBeTruthy();
-    expect(fetcher.mock.calls[2]?.[1].headers['X-Passkey-Assertion']).toBeUndefined();
+  it.each([false, true])('directs changes without a passkey to terminal registration before requesting credentials (readOnly=%s)', async readOnly => {
+    configureSession({ ...session, readOnly, passkeys: 0 });
+    const credentials = { get: vi.fn(), create: vi.fn() };
+    Object.defineProperty(navigator, 'credentials', { configurable: true, value: credentials });
+    const fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
+    await expect(postWithPasskey('rotate', {})).rejects.toThrow('Register a passkey with keysentry passkey register in your terminal, then reload this page.');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(credentials.get).not.toHaveBeenCalled(); expect(credentials.create).not.toHaveBeenCalled();
   });
 
   it('does not display an API error body or credential error message', async () => {
@@ -209,6 +221,22 @@ describe('dashboard components', () => {
     expect(component.textContent).toContain('Hidden'); expect(fetcher).not.toHaveBeenCalled(); component.querySelector('button')!.click();
     expect(fetcher).not.toHaveBeenCalled(); [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
     expect(component.textContent).toContain('explicit-reveal-only'); [...component.querySelectorAll('button')].find(b => b.textContent === 'Hide')!.click(); expect(component.textContent).not.toContain('explicit-reveal-only'); expect(component.textContent).toContain('Hidden');
+  });
+
+  it('announces only reveal state while the value stays outside live regions', async () => {
+    Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: vi.fn(async () => assertion()) } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'private-revealed-value' })));
+    const component = maskedValue(); document.body.append(component);
+    const output = component.querySelector('.masked-value-output')!;
+    expect(output.closest('[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], [role="log"]')).toBeNull();
+    component.querySelector('button')!.click();
+    [...document.querySelectorAll('dialog button')].find(control => control.textContent === 'Reveal value')!.click();
+    await vi.waitFor(() => expect(output.textContent).toBe('private-revealed-value'));
+    expect(component.querySelector('[role="status"]')?.textContent).toBe('Value shown');
+    expect(output.closest('[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], [role="log"]')).toBeNull();
+    [...component.querySelectorAll('button')].find(control => control.textContent === 'Hide')!.click();
+    expect(component.querySelector('[role="status"]')?.textContent).toBe('Value hidden');
+    expect(component.textContent).not.toContain('private-revealed-value');
   });
 
   it('clears a copied value 30 seconds after the most recent copy', async () => {

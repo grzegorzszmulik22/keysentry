@@ -6,6 +6,8 @@ import { startDashboard, type DashboardApi } from '../../../src/dashboard/server
 import { canonicalJson } from '../../../src/security/index.js';
 import { createFakeAuthenticator } from '../helpers/fake-authenticator.js';
 import type { PasskeyCredential } from '../../../src/types.js';
+import { DashboardError } from '../../../src/dashboard/server/security.js';
+import { VaultLockedError, VaultUnavailableError } from '../../../src/vault/errors.js';
 
 interface Reply { status: number; headers: import('node:http').IncomingHttpHeaders; text: string; json: any }
 const running: Awaited<ReturnType<typeof startDashboard>>[] = [];
@@ -118,30 +120,36 @@ describe('dashboard HTTP boundary', () => {
     expect((await post(d.port, '/api/passkey/challenge', auth, { route: 'constructor', bodyDigest })).status).toBe(400);
   });
 
-  it('registers the first passkey with UV and gates adding another on an existing passkey', async () => {
+  it('offers no browser registration route and requires terminal registration before changes', async () => {
     const d = await start(); const auth = await login(d); const key = createFakeAuthenticator();
-    const options = await post(d.port, '/api/passkey/register/options', auth);
-    expect(options.status).toBe(200);
-    expect(options.json.authenticatorSelection.userVerification).toBe('required');
-    const finish = await post(d.port, '/api/passkey/register/finish', auth, key.registration(options.json.challenge, `http://localhost:${d.port}`));
-    expect(finish.status).toBe(200);
+    for (const path of ['options', 'finish']) {
+      expect((await post(d.port, `/api/passkey/register/${path}`, auth)).status).toBe(404);
+    }
+    const expected = { error: 'Register a passkey with keysentry passkey register in your terminal, then reload this page.' };
+    const mutation = await post(d.port, '/api/rotate', auth);
+    expect(mutation.status).toBe(403); expect(mutation.json).toEqual(expected);
+    const challenge = await post(d.port, '/api/passkey/challenge', auth, { route: 'rotate', bodyDigest: 'a'.repeat(64) });
+    expect(challenge.status).toBe(403); expect(challenge.json).toEqual(expected);
+    expect(d.handlers.write).not.toHaveBeenCalled();
+    d.keys.push(key.credential());
     expect((await req(d.port, '/api/session', { headers: { Cookie: auth.cookie } })).json.passkeys).toBe(1);
-    expect((await post(d.port, '/api/passkey/register/options', auth)).status).toBe(403);
-    const digest = createHash('sha256').update('{}').digest('hex');
-    const challenge = await post(d.port, '/api/passkey/challenge', auth, { route: 'passkey/register/options', bodyDigest: digest });
-    const proof = key.assertionHeader(challenge.json.challenge, `http://localhost:${d.port}`);
-    const second = await post(d.port, '/api/passkey/register/options', auth, {}, { 'X-Passkey-Assertion': proof });
-    expect(second.status).toBe(200);
-    const key2 = createFakeAuthenticator();
-    expect((await post(d.port, '/api/passkey/register/finish', auth, key2.registration(second.json.challenge, `http://localhost:${d.port}`))).status).toBe(200);
-    expect(d.keys).toHaveLength(2);
+    expect((await post(d.port, '/api/passkey/challenge', auth, { route: 'passkey/register/options', bodyDigest: 'a'.repeat(64) })).status).toBe(400);
+    for (const path of ['options', 'finish']) expect((await post(d.port, `/api/passkey/register/${path}`, auth)).status).toBe(404);
   });
 
   it('refuses mutations and enrollment in read-only mode', async () => {
     const d = await start({ readOnly: true }); const auth = await login(d);
     expect((await req(d.port, '/api/session', { headers: { Cookie: auth.cookie } })).json.readOnly).toBe(true);
-    for (const path of ['rotate', 'passkey/challenge', 'passkey/register/options', 'passkey/register/finish']) {
-      expect((await post(d.port, `/api/${path}`, auth)).status).toBe(403);
+    for (const path of ['rotate', 'passkey/challenge']) {
+      const response = await post(d.port, `/api/${path}`, auth);
+      expect(response.status).toBe(403);
+      expect(response.json).toEqual({ error: 'Register a passkey with keysentry passkey register in your terminal, then reload this page.' });
+    }
+    d.keys.push(createFakeAuthenticator().credential());
+    for (const path of ['rotate', 'passkey/challenge']) {
+      const response = await post(d.port, `/api/${path}`, auth);
+      expect(response.status).toBe(403);
+      expect(response.json).toEqual({ error: 'This dashboard is read-only. Open keysentry from a human terminal to make changes.' });
     }
     expect(d.handlers.write).not.toHaveBeenCalled();
   });
@@ -154,7 +162,77 @@ describe('dashboard HTTP boundary', () => {
     expect((await post(d.port, '/api/disarm', auth, {}, { 'Content-Type': 'text/plain' })).status).toBe(415);
     expect((await post(d.port, '/api/disarm', auth, {}, { 'Content-Encoding': 'gzip' })).status).toBe(415);
     const error = await req(d.port, '/api/broken', { headers: { Cookie: auth.cookie } });
-    expect(error.status).toBe(400); expect(error.text).not.toContain('planted-private-value');
+    expect(error.status).toBe(500); expect(error.text).not.toContain('planted-private-value');
+  });
+
+  it('refuses cross-site Fetch Metadata before running handlers or refreshing a session', async () => {
+    let now = 0;
+    const d = await start({ idleMs: 5000, now: () => now }); const auth = await login(d);
+    now = 4000;
+    for (const site of ['same-site', 'cross-site', 'unexpected', '']) {
+      const response = await req(d.port, '/api/keys', { headers: { Cookie: auth.cookie, 'Sec-Fetch-Site': site } });
+      expect(response.status).toBe(403);
+      expect(response.json).toEqual({ error: 'Send this request from the local dashboard.' });
+      expect(response.headers['cross-origin-resource-policy']).toBe('same-origin');
+      expect(response.headers['cross-origin-opener-policy']).toBe('same-origin');
+    }
+    expect(d.handlers.read).not.toHaveBeenCalled();
+    now = 5000;
+    expect((await req(d.port, '/api/session', { headers: { Cookie: auth.cookie, 'Sec-Fetch-Site': 'same-origin' } })).status).toBe(401);
+  });
+
+  it('accepts same-origin and direct Fetch Metadata, but never exchanges a cross-site login token', async () => {
+    const d = await start();
+    const path = `/${new URL(d.url).search}`;
+    expect((await req(d.port, path, { headers: { 'Sec-Fetch-Site': 'same-site' } })).status).toBe(403);
+    const auth = await login(d);
+    for (const site of ['same-origin', 'none']) {
+      expect((await req(d.port, '/api/keys', { headers: { Cookie: auth.cookie, 'Sec-Fetch-Site': site } })).status).toBe(200);
+    }
+    expect((await post(d.port, '/api/disarm', auth, {}, { 'Sec-Fetch-Site': 'same-site' })).status).toBe(403);
+    expect((await post(d.port, '/api/disarm', auth, {}, { 'Sec-Fetch-Site': 'same-site', Expect: '100-continue' })).status).toBe(403);
+    expect(d.handlers.write).not.toHaveBeenCalled();
+  });
+
+  it('does not keep the server alive with refused cross-port requests', async () => {
+    const d = await start({ idleMs: 150 }); const auth = await login(d);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect((await req(d.port, '/api/keys', { headers: { Cookie: auth.cookie, 'Sec-Fetch-Site': 'same-site' } })).status).toBe(403);
+    await new Promise(resolve => setTimeout(resolve, 90));
+    await expect(req(d.port, '/')).rejects.toThrow();
+    expect(d.handlers.read).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [Object.assign(new Error('private-value'), { code: 'STATE_BUSY' }), 503, 'STATE_BUSY'],
+    [new Error("keysentry's saved state is busy. Try again when the other operation finishes."), 503, 'STATE_BUSY'],
+    [new VaultUnavailableError('private-value'), 503, 'VAULT_UNAVAILABLE'],
+    [new VaultLockedError('The vault is busy in another keysentry process. Try again after it finishes.'), 503, 'VAULT_BUSY'],
+    [new VaultLockedError('private-value'), 500, 'VAULT_LOCKED'],
+    [Object.assign(new Error('private-value'), { name: 'private-name', code: 'private-code' }), 500, 'ERROR'],
+  ])('classifies operational errors without returning or reporting values (%#)', async (error, status, errorClass) => {
+    const onError = vi.fn();
+    const d = await start({ onError, api: { broken: { method: 'GET', mutating: false, handler: async () => { throw error; } } } });
+    const auth = await login(d);
+    const response = await req(d.port, '/api/broken', { headers: { Cookie: auth.cookie } });
+    expect(response.status).toBe(status);
+    expect(response.json).toEqual({ error: 'The request could not be completed. Try again from keysentry.' });
+    expect(response.headers['retry-after']).toBe(status === 503 ? '2' : undefined);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(errorClass);
+  });
+
+  it('keeps explicit input errors at 400 and safely handles a failing error reporter', async () => {
+    const onError = vi.fn(() => { throw new Error('reporter-private-value'); });
+    const d = await start({ onError, api: {
+      invalid: { method: 'POST', mutating: false, handler: async () => { throw new DashboardError(400, 'Choose a key.'); } },
+      broken: { method: 'GET', mutating: false, handler: async () => { throw new Error('handler-private-value'); } },
+    } });
+    const auth = await login(d);
+    const invalid = await post(d.port, '/api/invalid', auth);
+    expect(invalid.status).toBe(400); expect(invalid.json).toEqual({ error: 'Choose a key.' });
+    expect(onError).not.toHaveBeenCalled();
+    const broken = await req(d.port, '/api/broken', { headers: { Cookie: auth.cookie } });
+    expect(broken.status).toBe(500); expect(broken.text).not.toContain('private-value');
   });
 
   it('caps streamed bodies without Content-Length and rejects invalid UTF-8 JSON', async () => {
@@ -185,6 +263,7 @@ describe('dashboard HTTP boundary', () => {
     expect((await req(d.port, '/', { method: 'OPTIONS' })).status).toBe(405);
     expect(d.handlers.write).not.toHaveBeenCalled();
     await expect(startDashboard({ readOnly: false, api: { reveal: { method: 'GET', mutating: true, handler: async () => ({ value: 'must-not-be-served' }) } } })).rejects.toThrow('Configure dashboard routes');
+    await expect(startDashboard({ readOnly: false, api: { 'passkey/register/options': { method: 'POST', mutating: false, handler: async () => ({}) } } })).rejects.toThrow('Configure dashboard routes');
   });
 
   it('sets security headers on success, errors, redirects and unauthenticated pages', async () => {
@@ -195,6 +274,8 @@ describe('dashboard HTTP boundary', () => {
       expect(response.headers['x-content-type-options']).toBe('nosniff');
       expect(response.headers['referrer-policy']).toBe('no-referrer');
       expect(response.headers['cache-control']).toBe('no-store');
+      expect(response.headers['cross-origin-resource-policy']).toBe('same-origin');
+      expect(response.headers['cross-origin-opener-policy']).toBe('same-origin');
       expect(response.headers['access-control-allow-origin']).toBeUndefined();
     }
   });
@@ -225,6 +306,8 @@ describe('dashboard HTTP boundary', () => {
       });
       expect(response).toContain('Content-Security-Policy:'); expect(response).toContain('Cache-Control: no-store');
       expect(response).toContain('X-Content-Type-Options: nosniff'); expect(response).toContain('Permissions-Policy:');
+      expect(response).toContain('Cross-Origin-Resource-Policy: same-origin');
+      expect(response).toContain('Cross-Origin-Opener-Policy: same-origin');
     }
     expect(d.handlers.write).not.toHaveBeenCalled();
   });
