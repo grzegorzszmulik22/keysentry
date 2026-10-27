@@ -2,6 +2,8 @@ import { fetchSession, registerPasskey } from './api.js';
 import type { DashboardSession } from './api.js';
 import { button, emptyState, notice } from './components.js';
 import { createRouter } from './router.js';
+import { registerScreensA } from './screens/a.js';
+import { registerScreensB } from './screens/b.js';
 import type { DashboardRouter } from './router.js';
 
 export interface DashboardApp { session: DashboardSession; router: DashboardRouter; destroy(): void }
@@ -48,6 +50,9 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   for (const [path, , title] of [...pages, ['access', 'Access', 'What keysentry can access'], ['network', 'Network', 'Network']] as const) {
     router.register(path, { title, render: () => emptyState(path === 'home' ? 'Start with your keys to review the next steps for this project.' : 'Return to the overview to choose the next step for this project.', { label: path === 'home' ? 'See your keys' : 'Open overview', onClick: () => router.navigate(path === 'home' ? 'keys' : 'home') }) });
   }
+  // Real screens replace the placeholders above (tasks 6a and 6b each own one registration module).
+  registerScreensA(router, session);
+  registerScreensB(router, session);
   await router.start();
   return { session, router, destroy() { router.stop(); root.replaceChildren(); } };
 }
