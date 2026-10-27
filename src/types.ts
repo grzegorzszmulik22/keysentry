@@ -519,3 +519,145 @@ export type CrashPoint =
   | 'after-verify'
   | 'before-revoke'
   | 'after-revoke';
+
+// ---------------------------------------------------------------- phase 2: autopilot
+export type AutopilotMethod = 'auto' | 'generate';
+
+export interface ArmedCluster {
+  clusterId: string;
+  provider: ProviderId;
+  method: AutopilotMethod;
+  /** Every consumer at arming time; a new, removed or changed consumer downgrades the cluster to "ask". */
+  consumers: { serviceKey: string; varName: string; fingerprint: string | null }[];
+  /** Write-only consumers adopted at arming: keysentry wrote this value (by fingerprint) and knows its key ref. */
+  adopted?: { fingerprint: string; keyRef: string | null; at: string };
+}
+
+/** Signed by the device key; the watcher executes automatic rotations only inside it. */
+export interface ArmedPlan {
+  v: 1;
+  id: string;
+  projectId: string;
+  createdAt: string;
+  expiresAt: string;
+  /** Incidents on these hosts may trigger automatic rotation. */
+  hosts: HostId[];
+  clusters: ArmedCluster[];
+  maxServicesPerWave: number;
+  graceSeconds: number;
+  healthChecks: { serviceKey: string; url: string; expectStatus?: number }[];
+  /** The user accepted that activation on these hosts is confirmed at the next deploy (Vercel preview, GitHub Actions). */
+  nextDeployAcceptance: { host: HostId; maxHours: number; revokeAfterMax: boolean }[];
+  quiet: { lowPriorityHours?: { start: string; end: string; timeZone: string } };
+  signer: { keyId: string; publicKeyDer: string };
+  sig: string;
+}
+
+export interface ScopeDecision {
+  execute: string[];
+  ask: { clusterId: string; reasons: string[] }[];
+}
+
+// ---------------------------------------------------------------- phase 2: incidents
+export type SourceKind = 'official' | 'news';
+
+export interface FeedSource {
+  id: string;
+  kind: SourceKind;
+  url: string;
+  /** Platforms an official source speaks for; news sources list the platforms they may report on (all). */
+  hosts: HostId[];
+  outlet: string;
+  /** Publishing company: two news items corroborate each other only when their owners differ. */
+  owner: string;
+  maxBytes?: number;
+}
+
+export interface IncidentEvidence {
+  sourceId: string;
+  kind: SourceKind;
+  outlet: string;
+  owner: string;
+  /** Keyed hash of the item id; raw ids and bodies are not kept. */
+  itemKey: string;
+  /** Sanitized, at most 200 characters. */
+  title: string;
+  link: string | null;
+  publishedAt: string | null;
+  credentialExposure: boolean;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface Incident {
+  id: string;
+  host: HostId;
+  openedAt: string;
+  evidence: IncidentEvidence[];
+  status: 'watching' | 'alerted' | 'triggered' | 'closed';
+  trigger?: { at: string; rule: 'official' | 'official+news' | 'corroborated-news' };
+  waveId?: string;
+}
+
+// ---------------------------------------------------------------- phase 2: notifications
+export type NotifySeverity = 'info' | 'warning' | 'urgent';
+
+/** Never contains a secret value; key hints only when the user enabled them. */
+export interface NotifyMessage {
+  id: string;
+  at: string;
+  kind: string;
+  severity: NotifySeverity;
+  title: string;
+  lines: string[];
+  actionId?: string;
+  approveUrl?: string;
+}
+
+export interface SignedNotifyMessage extends NotifyMessage {
+  keyId: string;
+  sig: string;
+  /** Short verification code shown in the message, e.g. "K7QM-2XRA". */
+  code: string;
+}
+
+export type NotifyChannelKind = 'telegram' | 'discord' | 'slack' | 'ntfy' | 'webhook' | 'resend' | 'smtp' | 'console';
+
+export interface NotifyChannel {
+  readonly id: string;
+  readonly kind: NotifyChannelKind;
+  send(m: SignedNotifyMessage): Promise<void>;
+}
+
+// ---------------------------------------------------------------- phase 2: approvals
+export interface PasskeyCredential {
+  /** base64url credential id. */
+  id: string;
+  /** base64url COSE public key. */
+  publicKeyCose: string;
+  alg: -7 | -8 | -257;
+  signCount: number;
+  backupEligible: boolean;
+  rpId: string;
+  origins: string[];
+  label: string;
+  createdAt: string;
+}
+
+export interface ApprovalRequest {
+  actionId: string;
+  /** sha256 hex of the canonical action description. */
+  digest: string;
+  createdAt: string;
+  expiresAt: string;
+  /** base64url, single use. */
+  challenge: string;
+  /** Policy-widening actions can only be approved on a registered device with the local CLI. */
+  widening: boolean;
+}
+
+export interface ApprovalGrant {
+  actionId: string;
+  digest: string;
+  at: string;
+  by: { kind: 'passkey'; credentialId: string } | { kind: 'device'; keyId: string };
+}

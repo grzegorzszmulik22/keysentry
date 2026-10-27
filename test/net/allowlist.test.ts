@@ -9,7 +9,10 @@ import { DEFAULT_BREACH_FEEDS } from '../../src/monitor/detectors/breach-feed.js
 
 async function sources(dir: string): Promise<string[]> {
   const files: string[] = [];
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return files; throw error; }
+  for (const entry of entries) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) files.push(...await sources(path));
     else if (entry.name.endsWith('.ts')) files.push(path);
@@ -17,12 +20,13 @@ async function sources(dir: string): Promise<string[]> {
   return files;
 }
 
-test('every https literal in src/hosts, src/providers and src/monitor is allow-listed or display-only', async () => {
+test('every https literal in network-calling modules is allow-listed or display-only', async () => {
   const templateHosts: Record<string, string[]> = {
     '${service}.amazonaws.com': ['iam.amazonaws.com', 'sts.amazonaws.com'],
   };
   let literals = 0;
-  for (const dir of ['src/hosts', 'src/providers', 'src/monitor']) {
+  // Phase 2 modules are scanned as soon as they exist.
+  for (const dir of ['src/hosts', 'src/providers', 'src/monitor', 'src/feeds', 'src/autopilot', 'src/notify', 'src/approvals', 'src/watcher']) {
     for (const path of await sources(dir)) {
       const source = await readFile(path, 'utf8');
       const occurrences = [...source.matchAll(/https:\/\//g)].length;
