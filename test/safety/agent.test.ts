@@ -80,4 +80,16 @@ describe('human mutation gate', () => {
     expect(() => assertHumanForMutation({ ...human, env: { CODEX_CI: '1', KEYSENTRY_ALLOW_AGENT: '1', KEYSENTRY_NO_SANDBOX: '1', KEYSENTRY_YES: '1' } }))
       .toThrow(AgentRefusalError);
   });
+
+  test('allows piped stdin only with the explicit stdin option and an interactive stdout', () => {
+    expect(() => assertHumanForMutation({ ...human, stdinIsTTY: false, allowPipedStdin: true })).not.toThrow();
+    expect(() => assertHumanForMutation({ ...human, stdinIsTTY: false })).toThrow(AgentRefusalError);
+    expect(() => assertHumanForMutation({ ...human, stdinIsTTY: false, stdoutIsTTY: false, allowPipedStdin: true }))
+      .toThrow(AgentRefusalError);
+  });
+
+  test('checks agent markers before allowing an explicitly piped value', () => {
+    expect(() => assertHumanForMutation({ ...human, env: { CODEX_CI: '1' }, stdinIsTTY: false, allowPipedStdin: true }))
+      .toThrow(/detected: Codex/);
+  });
 });

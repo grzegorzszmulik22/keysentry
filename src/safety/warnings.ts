@@ -1,0 +1,1 @@
+export const MEMORY_ONLY_ROTATION_WARNING = 'Your vault keeps rotation values in memory only; if keysentry stops mid-rotation, the new key cannot be recovered. Use the OS credential store or the encrypted file for rotations.';

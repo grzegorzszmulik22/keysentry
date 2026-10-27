@@ -71,7 +71,7 @@ describe('eligibility and adoption', () => {
     } finally { Object.assign(adapter, { [capability]: original }); }
   });
 
-  test('adoption is needed for sealed, Fly and Actions consumers only without a record', () => {
+  test('adoption is needed for sealed, Fly and Actions consumers without a usable provider reference', () => {
     expect(adoptionNeeded(cluster())).toBe(false);
     for (const host of ['railway', 'fly', 'github-actions'] as HostId[]) {
       const c = cluster(); c.consumers[0]!.service.host = host; c.consumers[0]!.sealed = host === 'railway';
@@ -81,6 +81,35 @@ describe('eligibility and adoption', () => {
       expect(adoptionNeeded(c)).toBe(false);
       expect(autopilotEligibility(c)).toEqual({ eligible: true, method: 'auto' });
     }
+  });
+
+  test.each(['railway', 'fly', 'github-actions'] as const)('write-only %s adoption requires a non-null key reference', host => {
+    const c = cluster({ adopted: { ...adopted, keyRef: null } });
+    c.consumers[0]!.service.host = host;
+    c.consumers[0]!.sealed = host === 'railway';
+    expect(adoptionNeeded(c)).toBe(true);
+    expect(autopilotEligibility(c)).toMatchObject({ eligible: false, reason: expect.stringMatching(/adopt/i) });
+    const result = buildArmedPlan({ projectId: 'p', inventory: inventory([c]), clusterIds: [c.id], hosts: [host], options: {}, now });
+    expect(result.plan.clusters).toEqual([]);
+    expect(result.refused).toEqual([{ clusterId: c.id, reason: expect.stringMatching(/adopt/i) }]);
+  });
+
+  test('write-only adoption requires the provider reference-rotation capability', () => {
+    const c = cluster({ adopted }); c.consumers[0]!.sealed = true;
+    const adapter = getProvider(c.provider);
+    const original = adapter.rotateByRef;
+    try {
+      adapter.rotateByRef = undefined;
+      expect(adoptionNeeded(c)).toBe(true);
+      expect(autopilotEligibility(c)).toMatchObject({ eligible: false, reason: expect.stringMatching(/adopt/i) });
+    } finally { adapter.rotateByRef = original; }
+  });
+
+  test('write-only generated secrets require reference-rotation adoption too', () => {
+    const c = cluster({ provider: 'app-secret', tier: 'app', method: 'generate', adopted: { ...adopted, keyRef: null } });
+    c.consumers[0]!.sealed = true; c.consumers[0]!.varName = 'SESSION_SECRET';
+    expect(adoptionNeeded(c)).toBe(true);
+    expect(autopilotEligibility(c)).toMatchObject({ eligible: false, reason: expect.stringMatching(/adopt/i) });
   });
 });
 

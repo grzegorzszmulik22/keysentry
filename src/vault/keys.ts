@@ -1,5 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { link, mkdir, open, readFile, unlink } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { link, mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { Vault } from '../types.js';
 import { deviceKeyFromPrivate, generateDeviceKey, type DeviceKey } from '../security/index.js';
@@ -71,6 +71,26 @@ export function getProjectId(stateDir: string): Promise<string> {
       });
     }
     return id;
+  });
+}
+
+/** Keep the project identity outside the project files that it authenticates. */
+export async function bindProjectPath(vault: Vault, projectDir: string, projectId: string): Promise<void> {
+  if (!/^[0-9a-f]{16}$/.test(projectId)) throw new TypeError('The project identifier is invalid. Restore project.json before continuing.');
+  // Canonicalize physical aliases and Windows casing so the same directory cannot acquire a second identity.
+  const projectPath = await realpath(resolve(projectDir));
+  const name = `projects/by-path/${createHash('sha256').update(projectPath).digest('hex').slice(0, 32)}`;
+  return withVaultLock(vault, name, async () => {
+    const existing = await vault.get(name);
+    try {
+      if (existing !== null) {
+        if (!existing.equals(Buffer.from(projectId))) {
+          throw new VaultLockedError('project.json was changed or copied from another project. Restore the original project.json before opening saved state.');
+        }
+        return;
+      }
+      await vault.set(name, Buffer.from(projectId));
+    } finally { existing?.fill(0); }
   });
 }
 

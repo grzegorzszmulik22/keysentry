@@ -2,7 +2,7 @@ import { CliError } from './errors.js';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
-import { RotationAbortedError, type GraceDecision, type GraceInfo, type GuidedPrompt, type ProviderId } from '../types.js';
+import { RotationAbortedError, type GraceDecision, type GraceInfo, type GuidedPrompt, type ProviderId, type VaultBackendId } from '../types.js';
 import { getProvider } from '../providers/index.js';
 
 /** Separate the terminal from diagnostics so an explicit reveal never reaches a log sink. */
@@ -175,6 +175,33 @@ export async function confirmVaultFallback(store: string, reason: string, write:
   write(`keysentry can't use ${store} here (${reason}). Keep keys in an encrypted file protected by a passphrase instead? [y/N]`);
   const answer = await readHidden(tty);
   return /^(?:y|yes)$/i.test(answer.value ?? '') && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+export async function confirmInventoryReplacement(write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {
+  const tty = terminal(io);
+  if (!tty) return false;
+  write("keysentry can't read the saved inventory on this computer. Replace it with a fresh scan? [y/N]");
+  const answer = await readHidden(tty);
+  return /^(?:y|yes)$/i.test(answer.value ?? '') && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+export async function confirmMissingManifest(write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {
+  write('The release manifest is missing, so this installation could not be checked. Type yes and press Enter to continue:');
+  const tty = terminal(io);
+  if (!tty) return false;
+  const answer = await readHidden(tty);
+  return answer.value === 'yes' && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+export async function promptVaultBackend(osBackend: VaultBackendId, write: (text: string) => void, io: PromptIO = {}): Promise<VaultBackendId> {
+  const tty = terminal(io);
+  if (!tty) return 'encrypted-file';
+  write(`An encrypted file and ${osBackend} are both available. Type file to use the encrypted file, or os to use ${osBackend}. Press Enter to keep using the encrypted file.`);
+  const answer = await readHidden(tty);
+  if (answer.pasted || !hasInteractiveTerminal(io)) throw new CliError('Choose file or os.');
+  if (answer.value === null || answer.value === 'file') return 'encrypted-file';
+  if (answer.value === 'os') return osBackend;
+  throw new CliError('Choose file or os.');
 }
 
 export async function confirmStateReset(write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {

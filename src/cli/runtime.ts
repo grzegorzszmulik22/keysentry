@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
 import {
   buildPlan, classify, createLogger, createRedactor, createStateStore, createStateCipher, createInFlightStore,
-  renderBlastRadius, renderRunbook, scanHosts, serviceKey, statePaths, type StateStore,
+  renderBlastRadius, renderRunbook, scanHosts, serviceKey, statePaths, StateLockedError, type StateStore,
 } from '../core/index.js';
 import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { executePlan, resumeRotation, finishRotation, undoRotation, type RotateOptions, type EngineDeps } from '../rotate/index.js';
@@ -15,9 +15,9 @@ import { createGuardedHttp, createFileReceipt, EGRESS_RULES, rulesForUserFeeds, 
 import { createFetchHttp } from '../http.js';
 import { checkLocalIntegrity } from '../release/index.js';
 import { runDoctor } from '../doctor/index.js';
-import { assertHumanForMutation } from '../safety/index.js';
+import { assertHumanForMutation, MEMORY_ONLY_ROTATION_WARNING } from '../safety/index.js';
 import {
-  approve, createCanary, createFileMonitorStateStore, dismiss, listCanaries, removeCanary,
+  approve, createCanary, createFileMonitorStateStore, createMonitorState, dismiss, listCanaries, removeCanary,
   runMonitorOnce, type BreachFeed, type DetectorContext, type MonitorState, type MonitorStateStore, type RotateExecutor,
 } from '../monitor/index.js';
 import type {
@@ -27,7 +27,7 @@ import type {
 import { loadConfig, loadConfigMetadata } from './config.js';
 import { inventorySchema, planIdSchema, planSchema } from './schemas.js';
 import { humanizeServices, serviceLabel } from './display.js';
-import { hasInteractiveTerminal, promptSecret, revealSecret, promptPassphrase, promptGrace, confirmVaultFallback, type RevealInfo, type PromptIO } from './prompts.js';
+import { hasInteractiveTerminal, promptSecret, revealSecret, promptPassphrase, promptGrace, confirmVaultFallback, confirmInventoryReplacement, confirmMissingManifest, promptVaultBackend, type RevealInfo, type PromptIO } from './prompts.js';
 import { RotationAbortedError } from '../types.js';
 
 export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
@@ -42,6 +42,8 @@ export interface RuntimeOptions {
   stdinIsTTY?: boolean; stdoutIsTTY?: boolean; userDir?: string;
   grace?: (info: GraceInfo) => Promise<GraceDecision>;
   passphrase?: () => Promise<Buffer>; allowFileFallback?: (reason: string) => Promise<boolean>;
+  confirmInventoryReplacement?: () => Promise<boolean>;
+  confirmMissingManifest?: () => Promise<boolean>;
   promptIO?: PromptIO;
   verbose?: boolean; json?: boolean; sleep?: (ms: number) => Promise<void>; now?: () => Date;
 }
@@ -119,11 +121,26 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const storeName = env.KEYSENTRY_VAULT ?? (process.platform === 'win32' ? 'windows-dpapi' : process.platform === 'darwin' ? 'macos-keychain' : 'linux-secret-service');
   const vault = options.vault ?? await openVault({ env, userDir, log, passphrase,
     allowFileFallback: options.allowFileFallback ?? (reason => interactive ? confirmVaultFallback(storeName, reason, diagnostic, options.promptIO) : Promise.resolve(false)),
+    ...(interactive ? { chooseBackend: (backend: import('../types.js').VaultBackendId) => promptVaultBackend(backend, diagnostic, options.promptIO) } : {}),
   });
   const projectId = await getProjectId(paths.dir);
   const key = await stateKey(vault, projectId);
+  // The env backend has no writable durable store. Keep internal binding markers
+  // process-local, like its in-flight values; supplied environment markers win.
+  const transientMetadata = createMemoryVault();
+  const stateMetadata = (name: string) => name.startsWith('projects/by-path/') || name.endsWith('/state-initialized');
+  const stateVault: Vault = vault.backend === 'env' ? {
+    backend: vault.backend, weakness: vault.weakness,
+    // The environment vault cannot persist the initialized marker, and environments that use it (CI, the
+    // watcher) never held 0.1 plaintext state: report state as initialized so plaintext is never migrated there.
+    get: async name => name.endsWith('/state-initialized') ? Buffer.from('1')
+      : stateMetadata(name) ? await vault.get(name) ?? transientMetadata.get(name) : vault.get(name),
+    set: (name, value) => stateMetadata(name) ? transientMetadata.set(name, value) : vault.set(name, value),
+    delete: name => stateMetadata(name) ? transientMetadata.delete(name) : vault.delete(name),
+    list: prefix => vault.list(prefix),
+  } : vault;
   let baseStore: StateStore;
-  try { baseStore = createStateStore({ cwd: metadata.cwd, cipher: createStateCipher(key) }); }
+  try { baseStore = createStateStore({ cwd: metadata.cwd, cipher: createStateCipher(key), vault: stateVault, projectId }); }
   finally { key.fill(0); }
   const migration = await baseStore.migratePlaintext();
   if (migration.migrated.length) log.info(`Encrypted ${migration.migrated.length} files saved by keysentry 0.1. Nothing else changed.`);
@@ -138,9 +155,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   // process-local head is possible; never present it as a durable vault anchor.
   const auditVault: Vault = vault.backend === 'env' ? {
     backend: vault.backend, weakness: vault.weakness,
-    get: async name => name.startsWith('audit/head/') ? await transientHeads.get(name) ?? vault.get(name) : vault.get(name),
-    set: (name, value) => name.startsWith('audit/head/') ? transientHeads.set(name, value) : vault.set(name, value),
-    delete: name => name.startsWith('audit/head/') ? transientHeads.delete(name) : vault.delete(name),
+    get: async name => name.startsWith('audit/head/') || name === 'audit/mac' ? await transientHeads.get(name) ?? vault.get(name) : vault.get(name),
+    set: (name, value) => name.startsWith('audit/head/') || name === 'audit/mac' ? transientHeads.set(name, value) : vault.set(name, value),
+    delete: name => name.startsWith('audit/head/') || name === 'audit/mac' ? transientHeads.delete(name) : vault.delete(name),
     list: prefix => vault.list(prefix),
   } : {
     backend: vault.backend, weakness: vault.weakness,
@@ -148,13 +165,13 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     async set(name, value) { if (name.startsWith('audit/head/')) await markAnchor(); await vault.set(name, value); },
     delete: name => vault.delete(name), list: prefix => vault.list(prefix),
   };
-  const rawAudit = options.audit ?? createAuditLog({ path: paths.audit, vault: auditVault, deviceKey: () => deviceKey(vault), redactor, now: options.now });
+  const rawAudit = options.audit ?? createAuditLog({ path: paths.audit, vault: auditVault, deviceKey: () => deviceKey(vault), keyLockPath: join(userDir, 'audit-mac'), redactor, now: options.now });
   let auditDirty = false;
   let auditWeaknessReported = false;
   const audit: AuditLog = {
     async append(event) {
       if (!options.audit && vault.backend === 'env' && !auditWeaknessReported) {
-        log.warn('The environment vault cannot save an independent audit head. Checkpoint signatures are still checked.');
+        log.warn('The environment vault cannot save an independent audit head. Its audit MAC key is process-local unless supplied in the environment; verification across runs needs the same key.');
         auditWeaknessReported = true;
       }
       await rawAudit.append(event); auditDirty = true;
@@ -233,19 +250,52 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       providerCtx: writeConfig.providerCtx };
   }
 
-  async function integrityForExecution() {
+  let rotationVaultWarningShown = false;
+  let developmentWarningShown = false;
+  let missingManifestAccepted = false;
+  async function prepareExecution(write: (text: string) => void = diagnostic, developmentAlreadyReported = false) {
+    developmentWarningShown ||= developmentAlreadyReported;
+    if (!rotationVaultWarningShown && (vault.backend === 'env' || vault.backend === 'memory')) {
+      write(MEMORY_ONLY_ROTATION_WARNING); rotationVaultWarningShown = true;
+    }
     const integrity = await checkLocalIntegrity();
     if (integrity.status === 'mismatch') throw new CliError('The local installation check did not match. Reinstall keysentry before rotating keys.');
+    if (integrity.status === 'dev' && !developmentWarningShown) {
+      write('Development copy: release integrity has not been checked.'); developmentWarningShown = true;
+    }
+    if (integrity.status === 'missing-manifest' && !missingManifestAccepted) {
+      write('This installation has no release manifest. Its local integrity could not be checked.');
+      if (!interactive || !await (options.confirmMissingManifest ?? (() => confirmMissingManifest(write, options.promptIO)))()) {
+        throw new CliError('Execution cancelled because the release manifest is missing. Type yes at the confirmation to continue.');
+      }
+      missingManifestAccepted = true;
+    }
   }
 
-  async function scan(): Promise<Inventory> {
+  async function scan(allowReplacement = false): Promise<Inventory> {
+    let previousInventory: Inventory | null = null;
+    let monitorState: MonitorState | undefined;
+    let inventoryLocked = false; let monitorLocked = false;
+    try { previousInventory = await store.loadInventory(); }
+    catch (error) { if (!(error instanceof StateLockedError)) throw error; inventoryLocked = true; }
+    try { monitorState = await stateStore.load(); }
+    catch (error) { if (!(error instanceof StateLockedError)) throw error; monitorLocked = true; }
+    if (inventoryLocked || monitorLocked) {
+      if (!allowReplacement || !interactive) throw new CliError('keysentry can\'t read the saved inventory on this computer. Run "keysentry state reset" in an interactive terminal to start over.');
+      const auditCheck = await audit.verify();
+      if (!auditCheck.ok) throw new CliError('The saved audit log cannot be authenticated. Restore its matching vault audit key before replacing saved state.');
+      if (!await (options.confirmInventoryReplacement ?? (() => confirmInventoryReplacement(diagnostic, options.promptIO)))()) {
+        throw new CliError('Fresh scan cancelled. Saved state was kept.');
+      }
+      monitorState ??= createMonitorState();
+    }
     const inventory = await scanHosts(hosts, fingerprintKey, log);
     if (!options.hosts) inventory.errors.push(...config.disabledHosts.map(item => ({ host: item.host, message: item.reason })));
     // Retain only fingerprint metadata for unavailable hosts. Dropping a known
     // consumer would let a later partial scan understate a shared key's scope.
     const failedHosts = new Set(inventory.errors.map(error => error.host));
     if (failedHosts.size) {
-      const previous = inventorySchema.safeParse(await store.loadInventory());
+      const previous = inventorySchema.safeParse(previousInventory);
       if (previous.success) {
         const consumerKey = (consumer: Inventory['findings'][number] | Inventory['clusters'][number]['consumers'][number]) => `${serviceKey(consumer.service)}\0${consumer.varName}`;
         const services = new Set(inventory.services.map(serviceKey));
@@ -274,7 +324,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         }
       }
     }
-    const state = await stateStore.load();
+    const state = monitorState!;
     // Decoys are monitored separately. Never rotate one into a fully privileged production key.
     const decoys = new Set(state.canaries.map(canary => `${serviceKey(canary.service)}\0${canary.varName}`));
     const realConsumer = (consumer: Inventory['findings'][number] | Inventory['clusters'][number]['consumers'][number]) => !decoys.has(`${serviceKey(consumer.service)}\0${consumer.varName}`);
@@ -282,7 +332,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     inventory.clusters = inventory.clusters.map(cluster => ({ ...cluster, consumers: cluster.consumers.filter(realConsumer) })).filter(cluster => cluster.consumers.length > 0);
     const clean = safe(inventorySchema.parse(inventory));
     remember(clean.services);
-    await store.saveInventory(clean);
+    if (monitorLocked) await store.writeJson('monitor', paths.monitor, state, { replaceUndecryptable: true });
+    if (inventoryLocked) await store.writeJson('inventory', paths.inventory, clean, { replaceUndecryptable: true });
+    else await store.saveInventory(clean);
     await audit.append({ kind: 'scan', summary: 'Scan saved.', data: { hosts: clean.hosts.length, services: clean.services.length, clusters: clean.clusters.length, errors: clean.errors.length } });
     return clean;
   }
@@ -360,7 +412,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function rotate(rotationPlan: RotationPlan, opts: ExecutionOptions = {}): Promise<RotationReport> {
-    if (opts.execute === true) { assertHuman('rotate keys'); await integrityForExecution(); }
+    if (opts.execute === true) { assertHuman('rotate keys'); await prepareExecution(); }
     const inv = await inventory();
     let interrupted: RotationInterruptedError | undefined;
     let report: RotationReport;
@@ -430,7 +482,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function monitorOnce() {
-    if (config.monitor.policy.autoExecute || config.monitor.policy.autoContain) assertHuman('run automatic monitor actions');
+    if (config.monitor.policy.autoExecute || config.monitor.policy.autoContain) { assertHuman('run automatic monitor actions'); await prepareExecution(); }
     const inv = await scan();
     if (inv.errors.length) log.warn('Host scans failed or are disabled; monitoring continues on partial inventory. Clusters on unavailable hosts require remediation.');
     const ctx = { ...detector(inv, await stateStore.load()), state: stateStore as MonitorStateStore,
@@ -491,6 +543,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   async function approveAction(id: string, opts: ApprovalOptions = {}) {
     assertHuman('approve a key change');
+    await prepareExecution();
     const interactive = opts.interactive ?? hasInteractiveTerminal();
     const diagnostic = (text: string) => process.stderr.write(`${redactor.redact(humanize(text))}\n`);
     const interaction = interactive ? {
@@ -517,7 +570,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function plant(opts: { host: HostId; service: string; varName?: string; execute?: boolean }) {
-    if (opts.execute) assertHuman('create a canary');
+    if (opts.execute) { assertHuman('create a canary'); await prepareExecution(); }
     const selected = await adapters(opts.execute ? 'write' : 'read');
     const host = selected.hostMap[opts.host];
     if (!host) throw new CliError('Requested host is not enabled.');
@@ -588,6 +641,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   async function recover(mode: 'resume' | 'finish', id?: string, now = false) {
     assertHuman(mode === 'resume' ? 'resume a rotation' : 'finish a rotation');
+    await prepareExecution();
     const input = await recoveryInput(id);
     const deps = await recoveryDeps();
     const opts = { ...config.rotation, dryRun: false, early: now };
@@ -665,13 +719,14 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const command = <A extends unknown[], R>(operation: (...args: A) => Promise<R>) => (...args: A) => checkpointAfter(() => operation(...args));
 
   return {
-    config, paths, redactor, providers, safe, humanize, vault, store, inflight, audit, credentials, http, receipt, rules, userDir, interactive, assertHuman, mutationContext, assertStateResetSafe,
-    scan: command(scan), inventory: command(inventory), plan: command(plan), loadPlan, rotate: command(rotate),
+    config, paths, redactor, providers, safe, humanize, vault, store, inflight, audit, credentials, http, receipt, rules, userDir, interactive, assertHuman, mutationContext, assertStateResetSafe, prepareExecution,
+    scan: command(() => scan(true)), inventory: command(inventory), plan: command(plan), loadPlan, rotate: command(rotate),
     monitorOnce: command(monitorOnce), monitor, reviewAction, checkpoint: () => audit.checkpoint(),
     createCanary: command(plant), drill: command(readiness),
     resume: command((id?: string) => recover('resume', id)), finish: command((id?: string, now: boolean = false) => recover('finish', id, now)),
     undo: command(async (id: string, clusterIds?: string[]) => {
       assertHuman('undo a rotation');
+      await prepareExecution();
       const input = await recoveryInput(id);
       const report = await undoRotation({ ...input, clusterIds }, await recoveryDeps(), { ...config.rotation, dryRun: false });
       const state = await stateStore.load();
@@ -687,8 +742,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     }),
     resetState: command(resetState), vaultList,
     async vaultStatus() { return { backend: vault.backend, ...(vault.weakness ? { weakness: vault.weakness } : {}), credentials: await vaultList(), supportedNames: [...CREDENTIAL_NAMES] }; },
-    vaultSet: command(async (name: string, value: string, role: TokenRole = 'write') => {
-      assertHuman('store a credential'); const item = credentialName(name, role);
+    vaultSet: command(async (name: string, value: string, role: TokenRole = 'write', opts: { stdin?: boolean } = {}) => {
+      assertHumanForMutation({ ...mutationContext, action: 'store a credential', allowPipedStdin: opts.stdin === true }); const item = credentialName(name, role);
       if (!value) throw new CliError('The credential value was empty. Nothing was stored.');
       redactor.register(value); const bytes = Buffer.from(value);
       try { await vault.set(item, bytes); } finally { bytes.fill(0); }
@@ -712,7 +767,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       const enabledHosts = [...new Set([...config.hosts.map(host => host.id), ...config.disabledHosts.filter(item => item.reason !== 'Disabled in configuration.').map(item => item.host)])];
       const result = await runDoctor({ vault, credentials, enabledHosts, env, nodeVersion: process.versions.node,
         ...(probe ? { probe: { http } } : {}), previous, integrity: await checkLocalIntegrity(),
-        sandboxed: env.KEYSENTRY_SANDBOXED === '1' || !!process.permission });
+        sandboxed: !!process.permission });
       if (probe) await store.writeJson('doctor', path, result.fingerprints);
       await audit.append({ kind: 'doctor', summary: 'Doctor checks completed.', data: { probe, checks: result.items.length, warnings: result.items.filter(item => item.status === 'warn').length } });
       return safe(result);
@@ -728,7 +783,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     async runbook(rotationPlan: RotationPlan) { remember(rotationPlan.services); return redactor.redact(humanize(renderRunbook(rotationPlan, await inventory()))); },
     async canaries() { return safe(listCanaries(await stateStore.load())); },
     async removeCanary(id: string, execute = false) {
-      if (execute) assertHuman('remove a canary');
+      if (execute) { assertHuman('remove a canary'); await prepareExecution(); }
       const selected = await adapters(execute ? 'write' : 'read');
       const state = await stateStore.load();
       await removeCanary(id, detector(await inventory(), state, selected), { dryRun: !execute });
@@ -741,7 +796,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       return safe({ policy: config.monitor.policy, canaries: listCanaries(state), pendingActions: state.pendingActions, cooldowns: state.cooldowns, autoRotations: state.autoRotations });
     },
     approve: command(approveAction),
-    async dismiss(id: string) { await dismiss(id, await actionContext()); return { id, status: 'dismissed' }; },
+    async dismiss(id: string) { assertHuman('dismiss a pending action'); await dismiss(id, await actionContext()); return { id, status: 'dismissed' }; },
     async writeRunbook(path: string, text: string) {
       const target = resolve(config.cwd, path);
       await writeFile(target, redactor.redact(text), { mode: 0o600, flag: 'wx' });

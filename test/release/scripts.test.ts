@@ -20,6 +20,19 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
+async function signingFixture(dir: string, newline = '\n'): Promise<{ sumsPath: string; sums: Buffer }> {
+  const entries: string[] = [];
+  for (const name of ['keysentry.mjs', 'release-manifest.json', 'keysentry-1.0.0.tgz']) {
+    const bytes = Buffer.from(`fixture ${name}\n`);
+    await writeFile(join(dir, name), bytes);
+    entries.push(`${createHash('sha256').update(bytes).digest('hex')}  ${name}${newline}`);
+  }
+  const sums = Buffer.from(entries.join(''));
+  const sumsPath = join(dir, 'SHA256SUMS');
+  await writeFile(sumsPath, sums);
+  return { sumsPath, sums };
+}
+
 test('bundle keeps one executable shebang when esbuild preserves the entry shebang before the banner', () => {
   const banner = '#!/usr/bin/env node\n';
   expect(normalizeBundleShebang(`${banner}${banner}import "node:crypto";\n`)).toBe(`${banner}import "node:crypto";\n`);
@@ -71,9 +84,8 @@ test('esbuild environment wrapper restores the original environment when the bui
 
 test('sign-release signs exact checksum bytes with the release domain and public-key-derived key id', async () => {
   const dir = await temporaryDirectory();
-  const sumsPath = join(dir, 'SHA256SUMS');
-  const sums = Buffer.from(`${'a'.repeat(64)}  keysentry.mjs\r\n`, 'utf8');
-  await writeFile(sumsPath, sums);
+  // Signing unchecked hashes was part of the defect; fixtures now include checked artifacts.
+  const { sumsPath, sums } = await signingFixture(dir, '\r\n');
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const publicDer = publicKey.export({ format: 'der', type: 'spki' });
   const privateDer = privateKey.export({ format: 'der', type: 'pkcs8' });
@@ -92,8 +104,7 @@ test('sign-release signs exact checksum bytes with the release domain and public
 
 test('sign-release requires the signing environment variable and leaves no signature behind', async () => {
   const dir = await temporaryDirectory();
-  const path = join(dir, 'SHA256SUMS');
-  await writeFile(path, `${'a'.repeat(64)}  keysentry.mjs\n`);
+  const { sumsPath: path } = await signingFixture(dir);
   await expect(signRelease(path, {})).rejects.toThrow(/KEYSENTRY_RELEASE_SIGNING_KEY/);
   await expect(readFile(`${path}.sig`)).rejects.toMatchObject({ code: 'ENOENT' });
 });
@@ -102,8 +113,7 @@ test.each(['private-material-is-not-base64', Buffer.from('private-material').toS
   'sign-release rejects malformed private material without echoing it (%#)',
   async material => {
     const dir = await temporaryDirectory();
-    const path = join(dir, 'SHA256SUMS');
-    await writeFile(path, 'checksums\n');
+    const { sumsPath: path } = await signingFixture(dir);
     const error = await signRelease(path, { KEYSENTRY_RELEASE_SIGNING_KEY: material }).catch((error: Error) => error);
     expect(error).toBeInstanceOf(Error);
     expect(error.message).not.toContain(material);
@@ -114,8 +124,7 @@ test.each(['private-material-is-not-base64', Buffer.from('private-material').toS
 
 test('sign-release rejects a non-Ed25519 private key', async () => {
   const dir = await temporaryDirectory();
-  const path = join(dir, 'SHA256SUMS');
-  await writeFile(path, 'checksums\n');
+  const { sumsPath: path } = await signingFixture(dir);
   const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const material = privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
   await expect(signRelease(path, { KEYSENTRY_RELEASE_SIGNING_KEY: material })).rejects.toThrow(/Ed25519/);

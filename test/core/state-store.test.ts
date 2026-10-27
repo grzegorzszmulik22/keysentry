@@ -38,7 +38,8 @@ describe('encrypted state store', () => {
     expect(disk.split('\n')[0]).toBe(header);
     expect(disk).not.toContain('private-service');
     expect(disk).not.toContain('partial-hint');
-    expect(JSON.parse(openBytes(key, Buffer.from(disk.split('\n')[1]!, 'base64'), 'keysentry-state:inventory').toString())).toEqual(inventory);
+    // M3: the old kind-only AAD allowed swapping ciphertext between paths.
+    expect(JSON.parse(openBytes(key, Buffer.from(disk.split('\n')[1]!, 'base64'), 'keysentry-state:v2:inventory:inventory.json').toString())).toEqual(inventory);
     expect(await readFile(join(store.paths.dir, '.gitignore'), 'utf8')).toBe('*\n');
     if (process.platform !== 'win32') expect((await stat(store.paths.inventory)).mode & 0o777).toBe(0o600);
   });
@@ -91,21 +92,25 @@ describe('encrypted state store', () => {
     expect(await readFile(join(outside, 'state.json'), 'utf8')).toBe('{"untouched":true}');
   });
 
-  it('reads missing and legacy plaintext files while hiding JSON parser input', async () => {
+  it('requires explicit legacy migration while hiding JSON parser input', async () => {
     const { store } = await fixture();
     expect(await store.loadInventory()).toBeNull();
-    await writeFile(store.paths.inventory, JSON.stringify(inventory));
-    expect(await store.loadInventory()).toEqual(inventory);
     await writeFile(store.paths.inventory, '{"private-sensitive-input":');
-    await expect(store.loadInventory()).rejects.toThrow(/JSON/);
-    await expect(store.loadInventory()).rejects.not.toThrow('private-sensitive-input');
+    await expect(store.migratePlaintext()).rejects.toThrow(/JSON/);
+    await expect(store.migratePlaintext()).rejects.not.toThrow('private-sensitive-input');
+    await writeFile(store.paths.inventory, JSON.stringify(inventory));
+    // M3: accepting plaintext during ordinary reads was the downgrade defect.
+    await expect(store.loadInventory()).rejects.toThrow(StateLockedError);
+    await store.migratePlaintext();
+    expect(await store.loadInventory()).toEqual(inventory);
   });
 
-  it('keeps plaintext mode compatible but never overwrites encrypted files without permission', async () => {
+  it('requires a cipher for saved state and never overwrites encrypted files without permission', async () => {
     const { store, cwd } = await fixture();
     const plain = createStateStore({ cwd, cipher: null });
-    await plain.writeJson('monitor', plain.paths.monitor, { version: 1 });
-    expect(JSON.parse(await readFile(plain.paths.monitor, 'utf8'))).toEqual({ version: 1 });
+    // M3: plaintext is accepted only by migration; the StateStore must not create new plaintext state.
+    await expect(plain.writeJson('monitor', plain.paths.monitor, { version: 1 })).rejects.toThrow(StateLockedError);
+    await expect(readFile(plain.paths.monitor)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await plain.migratePlaintext()).toEqual({ migrated: [] });
     await store.saveInventory(inventory);
     await expect(plain.loadInventory()).rejects.toThrow(StateLockedError);
@@ -292,7 +297,8 @@ describe('encrypted journal', () => {
   it('skips a first torn record even when its truncated envelope is valid base64', async () => {
     const { store, cipher } = await fixture();
     await mkdir(store.paths.dir);
-    const partial = cipher.seal('journal', Buffer.from(JSON.stringify(first))).subarray(0, 36).toString('base64');
+    // M3: records now carry an authenticated chain and path-bound context.
+    const partial = cipher.seal('journal:journal.jsonl', Buffer.from(JSON.stringify({ entry: first, prev: '0'.repeat(64), n: 1 }))).subarray(0, 36).toString('base64');
     await writeFile(store.paths.journal, `${header}\n${partial}`);
     expect(await store.journal().read()).toEqual([]);
     await store.journal().append(second);
@@ -310,7 +316,8 @@ describe('encrypted journal', () => {
     const { store } = await fixture();
     await mkdir(store.paths.dir);
     await writeFile(store.paths.journal, [first, second].map(entry => JSON.stringify(entry)).join('\n') + '\n');
-    expect(await store.journal().read()).toEqual([first, second]);
+    // M3: plaintext journals must be migrated explicitly before they can be read.
+    await expect(store.journal().read()).rejects.toThrow(StateLockedError);
     expect(await store.migratePlaintext()).toEqual({ migrated: ['journal.jsonl'] });
     expect(await store.journal().read()).toEqual([first, second]);
     expect((await readFile(store.paths.journal, 'utf8')).split('\n')[0]).toBe(header);

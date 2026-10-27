@@ -175,15 +175,34 @@ async function resolveKeyRef(value: string, ctx: ProviderContext): Promise<strin
 async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationResult> {
   const oldKey = await resolveKey(oldValue, ctx);
   if (!oldKey) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
-  const oldKeyRef = oldKey.info.keyRef;
+  return createReplacement(oldKey.info.keyRef, oldKey.scopes, ctx, oldValue);
+}
+
+async function rotateByRef(oldKeyRef: string, ctx: ProviderContext): Promise<RotationResult> {
+  let ref: KeyRef;
+  try {
+    ref = parseRef(oldKeyRef, ctx);
+  } catch {
+    throw new OpenAIGuidedRotationRequiredError();
+  }
+  if (!ref.serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
+  const key = await adminJson(ctx, { method: 'GET',
+    url: `${BASE}/organization/projects/${encodeURIComponent(ref.projectId)}/api_keys/${encodeURIComponent(ref.keyId)}` });
+  const owner = object(key) && object(key.owner) ? key.owner : undefined;
+  const account = owner && object(owner.service_account) ? owner.service_account : undefined;
+  if (!object(key) || key.id !== ref.keyId || owner?.type !== 'service_account'
+    || account?.id !== ref.serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
+  return createReplacement(oldKeyRef, key.scopes, ctx);
+}
+
+async function createReplacement(oldKeyRef: string, scopes: unknown, ctx: ProviderContext, oldValue?: string): Promise<RotationResult> {
   const { projectId, serviceAccountId } = parseRef(oldKeyRef, ctx);
   if (!serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
-  const scopes = oldKey.scopes;
   // Missing scopes do not prove unrestricted access. Empty/default scope semantics
   // are ambiguous, so only explicit, representable permissions permit creation.
   if (!Array.isArray(scopes) || scopes.length === 0 || scopes.some(scope => typeof scope !== 'string'
     || scope.length === 0 || /[\s\u0000-\u001f\u007f]/.test(scope)
-    || safeLabel(scope, '', ctx, [oldValue]) !== scope)) {
+    || safeLabel(scope, '', ctx, oldValue === undefined ? [] : [oldValue]) !== scope)) {
     throw new OpenAIGuidedRotationRequiredError();
   }
   const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
@@ -202,7 +221,7 @@ async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationR
     throw new Error('OpenAI did not return a new service-account key.');
   }
   const newValue = key.value;
-  const keyId = referenceId(key.id, ctx, [oldValue, newValue]);
+  const keyId = referenceId(key.id, ctx, oldValue === undefined ? [newValue] : [oldValue, newValue]);
   return { newValue, oldKeyRef, newKeyRef: `${projectId}/${keyId}/sa-key:${serviceAccountId}`, oldRevoked: false };
 }
 
@@ -275,6 +294,7 @@ export const openaiProvider: ProviderAdapter = {
     method: 'GET', url: `${BASE}/models`, headers: { Authorization: `Bearer ${value}` },
   }, PROVIDER, () => 'OpenAI API key'),
   rotate,
+  rotateByRef,
   revoke,
   resolveKeyRef,
   listKeys: async ctx => (await keyRecords(ctx)).map(key => key.info),

@@ -3,6 +3,7 @@ import { buildArmedPlan, signArmedPlan } from '../../src/autopilot/armed-plan.js
 import { isAlertOnly } from '../../src/autopilot/kill-switch.js';
 import { runAutopilot, resumeWaves, settleWaves, type AutopilotState } from '../../src/autopilot/runner.js';
 import { generateDeviceKey } from '../../src/security/index.js';
+import { buildInventory } from '../../src/core/index.js';
 import type { ArmedCluster, AuditEvent, AuditLog, Cluster, Incident, NotifyMessage } from '../../src/types.js';
 import { FakeHttp, text } from '../helpers/fake-http.js';
 import { recoveryFixture } from '../rotate/recovery-fixture.js';
@@ -216,10 +217,10 @@ describe('autopilot runner', () => {
   test('settleWaves finishes only after grace expires', async () => {
     const f = await fixture();
     await runAutopilot(f.input, f.deps);
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
     f.clock.ms += 900_001;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
     expect(f.state.waves[0]?.status).toBe('done');
   });
@@ -231,7 +232,7 @@ describe('autopilot runner', () => {
     const deps = { ...f.recoveryDeps };
     if (mode === 'env') deps.env = { KEYSENTRY_ALERT_ONLY: '1' };
     if (mode === 'self-check') deps.selfCheck = { ok: false, reasons: ['Offline.'] };
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: mode === 'disarmed' }, deps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: mode === 'disarmed' }, deps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
     expect(f.state.waves[0]?.status).toBe('grace');
   });
@@ -251,7 +252,7 @@ describe('autopilot runner', () => {
     const f = await fixture();
     await runAutopilot(f.input, f.deps);
     const calls = f.trace.filter(c => /^(rotate|rotated|verify|resolve|list|revoke):openai/.test(c)).length;
-    await settleWaves({ state: f.state, now: new Date('2027-12-01T00:00:00Z'), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: new Date('2027-12-01T00:00:00Z'), disarmed: false }, f.recoveryDeps);
     expect(f.trace.filter(c => /^(rotate|rotated|verify|resolve|list|revoke):openai/.test(c))).toHaveLength(calls);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
   });
@@ -340,14 +341,14 @@ describe('autopilot runner', () => {
     await runAutopilot(f.input, f.deps);
     f.clock.ms += 900_001;
     const { selfCheck: _selfCheck, ...deps } = f.recoveryDeps;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, deps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, deps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
   });
 
   test('settlement uses the supplied tick time even when the dependency clock has an older baseline', async () => {
     const f = await fixture();
     await runAutopilot(f.input, f.deps);
-    await settleWaves({ state: f.state, now: new Date('2026-10-27T09:00:00Z'), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: new Date('2026-10-27T09:00:00Z'), disarmed: false }, f.recoveryDeps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
   });
 
@@ -358,7 +359,7 @@ describe('autopilot runner', () => {
     await runAutopilot(f.input, f.deps);
     f.generate.revoke = async () => { throw new Error('ambiguous response'); };
     f.clock.ms += 900_001;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
     const failure = f.notifications.find(m => m.kind === 'autopilot:failure');
     expect(failure).toBeDefined();
@@ -398,7 +399,7 @@ describe('autopilot runner', () => {
     await runAutopilot(f.input, f.deps);
     const restored = JSON.parse(JSON.stringify(f.saved.at(-1))) as AutopilotState;
     f.clock.ms += 900_001;
-    await settleWaves({ state: restored, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: restored, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(restored.waves[0]?.status).toBe('done');
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
   });
@@ -408,7 +409,7 @@ describe('autopilot runner', () => {
     await runAutopilot(f.input, f.deps);
     f.clock.ms += 900_001;
     const traceLength = f.trace.length;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: true }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: true }, f.recoveryDeps);
     expect(f.trace).toHaveLength(traceLength);
     expect(f.auditEvents.map(event => event.kind)).toContain('autopilot:settle-alert-only');
   });
@@ -421,11 +422,11 @@ describe('autopilot runner', () => {
     f.clock.ms += 900_001;
     const death = new Error('settlement process death');
     f.deps.engine.crashHook = (point, detail) => { if (point === 'after-revoke' && detail.clusterId === f.clusterId) throw death; };
-    await expect(settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps)).rejects.toBe(death);
+    await expect(settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps)).rejects.toBe(death);
     delete f.deps.engine.crashHook;
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
     f.generate.failVerifyOfNew = true;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(f.notifications.find(m => m.kind === 'autopilot:failure')?.title).toContain('Some old keys may already be revoked.');
   });
 
@@ -434,9 +435,34 @@ describe('autopilot runner', () => {
     await runAutopilot(f.input, f.deps);
     await f.host.writeVariables(f.services[1]!, { OPENAI_API_KEY: f.old.value }, { skipDeploy: true });
     f.clock.ms += 900_001;
-    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    await settleWaves({ state: f.state, inventory: f.input.inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
     expect(f.state.waves[0]?.status).toBe('stopped');
+  });
+
+  test('settlement passes a fresh scan so an old key used by a new consumer is kept', async () => {
+    const f = await fixture();
+    await runAutopilot(f.input, f.deps);
+    f.host.addService('new-consumer', { OPENAI_API_KEY: f.old.value });
+    const inventory = buildInventory([{ host: 'railway', services: await Promise.all((await f.host.listServices()).map(async service => ({
+      service, vars: await f.host.readVariables(service),
+    }))) }], f.deps.engine.fingerprintKey);
+    f.clock.ms += 900_001;
+    const result = await settleWaves({ state: f.state, inventory, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    expect(result.settled).toEqual(['wave-incident-1']);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+    expect(f.state.waves[0]?.status).toBe('stopped');
+    expect(f.host.peek('new-consumer', 'OPENAI_API_KEY')).toBe(f.old.value);
+  });
+
+  test('a JavaScript settlement caller omitting the latest inventory cannot revoke', async () => {
+    const f = await fixture();
+    await runAutopilot(f.input, f.deps);
+    f.clock.ms += 900_001;
+    await settleWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false } as Parameters<typeof settleWaves>[0], f.recoveryDeps);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+    expect(f.state.waves[0]?.status).toBe('grace');
+    expect(f.auditEvents.map(event => event.kind)).toContain('autopilot:settle-blocked');
   });
 
   test('recovery rechecks saved scope against the signed plan before any write', async () => {

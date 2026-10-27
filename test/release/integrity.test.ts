@@ -57,9 +57,10 @@ test('checkLocalIntegrity reports a missing-manifest', async () => {
   expect(await checkLocalIntegrity({ bundlePath })).toMatchObject({ status: 'missing-manifest' });
 });
 
-test('checkLocalIntegrity uses the resolved running keysentry.mjs by default', async () => {
+test('checkLocalIntegrity uses its own module path instead of an argv entry by default', async () => {
+  // Trusting argv[1] was the defect: npm's POSIX bin symlink has another name.
   process.argv[1] = await fixture();
-  expect(await checkLocalIntegrity()).toMatchObject({ status: 'ok' });
+  expect(await checkLocalIntegrity()).toEqual({ status: 'dev' });
   process.argv[1] = resolve(dir, 'src/cli/index.ts');
   expect(await checkLocalIntegrity()).toEqual({ status: 'dev' });
 });

@@ -1,4 +1,3 @@
-import { lstat, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -7,10 +6,10 @@ import { createFetchHttp } from '../http.js';
 import { EGRESS_RULES, createFileReceipt, createGuardedHttp, rulesForUserFeeds, rulesForUserUrls } from '../net/index.js';
 import { BUILD_VERSION, checkLocalIntegrity, verifyRelease } from '../release/index.js';
 import { createAuditLog, deviceKeyFromPrivate } from '../security/index.js';
-import { createMemoryVault, openVault } from '../vault/index.js';
+import { openVault } from '../vault/index.js';
 import { loadConfigMetadata } from './config.js';
 import { CliError } from './errors.js';
-import { confirmVaultFallback, promptPassphrase } from './prompts.js';
+import { confirmVaultFallback, promptPassphrase, promptVaultBackend } from './prompts.js';
 import type { RuntimeOptions } from './runtime.js';
 
 function validTimestamp(value: string): boolean {
@@ -51,29 +50,18 @@ export async function inspectRelease(options: RuntimeOptions, offline = false) {
   return { local, release };
 }
 
-/** Unsigned/empty logs need no vault. A checkpoint needs the saved device key. */
+/** Always consult the vault: public files cannot decide whether its anchor is checked. */
 export async function inspectAudit(options: RuntimeOptions) {
-  if (options.audit) return { ...await options.audit.verify(), anchorChecked: options.vault?.backend !== 'env' };
   const path = join(resolve(options.cwd ?? process.cwd()), '.keysentry', 'audit.jsonl');
   const userDir = resolve(options.userDir ?? join(homedir(), '.keysentry'));
   const anchor = createHash('sha256').update(resolve(path)).digest('hex').slice(0, 16);
-  let hasAnchorMarker = false;
-  try { await lstat(join(userDir, 'audit-heads', `${anchor}.json`)); hasAnchorMarker = true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new CliError('The audit anchor marker could not be read.'); }
-  let hasCheckpoint = false;
-  try {
-    hasCheckpoint = (await readFile(path, 'utf8')).split('\n').some(line => {
-      try { return (JSON.parse(line) as { kind?: unknown }).kind === 'checkpoint'; } catch { return false; }
-    });
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new CliError('The audit log could not be read.'); }
   const redactor = createRedactor();
   const env = options.env ?? process.env;
   const interactive = (options.stdinIsTTY ?? !!process.stdin.isTTY) && (options.stdoutIsTTY ?? !!process.stdout.isTTY);
   const log = options.log ?? createLogger({ redactor });
   const diagnostic = (text: string) => log.info(redactor.redact(text));
   const store = env.KEYSENTRY_VAULT ?? (process.platform === 'win32' ? 'windows-dpapi' : process.platform === 'darwin' ? 'macos-keychain' : 'linux-secret-service');
-  const needsVault = !!options.vault || hasCheckpoint || hasAnchorMarker;
-  const vault = options.vault ?? (needsVault ? await openVault({
+  const vault = options.vault ?? await openVault({
     env, userDir, log,
     passphrase: options.passphrase ?? (async () => {
       if (interactive) return promptPassphrase(diagnostic, options.promptIO);
@@ -82,11 +70,19 @@ export async function inspectAudit(options: RuntimeOptions) {
       return Buffer.from(env.KEYSENTRY_VAULT_PASSPHRASE);
     }),
     allowFileFallback: options.allowFileFallback ?? (reason => interactive ? confirmVaultFallback(store, reason, diagnostic, options.promptIO) : Promise.resolve(false)),
-  }) : createMemoryVault());
-  const verification = await createAuditLog({ path, vault, redactor, deviceKey: async () => {
+    ...(interactive ? { chooseBackend: backend => promptVaultBackend(backend, diagnostic, options.promptIO) } : {}),
+  });
+  const audit = options.audit ?? createAuditLog({ path, vault, redactor, keyLockPath: join(userDir, 'audit-mac'), deviceKey: async () => {
     const key = await vault.get('key/device-ed25519');
     if (!key) throw new CliError('The device signing key is unavailable; the audit checkpoint cannot be verified here.');
     try { return deviceKeyFromPrivate(key); } finally { key.fill(0); }
-  } }).verify();
-  return { ...verification, anchorChecked: needsVault && vault.backend !== 'env' };
+  } });
+  const verification = await audit.verify();
+  const head = await vault.get(`audit/head/${anchor}`);
+  const hasHead = head !== null;
+  head?.fill(0);
+  if (!hasHead && verification.entries > 0) {
+    return { ...verification, ok: false, problem: 'This audit log has no anchor in your vault; it may have been replaced.', anchorChecked: vault.backend !== 'env' };
+  }
+  return { ...verification, anchorChecked: vault.backend !== 'env' };
 }

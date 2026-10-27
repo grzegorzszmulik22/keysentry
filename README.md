@@ -30,7 +30,7 @@ The current receipt keeps a bounded local history, rather than an unlimited reco
 
 Requires Node.js **22.13 or newer** and the installed project dependencies. The optional Node permission sandbox requires a patched supported release: **22.23.4, 24.22.1 or 26.12.1 or newer within those major lines**. Older or unsupported Node releases run without that additional sandbox; the HTTP allow-list still applies.
 
-The current sandbox grants writes only to the project's `.keysentry/` directory and the user data directory. It therefore denies creation of `keysentry.yaml` by `init`, dotenv updates and `plan -o` outputs elsewhere, even when those locations can be scanned. For operations that need those writes, explicitly set `KEYSENTRY_NO_SANDBOX=1` for the command. This disables the additional Node filesystem/process restrictions; the guarded HTTP client still applies.
+The sandbox grants writes to the project's `.keysentry/` directory and the user data directory. `init` also receives the config file path, and `plan -o` receives its output file path. Executing commands receive the configured dotenv consumer files from the inventory, plus their temporary-file prefixes for atomic replacement. If the inventory cannot be read yet, those commands receive the configured dotenv roots instead. Sandbox status comes from Node's permission API.
 
 ```sh
 npm run build
@@ -63,7 +63,7 @@ Global flags are `--cwd <dir>`, `--config <path>`, `--json`, and `--verbose`. Co
 
 ## Vault and credential roles
 
-Tokens and keysentry's encryption/signing keys live in macOS Keychain, Windows current-user DPAPI, or Linux Secret Service. If an OS store is unavailable, keysentry asks before using a passphrase-protected encrypted file in `~/.keysentry/`. A new file asks for the passphrase twice. Linux Secret Service needs `secret-tool` (usually the `libsecret-tools` package) and a session bus.
+Tokens and keysentry's encryption/signing keys live in macOS Keychain, Windows current-user DPAPI, or Linux Secret Service. If an OS store is unavailable, keysentry asks before using a passphrase-protected encrypted file in `~/.keysentry/`. It remembers the backend in `~/.keysentry/vault-backend.json`, so returning to a desktop terminal does not switch key sets. If an older installation has an encrypted file and an available OS store without a remembered choice, it asks which to use; non-interactive runs use the file with a warning. A new file asks for the passphrase twice. Linux Secret Service needs `secret-tool` (usually the `libsecret-tools` package) and a session bus.
 
 ```sh
 keysentry vault status
@@ -73,11 +73,11 @@ keysentry vault set GITHUB_TOKEN --role write
 keysentry vault remove GITHUB_TOKEN --role read
 ```
 
-`status` shows the backend, any weakness, and credential names by role. `list` shows names only. `set` never accepts a token argument; use its hidden prompt. Although `--stdin` reads a value from standard input, the current human-terminal gate still requires both input and output to be TTYs, so an ordinary pipe is refused. The default role is `write`. Use only the supported host and provider credential names listed in the tables below. `vault import-env` copies present credentials into the vault; they can then be removed from the environment.
+`status` shows the backend, any weakness, and credential names by role. `list` shows names only. `set` never accepts a token argument; use its hidden prompt. With explicit `--stdin`, a human may pipe one value from their terminal while stdout remains a TTY. Without `--stdin`, both input and output must be TTYs. Known coding-agent environments are refused in either case. The default role is `write`. Use only the supported host and provider credential names listed in the tables below. `vault import-env` copies present credentials into the vault; they can then be removed from the environment.
 
 Scanning, reports, plans, drills and monitor detection use read-role credentials. Reads fall back from the dedicated read token to the base token, then the existing environment variable. Approved mutations rebuild adapters with the write token; they never substitute the dedicated read token for writes. A role name does not reduce a token's actual vendor permissions: `doctor` explains those limits.
 
-Existing credential environment names still work. Explicit `KEYSENTRY_VAULT=env` is read-only and needs keysentry's encryption/signing keys supplied separately; `doctor` explains missing settings. `KEYSENTRY_VAULT=encrypted-file` selects the file store. Non-interactive file-store reads use `KEYSENTRY_VAULT_PASSPHRASE`. Environment and memory backends keep in-flight rotation values only for that process and cannot provide recovery after it exits. OS stores and the encrypted file protect data at rest; other programs running as your user can still request or use credentials.
+Existing credential environment names still work. Explicit `KEYSENTRY_VAULT=env` is read-only and needs keysentry's encryption/signing keys supplied separately; `doctor` explains missing settings. `KEYSENTRY_VAULT=encrypted-file` selects the file store. Non-interactive file-store reads use `KEYSENTRY_VAULT_PASSPHRASE`. Environment and memory backends keep in-flight rotation values only for that process and cannot provide recovery after it exits; executing commands and doctor warn about this. Environment-backed project bindings and initialization markers are also process-local unless supplied in the environment. OS stores and the encrypted file protect data at rest; other programs running as your user can still request or use credentials.
 
 ## Doctor
 
@@ -107,11 +107,11 @@ keysentry verify
 keysentry audit verify
 ```
 
-The offline command compares the bundle with its adjacent local manifest. The online command additionally checks published signed checksums through the guarded client. A local manifest comparison checks consistency, not who published the files. Source checkouts are reported as development builds. Until signing keys are published, online verification prints: `Release signing keys are not published yet; only the local check ran.` A local bundle mismatch blocks `rotate --execute`.
+The offline command compares the bundle with its adjacent local manifest. The online command additionally checks published signed checksums through the guarded client. A local manifest comparison checks consistency, not who published the files. Run verification from an independently obtained copy, such as a fresh `npm pack` of the published version: a modified bundle can lie about its own checks. Source checkouts are reported as development builds. Until signing keys are published, online verification prints: `Release signing keys are not published yet; only the local check ran.` A local bundle mismatch blocks `rotate --execute`; a missing manifest warns and requires typing `yes`, including with `--yes`.
 
-`.keysentry/audit.jsonl` records metadata for scans, saved plans, approvals, vault changes, doctor runs, state resets and every rotation journal event. Records form a hash chain with signed checkpoints; registered secrets are redacted. `audit verify` returns exit status 1 if verification fails. A vault head helps detect truncation; without it, a removed suffix cannot always be detected. The audit log remains after a state reset.
+`.keysentry/audit.jsonl` records metadata for scans, saved plans, approvals, vault changes, doctor runs, state resets and every rotation journal event. Every hash-chain record has an HMAC under a vault-held key, and checkpoints are signed; registered secrets are redacted. Forged appends require the vault MAC key. The saved vault head detects truncation behind the last checkpoint; an uncheckpointed suffix can still be removed. `audit verify` always consults the vault for this log path and returns exit status 1 for a failed MAC, a changed chain, or a nonempty log without an anchor. The audit log remains after a state reset.
 
-A public presence marker under `~/.keysentry/audit-heads/` tells verification to check the vault anchor even if the project audit log was removed. If both marker and log are absent and no vault is supplied, verification checks the local chain only and says the independent head was not checked. The environment vault cannot persist audit heads: signed checkpoints are still verified, but its head is process-local, a warning is shown, and there is no durable tail-truncation check across runs.
+Public markers under `~/.keysentry/audit-heads/` are hints only; removing one never skips the vault lookup. The environment vault cannot persist audit heads, so a later `audit verify` refuses a nonempty unanchored log. Its audit MAC key is process-local unless `KEYSENTRY_VAULT_AUDIT_MAC` supplies the same 32 UTF-8 bytes on every run. These backends provide no durable tail-truncation check across runs.
 
 ## Resume, undo and finish
 
@@ -132,11 +132,13 @@ Undo needs a readable saved old value and a still-valid old key; sealed values m
 
 `keysentry state reset` requires typing `RESET`. It deletes encrypted state and in-flight records, keeps the audit log, and records the reset. It refuses to discard in-flight values from partial or grace-pending plans unless `--force` is supplied; forcing reset gives up that recovery data.
 
+If the state key is lost, an interactive `scan` asks before replacing unreadable inventory and monitor state with a fresh scan. It keeps saved journals, plans and in-flight records. Non-interactive scans refuse and point to `keysentry state reset`. Losing the audit key separately prevents extending or authenticating the old audit log; restore that vault key before continuing.
+
 ## Using keysentry with AI coding tools
 
 Your coding agent may suggest commands and, at your request, run read-only `scan`, `report`, `plan` and dry runs. Their output contains fingerprints, short hints and metadata, not key values. Review the output and run changes yourself in a normal terminal.
 
-keysentry refuses known agent environments for key changes, recovery commands, vault changes, state reset and monitoring configured for automatic actions. These commands also require an interactive terminal, even with `--yes`. This keeps a model-generated suggestion from becoming approval to change your credentials. Marker detection is an additional check, not a guarantee against software that hides its identity.
+keysentry refuses known agent environments for key changes, dismissing pending actions, recovery commands, vault changes, state reset and monitoring configured for automatic actions. These commands also require an interactive terminal, even with `--yes`; explicit `vault set --stdin` permits piped input with terminal output. This keeps a model-generated suggestion from becoming approval to change your credentials. Marker detection is an additional check, not a guarantee against software that hides its identity.
 
 ## Configuration and supported hosts
 

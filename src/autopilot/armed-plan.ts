@@ -86,10 +86,13 @@ const signedPlanSchema = planBodySchema.extend({
   sig: base64Schema,
 }).strict().refine(validLifetime);
 
-/** Fly and Actions values are write-only even if a stale scan says otherwise. */
+/** Write-only adoption needs a usable provider reference, never a retained plaintext value. */
 export function adoptionNeeded(cluster: Cluster): boolean {
-  return cluster.consumers.some(consumer => consumer.sealed || consumer.service.host === 'fly' || consumer.service.host === 'github-actions')
-    && !(cluster as AdoptableCluster).adopted;
+  const writeOnly = cluster.consumers.some(consumer => consumer.sealed || consumer.service.host === 'fly' || consumer.service.host === 'github-actions');
+  if (!writeOnly) return false;
+  if ((cluster as AdoptableCluster).adopted?.keyRef == null) return true;
+  try { return typeof getProvider(cluster.provider).rotateByRef !== 'function'; }
+  catch { return true; }
 }
 
 /** Eligibility is a capability check, never evidence that credentials are usable. */

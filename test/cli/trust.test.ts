@@ -263,7 +263,9 @@ describe('phase 1 CLI trust boundaries', () => {
   it('environment vault can scan and verify signed audit records without a persistent head', async () => {
     const f = await fixture(); const device = generateDeviceKey();
     const env = { KEYSENTRY_STATE_KEY: Buffer.alloc(32, 0x71).toString('base64'),
-      KEYSENTRY_FINGERPRINT_KEY: Buffer.alloc(32, 0x72).toString('base64'), KEYSENTRY_DEVICE_KEY: device.privateKeyDer.toString('base64') };
+      KEYSENTRY_FINGERPRINT_KEY: Buffer.alloc(32, 0x72).toString('base64'), KEYSENTRY_DEVICE_KEY: device.privateKeyDer.toString('base64'),
+      // L1: a reopened process must have the same MAC key; signatures alone accepted forged appends.
+      KEYSENTRY_VAULT_AUDIT_MAC: '0123456789abcdef0123456789abcdef' };
     const vault = createEnvVault(env); const host = new FakeHost('railway'); host.addService('api', { PORT: '3000' });
     const runtime = await createRuntime({ ...f.options, vault, env, hosts: [host] });
     await runtime.scan();
@@ -273,6 +275,24 @@ describe('phase 1 CLI trust boundaries', () => {
     expect(audit.some(entry => entry.kind === 'checkpoint' && typeof entry.data?.sig === 'string')).toBe(true);
     const reopened = await createRuntime({ ...f.options, vault: createEnvVault(env), env, hosts: [host] });
     expect((await reopened.audit.verify()).ok).toBe(true);
+  });
+
+  it('environment vault never migrates plaintext that appears in saved state, across processes', async () => {
+    // Review M3 follow-up: the env vault cannot persist the initialized marker, so it always reports state as
+    // initialized; a planted plaintext file is rejected in every new process instead of being migrated.
+    const f = await fixture(); const device = generateDeviceKey();
+    const env = { KEYSENTRY_STATE_KEY: Buffer.alloc(32, 0x73).toString('base64'),
+      KEYSENTRY_FINGERPRINT_KEY: Buffer.alloc(32, 0x74).toString('base64'), KEYSENTRY_DEVICE_KEY: device.privateKeyDer.toString('base64'),
+      KEYSENTRY_VAULT_AUDIT_MAC: 'fedcba9876543210fedcba9876543210' };
+    const host = new FakeHost('railway'); host.addService('api', { PORT: '3000' });
+    const first = await createRuntime({ ...f.options, vault: createEnvVault(env), env, hosts: [host] });
+    await first.scan();
+    const planted = join(first.paths.plans, 'planted.json');
+    await mkdir(first.paths.plans, { recursive: true });
+    await writeFile(planted, JSON.stringify({ id: 'planted', steps: [] }));
+    const reopened = await createRuntime({ ...f.options, vault: createEnvVault(env), env, hosts: [host] });
+    await expect(reopened.store.readJson('plan', planted)).rejects.toThrow(/unencrypted file/);
+    expect(await readFile(planted, 'utf8')).toBe(JSON.stringify({ id: 'planted', steps: [] }));
   });
 
   it('grace prompt l keeps old keys valid, then finish settles the latest plan after its deadline', async () => {

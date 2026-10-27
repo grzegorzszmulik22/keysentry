@@ -75,6 +75,19 @@ function openRecord(key: Buffer, planId: string, line: string): { slot: string; 
   return { slot: routing.slot, value: record.value };
 }
 
+function openRecords(key: Buffer, planId: string, contents: Buffer): { values: Map<string, string>; completeBytes: number } {
+  // A record is committed only when its newline reached the file. Ignore the final torn write in full.
+  const completeBytes = contents.lastIndexOf(0x0a) + 1;
+  const lines = contents.subarray(0, completeBytes).toString('utf8').split('\n');
+  lines.pop();
+  const values = new Map<string, string>();
+  for (const line of lines) {
+    const record = openRecord(key, planId, line.endsWith('\r') ? line.slice(0, -1) : line);
+    values.set(record.slot, record.value);
+  }
+  return { values, completeBytes };
+}
+
 /** No key is retained in memory between calls, including after crypto-shredding. */
 export function createInFlightStore(opts: { dir: string; vault: Vault; projectId: string }): InFlightStore {
   const dir = resolve(opts.dir);
@@ -84,21 +97,17 @@ export function createInFlightStore(opts: { dir: string; vault: Vault; projectId
     return join(dir, `${planId.replaceAll(':', '%3A')}.jsonl`);
   }
 
+  async function readContents(path: string): Promise<Buffer | null> {
+    try { return await readFile(path); }
+    catch (error) { if (missing(error)) return null; throw new Error('Unable to read temporary rotation values.'); }
+  }
+
   async function readValues(planId: string, path: string): Promise<Map<string, string>> {
     const key = await inflightKey(opts.vault, opts.projectId, vaultPlanId(planId), false);
-    const values = new Map<string, string>();
-    if (key === null) return values;
+    if (key === null) return new Map();
     try {
-      let contents: string;
-      try { contents = await readFile(path, 'utf8'); }
-      catch (error) { if (missing(error)) return values; throw new Error('Unable to read temporary rotation values.'); }
-      const lines = contents.split('\n');
-      if (lines.at(-1) === '') lines.pop();
-      for (const line of lines) {
-        const record = openRecord(key, planId, line.endsWith('\r') ? line.slice(0, -1) : line);
-        values.set(record.slot, record.value);
-      }
-      return values;
+      const contents = await readContents(path);
+      return contents === null ? new Map() : openRecords(key, planId, contents).values;
     } finally { key.fill(0); }
   }
 
@@ -108,11 +117,26 @@ export function createInFlightStore(opts: { dir: string; vault: Vault; projectId
       validateIdentifier(slot);
       return enqueue(path, async () => {
         if (closed.has(planId)) throw new InFlightClosedError();
-        const key = await inflightKey(opts.vault, opts.projectId, vaultPlanId(planId), true);
+        const contents = await readContents(path);
+        let key = await inflightKey(opts.vault, opts.projectId, vaultPlanId(planId), false);
+        if (key === null) {
+          if (contents !== null) {
+            throw new Error(`The temporary values for rotation plan ${planId} cannot be opened because its vault key is missing. Check the provider for unrecorded keys, then run "keysentry state reset --force" before starting over.`);
+          }
+          key = await inflightKey(opts.vault, opts.projectId, vaultPlanId(planId), true);
+        }
         if (key === null) throw new Error('Unable to create a temporary rotation key.');
         try {
+          // Validate every complete record before changing any bytes, including when a torn tail follows it.
+          const completeBytes = contents === null ? 0 : openRecords(key, planId, contents).completeBytes;
           const line = Buffer.from(sealRecord(key, planId, slot, value), 'utf8');
           await mkdir(dir, { recursive: true, mode: 0o700 });
+          if (contents !== null && completeBytes < contents.length) {
+            // Windows append handles cannot truncate, so repair the tail before opening for append.
+            const repair = await open(path, 'r+');
+            try { await repair.truncate(completeBytes); }
+            finally { await repair.close(); }
+          }
           const handle = await open(path, 'a', 0o600);
           try {
             const { bytesWritten } = await handle.write(line);

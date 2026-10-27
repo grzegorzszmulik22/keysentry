@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { pathToFileURL } from 'node:url';
-import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { basename } from 'node:path';
 import { Command, CommanderError, InvalidArgumentError } from 'commander';
 import { createRedactor, renderBlastRadius } from '../core/index.js';
 import type { GuidedPrompt, Inventory, RotationReport, TokenRole } from '../types.js';
@@ -15,6 +15,8 @@ import { loadConfigMetadata } from './config.js';
 import { inspectAudit, inspectNetwork, inspectRelease } from './inspection.js';
 import { AgentRefusalError, assertHumanForMutation, maybeReexecWithPermissions } from '../safety/index.js';
 import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
+import { permissionOptionsForBin } from './sandbox-grants.js';
+export { permissionOptionsForBin } from './sandbox-grants.js';
 import { StateLockedError } from '../core/index.js';
 import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
 
@@ -92,9 +94,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   const interactive = () => options.stdinIsTTY !== undefined || options.stdoutIsTTY !== undefined
     ? (options.stdinIsTTY ?? process.stdin.isTTY === true) && (options.stdoutIsTTY ?? process.stdout.isTTY === true)
     : runtime?.interactive ?? hasInteractiveTerminal(options.promptIO);
-  const human = (action: string) => {
+  const human = (action: string, allowPipedStdin = false) => {
     const context = runtime?.mutationContext;
-    assertHumanForMutation({ env: options.env ?? context?.env ?? process.env, action,
+    assertHumanForMutation({ env: options.env ?? context?.env ?? process.env, action, allowPipedStdin,
       stdinIsTTY: options.stdinIsTTY ?? context?.stdinIsTTY ?? process.stdin.isTTY === true,
       stdoutIsTTY: options.stdoutIsTTY ?? context?.stdoutIsTTY ?? process.stdout.isTTY === true });
   };
@@ -160,10 +162,13 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     .option('--no-generate', 'Skip generated application secrets')
     .action(async (opts, command: Command) => {
       if (opts.execute) human('rotate keys');
+      let developmentAlreadyReported = false;
       if (opts.execute) {
         const integrity = await checkLocalIntegrity();
         if (integrity.status === 'mismatch') throw new CliError('The installed copy does not match its local manifest. Reinstall keysentry before rotating keys.');
-        if (integrity.status === 'dev') diagnostic('Development copy: release integrity has not been checked.');
+        if (integrity.status === 'dev') {
+          diagnostic('Development copy: release integrity has not been checked.'); developmentAlreadyReported = true;
+        }
       }
       const rt = await getRuntime();
       if (opts.revoke && !['after-deploy', 'immediately', 'never'].includes(opts.revoke)) throw new CliError('Invalid revocation policy; use after-deploy, immediately, or never.');
@@ -178,6 +183,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       const preview = await rt.rotate(rotationPlan, rotationOptions);
       if (!opts.execute) { emit({ report: preview, journal: rt.paths.journal }, `${preview.diff.join('\n')}\n${summary(preview, rt.paths.journal)}`); reportExit(preview); return; }
       diagnostic(`Rotation preview (${rotationPlan.steps.length} secret clusters):\n${preview.diff.join('\n')}`);
+      await rt.prepareExecution(diagnostic, developmentAlreadyReported);
       const isInteractive = interactive();
       if (rotationPlan.steps.some(step => step.method === 'atomic-roll') && !isInteractive) {
         throw new CliError('Atomic-roll rotation requires an interactive terminal for replacement recovery. Run rotate --execute in a terminal.');
@@ -198,7 +204,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if (opts.execute) human('create a canary');
       if (opts.provider !== 'openrouter') throw new CliError('Canaries currently support OpenRouter only.');
       const host = hostIdSchema.safeParse(opts.host); if (!host.success) throw new CliError('Invalid host.');
-      const rt = await getRuntime(); const result = await rt.createCanary({ host: host.data, service: opts.service, varName: opts.var, execute: opts.execute });
+      const rt = await getRuntime();
+      if (opts.execute) await rt.prepareExecution(diagnostic);
+      const result = await rt.createCanary({ host: host.data, service: opts.service, varName: opts.var, execute: opts.execute });
       emit({ dryRun: !opts.execute, canary: result }, result ? `Canary ${result.id} planted in ${serviceLabel(result.service)}:${result.varName}.` : 'Dry run: would plant a $0.01 OpenRouter canary. Pass --execute to plant it.');
     });
   canary.command('list').action(async () => {
@@ -207,7 +215,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   });
   canary.command('remove <id>').option('--execute', 'Revoke the canary and remove monitoring metadata').action(async (id, opts) => {
     if (opts.execute) human('remove a canary');
-    const rt = await getRuntime(); emit(await rt.removeCanary(id, opts.execute), opts.execute ? 'Canary revoked; inert host variable remains.' : 'Dry run: would revoke the canary. Pass --execute to remove it.');
+    const rt = await getRuntime();
+    if (opts.execute) await rt.prepareExecution(diagnostic);
+    emit(await rt.removeCanary(id, opts.execute), opts.execute ? 'Canary revoked; inert host variable remains.' : 'Dry run: would revoke the canary. Pass --execute to remove it.');
   });
 
   program.command('monitor').description('Poll signals; rotations follow configured policy, guided steps are skipped')
@@ -217,6 +227,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       const policy = options.policy ?? runtime?.config.monitor.policy;
       if ((policy?.autoExecute ?? settings.monitor.autoExecute) || (policy?.autoContain ?? settings.monitor.autoContain)) human('run automatic monitor actions');
       const rt = await getRuntime();
+      if (rt.config.monitor.policy.autoExecute || rt.config.monitor.policy.autoContain) await rt.prepareExecution(diagnostic);
       if (opts.once) { const result = await rt.monitorOnce(); emit(result, `Monitor: ${result.signals.length} signals, ${result.decisions.length} decisions. Guided steps require human remediation.`); return; }
       const controller = new AbortController(); const stop = () => controller.abort();
       process.once('SIGINT', stop); process.once('SIGTERM', stop);
@@ -232,6 +243,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     .action(async (id: string, opts: { yes?: boolean }) => {
     human('approve a key change');
     const rt = await getRuntime(); const review = await rt.reviewAction(id);
+    await rt.prepareExecution(diagnostic);
     const rotation = review.action.action === 'rotate' || review.action.action === 'breach-mode';
     diagnostic([`Action ${review.action.id}: ${review.action.action} ${review.action.clusterIds.length} secret cluster(s).`,
       ...review.plan.steps.map(step => `${step.provider} (${step.method}): ${step.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}`),
@@ -259,7 +271,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if (!executed) exitCode = 1;
     }
   });
-  program.command('dismiss <id>').description('Dismiss a pending monitor action').action(async id => { const rt = await getRuntime(); emit(await rt.dismiss(id)); });
+  program.command('dismiss <id>').description('Dismiss a pending monitor action').action(async id => { human('dismiss a pending action'); const rt = await getRuntime(); emit(await rt.dismiss(id)); });
   program.command('drill').description('Time a full dry run and explain readiness from 0 to 100').action(async () => {
     const rt = await getRuntime(); const result = await rt.drill();
     emit(result, `Readiness: ${result.score}/100 (${result.elapsedMs} ms)\n${result.reasons.join('\n')}\n${summary(result.report, rt.paths.journal)}`); reportExit(result.report);
@@ -275,12 +287,12 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   vault.command('set <NAME>').description('Read a credential through hidden input or --stdin')
     .option('--role <role>', 'read or write', role, 'write').option('--stdin', 'Read one value from piped stdin')
     .action(async (name: string, opts: { role: TokenRole; stdin?: boolean }) => {
-      human('store a credential'); credentialName(name);
+      human('store a credential', opts.stdin === true); credentialName(name);
       const value = opts.stdin ? await readPipedValue(options.promptIO) : await promptVaultValue(name, diagnostic, options.promptIO);
       if (value === null) { emit({ cancelled: true }, 'Credential entry cancelled.'); return; }
       initialRedactor.register(value);
       const rt = await getRuntime(); rt.redactor.register(value);
-      emit(await rt.vaultSet(name, value, opts.role), `Stored ${name} (${opts.role}).`);
+      emit(await rt.vaultSet(name, value, opts.role, { stdin: opts.stdin }), `Stored ${name} (${opts.role}).`);
     });
   vault.command('remove <NAME>').description('Remove one credential role')
     .option('--role <role>', 'read or write', role, 'write').action(async (name: string, opts: { role: TokenRole }) => {
@@ -331,17 +343,17 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if (result.local.status === 'mismatch' || result.release && !['verified', 'unconfigured'].includes(result.release.status)) exitCode = 1;
     });
   program.command('resume [planId]').description('Continue the latest unfinished rotation, or a selected plan').action(async planId => {
-    human('resume a rotation'); const rt = await getRuntime(); const report = await rt.resume(planId);
+    human('resume a rotation'); const rt = await getRuntime(); await rt.prepareExecution(diagnostic); const report = await rt.resume(planId);
     emit({ report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report);
   });
   program.command('finish [planId]').description('Re-verify and revoke old keys after the grace period')
     .option('--now', 'End the grace period now after re-verification').action(async (planId, opts) => {
-      human('finish a rotation'); const rt = await getRuntime(); const report = await rt.finish(planId, opts.now === true);
+      human('finish a rotation'); const rt = await getRuntime(); await rt.prepareExecution(diagnostic); const report = await rt.finish(planId, opts.now === true);
       emit({ report, journal: rt.paths.journal }, summary(report, rt.paths.journal)); reportExit(report);
     });
   program.command('undo <planId>').description('Restore readable old values during an unfinished rotation')
     .option('--cluster <id>', 'Restore only this cluster').action(async (planId, opts) => {
-      human('undo a rotation'); const rt = await getRuntime(); const result = await rt.undo(planId, opts.cluster ? [opts.cluster] : undefined);
+      human('undo a rotation'); const rt = await getRuntime(); await rt.prepareExecution(diagnostic); const result = await rt.undo(planId, opts.cluster ? [opts.cluster] : undefined);
       emit(result); if (result.unavailable.length) exitCode = 1;
     });
   const state = program.command('state').description('Manage encrypted saved project state');
@@ -373,7 +385,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       } else diagnostic('aborted, no further changes');
     } else {
       // Only local fixed errors are surfaced; arbitrary adapters can include unregistered secrets.
-      diagnostic(error instanceof CliError || error instanceof AgentRefusalError || error instanceof StateLockedError
+      diagnostic(error instanceof StateLockedError
+        ? 'Saved state cannot be read on this computer. Run "keysentry scan" interactively to rebuild inventory and monitor state, or "keysentry state reset" to start over. Scan keeps journals, plans and in-flight values.'
+        : error instanceof CliError || error instanceof AgentRefusalError
         || error instanceof VaultLockedError || error instanceof VaultReadOnlyError || error instanceof VaultUnavailableError
         ? error.message : 'Command failed. Check configuration, enabled hosts, and the redacted rotation journal.');
     }
@@ -385,30 +399,19 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   return exitCode;
 }
 
-/** Calculate grants without spawning; only the executable entry calls the re-exec helper. */
-export async function permissionOptionsForBin(argv: string[], env: NodeJS.ProcessEnv = process.env) {
-    const args = argv.slice(2);
-    const argument = (name: string) => {
-      const inline = args.find(value => value.startsWith(`${name}=`));
-      if (inline) return inline.slice(name.length + 1);
-      const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1];
-    };
-    const metadata = await loadConfigMetadata({ cwd: argument('--cwd'), config: argument('--config'), env });
-    const userDir = resolve(join(homedir(), '.keysentry'));
-    const directory = (path: string) => path.endsWith(sep) ? path : `${path}${sep}`;
-    const bundle = resolve(argv[1] ?? 'keysentry.mjs');
-    return {
-      readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), ...metadata.dotenvRoots.map(directory)],
-      writePaths: [directory(join(metadata.cwd, '.keysentry')), directory(userDir)],
-      allowChildProcess: !['env', 'encrypted-file', 'memory'].includes(env.KEYSENTRY_VAULT ?? ''),
-    };
+/** npm's bin links resolve to the same module; importing this file does not start the CLI. */
+export function isExecutableEntry(entry: string | undefined, modulePath = fileURLToPath(import.meta.url)): boolean {
+  if (!entry) return false;
+  try { return realpathSync(entry) === modulePath; }
+  catch { return ['keysentry', 'keysentry.mjs'].includes(basename(entry)); }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isExecutableEntry(process.argv[1])) {
   const main = async () => {
-    const permissions = await permissionOptionsForBin(process.argv);
+    const bundlePath = fileURLToPath(import.meta.url);
+    const permissions = await permissionOptionsForBin(process.argv, process.env, bundlePath);
     const result = await maybeReexecWithPermissions({ argv: process.argv, env: process.env, execPath: process.execPath,
-      nodeVersion: process.versions.node, ...permissions,
+      nodeVersion: process.versions.node, bundlePath, ...permissions,
     });
     return result.reexeced ? result.exitCode ?? 1 : runCli();
   };

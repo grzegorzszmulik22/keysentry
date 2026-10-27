@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -16,6 +16,7 @@ interface Line {
   data?: Record<string, unknown>;
   prev: string;
   hash: string;
+  mac?: string;
 }
 
 let dir: string;
@@ -62,7 +63,7 @@ test('audit verify passes on an untouched log of 3 entries', async () => {
   expect(await audit.verify()).toEqual({ ok: true, entries: 3, checkpoints: 0 });
   const entries = await lines();
   expect(entries.map((entry) => entry.seq)).toEqual([1, 2, 3]);
-  expect(entries[0]).toEqual({ seq: 1, at, kind: 'scan', summary: 'Scan 0', prev: '0'.repeat(64), hash: hash(entries[0]!) });
+  expect(entries[0]).toEqual({ seq: 1, at, kind: 'scan', summary: 'Scan 0', prev: '0'.repeat(64), hash: hash(entries[0]!), mac: expect.stringMatching(/^[a-f0-9]{64}$/) });
   expect(entries[1]!.prev).toBe(entries[0]!.hash);
 });
 
@@ -148,6 +149,10 @@ test('audit verify rejects a forged checkpoint signature even with a correct lin
   const entries = await lines();
   entries[1]!.data!.sig = Buffer.alloc(64).toString('base64');
   entries[1]!.hash = hash(entries[1]!);
+  // A valid MAC isolates the signature check; forged entries without it now fail authentication first.
+  const macKey = (await vault.get('audit/mac'))!;
+  try { entries[1]!.mac = createHmac('sha256', macKey).update(entries[1]!.hash).digest('hex'); }
+  finally { macKey.fill(0); }
   await save(entries);
   await vault.delete(headName());
   expect(await audit.verify()).toMatchObject({ ok: false, firstBadSeq: 2, problem: expect.stringMatching(/signature/i) });
@@ -378,7 +383,8 @@ test.each(['append', 'checkpoint'])('a longer rewritten chain cannot reset the v
   }
   await save(replacement);
   const attempt = operation === 'append' ? audit.append({ kind: 'scan', summary: 'Next scan' }) : audit.checkpoint();
-  await expect(attempt).rejects.toThrow(/vault head|truncat/i);
+  // MACs now reject a fabricated replacement before tail traversal reaches the older vault head.
+  await expect(attempt).rejects.toThrow(/vault head|truncat|not written by keysentry/i);
   expect(await vault.get(headName())).toEqual(savedHead);
   expect(await audit.verify()).toMatchObject({ ok: false, truncatedSinceLastKnownHead: true });
 });
@@ -398,4 +404,67 @@ test.skipIf(process.platform === 'win32')('new audit directories and files have 
   await log().append({ kind: 'scan', summary: 'Scan complete' });
   expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
   expect((await stat(path)).mode & 0o777).toBe(0o600);
+});
+
+test('every event and checkpoint has an HMAC from a stable 32-byte vault key', async () => {
+  await log().append({ kind: 'scan', summary: 'Scan complete' });
+  const firstKey = (await vault.get('audit/mac'))!;
+  try {
+    expect(firstKey).toHaveLength(32);
+    await log().checkpoint();
+    expect(await vault.get('audit/mac')).toEqual(firstKey);
+    for (const line of await lines()) {
+      expect(line.mac).toBe(createHmac('sha256', firstKey).update(line.hash).digest('hex'));
+    }
+  } finally { firstKey.fill(0); }
+});
+
+test.each(['missing', 'wrong'])('audit verification identifies a %s entry MAC without echoing content', async mode => {
+  const audit = log();
+  await audit.append({ kind: 'scan', summary: 'First scan' });
+  await audit.checkpoint();
+  const entries = await lines();
+  const prior = entries.at(-1)!;
+  const forged = { seq: prior.seq + 1, at, kind: 'state-reset', summary: 'Reset that did not happen', prev: prior.hash };
+  entries.push({ ...forged, hash: hash(forged), ...(mode === 'wrong' ? { mac: '0'.repeat(64) } : {}) });
+  await save(entries);
+  expect(await audit.verify()).toMatchObject({ ok: false, firstBadSeq: 3, problem: 'entry 3 was not written by keysentry on this computer' });
+  await expect(audit.append({ kind: 'scan', summary: 'Next scan' })).rejects.toThrow(/not written by keysentry/i);
+});
+
+test('verification never creates a missing audit MAC key', async () => {
+  const audit = log();
+  await audit.append({ kind: 'scan', summary: 'Scan complete' });
+  await vault.delete('audit/mac');
+  expect(await audit.verify()).toMatchObject({ ok: false, firstBadSeq: 1, problem: 'entry 1 was not written by keysentry on this computer' });
+  expect(await vault.get('audit/mac')).toBeNull();
+});
+
+test('concurrent projects share one MAC key even through separate vault wrappers', async () => {
+  const first = log({ vault: { ...vault } });
+  const second = log({ path: join(dir, 'another-project', 'audit.jsonl'), vault: { ...vault } });
+  await Promise.all([
+    first.append({ kind: 'scan', summary: 'First project' }),
+    second.append({ kind: 'scan', summary: 'Second project' }),
+  ]);
+  expect((await first.verify()).ok).toBe(true);
+  expect((await second.verify()).ok).toBe(true);
+});
+
+test('MAC key initialization waits for the shared per-user filesystem lock', async () => {
+  const keyLockPath = join(dir, 'user', 'audit-mac');
+  await mkdir(dirname(keyLockPath), { recursive: true });
+  await writeFile(`${keyLockPath}.lock`, '');
+  let finished = false;
+  const pending = log({ keyLockPath }).append({ kind: 'scan', summary: 'Scan complete' }).then(() => { finished = true; });
+  try {
+    await new Promise(done => setTimeout(done, 80));
+    expect(finished).toBe(false);
+    expect(await vault.get('audit/mac')).toBeNull();
+  } finally {
+    await unlink(`${keyLockPath}.lock`);
+    await pending;
+  }
+  expect((await log({ keyLockPath }).verify()).ok).toBe(true);
+  await expect(stat(`${keyLockPath}.lock`)).rejects.toMatchObject({ code: 'ENOENT' });
 });

@@ -19,7 +19,7 @@ permission or deployment behaviour.
 | Existing and replacement secret values | Applications need them; losing a replacement can interrupt a rotation. | Original host/provider, process memory, and encrypted per-rotation records while recovery or undo needs them. |
 | State and fingerprint keys | Allow saved inventory to be decrypted and copies of a value to be matched. | Vault; in memory while used. |
 | Inventory, plans, journal, hints, service names | Describe infrastructure even without full secret values. | Encrypted project state. Exported reports and terminal output need the user's own care. |
-| Audit chain and device signing key | Help detect changes to the recorded history. | Secret-free audit metadata in a local log; signing key and known head in the vault. |
+| Audit chain, MAC key and device signing key | Help detect changes to the recorded history. | Secret-free audit metadata in a local log; MAC key, signing key and known head in the vault. |
 | Release signing key and trusted public keys | Determine which published checksum signatures users accept. | Private key in the maintainer's release secret store/signing process; public trust list in the source and bundle. |
 | Running applications | A mistimed change or revocation can stop them. | Hosting platforms controlled by the user; modified only through an approved rotation. |
 
@@ -34,9 +34,22 @@ access boundary.
 **The CLI to storage.** Credential values go to macOS Keychain, Windows DPAPI under the current
 user, or Linux Secret Service. If those are unavailable, the user must choose the encrypted-file
 fallback; it uses scrypt and AES-256-GCM. Environment credentials are allowed for workflows that
-need them and are identified as weaker. State uses authenticated encryption with a vault-held key.
-Copying encrypted state to another machine without that key does not make it readable, and an
-unreadable state file must not be silently overwritten.
+need them and are identified as weaker.
+
+State uses AES-256-GCM authenticated encryption with a vault-held key. Authentication binds each encrypted file
+to its kind and its path within `.keysentry`; journal records also carry an authenticated sequence number and the
+hash of the previous sealed line, so reordering, deletion in the middle and record substitution are detected. A
+vault entry binds the project directory to its original project ID, and a vault marker closes the one-time 0.1
+plaintext migration: after it, any unencrypted file that appears in saved state is rejected, never migrated.
+`project.json`, `.gitignore`, `audit.jsonl` and `network.jsonl` are plaintext by design. The read-only environment
+vault (CI, the watcher) never migrates plaintext; its project binding lasts only for one process. Copying encrypted
+state to another machine without its key does not make it readable, and unreadable files are not silently
+overwritten. These checks do not establish freshness: an older valid file at the same path, a cut-off journal
+ending, or the whole directory rolled back to an older consistent copy cannot be detected without a vault-held
+generation counter (not built yet). A torn final journal or in-flight record from a crash is ignored; damage to a
+complete record is reported. An interactive scan may replace unreadable inventory and monitor state
+after confirmation, keeping plans, journal and in-flight records. It refuses before replacing anything
+if the existing audit history cannot be authenticated with the selected vault.
 
 **The CLI to the network.** All outbound requests use the injected `HttpClient`; production adds a
 host allow-list and a network receipt. HTTPS, URL validation, redirect checks, response-size limits,
@@ -64,11 +77,20 @@ guesswork. A write-only old value cannot be restored. A platform that applies va
 deployment needs an explicit activation decision. Cloudflare's atomic roll invalidates the old
 token immediately and cannot provide overlap or restore it.
 
-**The audit log to the vault.** Entries form a SHA-256 chain; periodic Ed25519 checkpoints and the
-vault-held known head help detect edits, deletions, and reordering. Checkpoints are local, not an
-independent witness. Tail truncation after the latest known head may not be distinguishable from a
-shorter valid log. An actor able to replace the log, signing key, and vault head can create a new
-consistent history. The audit log is tamper-evident within that boundary, not tamper-proof.
+**The audit log to the vault.** Entries form a SHA-256 chain, and each entry carries an HMAC-SHA256
+over its hash using the 32-byte `audit/mac` key held in the vault. Missing or incorrect MACs are
+reported at the first affected entry, so fabricating an append requires that vault key. Periodic
+Ed25519 checkpoints and the vault-held known head detect replacement or tail truncation through the
+latest saved checkpoint. `audit verify` always opens the selected vault and reads the head for the
+log path; it refuses a nonempty log with no vault anchor. A public marker cannot skip that lookup.
+Checkpoints are local, not an independent witness. Deleting a suffix after the latest saved head
+remains undetectable until a newer head is saved. An actor able to replace the log and its vault-held
+MAC key, signing key, and head can create a new consistent history. The audit log is tamper-evident
+within that boundary, not tamper-proof.
+
+Environment vaults keep the audit head in memory only. Their MAC key is also process-local unless the
+same 32 UTF-8 bytes are supplied in `KEYSENTRY_VAULT_AUDIT_MAC`. A later audit inspection refuses a
+nonempty log without a vault head; a valid checkpoint signature alone does not establish completeness.
 
 **Source to release to installation.** Locked dependencies, installs with `--ignore-scripts`, a
 readable bundle, a package without dependencies or install hooks, pinned workflow actions, and

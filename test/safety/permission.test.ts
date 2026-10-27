@@ -82,6 +82,38 @@ describe('permission re-exec', () => {
     expect(env.KEYSENTRY_SANDBOXED).toBe('0');
   });
 
+  test.each([
+    '--permission --allow-fs-read=* --allow-fs-write="/old path/*" --allow-child-process --no-warnings',
+    '--experimental-permission --allow-fs-read "/old path/*" --allow-fs-write /old/* --allow-worker --stack-trace-limit=20',
+    '--allow-future-permission=* --no-allow-child-process --no-permission --no-warnings',
+  ])('strips permission grants from NODE_OPTIONS: %s', async NODE_OPTIONS => {
+    let observed: NodeJS.ProcessEnv | undefined;
+    const env = { NODE_OPTIONS };
+    const spawnImpl: SpawnLike = (_command, _args, childOptions) => {
+      observed = childOptions.env;
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('exit', 0, null));
+      return child;
+    };
+    expect(await maybeReexecWithPermissions({ ...options(), env, spawnImpl })).toEqual({ reexeced: true, exitCode: 0 });
+    expect(observed?.NODE_OPTIONS).not.toMatch(/--(?:no-)?(?:allow-|(?:experimental-)?permission)/);
+    expect(observed?.NODE_OPTIONS).toMatch(/--no-warnings|--stack-trace-limit=20/);
+    expect(env.NODE_OPTIONS).toBe(NODE_OPTIONS);
+  });
+
+  test('uses the actual bundle path for an npm bin link and grants read access to it', async () => {
+    let observed: readonly string[] = [];
+    const spawnImpl: SpawnLike = (_command, args) => {
+      observed = args;
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('exit', 0, null));
+      return child;
+    };
+    await maybeReexecWithPermissions({ ...options(), readPaths: ['/project/'], argv: ['/node', '/prefix/bin/keysentry', '--help'], bundlePath: '/prefix/lib/keysentry/keysentry.mjs', spawnImpl });
+    expect(observed).toContain('--allow-fs-read=/prefix/lib/keysentry/keysentry.mjs');
+    expect(observed.slice(-2)).toEqual(['/prefix/lib/keysentry/keysentry.mjs', '--help']);
+  });
+
   test('maps a child signal to exit code 1', async () => {
     const spawnImpl: SpawnLike = () => {
       const child = new EventEmitter();

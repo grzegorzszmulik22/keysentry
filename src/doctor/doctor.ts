@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { CredentialSource, HttpClient, Vault } from '../types.js';
 import type { checkLocalIntegrity } from '../release/index.js';
 import { credentialVaultName } from '../vault/credentials.js';
-import { detectAgentEnvironment, sandboxSupport } from '../safety/index.js';
+import { detectAgentEnvironment, MEMORY_ONLY_ROTATION_WARNING, sandboxSupport } from '../safety/index.js';
 import { TOKEN_CAPABILITIES, type PlatformCapabilities } from './capabilities.js';
 
 export interface DoctorItem {
@@ -97,10 +97,12 @@ function guidance(capability: PlatformCapabilities): { detail: string; fix: stri
 
 /** Local diagnostics are read-only. Only an explicit probe makes HTTP requests. */
 export async function runDoctor(input: DoctorInput): Promise<DoctorResult> {
+  const memoryOnly = input.vault.backend === 'env' || input.vault.backend === 'memory';
+  const vaultWarning = [input.vault.weakness, memoryOnly ? MEMORY_ONLY_ROTATION_WARNING : undefined].filter(Boolean).join(' ');
   const items: DoctorItem[] = [installItem(input.integrity), nodeItem(input), {
-    area: 'vault', status: input.vault.weakness ? 'warn' : 'ok', title: 'Credential vault',
-    detail: `Backend: ${input.vault.backend}.${input.vault.weakness ? ` ${input.vault.weakness}` : ''}`,
-    ...(input.vault.weakness ? { fix: 'keysentry vault status' } : {}),
+    area: 'vault', status: vaultWarning ? 'warn' : 'ok', title: 'Credential vault',
+    detail: `Backend: ${input.vault.backend}.${vaultWarning ? ` ${vaultWarning}` : ''}`,
+    ...(vaultWarning ? { fix: 'keysentry vault status' } : {}),
   }];
   const fingerprints: Record<string, string> = {};
   const secrets = new Set<string>();

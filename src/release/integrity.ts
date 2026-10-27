@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export async function computeSha256File(path: string): Promise<string> {
   const hash = createHash('sha256');
@@ -19,8 +20,8 @@ export interface LocalIntegrityResult {
 export async function checkLocalIntegrity(opts: { bundlePath?: string | null } = {}): Promise<LocalIntegrityResult> {
   let bundlePath = opts.bundlePath;
   if (bundlePath === undefined) {
-    const entry = process.argv[1];
-    bundlePath = entry && basename(entry) === 'keysentry.mjs' ? resolve(entry) : null;
+    const entry = fileURLToPath(import.meta.url);
+    bundlePath = basename(entry) === 'keysentry.mjs' ? entry : null;
   }
   if (bundlePath === null) return { status: 'dev' };
 

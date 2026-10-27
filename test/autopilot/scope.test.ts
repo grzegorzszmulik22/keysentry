@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import type { ArmedCluster, ArmedPlan, Cluster, Consumer, HostId, Inventory, ServiceRef } from '../../src/types.js';
 import { serviceKey } from '../../src/core/service-key.js';
 import { checkScope } from '../../src/autopilot/scope.js';
+import { getProvider } from '../../src/providers/index.js';
 
 const now = '2026-10-27T12:00:00.000Z';
 const adopted = { fingerprint: 'a'.repeat(32), keyRef: 'key-1', at: now };
@@ -141,6 +142,43 @@ describe('checkScope', () => {
     const c = cluster('c', [consumer('api', { service: service('api', 'fly'), fingerprint: null })]);
     const p = plan([c], { hosts: ['fly'], clusters: [armed(c, { adopted })] });
     expect(scope(p, [c], ['c'], 'fly')).toEqual({ execute: ['c'], ask: [] });
+  });
+
+  test.each(['railway', 'fly', 'github-actions'] as const)('signed %s adoption without a key reference asks', host => {
+    const c = cluster('c', [consumer('api', { service: service('api', host), sealed: host === 'railway', fingerprint: null })]);
+    const p = plan([c], { hosts: [host], clusters: [armed(c, { adopted: { ...adopted, keyRef: null } })] });
+    expect(scope(p, [c], ['c'], host)).toEqual({ execute: [], ask: [{ clusterId: 'c', reasons: ['write-only consumer was not adopted'] }] });
+  });
+
+  test('signed adoption cannot authorize a provider without reference rotation', () => {
+    const c = cluster('c', [consumer('api', { sealed: true, fingerprint: null })]);
+    const p = plan([c], { clusters: [armed(c, { adopted })] });
+    const adapter = getProvider(c.provider);
+    const original = adapter.rotateByRef;
+    try {
+      adapter.rotateByRef = undefined;
+      expect(scope(p, [c])).toEqual({ execute: [], ask: [{ clusterId: 'c', reasons: ['write-only consumer was not adopted'] }] });
+    } finally { adapter.rotateByRef = original; }
+  });
+
+  test('an unsigned reference cannot replace a signed adoption with no reference', () => {
+    const c = Object.assign(cluster('c', [consumer('api', { sealed: true, fingerprint: null })]), { adopted });
+    const p = plan([c], { clusters: [armed(c, { adopted: { ...adopted, keyRef: null } })] });
+    expect(scope(p, [c])).toEqual({ execute: [], ask: [{ clusterId: 'c', reasons: ['write-only consumer was not adopted'] }] });
+  });
+
+  test('a readable copy does not bypass the adoption requirement for write-only consumers', () => {
+    const c = cluster('c', [consumer(), consumer('worker', { sealed: true, fingerprint: null })]);
+    const p = plan([c], { clusters: [armed(c, { adopted: { ...adopted, keyRef: null } })] });
+    expect(scope(p, [c])).toEqual({ execute: [], ask: [{ clusterId: 'c', reasons: ['write-only consumer was not adopted'] }] });
+  });
+
+  test('write-only generated secrets with null references ask', () => {
+    const c = cluster('c', [consumer('api', { sealed: true, fingerprint: null, varName: 'SESSION_SECRET' })], {
+      provider: 'app-secret', tier: 'app', method: 'generate',
+    });
+    const p = plan([c], { clusters: [armed(c, { adopted: { ...adopted, keyRef: null } })] });
+    expect(scope(p, [c])).toEqual({ execute: [], ask: [{ clusterId: 'c', reasons: ['write-only consumer was not adopted'] }] });
   });
 
   test('unsigned current adoption cannot replace missing signed adoption', () => {

@@ -79,6 +79,13 @@ function parseResponse(response: HttpResponse, name: string): Record<string, unk
 export const awsProvider: ProviderAdapter = {
   id: 'aws',
   method: 'auto',
+  async rotateByRef() {
+    // This adapter authenticates as the old/current sibling pair and has no
+    // separate configured management identity. An access id alone cannot sign
+    // GetAccessKeyLastUsed/GetUser or prove the owning IAM user.
+    const error = new Error('AWS key ownership cannot be determined with the configured credentials; use guided rotation.');
+    throw Object.assign(error, { code: 'GUIDED_ROTATION_REQUIRED' });
+  },
   async verify(value, ctx) {
     let status: number | undefined;
     try {

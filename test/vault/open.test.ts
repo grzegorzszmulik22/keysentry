@@ -1,10 +1,11 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openVault, VaultUnavailableError } from '../../src/vault/index.js';
 import type { Logger } from '../../src/types.js';
 import type { runHelper } from '../../src/vault/exec.js';
+import { getProjectId, stateKey } from '../../src/vault/keys.js';
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true }))); });
@@ -124,4 +125,76 @@ test('explicit unavailable operating system backend gives its fix without substi
 test('missing passphrase callback explains how to open the encrypted file', async () => {
   const opts = await options();
   await expect(openVault({ ...opts, passphrase: undefined, env: { KEYSENTRY_VAULT: 'encrypted-file' } })).rejects.toThrow('passphrase');
+});
+
+function fakeSecretTool(): typeof runHelper {
+  const items = new Map<string, string>();
+  return async (_cmd, args, opts) => {
+    const account = args[args.indexOf('account') + 1]!;
+    if (args[0] === 'store') { items.set(account, opts?.stdin?.toString('utf8').trim() ?? ''); return { code: 0, stdout: Buffer.alloc(0), stderr: '' }; }
+    if (args[0] === 'lookup') return items.has(account) ? { code: 0, stdout: Buffer.from(items.get(account)!), stderr: '' } : { code: 1, stdout: Buffer.alloc(0), stderr: '' };
+    if (args[0] === 'clear') return { code: items.delete(account) ? 0 : 1, stdout: Buffer.alloc(0), stderr: '' };
+    return { code: 2, stdout: Buffer.alloc(0), stderr: 'unexpected' };
+  };
+}
+
+test('an accepted encrypted-file fallback retains the same state key when the OS store becomes reachable', async () => {
+  const opts = await options();
+  const projectId = await getProjectId(join(opts.userDir, 'project', '.keysentry'));
+  const exec = fakeSecretTool();
+  const overSsh = await openVault({ ...opts, platform: 'linux', exec });
+  expect(overSsh.backend).toBe('encrypted-file');
+  const firstKey = await stateKey(overSsh, projectId);
+  opts.allowFileFallback.mockClear();
+
+  const onDesktop = await openVault({ ...opts, platform: 'linux', env: { DBUS_SESSION_BUS_ADDRESS: 'session' }, exec });
+  const secondKey = await stateKey(onDesktop, projectId);
+  expect({ backend: onDesktop.backend, sameStateKey: secondKey.equals(firstKey), asked: opts.allowFileFallback.mock.calls.length > 0 })
+    .toEqual({ backend: 'encrypted-file', sameStateKey: true, asked: false });
+  expect(JSON.parse(await readFile(join(opts.userDir, 'vault-backend.json'), 'utf8'))).toEqual({ backend: 'encrypted-file' });
+});
+
+test('an existing file without a remembered choice is selected with a warning non-interactively', async () => {
+  const opts = await options();
+  const initial = await openVault({ ...opts, env: { KEYSENTRY_VAULT: 'encrypted-file' } });
+  await initial.set('item', Buffer.from('value'));
+  await rm(join(opts.userDir, 'vault-backend.json'), { force: true });
+  const vault = await openVault({ ...opts, platform: 'linux', env: { DBUS_SESSION_BUS_ADDRESS: 'session' }, exec: fakeSecretTool() });
+  expect(vault.backend).toBe('encrypted-file');
+  expect(opts.log.warn).toHaveBeenCalledWith(expect.stringMatching(/both.*encrypted file.*operating system.*using the encrypted file/i));
+  expect(opts.allowFileFallback).not.toHaveBeenCalled();
+});
+
+test.each(['encrypted-file', 'linux-secret-service'] as const)('an interactive choice between existing stores remembers %s', async backend => {
+  const opts = await options();
+  const initial = await openVault({ ...opts, env: { KEYSENTRY_VAULT: 'encrypted-file' } });
+  await initial.set('item', Buffer.from('value'));
+  await rm(join(opts.userDir, 'vault-backend.json'), { force: true });
+  const chooseBackend = vi.fn(async () => backend);
+  const vault = await openVault({ ...opts, platform: 'linux', env: { DBUS_SESSION_BUS_ADDRESS: 'session' }, exec: fakeSecretTool(), chooseBackend });
+  expect(vault.backend).toBe(backend);
+  expect(chooseBackend).toHaveBeenCalledExactlyOnceWith('linux-secret-service');
+  expect(JSON.parse(await readFile(join(opts.userDir, 'vault-backend.json'), 'utf8'))).toEqual({ backend });
+});
+
+test('a remembered OS backend does not switch to a different key set when unavailable', async () => {
+  const opts = await options();
+  await openVault({ ...opts, platform: 'linux', env: { DBUS_SESSION_BUS_ADDRESS: 'session' }, exec: fakeSecretTool() });
+  await expect(openVault({ ...opts, platform: 'linux' })).rejects.toThrow(VaultUnavailableError);
+  expect(opts.allowFileFallback).not.toHaveBeenCalled();
+});
+
+test('an invalid backend preference fails closed instead of selecting a different key set', async () => {
+  const opts = await options();
+  await writeFile(join(opts.userDir, 'vault-backend.json'), JSON.stringify({ backend: 'unknown' }));
+  await expect(openVault({ ...opts, platform: 'linux', exec: fakeSecretTool() })).rejects.toThrow(/saved vault backend choice/i);
+  expect(opts.allowFileFallback).not.toHaveBeenCalled();
+});
+
+test('an explicit backend overrides and replaces the remembered choice', async () => {
+  const opts = await options();
+  await writeFile(join(opts.userDir, 'vault-backend.json'), JSON.stringify({ backend: 'linux-secret-service' }));
+  const vault = await openVault({ ...opts, env: { KEYSENTRY_VAULT: 'memory' } });
+  expect(vault.backend).toBe('memory');
+  expect(JSON.parse(await readFile(join(opts.userDir, 'vault-backend.json'), 'utf8'))).toEqual({ backend: 'memory' });
 });

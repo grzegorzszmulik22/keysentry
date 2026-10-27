@@ -27,7 +27,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
-      - run: node tools/vitest-sandbox.mjs
+      - run: node tools/vitest-sandbox.mjs test/
 
   release-build:
     name: Audit and reproducible release build
@@ -57,3 +57,39 @@ jobs:
             dist-release/out/release-manifest.json
             dist-release/out/SHA256SUMS
             dist-release/out/*.tgz
+
+  packed-bin:
+    name: Packed npm bin on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.23.4
+      - run: npm ci --ignore-scripts
+      - run: npm run release:build
+      - name: Exercise global and local npm bin links
+        shell: bash
+        run: |
+          tarballs=("$GITHUB_WORKSPACE"/dist-release/out/*.tgz)
+          test "${#tarballs[@]}" -eq 1
+          version="$(node -p 'require("./package.json").version')"
+          prefix="$(mktemp -d)"
+          project="$(mktemp -d)"
+          npm install --global --prefix "$prefix" --ignore-scripts --offline "${tarballs[0]}"
+          export PATH="$prefix/bin:$PATH"
+          test "$(keysentry --version)" = "$version"
+          keysentry --help > "$prefix/help.txt"
+          grep -q 'Usage: keysentry' "$prefix/help.txt"
+          cd "$project"
+          npm init --yes
+          npm install --ignore-scripts --offline "${tarballs[0]}"
+          test "$(npx --no-install keysentry --version)" = "$version"

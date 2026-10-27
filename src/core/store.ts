@@ -1,9 +1,12 @@
-import { randomBytes } from 'node:crypto';
-import { mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { link, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { DecryptError, openBytes, sealBytes } from '../security/index.js';
-import type { Inventory, Journal, JournalEntry, StateCipher } from '../types.js';
+import type { Inventory, Journal, JournalEntry, StateCipher, Vault } from '../types.js';
+import { bindProjectPath, getProjectId } from '../vault/keys.js';
 
 export interface StatePaths {
   dir: string;
@@ -28,8 +31,8 @@ export interface StateStore {
 
 export class StateLockedError extends Error {
   readonly code = 'STATE_LOCKED';
-  constructor(dir: string) {
-    super(`keysentry's saved state in ${dir} can't be decrypted on this computer. Run "keysentry scan" to rebuild it, or "keysentry state reset" to start over.`);
+  constructor(dir: string, message?: string) {
+    super(message ?? `keysentry's saved state in ${dir} can't be decrypted on this computer. Run "keysentry scan" in a terminal to replace the saved inventory with a fresh scan (it asks first), or "keysentry state reset" to start over.`);
     this.name = 'StateLockedError';
   }
 }
@@ -46,8 +49,8 @@ export function createStateCipher(key: Buffer): StateCipher {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new TypeError('Encryption key must be exactly 32 bytes.');
   const ownedKey = Buffer.from(key);
   return {
-    seal: (kind, plaintext) => sealBytes(ownedKey, plaintext, `keysentry-state:${kind}`),
-    open: (kind, sealed) => openBytes(ownedKey, sealed, `keysentry-state:${kind}`),
+    seal: (kind, plaintext) => sealBytes(ownedKey, plaintext, `keysentry-state:v2:${kind}`),
+    open: (kind, sealed) => openBytes(ownedKey, sealed, `keysentry-state:v2:${kind}`),
   };
 }
 
@@ -112,7 +115,8 @@ export async function writeJsonAtomic(path: string, data: unknown): Promise<void
 }
 
 /** Optional verification happens on the durable encrypted temporary file before replacing the original. */
-async function writeTextAtomic(path: string, content: string, verify?: (saved: string) => void): Promise<void> {
+async function writeTextAtomic(path: string, content: string, verify?: (saved: string) => void,
+  beforeReplace?: () => Promise<void>): Promise<void> {
   const target = resolve(path);
   await preparePath(target);
   const temp = join(dirname(target), `.${basename(target)}-${randomBytes(16).toString('hex')}.tmp`);
@@ -123,6 +127,8 @@ async function writeTextAtomic(path: string, content: string, verify?: (saved: s
     try { await handle.writeFile(content, 'utf8'); await handle.sync(); }
     finally { await handle.close(); }
     if (verify) verify(await readFile(temp, 'utf8'));
+    // Persist the migration boundary before publishing encrypted state, including on a partial migration.
+    await beforeReplace?.();
     // Windows may temporarily deny replacement while another process reads the target.
     for (let attempt = 0; ; attempt++) {
       try { await rename(temp, target); break; }
@@ -247,23 +253,28 @@ async function readText(path: string): Promise<string | null> {
   catch (error) { if (hasCode(error, 'ENOENT')) return null; throw error; }
 }
 
-function sealJson(cipher: StateCipher, kind: StateKind, data: unknown): string {
+function sealJson(cipher: StateCipher, context: string, data: unknown): string {
   let plaintext: Buffer | undefined;
   try {
     plaintext = Buffer.from(serialize(data));
-    return cipher.seal(kind, plaintext).toString('base64');
+    return cipher.seal(context, plaintext).toString('base64');
   } catch { throw new Error('Unable to write JSON state.'); }
   finally { plaintext?.fill(0); }
 }
 
-function openJson<T>(cipher: StateCipher | null, kind: StateKind, content: string, dir: string): T {
-  if (!encrypted(content)) return parseJson<T>(content);
+function unencryptedState(dir: string, path: string): StateLockedError {
+  const rel = relative(dir, path).split(sep).join('/');
+  return new StateLockedError(dir, `An unencrypted file appeared in keysentry's saved state: ${rel}. It was not written by keysentry; remove it or run keysentry state reset.`);
+}
+
+function openJson<T>(cipher: StateCipher | null, context: string, content: string, dir: string, path: string): T {
+  if (!encrypted(content)) throw unencryptedState(dir, path);
   if (!cipher) throw new StateLockedError(dir);
   const lines = content.split(/\r?\n/);
   let plaintext: Buffer;
   try {
     if (lines.length < 2 || lines.slice(2).some(line => line !== '')) throw new DecryptError();
-    plaintext = cipher.open(kind, decodeBase64(lines[1]!));
+    plaintext = cipher.open(context, decodeBase64(lines[1]!));
   } catch (error) {
     if (error instanceof DecryptError) throw new StateLockedError(dir);
     throw new Error('Unable to read encrypted JSON state.');
@@ -272,7 +283,13 @@ function openJson<T>(cipher: StateCipher | null, kind: StateKind, content: strin
   finally { plaintext.fill(0); }
 }
 
-interface JournalSnapshot { entries: JournalEntry[]; content: string }
+const FIRST_RECORD_PREV = '0'.repeat(64);
+interface JournalSnapshot { entries: JournalEntry[]; content: string; head: string }
+interface SealedJournalRecord { entry: JournalEntry; prev: string; n: number }
+
+function sealedLineHash(line: string): string {
+  return createHash('sha256').update(line).digest('hex');
+}
 
 function plaintextJournal(content: string): JournalEntry[] {
   return content.split(/\r?\n/).filter(line => line.trim() !== '').map((line, index) => {
@@ -281,13 +298,14 @@ function plaintextJournal(content: string): JournalEntry[] {
   });
 }
 
-function openJournal(cipher: StateCipher | null, content: string, dir: string): JournalSnapshot {
-  if (!encrypted(content)) return { entries: plaintextJournal(content), content };
+function openJournal(cipher: StateCipher | null, context: string, content: string, dir: string, path: string): JournalSnapshot {
+  if (!encrypted(content)) throw unencryptedState(dir, path);
   if (!cipher) throw new StateLockedError(dir);
   const lines = content.split('\n');
   const entries: JournalEntry[] = [];
   const failures: { line: number; locked: boolean; torn: boolean; offset: number }[] = [];
   let authenticated = 0;
+  let head = FIRST_RECORD_PREV;
   let offset = lines[0]!.length + 1;
   for (let index = 1; index < lines.length; index++) {
     const raw = lines[index]!;
@@ -296,15 +314,23 @@ function openJournal(cipher: StateCipher | null, content: string, dir: string): 
     const torn = index === lines.length - 1 && !content.endsWith('\n');
     let plaintext: Buffer | undefined;
     let decoded = false;
+    let opened = false;
     try {
       const sealed = decodeBase64(line);
       // A partial envelope is a torn record, not evidence of a different key.
       decoded = sealed.length >= 32 && sealed.subarray(0, 4).equals(Buffer.from([75, 83, 49, 1]));
-      plaintext = cipher.open('journal', sealed);
+      plaintext = cipher.open(context, sealed);
+      opened = true;
       authenticated++;
-      entries.push(JSON.parse(plaintext.toString('utf8')) as JournalEntry);
+      const record = JSON.parse(plaintext.toString('utf8')) as SealedJournalRecord | null;
+      if (!record || record.n !== index || record.prev !== head || !record.entry || typeof record.entry !== 'object') {
+        throw new StateCorruptError(index + 1);
+      }
+      entries.push(record.entry);
+      head = sealedLineHash(line);
     } catch (error) {
-      failures.push({ line: index + 1, locked: decoded && error instanceof DecryptError, torn, offset });
+      failures.push({ line: index + 1, locked: decoded && error instanceof DecryptError,
+        torn: torn && !opened, offset });
     } finally { plaintext?.fill(0); }
     offset += raw.length + 1;
   }
@@ -313,11 +339,17 @@ function openJournal(cipher: StateCipher | null, content: string, dir: string): 
   const corrupt = failures.find(failure => !failure.torn);
   if (corrupt) throw new StateCorruptError(corrupt.line);
   const tail = failures.find(failure => failure.torn);
-  return { entries, content: tail ? content.slice(0, tail.offset) : content };
+  return { entries, content: tail ? content.slice(0, tail.offset) : content, head };
 }
 
-function sealedJournal(cipher: StateCipher, entries: JournalEntry[]): string {
-  return `${ENCRYPTED_HEADER}\n${entries.map(entry => `${sealJson(cipher, 'journal', entry)}\n`).join('')}`;
+function sealedJournal(cipher: StateCipher, context: string, entries: JournalEntry[]): string {
+  let prev = FIRST_RECORD_PREV;
+  const lines = entries.map((entry, index) => {
+    const line = sealJson(cipher, context, { entry, prev, n: index + 1 } satisfies SealedJournalRecord);
+    prev = sealedLineHash(line);
+    return `${line}\n`;
+  });
+  return `${ENCRYPTED_HEADER}\n${lines.join('')}`;
 }
 
 /** Resolve existing links even if the final file or its parents have not been created yet. */
@@ -341,9 +373,170 @@ async function appendDurable(path: string, line: string): Promise<void> {
   } finally { await handle.close(); }
 }
 
-export function createStateStore(opts: { cwd: string; cipher: StateCipher | null }): StateStore {
+export interface StateStoreOptions {
+  cwd: string;
+  cipher: StateCipher | null;
+  /** Supply both to persist project-path binding and the one-time migration marker in the vault. */
+  vault?: Vault;
+  projectId?: string;
+}
+
+interface StateLockSnapshot { identity: Stats; content: string; pid: number | null }
+
+function sameStateLock(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs && left.size === right.size;
+}
+
+async function inspectStateLock(path: string): Promise<StateLockSnapshot | null> {
+  let handle: FileHandle;
+  try { handle = await open(path, 'r'); }
+  catch (error) { if (hasCode(error, 'ENOENT')) return null; throw error; }
+  try {
+    const identity = await handle.stat();
+    const content = await handle.readFile('utf8');
+    if (!sameStateLock(identity, await handle.stat())) return null;
+    let pid: number | null = null;
+    try {
+      const metadata = JSON.parse(content) as { pid?: unknown } | null;
+      if (metadata && typeof metadata.pid === 'number' && Number.isInteger(metadata.pid)
+        && metadata.pid > 0 && metadata.pid <= 2_147_483_647) pid = metadata.pid;
+    } catch { /* A crash may leave an incomplete metadata write. */ }
+    return { identity, content, pid };
+  } finally { await handle.close(); }
+}
+
+function stateLockOwnerExited(pid: number): boolean {
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return hasCode(error, 'ESRCH'); }
+}
+
+/** The filesystem lock also serializes independent modules, processes, and aliases of the same directory. */
+async function withStateLock<T>(dir: string, operation: (assertLock: () => Promise<void>) => Promise<T>): Promise<T> {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, '.state.lock');
+  const token = randomBytes(16).toString('hex');
+  const temporary = join(dir, `.state-lock-${process.pid}-${token}.tmp`);
+  const metadata = JSON.stringify({ pid: process.pid, token });
+  const busy = () => new Error('keysentry\'s saved state is busy. Try again when the other operation finishes.');
+  let handle: FileHandle;
+  try { handle = await open(temporary, 'wx', 0o600); }
+  catch { throw new Error('Unable to open the saved state lock.'); }
+  let temporaryExists = true;
+  let published = false;
+  let identity: Stats | undefined;
+  try {
+    // Metadata is coordination data, not durable state; journal appends retain their single write/fsync.
+    await handle.writeFile(metadata, 'utf8');
+    const deadline = Date.now() + 10_000;
+    let backoff = 10;
+    for (;;) {
+      if (Date.now() >= deadline) throw busy();
+      try {
+        // Publish complete owner metadata atomically, with no empty-lock window for another process.
+        await link(temporary, path);
+        published = true;
+        break;
+      } catch (error) { if (!hasCode(error, 'EEXIST')) throw new Error('Unable to open the saved state lock.'); }
+      let current: StateLockSnapshot | null;
+      try { current = await inspectStateLock(path); }
+      catch { throw new Error('Unable to check the saved state lock.'); }
+      if (current === null) continue;
+      if (current.pid === null || stateLockOwnerExited(current.pid)) {
+        // stat/unlink cannot atomically avoid deleting a new owner during concurrent stale recovery.
+        throw new Error('The saved state lock needs attention. Confirm that no keysentry command is running, then remove ".keysentry/.state.lock" and try again.');
+      }
+      // Never expire a live PID, even during a long vault call or a suspended event loop.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw busy();
+      await new Promise<void>(done => setTimeout(done, Math.min(remaining, backoff)));
+      backoff = Math.min(backoff * 2, 200);
+    }
+    await unlink(temporary);
+    temporaryExists = false;
+    identity = await handle.stat();
+    async function assertLock(): Promise<void> {
+      const current = await inspectStateLock(path);
+      if (!current || !identity || !sameStateLock(identity, current.identity) || current.content !== metadata) {
+        throw new Error('The saved state lock changed. Try the operation again.');
+      }
+    }
+    await assertLock();
+    const result = await operation(assertLock);
+    await assertLock();
+    return result;
+  } finally {
+    try {
+      if (published) {
+        // Check the held inode again before unlinking; leave a replacement lock for its owner.
+        const owned = identity ?? await handle.stat();
+        const current = await inspectStateLock(path);
+        if (current && sameStateLock(owned, current.identity) && current.content === metadata) {
+          await unlink(path).catch((error: unknown) => { if (!hasCode(error, 'ENOENT')) throw error; });
+        }
+      }
+    } finally {
+      try { await handle.close(); }
+      finally {
+        if (temporaryExists) await unlink(temporary).catch((error: unknown) => { if (!hasCode(error, 'ENOENT')) throw error; });
+      }
+    }
+  }
+}
+
+export function createStateStore(opts: StateStoreOptions): StateStore {
   const paths = statePaths(opts.cwd);
-  const { cipher } = opts;
+  const { cipher, vault, projectId } = opts;
+  if ((vault === undefined) !== (projectId === undefined)) throw new TypeError('State project binding needs both a vault and a project identifier.');
+  let identityBound = false;
+  let initialized = false;
+
+  function relativePath(path: string): string {
+    return relative(paths.dir, path).split(sep).join('/');
+  }
+
+  function context(kind: StateKind, path: string): string {
+    return `${kind}:${relativePath(path)}`;
+  }
+
+  function plaintextByDesign(path: string): boolean {
+    return ['project.json', '.gitignore', 'audit.jsonl', 'network.jsonl'].includes(relativePath(path));
+  }
+
+  async function initialize(): Promise<void> {
+    if (!vault || !projectId || identityBound) return;
+    await checkedPath(join(paths.dir, 'project.json'));
+    const actualId = await getProjectId(paths.dir);
+    if (actualId !== projectId) {
+      throw new StateLockedError(paths.dir, 'project.json was changed or copied from another project. Restore the original project.json before opening saved state.');
+    }
+    await bindProjectPath(vault, opts.cwd, projectId);
+    identityBound = true;
+  }
+
+  async function isInitialized(): Promise<boolean> {
+    if (initialized) return true;
+    if (vault && projectId) {
+      const marker = await vault.get(`project/${projectId}/state-initialized`);
+      initialized = marker !== null;
+      marker?.fill(0);
+    }
+    return initialized;
+  }
+
+  async function markInitialized(): Promise<void> {
+    if (await isInitialized()) return;
+    if (vault && projectId) await vault.set(`project/${projectId}/state-initialized`, Buffer.from('1'));
+    initialized = true;
+  }
+
+  // A migration and the first encrypted write must not race over the initialization marker.
+  function operate<T>(path: string, operation: () => Promise<T>): Promise<T> {
+    return enqueue(paths.dir, () => withStateLock(paths.dir, async assertLock => {
+      await initialize();
+      return enqueue(path, async () => { await assertLock(); return operation(); });
+    }));
+  }
 
   function targetPath(path: string): string {
     const target = resolve(path);
@@ -371,22 +564,27 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
 
   async function read<T>(kind: StateKind, path: string): Promise<T | null> {
     const target = targetPath(path);
-    return enqueue(target, async () => {
+    return operate(target, async () => {
       const content = await readStateText(target);
-      return content === null ? null : openJson<T>(cipher, kind, content, paths.dir);
+      if (content === null) return null;
+      if (!encrypted(content) && plaintextByDesign(target)) return parseJson<T>(content);
+      return openJson<T>(cipher, context(kind, target), content, paths.dir, target);
     });
   }
 
   async function write(kind: StateKind, path: string, data: unknown, options: { replaceUndecryptable?: boolean } = {}): Promise<void> {
     const target = targetPath(path);
-    return enqueue(target, async () => {
+    return operate(target, async () => {
       const existing = await readStateText(target);
-      if (existing !== null && encrypted(existing) && !options.replaceUndecryptable) {
-        openJson(cipher, kind, existing, paths.dir);
+      if (existing !== null) {
+        if (!encrypted(existing)) throw unencryptedState(paths.dir, target);
+        if (!options.replaceUndecryptable) openJson(cipher, context(kind, target), existing, paths.dir, target);
       }
+      if (!cipher) throw new StateLockedError(paths.dir);
       let content: string;
-      try { content = cipher ? `${ENCRYPTED_HEADER}\n${sealJson(cipher, kind, data)}\n` : serialize(data, true); }
+      try { content = `${ENCRYPTED_HEADER}\n${sealJson(cipher, context(kind, target), data)}\n`; }
       catch { throw new Error('Unable to write JSON state.'); }
+      await markInitialized();
       try { await writeTextAtomic(target, content); }
       catch { throw new Error('Unable to write JSON state.'); }
     });
@@ -395,31 +593,20 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
   function journal(): Journal {
     return {
       read(planId) {
-        return enqueue(paths.journal, async () => {
+        return operate(paths.journal, async () => {
           const content = await readStateText(paths.journal);
-          const entries = content === null ? [] : openJournal(cipher, content, paths.dir).entries;
+          const entries = content === null ? [] : openJournal(cipher, context('journal', paths.journal), content, paths.dir, paths.journal).entries;
           return planId === undefined ? entries : entries.filter(entry => entry.planId === planId);
         });
       },
       append(entry) {
-        return enqueue(paths.journal, async () => {
-          let content = await readStateText(paths.journal);
-          let snapshot = content === null ? { entries: [], content: '' } : openJournal(cipher, content, paths.dir);
-          if (!cipher) {
-            let line: string;
-            try { line = serialize(entry); }
-            catch { throw new Error('Unable to append JSONL state.'); }
-            return appendDurable(paths.journal, line);
-          }
-          if (content !== null && !encrypted(content)) {
-            const migrated = sealedJournal(cipher, snapshot.entries);
-            await writeTextAtomic(paths.journal, migrated, saved => {
-              if (!isDeepStrictEqual(openJournal(cipher, saved, paths.dir).entries, snapshot.entries)) throw new Error('Unable to verify journal migration.');
-            });
-            content = migrated;
-            snapshot = { entries: snapshot.entries, content: migrated };
-          }
-          const record = sealJson(cipher, 'journal', entry);
+        return operate(paths.journal, async () => {
+          const content = await readStateText(paths.journal);
+          const aad = context('journal', paths.journal);
+          const snapshot: JournalSnapshot = content === null ? { entries: [], content: '', head: FIRST_RECORD_PREV }
+            : openJournal(cipher, aad, content, paths.dir, paths.journal);
+          if (!cipher) throw new StateLockedError(paths.dir);
+          const record = sealJson(cipher, aad, { entry, prev: snapshot.head, n: snapshot.entries.length + 1 } satisfies SealedJournalRecord);
           const prefix = !snapshot.content ? `${ENCRYPTED_HEADER}\n` : snapshot.content.endsWith('\n') ? '' : '\n';
           if (content !== null && content !== snapshot.content) {
             // Windows append handles cannot truncate. Repair only the ignored torn tail first.
@@ -427,6 +614,7 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
             try { await repair.truncate(Buffer.byteLength(snapshot.content)); }
             finally { await repair.close(); }
           }
+          await markInitialized();
           await appendDurable(paths.journal, `${prefix}${record}\n`);
         });
       },
@@ -438,9 +626,9 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
       const content = await readStateText(path);
       if (content === null || encrypted(content)) return false;
       const data = parseJson<unknown>(content);
-      await writeTextAtomic(path, `${ENCRYPTED_HEADER}\n${sealJson(cipher!, kind, data)}\n`, saved => {
-        if (!isDeepStrictEqual(openJson(cipher, kind, saved, paths.dir), data)) throw new Error('Unable to verify state migration.');
-      });
+      await writeTextAtomic(path, `${ENCRYPTED_HEADER}\n${sealJson(cipher!, context(kind, path), data)}\n`, saved => {
+        if (!isDeepStrictEqual(openJson(cipher, context(kind, path), saved, paths.dir, path), data)) throw new Error('Unable to verify state migration.');
+      }, markInitialized);
       return true;
     });
   }
@@ -450,9 +638,10 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
       const content = await readStateText(paths.journal);
       if (content === null || encrypted(content)) return false;
       const entries = plaintextJournal(content);
-      await writeTextAtomic(paths.journal, sealedJournal(cipher!, entries), saved => {
-        if (!isDeepStrictEqual(openJournal(cipher, saved, paths.dir).entries, entries)) throw new Error('Unable to verify journal migration.');
-      });
+      const aad = context('journal', paths.journal);
+      await writeTextAtomic(paths.journal, sealedJournal(cipher!, aad, entries), saved => {
+        if (!isDeepStrictEqual(openJournal(cipher, aad, saved, paths.dir, paths.journal).entries, entries)) throw new Error('Unable to verify journal migration.');
+      }, markInitialized);
       return true;
     });
   }
@@ -469,14 +658,16 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
       await enqueue(archive, async () => {
         const existing = await readStateText(archive);
         if (existing !== null) {
-          if (!isDeepStrictEqual(openJson(cipher, 'legacy', existing, paths.dir), entries)) throw new Error('Unable to verify legacy audit migration. The original log was kept.');
+          const data = encrypted(existing) ? openJson(cipher, context('legacy', archive), existing, paths.dir, archive) : parseJson(existing);
+          if (!isDeepStrictEqual(data, entries)) throw new Error('Unable to verify legacy audit migration. The original log was kept.');
         }
         if (existing === null || !encrypted(existing)) {
-          await writeTextAtomic(archive, `${ENCRYPTED_HEADER}\n${sealJson(cipher!, 'legacy', entries)}\n`, saved => {
-            if (!isDeepStrictEqual(openJson(cipher, 'legacy', saved, paths.dir), entries)) throw new Error('Unable to verify legacy audit migration.');
-          });
+          await writeTextAtomic(archive, `${ENCRYPTED_HEADER}\n${sealJson(cipher!, context('legacy', archive), entries)}\n`, saved => {
+            if (!isDeepStrictEqual(openJson(cipher, context('legacy', archive), saved, paths.dir, archive), entries)) throw new Error('Unable to verify legacy audit migration.');
+          }, markInitialized);
         }
       });
+      await markInitialized();
       await unlink(paths.audit);
       return true;
     });
@@ -488,32 +679,36 @@ export function createStateStore(opts: { cwd: string; cipher: StateCipher | null
     loadInventory: () => read<Inventory>('inventory', paths.inventory),
     journal,
     async migratePlaintext() {
-      if (!cipher) return { migrated: [] };
-      await readStateText(paths.inventory);
-      const files: { path: string; kind: StateKind }[] = [];
-      for (const entry of await readdir(paths.dir, { withFileTypes: true })) {
-        if (!entry.isFile()) continue;
-        let kind: StateKind | undefined;
-        if (entry.name === 'inventory.json') kind = 'inventory';
-        else if (entry.name === 'monitor.json') kind = 'monitor';
-        else if (entry.name === 'rotation-report.json') kind = 'report';
-        else if (/^pending.*\.json$/.test(entry.name)) kind = 'pending';
-        else if (/^canar(?:y|ies).*\.json$/.test(entry.name)) kind = 'canary';
-        if (kind) files.push({ path: join(paths.dir, entry.name), kind });
-      }
-      try {
-        await checkedPath(paths.plans);
-        for (const entry of await readdir(paths.plans, { withFileTypes: true })) {
-          if (entry.isFile() && entry.name.endsWith('.json')) files.push({ path: join(paths.plans, entry.name), kind: 'plan' });
+      return enqueue(paths.dir, () => withStateLock(paths.dir, async assertLock => {
+        await initialize();
+        await assertLock();
+        if (!cipher || await isInitialized()) return { migrated: [] };
+        await readStateText(paths.inventory);
+        const files: { path: string; kind: StateKind }[] = [];
+        for (const entry of await readdir(paths.dir, { withFileTypes: true })) {
+          if (!entry.isFile()) continue;
+          let kind: StateKind | undefined;
+          if (entry.name === 'inventory.json') kind = 'inventory';
+          else if (entry.name === 'monitor.json') kind = 'monitor';
+          else if (entry.name === 'rotation-report.json') kind = 'report';
+          else if (/^pending.*\.json$/.test(entry.name)) kind = 'pending';
+          else if (/^canar(?:y|ies).*\.json$/.test(entry.name)) kind = 'canary';
+          if (kind) files.push({ path: join(paths.dir, entry.name), kind });
         }
-      } catch (error) { if (!hasCode(error, 'ENOENT')) throw error; }
-      const migrated: string[] = [];
-      for (const file of files) {
-        if (await migrateJson(file.path, file.kind)) migrated.push(relative(paths.dir, file.path).split(sep).join('/'));
-      }
-      if (await migrateJournal()) migrated.push('journal.jsonl');
-      if (await migrateAudit()) migrated.push('audit.jsonl');
-      return { migrated };
+        try {
+          await checkedPath(paths.plans);
+          for (const entry of await readdir(paths.plans, { withFileTypes: true })) {
+            if (entry.isFile() && entry.name.endsWith('.json')) files.push({ path: join(paths.plans, entry.name), kind: 'plan' });
+          }
+        } catch (error) { if (!hasCode(error, 'ENOENT')) throw error; }
+        const migrated: string[] = [];
+        for (const file of files) {
+          if (await migrateJson(file.path, file.kind)) migrated.push(relativePath(file.path));
+        }
+        if (await migrateJournal()) migrated.push('journal.jsonl');
+        if (await migrateAudit()) migrated.push('audit.jsonl');
+        return { migrated };
+      }));
     },
   };
 }

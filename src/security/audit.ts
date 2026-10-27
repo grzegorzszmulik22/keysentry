@@ -1,4 +1,4 @@
-import { createHash, randomInt } from 'node:crypto';
+import { createHash, createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
@@ -7,12 +7,13 @@ import type { AuditEvent, AuditLog, AuditVerifyResult, Redactor, Vault } from '.
 import { canonicalJson } from './canonical.js';
 import { signDetached, verifyDetached } from './signing.js';
 import type { DeviceKey } from './signing.js';
+import { getOrCreateKey } from '../vault/keys.js';
 
 export const AUDIT_CHECKPOINT_PREFIX = 'keysentry-audit-checkpoint:v1:';
 
 const ZERO_HASH = '0'.repeat(64);
 const HASH = /^[0-9a-f]{64}$/;
-const LINE_FIELDS = new Set(['seq', 'at', 'kind', 'summary', 'data', 'prev', 'hash']);
+const LINE_FIELDS = new Set(['seq', 'at', 'kind', 'summary', 'data', 'prev', 'hash', 'mac']);
 const queues = new Map<string, Promise<void>>();
 
 interface AuditLine extends AuditEvent {
@@ -20,6 +21,7 @@ interface AuditLine extends AuditEvent {
   at: string;
   prev: string;
   hash: string;
+  mac?: string;
 }
 
 interface Head { seq: number; hash: string }
@@ -126,9 +128,18 @@ function isLine(value: unknown): value is AuditLine {
     && typeof value.hash === 'string';
 }
 
-function lineHash(line: Omit<AuditLine, 'hash'>): string {
+function lineHash(line: Omit<AuditLine, 'hash' | 'mac'>): string {
   const { seq, at, kind, summary, data, prev } = line;
   return createHash('sha256').update(canonicalJson({ seq, at, kind, summary, data, prev })).digest('hex');
+}
+
+function lineMac(hash: string, key: Buffer): string {
+  return createHmac('sha256', key).update(hash, 'utf8').digest('hex');
+}
+
+function validMac(line: AuditLine, key: Buffer | null): boolean {
+  if (!key || key.length !== 32 || typeof line.mac !== 'string' || !HASH.test(line.mac)) return false;
+  return timingSafeEqual(Buffer.from(line.mac, 'hex'), Buffer.from(lineMac(line.hash, key), 'hex'));
 }
 
 /** Read backwards in chunks: appends never load the whole history just to find its head. */
@@ -160,7 +171,7 @@ async function* reverseLines(file: FileHandle, size: number): AsyncGenerator<str
   yield Buffer.concat(pending).toString('utf8');
 }
 
-async function readTail(file: FileHandle, interval: number, head: Head | null): Promise<Tail> {
+async function readTail(file: FileHandle, interval: number, head: Head | null, macKey: Buffer): Promise<Tail> {
   const { size } = await file.stat();
   if (size === 0) {
     if (head) throw new Error('The audit log is shorter than its vault head. Run audit verify before continuing.');
@@ -181,6 +192,7 @@ async function readTail(file: FileHandle, interval: number, head: Head | null): 
     } catch {
       throw new Error('The audit log tail is unreadable or has a hash mismatch. Run audit verify before appending.');
     }
+    if (!validMac(line, macKey)) throw new Error(`Audit entry ${line.seq} was not written by keysentry on this computer. Run audit verify before appending.`);
     last ??= line;
     if (next && (line.seq !== next.seq - 1 || line.hash !== next.prev)) {
       throw new Error('The audit log tail is not connected to its vault head. Run audit verify before continuing.');
@@ -228,12 +240,29 @@ export function createAuditLog(opts: {
   checkpointEvery?: number;
   redactor?: Redactor;
   now?: () => Date;
+  /** A shared per-user path; the existing lock protocol adds the .lock suffix. */
+  keyLockPath?: string;
 }): AuditLog {
   const path = resolve(opts.path);
   const headName = `audit/head/${createHash('sha256').update(path).digest('hex').slice(0, 16)}`;
   const interval = opts.checkpointEvery ?? 50;
   if (!Number.isSafeInteger(interval) || interval < 1) throw new TypeError('The audit checkpoint interval must be a positive integer.');
   const now = opts.now ?? (() => new Date());
+
+  function mutationMacKey(): Promise<Buffer> {
+    // Vault wrappers can share a backing store without sharing object identity. Serialize first-use
+    // initialization across all instances here and, in production, across projects/processes too.
+    return enqueue('audit/mac', async () => {
+      let key: Buffer | undefined;
+      const acquire = async () => { key = await getOrCreateKey(opts.vault, 'audit/mac', 32); return key; };
+      try {
+        return opts.keyLockPath ? await withLock(resolve(opts.keyLockPath), acquire) : await acquire();
+      } catch (error) {
+        key?.fill(0);
+        throw error;
+      }
+    });
+  }
 
   async function vaultHead(): Promise<Head | null> {
     const bytes = await opts.vault.get(headName);
@@ -247,10 +276,11 @@ export function createAuditLog(opts: {
     }
   }
 
-  function makeLine(event: AuditEvent, last: AuditLine | null): AuditLine {
+  function makeLine(event: AuditEvent, last: AuditLine | null, macKey: Buffer): AuditLine {
     const content = { seq: (last?.seq ?? 0) + 1, at: now().toISOString(), ...event, prev: last?.hash ?? ZERO_HASH };
     if (!Number.isSafeInteger(content.seq)) throw new Error('The audit log sequence limit has been reached.');
-    return { ...content, hash: lineHash(content) };
+    const hash = lineHash(content);
+    return { ...content, hash, mac: lineMac(hash, macKey) };
   }
 
   async function writeLine(file: FileHandle, line: AuditLine, needsNewline: boolean, assertLock: AssertLock): Promise<void> {
@@ -262,11 +292,11 @@ export function createAuditLog(opts: {
     await assertLock();
   }
 
-  async function writeCheckpoint(file: FileHandle, last: AuditLine, needsNewline: boolean, assertLock: AssertLock): Promise<void> {
+  async function writeCheckpoint(file: FileHandle, last: AuditLine, needsNewline: boolean, assertLock: AssertLock, macKey: Buffer): Promise<void> {
     const key = await opts.deviceKey();
     const seq = last.seq + 1;
     const sig = signDetached(key.privateKeyDer, Buffer.from(`${AUDIT_CHECKPOINT_PREFIX}${seq}:${last.hash}`, 'utf8')).toString('base64');
-    const line = makeLine({ kind: 'checkpoint', summary: 'Audit checkpoint', data: { head: last.hash, keyId: key.keyId, sig } }, last);
+    const line = makeLine({ kind: 'checkpoint', summary: 'Audit checkpoint', data: { head: last.hash, keyId: key.keyId, sig } }, last, macKey);
     await writeLine(file, line, needsNewline, assertLock);
     await opts.vault.set(headName, Buffer.from(JSON.stringify({ seq: line.seq, hash: line.hash }), 'utf8'));
   }
@@ -274,17 +304,20 @@ export function createAuditLog(opts: {
   async function mutate(event?: AuditEvent): Promise<void> {
     return enqueue(path, () => withLock(path, async (assertLock) => {
       const file = await open(path, 'a+', 0o600);
+      let macKey: Buffer | undefined;
       try {
         const head = await vaultHead();
-        const tail = await readTail(file, event ? interval : 1, head);
+        macKey = await mutationMacKey();
+        const tail = await readTail(file, event ? interval : 1, head, macKey);
         if (!event) {
-          if (tail.last && tail.last.kind !== 'checkpoint') await writeCheckpoint(file, tail.last, tail.needsNewline, assertLock);
+          if (tail.last && tail.last.kind !== 'checkpoint') await writeCheckpoint(file, tail.last, tail.needsNewline, assertLock, macKey);
           return;
         }
-        const line = makeLine(event, tail.last);
+        const line = makeLine(event, tail.last, macKey);
         await writeLine(file, line, tail.needsNewline, assertLock);
-        if (tail.events + 1 >= interval) await writeCheckpoint(file, line, false, assertLock);
+        if (tail.events + 1 >= interval) await writeCheckpoint(file, line, false, assertLock, macKey);
       } finally {
+        macKey?.fill(0);
         await file.close();
       }
     }));
@@ -304,50 +337,54 @@ export function createAuditLog(opts: {
       const parsed: unknown[] = raw.map((line) => { try { return JSON.parse(line) as unknown; } catch { return undefined; } });
       const entries = raw.length;
       const checkpoints = parsed.filter((line) => isRecord(line) && line.kind === 'checkpoint').length;
-      let failure: AuditVerifyResult | undefined;
-      let previous = ZERO_HASH;
-      let key: DeviceKey | undefined;
-      for (let index = 0; index < parsed.length; index++) {
-        const expected = index + 1;
-        const line = parsed[index];
-        let problem: string | undefined;
-        if (!isRecord(line)) problem = `Unreadable line ${expected}.`;
-        else if (line.seq !== expected) problem = `Sequence gap at line ${expected}.`;
-        else if (line.prev !== previous) problem = `Prev mismatch at line ${expected}.`;
-        else if (!isLine(line)) problem = `Unreadable line ${expected}.`;
-        else {
-          try {
-            if (lineHash(line) !== line.hash) problem = `Hash mismatch at line ${expected}.`;
-          } catch {
-            problem = `Unreadable line ${expected}.`;
-          }
-          if (!problem && line.kind === 'checkpoint') {
-            const data = line.data;
-            if (!data || data.head !== previous) problem = `Checkpoint head mismatch at line ${expected}.`;
-            else {
-              key ??= await opts.deviceKey();
-              if (data.keyId !== key.keyId) problem = `Checkpoint at line ${expected} was signed by a different device key.`;
-              else if (typeof data.sig !== 'string') problem = `Checkpoint signature check failed at line ${expected}.`;
+      const macKey = entries ? await opts.vault.get('audit/mac') : null;
+      try {
+        let failure: AuditVerifyResult | undefined;
+        let previous = ZERO_HASH;
+        let key: DeviceKey | undefined;
+        for (let index = 0; index < parsed.length; index++) {
+          const expected = index + 1;
+          const line = parsed[index];
+          let problem: string | undefined;
+          if (!isRecord(line)) problem = `Unreadable line ${expected}.`;
+          else if (line.seq !== expected) problem = `Sequence gap at line ${expected}.`;
+          else if (line.prev !== previous) problem = `Prev mismatch at line ${expected}.`;
+          else if (!isLine(line)) problem = `Unreadable line ${expected}.`;
+          else {
+            try {
+              if (lineHash(line) !== line.hash) problem = `Hash mismatch at line ${expected}.`;
+            } catch {
+              problem = `Unreadable line ${expected}.`;
+            }
+            if (!problem && !validMac(line, macKey)) problem = `entry ${expected} was not written by keysentry on this computer`;
+            if (!problem && line.kind === 'checkpoint') {
+              const data = line.data;
+              if (!data || data.head !== previous) problem = `Checkpoint head mismatch at line ${expected}.`;
               else {
-                const sig = Buffer.from(data.sig, 'base64');
-                if (sig.toString('base64') !== data.sig || !verifyDetached(key.publicKeyDer, Buffer.from(`${AUDIT_CHECKPOINT_PREFIX}${line.seq}:${data.head}`, 'utf8'), sig)) {
-                  problem = `Checkpoint signature check failed at line ${expected}.`;
+                key ??= await opts.deviceKey();
+                if (data.keyId !== key.keyId) problem = `Checkpoint at line ${expected} was signed by a different device key.`;
+                else if (typeof data.sig !== 'string') problem = `Checkpoint signature check failed at line ${expected}.`;
+                else {
+                  const sig = Buffer.from(data.sig, 'base64');
+                  if (sig.toString('base64') !== data.sig || !verifyDetached(key.publicKeyDer, Buffer.from(`${AUDIT_CHECKPOINT_PREFIX}${line.seq}:${data.head}`, 'utf8'), sig)) {
+                    problem = `Checkpoint signature check failed at line ${expected}.`;
+                  }
                 }
               }
             }
           }
+          if (problem) { failure = { ok: false, entries, checkpoints, firstBadSeq: expected, problem }; break; }
+          previous = (line as AuditLine).hash;
         }
-        if (problem) { failure = { ok: false, entries, checkpoints, firstBadSeq: expected, problem }; break; }
-        previous = (line as AuditLine).hash;
-      }
-      const head = await vaultHead();
-      if (head) {
-        const recorded = parsed[head.seq - 1];
-        if (entries < head.seq || !isRecord(recorded) || recorded.hash !== head.hash) {
-          return { ...(failure ?? { ok: false, entries, checkpoints, problem: entries < head.seq ? 'The audit log is shorter than the last head stored in the vault.' : 'The audit log differs from the last head stored in the vault.' }), truncatedSinceLastKnownHead: true };
+        const head = await vaultHead();
+        if (head) {
+          const recorded = parsed[head.seq - 1];
+          if (entries < head.seq || !isRecord(recorded) || recorded.hash !== head.hash) {
+            return { ...(failure ?? { ok: false, entries, checkpoints, problem: entries < head.seq ? 'The audit log is shorter than the last head stored in the vault.' : 'The audit log differs from the last head stored in the vault.' }), truncatedSinceLastKnownHead: true };
+          }
         }
-      }
-      return failure ?? { ok: true, entries, checkpoints };
+        return failure ?? { ok: true, entries, checkpoints };
+      } finally { macKey?.fill(0); }
     }));
   }
 

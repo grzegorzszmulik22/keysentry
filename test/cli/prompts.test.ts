@@ -22,6 +22,65 @@ afterEach(async () => {
 });
 
 describe('vault prompts', () => {
+  it.each(['y', 'yes'])('asks before replacing an unreadable inventory and accepts %j', async answer => {
+    const t = terminal();
+    const result = prompts.confirmInventoryReplacement(t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(true);
+    expect(t.diagnostics).toContain("keysentry can't read the saved inventory on this computer. Replace it with a fresh scan? [y/N]");
+  });
+
+  it.each(['', 'n', 'yes please', '\x1b[200~yes\x1b[201~'])('declines inventory replacement without a typed yes (%j)', async answer => {
+    const t = terminal();
+    const result = prompts.confirmInventoryReplacement(t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(false);
+  });
+
+  it('requires the full typed word yes when a release manifest is missing', async () => {
+    const t = terminal();
+    const result = prompts.confirmMissingManifest(t.write, t.io);
+    t.stream.write('yes\r');
+    expect(await result).toBe(true);
+    expect(t.diagnostics.join(' ')).toMatch(/release manifest.*missing/i);
+    expect(t.diagnostics.join(' ')).toContain('Type yes');
+  });
+
+  it.each(['', 'y', 'YES', ' yes', 'yes ', '\x1b[200~yes\x1b[201~'])('refuses abbreviated or pasted missing-manifest confirmation (%j)', async answer => {
+    const t = terminal();
+    const result = prompts.confirmMissingManifest(t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(false);
+  });
+
+  it.each([['', 'encrypted-file'], ['file', 'encrypted-file'], ['os', 'linux-secret-service']] as const)(
+    'chooses %s when both vault stores exist', async (answer, backend) => {
+      const t = terminal();
+      const result = prompts.promptVaultBackend('linux-secret-service', t.write, t.io);
+      t.stream.write(answer + '\r');
+      expect(await result).toBe(backend);
+      expect(t.diagnostics.join(' ')).toMatch(/encrypted file/i);
+      expect(t.diagnostics.join(' ')).toContain('linux-secret-service');
+    },
+  );
+
+  it.each(['other', '\x1b[200~os\x1b[201~'])('refuses an invalid or pasted vault choice (%j)', async answer => {
+    const t = terminal();
+    const result = prompts.promptVaultBackend('linux-secret-service', t.write, t.io);
+    t.stream.write(answer + '\r');
+    await expect(result).rejects.toThrow('Choose file or os.');
+  });
+
+  it('does not accept the new confirmations without a terminal', async () => {
+    for (const flags of [[false, true], [true, false]]) {
+      const t = terminal(...flags);
+      expect(await prompts.confirmInventoryReplacement(t.write, t.io)).toBe(false);
+      expect(await prompts.confirmMissingManifest(t.write, t.io)).toBe(false);
+      expect(await prompts.promptVaultBackend('linux-secret-service', t.write, t.io)).toBe('encrypted-file');
+      expect(t.raw).toEqual([]);
+    }
+  });
+
   it('reads a credential hidden and never interprets @ as a file', async () => {
     const t = terminal();
     const result = prompts.promptVaultValue('RAILWAY_TOKEN', t.write, t.io);

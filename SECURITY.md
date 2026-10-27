@@ -85,6 +85,11 @@ unless those separate release operations are requested.
 
 ## Verify an installed copy
 
+Run verification from an independently obtained copy, for example a fresh `npm pack` of the
+published version unpacked into a separate directory. A modified bundle can lie about its own
+verification result. To assess a copy you suspect has changed, compare its bytes with the
+independently verified release; do not trust that copy's verifier alone.
+
 ```sh
 keysentry verify --offline
 keysentry verify
@@ -115,6 +120,21 @@ publish its public key in the source trust list, and review that change.
 normal signing (`npm run release:sign -- dist-release/out/SHA256SUMS`) reads the
 base64 PKCS#8 DER private key from `KEYSENTRY_RELEASE_SIGNING_KEY`, never from command arguments.
 That environment variable is for the release-signing script, not a user's provider credentials.
+
+The release workflow builds and tests without the signing secret, then passes its artifacts to a
+separate signing job. That job checks out the release tag, installs no dependencies, uses no npm
+cache, and re-hashes the bundle, manifest and package against `SHA256SUMS` with Node built-ins before
+signing. The checkout is pinned to the tagged event's commit so a moved tag cannot replace the
+signing script during review. The signer checks the hashes again before reading the signing key. Checksums establish
+that the downloaded files match the build output; they do not establish that the build's
+dependencies produced trustworthy code.
+
+Before enabling signing, configure a GitHub environment named **`release`** with **required
+reviewers**, disable self-review, and restrict deployments to reviewed release tags. Store
+`KEYSENTRY_RELEASE_SIGNING_KEY` as that environment's secret, not as a repository or organization
+secret available to build jobs. Reviewers should check the tag, workflow and build artifacts before
+approving the signing job. These protections are repository settings; the workflow cannot create
+or enforce its own required reviewers.
 
 The public release workflow prepares Sigstore build-provenance attestation bundles on the GitHub
 release and npm publishing with provenance. Attestation, public release upload, and npm publishing are disabled for a private

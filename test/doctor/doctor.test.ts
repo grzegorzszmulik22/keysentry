@@ -72,6 +72,15 @@ describe('doctor', () => {
     expect(JSON.stringify(result.items)).toContain('memory');
   });
 
+  test.each(['env', 'memory'] as const)('warns that the %s vault cannot recover interrupted rotations', async backend => {
+    const vault = { ...createFakeVault(), backend };
+    const { items } = await runDoctor(input({ vault }));
+    expect(items).toContainEqual(expect.objectContaining({
+      area: 'vault', status: 'warn',
+      detail: expect.stringContaining('Your vault keeps rotation values in memory only; if keysentry stops mid-rotation, the new key cannot be recovered. Use the OS credential store or the encrypted file for rotations.'),
+    }));
+  });
+
   test('flags env credentials as weaker and names the narrower token', async () => {
     const result = await runDoctor(input({ enabledHosts: ['railway'], env: { RAILWAY_TOKEN: 'unique-env-credential' } }));
     expect(result.items).toContainEqual(expect.objectContaining({

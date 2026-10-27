@@ -60,8 +60,8 @@ export function checkScope(input: {
         addReason("a consumer's value changed since arming");
       }
 
-      // Only the signed adoption authorizes a write-only consumer. A fresh scan does
-      // not carry adoption metadata in the shared Inventory contract.
+      // Only signed adoption with a provider reference and reference-rotation
+      // capability authorizes a write-only consumer; unsigned scan metadata cannot.
       const effective: AdoptedCluster = { ...current, adopted: armed.adopted };
       const needsAdoption = adoptionNeeded(effective);
       if (needsAdoption) addReason('write-only consumer was not adopted');

@@ -25,6 +25,10 @@ export interface AutopilotWave {
 
 export interface AutopilotState {
   armedPlanId: string | null; disarmed: boolean; disarmedAt?: string; waves: AutopilotWave[];
+  /** Observed replacements, retained in encrypted watcher state until a local re-arm. Never signed here. */
+  adoptionUpdates?: Record<string, { fingerprint: string; keyRef: string; at: string }>;
+  adoptionUpdatesPlanId?: string;
+  adoptionNoticeSent?: boolean;
 }
 
 export interface AutopilotDeps {
@@ -49,7 +53,11 @@ export interface WaveRecoveryDeps extends AutopilotDeps {
 }
 
 export interface WaveRecoveryInput { state: AutopilotState; now: Date; disarmed: boolean }
-export interface WaveRecoveryResult { resumed: string[]; settled: string[]; reports: RotationReport[] }
+export interface WaveSettlementInput extends WaveRecoveryInput { inventory: Inventory }
+export interface WaveRecoveryResult {
+  resumed: string[]; settled: string[]; reports: RotationReport[];
+  adoptionUpdates?: NonNullable<AutopilotState['adoptionUpdates']>;
+}
 
 const PLATFORM: Record<HostId, string> = {
   railway: 'Railway', vercel: 'Vercel', render: 'Render', fly: 'Fly', 'github-actions': 'GitHub Actions', dotenv: 'Your local environment',
@@ -106,7 +114,10 @@ function options(deps: AutopilotDeps, armed: ArmedPlan): RotateOptions {
   return { ...deps.options, revoke: 'after-deploy', redeploy: true, revokeUnconfirmed: false,
     acceptUnplannedSealed: false, allowGenerate: true, deployConcurrency: 1,
     stopOnFirstFailure: true, holdRevocationOnAnyFailure: true,
-    graceMs: armed.graceSeconds * 1_000, nextDeployAcceptance: armed.nextDeployAcceptance };
+    graceMs: armed.graceSeconds * 1_000, nextDeployAcceptance: armed.nextDeployAcceptance,
+    // Caller options cannot supply unsigned provider identities to unattended execution.
+    adoptedKeyRefs: Object.fromEntries(armed.clusters.filter(cluster => cluster.adopted?.keyRef)
+      .map(cluster => [cluster.clusterId, cluster.adopted!.keyRef!])) };
 }
 
 function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState, env: NodeJS.ProcessEnv,
@@ -142,7 +153,7 @@ function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState
         const value: unknown = Reflect.get(target, property, target);
         if (typeof value !== 'function') return value;
         return (...args: unknown[]) => {
-          if (property === 'rotate' || property === 'revoke' || property === 'cap') active();
+          if (property === 'rotate' || property === 'rotateByRef' || property === 'revoke' || property === 'cap') active();
           if (settling && property === 'revoke') oldRevocationAttempted = true;
           return Reflect.apply(value, target, args);
         };
@@ -151,6 +162,14 @@ function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState
   };
   const sleep = deps.engine.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const engine: EngineDeps = { ...deps.engine, hosts, providers, now, prompt: async () => null, reveal: undefined,
+    providerCtx: { ...deps.engine.providerCtx, http: {
+      async request(request) {
+        // A reference lookup can await I/O before creation; authorization must
+        // still hold at the subsequent HTTP effect, not just at adapter entry.
+        if (request.method !== 'GET') active();
+        return deps.engine.providerCtx.http.request(request);
+      },
+    } },
     journal: {
       async read(planId) { return deps.engine.journal.read(planId); },
       async append(entry) {
@@ -221,8 +240,46 @@ async function outcome(state: AutopilotState, wave: AutopilotWave, report: Rotat
   ]);
 }
 
+async function recordAdoptions(state: AutopilotState, armed: ArmedPlan, report: RotationReport,
+  deps: AutopilotDeps, r: Reporter, now: () => Date): Promise<NonNullable<AutopilotState['adoptionUpdates']>> {
+  const updates: NonNullable<AutopilotState['adoptionUpdates']> = {};
+  const pending = new Set(report.pendingRevocations?.map(item => item.clusterId));
+  const entries = await deps.engine.journal.read(report.planId);
+  for (const step of report.steps) {
+    const cluster = armed.clusters.find(cluster => cluster.clusterId === step.clusterId && cluster.adopted);
+    if (!cluster || !step.newFingerprint || !step.newKeyRef) continue;
+    // A failed deployment or an ambiguous write response can leave the new key
+    // in a write-only consumer. Retain its identity and require local review.
+    const delivered = entries.some(entry => entry.data?.undo !== true && (entry.event === 'written' && entry.clusterId === step.clusterId
+      || entry.data?.partialWritePossible === true && cluster.consumers.some(consumer => consumer.serviceKey === entry.serviceKey)));
+    if (!delivered && !['deployed', 'revoked'].includes(step.status)
+      && !(step.status === 'written' && pending.has(step.clusterId))) continue;
+    const prior = state.adoptionUpdatesPlanId === armed.id ? state.adoptionUpdates?.[step.clusterId] : undefined;
+    updates[step.clusterId] = prior?.keyRef === step.newKeyRef && prior.fingerprint === step.newFingerprint
+      ? { ...prior } : { fingerprint: step.newFingerprint, keyRef: step.newKeyRef, at: now().toISOString() };
+  }
+  if (Object.keys(updates).length === 0) return updates;
+  if (state.adoptionUpdatesPlanId !== armed.id) {
+    state.adoptionUpdates = {};
+    state.adoptionUpdatesPlanId = armed.id;
+    state.adoptionNoticeSent = false;
+  }
+  state.adoptionUpdates = { ...state.adoptionUpdates, ...updates };
+  const notify = state.adoptionNoticeSent !== true;
+  await deps.saveState(state);
+  if (notify) {
+    await r.audit('adoption-updated', { updated: Object.keys(updates).length });
+    await r.notify('adoption-rearm', 'info', 'Adopted keys changed. Re-arm on your own computer before another automatic rotation.',
+      ['The replacement references are saved. The armed plan needs a new local signature.']);
+    state.adoptionNoticeSent = true;
+    await deps.saveState(state);
+  }
+  return updates;
+}
+
 export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): Promise<{
   executed: string[]; asked: string[]; report?: RotationReport;
+  adoptionUpdates?: NonNullable<AutopilotState['adoptionUpdates']>;
 }> {
   // Authentication is the first operation, before scope, persistence, notification, or audit I/O.
   const verified = verifyArmedPlan(input.armed, { now: input.now, trustedKeyIds: input.trustedKeyIds });
@@ -256,16 +313,20 @@ export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): 
     }
     const armed = verified.plan;
     const scope = checkScope({ plan: armed, inventory, candidateClusterIds: candidates, host: incident.host });
-    // ProviderAdapter.rotate consumes the previous value. A signed fingerprint/ref
-    // cannot safely substitute for it or establish the old key's restrictions.
+    const pendingAdoptions = state.adoptionUpdatesPlanId === armed.id ? state.adoptionUpdates : undefined;
     const unavailable = scope.execute.filter(id => {
       const cluster = inventory.clusters.find(cluster => cluster.id === id)!;
       return cluster.method === 'auto' && !cluster.consumers.some(consumer => !consumer.reference && !consumer.sealed
-        && deps.engine.hosts[consumer.service.host]?.capabilities.readValues);
+        && deps.engine.hosts[consumer.service.host]?.capabilities.readValues)
+        && !(armed.clusters.find(cluster => cluster.clusterId === id)?.adopted?.keyRef
+          && typeof deps.engine.providers(cluster.provider).rotateByRef === 'function');
     });
-    scope.execute = scope.execute.filter(id => !unavailable.includes(id));
+    const needsRearm = scope.execute.filter(id => pendingAdoptions?.[id] !== undefined);
+    scope.execute = scope.execute.filter(id => !unavailable.includes(id) && !needsRearm.includes(id));
     scope.ask.push(...unavailable.map(clusterId => ({ clusterId,
       reasons: ['The previous key value is unavailable; this provider needs a supervised rotation.'] })));
+    scope.ask.push(...needsRearm.filter(id => !unavailable.includes(id)).map(clusterId => ({ clusterId,
+      reasons: ['The adopted key changed; re-arm on your own computer before another automatic rotation.'] })));
     await r.audit('scope', { execute: scope.execute.length, asked: scope.ask.length });
     const asked = scope.ask.map(item => item.clusterId);
     await ask(deps, r, incident.id, asked, [...new Set(scope.ask.flatMap(item => item.reasons))]);
@@ -291,15 +352,18 @@ export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): 
     await r.notify('start', 'info', `${PLATFORM[incident.host]} reported a security incident. Rotating ${scope.execute.length} keys you armed for this.`, hints);
     const execution = engineDeps(deps, armed, state, input.env, input.selfCheck, now, r, input.trustedKeyIds);
     const report = await executePlan(plan, inventory, execution.engine, options(deps, armed));
+    const adoptionUpdates = await recordAdoptions(state, armed, report, deps, r, now);
     await outcome(state, wave, report, deps, r, execution.firstFailure, execution.blocked);
-    return { executed: scope.execute, asked, report };
+    return { executed: scope.execute, asked, report,
+      ...(Object.keys(adoptionUpdates).length ? { adoptionUpdates } : {}) };
   });
 }
 
-async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput, deps: WaveRecoveryDeps): Promise<WaveRecoveryResult> {
+async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput & { inventory?: Inventory }, deps: WaveRecoveryDeps): Promise<WaveRecoveryResult> {
   const now = operationClock(input.now, deps);
   return serialize(input.state, async () => {
     const result: WaveRecoveryResult = { resumed: [], settled: [], reports: [] };
+    const latestInventory = mode === 'settle' && input.inventory ? structuredClone(input.inventory) : undefined;
     const state = input.state;
     const env = deps.env ?? process.env;
     const selfCheck = deps.selfCheck ?? { ok: false, reasons: ['The watcher self-check is unavailable.'] };
@@ -318,6 +382,7 @@ async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput,
       const r = reporter(deps, wave.incidentId, wave.id, ids, now);
       const verified = verifyArmedPlan(wave.armed, { now: now(), trustedKeyIds: deps.trustedKeyIds });
       if (!verified.ok || state.armedPlanId !== verified.plan.id || !wave.plan || !wave.inventory
+        || mode === 'settle' && !latestInventory
         || wave.plan.id !== wave.planId || !recoveryScopeValid(wave, verified.plan)) {
         await r.audit(`${mode}-blocked`);
         continue;
@@ -332,10 +397,23 @@ async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput,
       const execution = engineDeps(deps, verified.plan, state, env, selfCheck, now, r, deps.trustedKeyIds,
         input.disarmed, mode === 'settle', priorRevocationPossible);
       await r.audit(mode);
-      const recovery = { plan: wave.plan, inventory: wave.inventory, entries };
+      // Null scan fingerprints stay null in signed scope and saved recovery
+      // metadata. For finish only, the signed adoption supplies the known old
+      // fingerprint needed to detect its reappearance in the latest inventory.
+      const plan = mode === 'settle' ? structuredClone(wave.plan) : wave.plan;
+      if (mode === 'settle') for (const step of plan.steps) {
+        const adopted = verified.plan.clusters.find(cluster => cluster.clusterId === step.clusterId)?.adopted;
+        if (!adopted?.keyRef) continue;
+        for (const consumer of step.consumers) {
+          if (consumer.sealed && consumer.fingerprint === null) consumer.fingerprint = adopted.fingerprint;
+        }
+      }
+      const recovery = { plan, inventory: mode === 'settle' ? latestInventory! : wave.inventory, entries };
       const report = mode === 'resume'
         ? await resumeRotation(recovery, execution.engine, options(deps, verified.plan))
         : await finishRotation(recovery, execution.engine, options(deps, verified.plan));
+      const adoptionUpdates = await recordAdoptions(state, verified.plan, report, deps, r, now);
+      if (Object.keys(adoptionUpdates).length) result.adoptionUpdates = { ...result.adoptionUpdates, ...adoptionUpdates };
       await outcome(state, wave, report, deps, r, execution.firstFailure, execution.blocked);
       result.reports.push(report);
       if (mode === 'resume') result.resumed.push(wave.id);
@@ -351,7 +429,7 @@ export function resumeWaves(input: WaveRecoveryInput, deps: WaveRecoveryDeps): P
 }
 
 /** Settle due grace periods without ever sleeping through one. Disarm and alert-only skip all engine work. */
-export function settleWaves(input: WaveRecoveryInput, deps: WaveRecoveryDeps): Promise<WaveRecoveryResult> {
+export function settleWaves(input: WaveSettlementInput, deps: WaveRecoveryDeps): Promise<WaveRecoveryResult> {
   return recoverWaves('settle', input, deps);
 }
 

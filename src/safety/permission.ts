@@ -61,8 +61,6 @@ const PERMISSION_SWITCHES = new Set([
   '--permission', '--experimental-permission', '--allow-child-process', '--allow-worker',
   '--allow-addons', '--allow-wasi', '--allow-inspector',
 ]);
-const PERMISSION_VALUE_FLAGS = new Set(['--allow-fs-read', '--allow-fs-write', '--allow-net']);
-
 /** Do not let inherited grants widen the new process's requested permissions. */
 function withoutPermissionFlags(args: readonly string[]): string[] {
   const retained: string[] = [];
@@ -70,7 +68,7 @@ function withoutPermissionFlags(args: readonly string[]): string[] {
     const arg = args[i]!;
     const name = arg.split('=', 1)[0]!.replace(/^--no-/, '--');
     if (PERMISSION_SWITCHES.has(name)) continue;
-    if (PERMISSION_VALUE_FLAGS.has(name)) {
+    if (name.startsWith('--allow-')) {
       if (!arg.includes('=') && args[i + 1] && !args[i + 1]!.startsWith('-')) i++;
       continue;
     }
@@ -79,30 +77,70 @@ function withoutPermissionFlags(args: readonly string[]): string[] {
   return retained;
 }
 
+/** NODE_OPTIONS uses whitespace-separated arguments with double-quoted values. */
+function sanitizedNodeOptions(value: string): string {
+  const args: string[] = [];
+  let arg = '';
+  let quoted = false;
+  let started = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i]!;
+    if (char === '\\' && quoted && (value[i + 1] === '"' || value[i + 1] === '\\')) {
+      arg += value[++i]!;
+      started = true;
+    } else if (char === '"') {
+      quoted = !quoted;
+      started = true;
+    } else if (/\s/.test(char) && !quoted) {
+      if (started) args.push(arg);
+      arg = '';
+      started = false;
+    } else {
+      arg += char;
+      started = true;
+    }
+  }
+  // An invalid option string cannot safely be retained in the child.
+  if (quoted) return '';
+  if (started) args.push(arg);
+  return withoutPermissionFlags(args).map(value => /[\s"\\]/.test(value)
+    ? `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+    : value).join(' ');
+}
+
 export async function maybeReexecWithPermissions(opts: PermissionOptions & {
   argv: string[];
   env: NodeJS.ProcessEnv;
   execPath: string;
+  /** The CLI passes its own fileURLToPath(import.meta.url), not npm's bin link. */
+  bundlePath?: string;
   spawnImpl?: SpawnLike;
 }): Promise<{ reexeced: boolean; exitCode?: number; reason?: string }> {
-  if ((process as NodeJS.Process & { permission?: unknown }).permission || opts.env.KEYSENTRY_SANDBOXED === '1') {
+  if ((process as NodeJS.Process & { permission?: unknown }).permission) {
     return { reexeced: false, reason: 'already sandboxed' };
   }
+  // This marker prevents a re-exec loop only. Runtime diagnostics must consult
+  // process.permission; the marker is not evidence that permissions are active.
+  if (opts.env.KEYSENTRY_SANDBOXED === '1') return { reexeced: false, reason: 'already sandboxed' };
   if (opts.env.KEYSENTRY_NO_SANDBOX === '1') {
     return { reexeced: false, reason: 'opted out with KEYSENTRY_NO_SANDBOX=1' };
   }
   const support = sandboxSupport(opts.nodeVersion);
   if (!support.supported) return { reexeced: false, reason: support.reason };
-  if (!opts.argv[1]?.endsWith('.mjs')) {
+  const bundlePath = opts.bundlePath ?? opts.argv[1];
+  if (!bundlePath?.endsWith('.mjs')) {
     return { reexeced: false, reason: 'running from TypeScript sources' };
   }
 
-  const args = [...permissionArgs(opts)!, ...withoutPermissionFlags(process.execArgv), ...opts.argv.slice(1)];
+  const readPaths = opts.readPaths.includes(bundlePath) ? opts.readPaths : [...opts.readPaths, bundlePath];
+  const args = [...permissionArgs({ ...opts, readPaths })!, ...withoutPermissionFlags(process.execArgv), bundlePath, ...opts.argv.slice(2)];
+  const env: NodeJS.ProcessEnv = { ...opts.env, KEYSENTRY_SANDBOXED: '1' };
+  if (env.NODE_OPTIONS !== undefined) env.NODE_OPTIONS = sanitizedNodeOptions(env.NODE_OPTIONS);
   const spawnImpl: SpawnLike = opts.spawnImpl ?? ((command, argv, options) => spawn(command, argv, options));
   return new Promise(resolve => {
     let child: Pick<ChildProcess, 'once'>;
     try {
-      child = spawnImpl(opts.execPath, args, { env: { ...opts.env, KEYSENTRY_SANDBOXED: '1' }, stdio: 'inherit', shell: false });
+      child = spawnImpl(opts.execPath, args, { env, stdio: 'inherit', shell: false });
     } catch {
       resolve({ reexeced: true, exitCode: 1 });
       return;

@@ -43,6 +43,8 @@ export interface RotateOptions {
   stopOnFirstFailure?: boolean;
   holdRevocationOnAnyFailure?: boolean;
   nextDeployAcceptance?: ArmedPlan['nextDeployAcceptance'];
+  /** Supervised adoption supplies the previous provider reference for write-only clusters. */
+  adoptedKeyRefs?: Record<string, string>;
 }
 
 interface ServiceWork {
@@ -66,6 +68,7 @@ interface StepWork {
   newCtx?: ProviderContext;
   provider?: ProviderAdapter;
   oldValue?: string;
+  byRef?: boolean;
   oldRevoked?: boolean;
   result?: RotationResult;
   ready: boolean;
@@ -172,6 +175,16 @@ export async function runRotation(
     report.steps.push(stepReport);
     return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
   });
+  function adoptedRef(work: StepWork): string | undefined {
+    const refs = opts?.adoptedKeyRefs;
+    if (!refs || !Object.hasOwn(refs, work.step.clusterId)) return undefined;
+    const value = refs[work.step.clusterId];
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  }
+  function canPrepareByRef(work: StepWork, provider: ProviderAdapter): boolean {
+    return work.step.method === 'auto' && provider.method === 'auto'
+      && adoptedRef(work) !== undefined && typeof provider.rotateByRef === 'function';
+  }
   const pendingOrphans = unresolvedOrphans(plan, history);
   const orphanClusters = new Set(pendingOrphans.map(suspect => suspect.clusterId));
   const cleanedOrphanClusters = new Set(history.filter(entry => entry.event === 'orphan-suspected'
@@ -582,6 +595,11 @@ export async function runRotation(
       let stale = false;
       let referenceChanged = false;
       let unreadable = false;
+      let adoptedWriteOnly = false;
+      if (adoptedRef(work)) {
+        try { adoptedWriteOnly = canPrepareByRef(work, deps.providers(work.step.provider)); }
+        catch (error) { if (isCrash(error)) throw error; }
+      }
       for (const consumer of work.step.consumers) {
         const service = await readService(consumer.service);
         if (service.readFailed) { unreadable = true; continue; }
@@ -599,7 +617,11 @@ export async function runRotation(
         const value = variable.sealed ? undefined : variable.value;
         const alreadyNew = work.recovered && value !== undefined && fingerprint(value, deps.fingerprintKey) === work.report.newFingerprint;
         if (alreadyNew) writesBegan = true;
-        if (!alreadyNew && consumer.fingerprint !== null && (value === undefined || fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
+        // A supervised fingerprint cannot be read back from a planned sealed
+        // consumer. Its adopted provider reference supplies the preparation path;
+        // readable mismatches and unexpectedly sealed consumers still fail closed.
+        const adoptedSealed = adoptedWriteOnly && consumer.sealed && variable.sealed;
+        if (!alreadyNew && consumer.fingerprint !== null && (value === undefined ? !adoptedSealed : fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
           stale = true;
         }
         if (!alreadyNew && cluster.fingerprint !== null && value !== undefined && fingerprint(value, deps.fingerprintKey) !== cluster.fingerprint) stale = true;
@@ -656,8 +678,8 @@ export async function runRotation(
           await fail(work, 'The provider is unavailable. A replacement may exist there; check the provider before continuing.');
           continue;
         }
-        let oldRef: string | null = null;
-        try { oldRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, work.ctx) : null; }
+        let oldRef: string | null = work.oldValue === undefined ? adoptedRef(work) ?? null : null;
+        try { if (work.oldValue !== undefined && provider.resolveKeyRef) oldRef = await provider.resolveKeyRef(work.oldValue, work.ctx); }
         catch (error) { if (isCrash(error)) throw error; }
         const known = new Set(history.filter(entry => plan.steps.some(step => step.provider === work.step.provider && step.clusterId === entry.clusterId))
           .flatMap(entry => [entry.data?.oldKeyRef, entry.data?.newKeyRef]).filter((ref): ref is string => typeof ref === 'string'));
@@ -704,8 +726,9 @@ export async function runRotation(
         try {
           const provider = deps.providers(work.step.provider);
           work.provider = provider;
-          work.guided = work.step.provider === 'encryption-key' || work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate
-            || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll'));
+          work.byRef = work.oldValue === undefined && canPrepareByRef(work, provider);
+          work.guided = work.step.provider === 'encryption-key' || work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate && !work.byRef
+            || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll') && !work.byRef);
           work.atomicRoll = !work.guided && (work.step.method === 'atomic-roll' || provider.method === 'atomic-roll');
           if (work.atomicRoll) {
             let blocked = blockedBySealed(work);
@@ -792,6 +815,7 @@ export async function runRotation(
             // The store can be durable even when the following metadata entry
             // was never appended. Recover references without creating another key.
             if (!result.oldKeyRef && work.oldValue !== undefined && provider.resolveKeyRef) result.oldKeyRef = await provider.resolveKeyRef(work.oldValue, ctx);
+            if (!result.oldKeyRef && work.byRef) result.oldKeyRef = adoptedRef(work) ?? null;
           } else if (work.guided) {
             const replacement = await guidedReplacement(work);
             if (!replacement) {
@@ -801,7 +825,8 @@ export async function runRotation(
             result = replacement;
           } else {
             try {
-              result = await provider.rotate!(work.oldValue ?? '', ctx);
+              result = work.byRef ? await provider.rotateByRef!(adoptedRef(work)!, ctx)
+                : await provider.rotate!(work.oldValue ?? '', ctx);
               providerProducedResult = true;
               work.result = result;
               work.atomicRoll ||= result.oldRevoked;

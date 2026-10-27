@@ -5,6 +5,15 @@ const BASE = 'https://openrouter.ai/api/v1';
 const PROVIDER = 'OpenRouter';
 const PAGE_SIZE = 100;
 
+class OpenRouterGuidedRotationRequiredError extends Error {
+  readonly code = 'GUIDED_ROTATION_REQUIRED';
+
+  constructor() {
+    super('OpenRouter key metadata could not be preserved safely; use guided rotation.');
+    this.name = 'OpenRouterGuidedRotationRequiredError';
+  }
+}
+
 type Row = Record<string, unknown>;
 
 function record(value: unknown): Row | undefined {
@@ -125,6 +134,29 @@ export const openrouterProvider: ProviderAdapter = {
       throw new Error(`${PROVIDER} returned an invalid spending limit`);
     }
     const created = await createKey(ctx, `keysentry-${new Date().toISOString()}`, limit as number | null | undefined);
+    return { newValue: created.value, oldKeyRef: previousRef, newKeyRef: created.keyRef, oldRevoked: false };
+  },
+
+  async rotateByRef(ref, ctx): Promise<RotationResult> {
+    let previousRef: string;
+    try {
+      previousRef = keyRef(ref, ctx);
+    } catch {
+      throw new OpenRouterGuidedRotationRequiredError();
+    }
+    const response = await request(ctx, {
+      method: 'GET', url: `${BASE}/keys/${encodeURIComponent(previousRef)}`, headers: headers(ctx),
+    }, PROVIDER);
+    ensureOk(response, PROVIDER);
+    const previous = record(record(readJson<unknown>(response, PROVIDER))?.data);
+    if (!previous || previous.hash !== previousRef || previous.disabled !== false
+      || typeof previous.name !== 'string' || !previous.name.trim()
+      || safeIdentity(previous.name, '', secretValues(ctx)) !== previous.name
+      || (previous.limit !== null && (typeof previous.limit !== 'number'
+        || !Number.isFinite(previous.limit) || previous.limit < 0))) {
+      throw new OpenRouterGuidedRotationRequiredError();
+    }
+    const created = await createKey(ctx, previous.name, previous.limit as number | null);
     return { newValue: created.value, oldKeyRef: previousRef, newKeyRef: created.keyRef, oldRevoked: false };
   },
 

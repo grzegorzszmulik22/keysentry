@@ -80,6 +80,12 @@ export const resendProvider: ProviderAdapter = {
 
   verify,
 
+  async rotateByRef() {
+    // The documented list API does not expose permission or domain_id. An id
+    // alone cannot prove the old key's restrictions, even with a full-access key.
+    throw new ResendGuidedRotationRequiredError();
+  },
+
   async rotate(oldValue, ctx) {
     const admin = credential(ctx, 'RESEND_ADMIN_KEY');
     const scope = await keyScope(oldValue, admin, ctx);

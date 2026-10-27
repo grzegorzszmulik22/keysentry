@@ -66,12 +66,14 @@ export function assertHumanForMutation(opts: {
   stdinIsTTY: boolean;
   stdoutIsTTY: boolean;
   action: string;
+  /** Only vault set --stdin permits a human terminal to pipe the value. */
+  allowPipedStdin?: boolean;
 }): void {
   const detected = detectAgentEnvironment(opts.env);
   if (detected) {
     throw new AgentRefusalError(`keysentry won't ${opts.action} when an AI coding agent runs it (detected: ${detected.agent}). Your agent can show you the command; run it yourself in a normal terminal.`);
   }
-  if (!opts.stdinIsTTY || !opts.stdoutIsTTY) {
+  if ((!opts.stdinIsTTY && !opts.allowPipedStdin) || !opts.stdoutIsTTY) {
     throw new AgentRefusalError(`${opts.action} needs you at an interactive terminal.`);
   }
 }
