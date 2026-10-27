@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+    <channel>
+        <title>Railway Blog</title>
+        <link>https://blog.railway.com</link>
+        <description>A series of posts ranging from deployment tutorials to deep engineering adventures to how the team works and builds Railway.</description>
+        <lastBuildDate>Mon, 26 Oct 2026 17:53:25 GMT</lastBuildDate>
+        <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
+        <generator>https://github.com/jpmonette/feed</generator>
+        <language>en</language>
+        <copyright>Copyright (c) 2026 Railway Corp.</copyright>
+        <item>
+            <title><![CDATA[Preliminary Report: Oct 21st Security Incident]]></title>
+            <link>https://blog.railway.com/p/preliminary-report-october-security-incident</link>
+            <guid>https://blog.railway.com/p/preliminary-report-october-security-incident</guid>
+            <pubDate>Thu, 22 Oct 2026 23:31:37 GMT</pubDate>
+            <description><![CDATA[Preliminary report detailing Railway's October 21st security incident.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/f22327a1-2304-49a1-bc08-27912ecb9ff0-blog-preliminary-report-oct-21st-security-incident.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure Recommendation: Check for Unexpected Anthropic Usage]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-recommendation-check-for-unexpected-anthropic-usage</link>
+            <guid>https://blog.railway.com/p/security-disclosure-recommendation-check-for-unexpected-anthropic-usage</guid>
+            <pubDate>Thu, 22 Oct 2026 00:46:00 GMT</pubDate>
+            <description><![CDATA[Learn how to Security Disclosure Recommendation: Check for Unexpected Anthropic Usage]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure Recommendation: Rotate PostgreSQL Database Credentials]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-recommendation-rotate-postgresql-database-credentials</link>
+            <guid>https://blog.railway.com/p/security-disclosure-recommendation-rotate-postgresql-database-credentials</guid>
+            <pubDate>Thu, 22 Oct 2026 00:45:42 GMT</pubDate>
+            <description><![CDATA[Learn how to rotate PostgreSQL Database Credentials]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+        </item>
+<item>
+            <title><![CDATA[Security Disclosure: Wednesday October 21st]]></title>
+            <link>https://blog.railway.com/p/security-disclosure-wednesday-october-21st</link>
+            <guid>https://blog.railway.com/p/security-disclosure-wednesday-october-21st</guid>
+            <pubDate>Wed, 21 Oct 2026 20:44:02 GMT</pubDate>
+            <description><![CDATA[Railway detected anomalous activity involving systems that store customer environment variables and recommends your immediate attention]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/011ecc20-b745-400f-94cc-b4a75dead6db-blog-security-disclosure-wednesday-october-21st.png" length="0" type="image/png"/>
+        </item>
+<item>
+            <title><![CDATA[The Best Declarative Deploy Configs in 2026]]></title>
+            <link>https://blog.railway.com/p/declarative-deploy-configs</link>
+            <guid>https://blog.railway.com/p/declarative-deploy-configs</guid>
+            <pubDate>Wed, 14 Oct 2026 20:03:47 GMT</pubDate>
+            <description><![CDATA[A comparison of declarative deployment config systems across cloud providers.]]></description>
+            
+            <category>railway</category>
+            <category>cloud</category>
+            <enclosure url="https://cms.railway.com/media/2d80145f-a699-4834-9fca-4a938fbc5128-blog-the-best-declarative-deploy-configs-in-2026.png" length="0" type="image/png"/>
+        </item>
+    </channel>
+</rss>

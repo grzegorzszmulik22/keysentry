@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>The Hacker News</title>
+    <link>https://thehackernews.com</link>
+    <description>Recorded 2026-10-27 from https://feeds.feedburner.com/TheHackersNews; trimmed to two items.</description>
+    <item>
+      <title>Railway Says Intruder May Have Accessed Customer Secrets, Urges Credential Rotation</title>
+      <link>https://thehackernews.com/2026/10/railway-says-intruder-may-have-accessed.html</link>
+      <pubDate>Thu, 22 Oct 2026 16:45:42 +0530</pubDate>
+      <description><![CDATA[Platform-as-a-Service (PaaS) provider Railway on Wednesday disclosed "anomalous activity" related to systems that store customer environment variables. Upon further investigation, the company found that an unauthorized third party may have gained access to encrypted environment variables, and, in some cases, obtained the decrypted contents.]]></description>
+    </item>
+    <item>
+      <title>Synthetic unrelated item: patch round-up for a desktop browser</title>
+      <link>https://thehackernews.com/2026/10/synthetic-unrelated.html</link>
+      <pubDate>Thu, 22 Oct 2026 10:00:00 +0530</pubDate>
+      <description><![CDATA[A browser vendor shipped fixes for several memory-safety bugs. Users should update.]]></description>
+    </item>
+  </channel>
+</rss>

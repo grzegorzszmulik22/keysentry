@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Synthetic negatives (not real news)</title>
+    <link>https://example.invalid/</link>
+    <description>Synthetic items written for keysentry tests. None of them describes a breach of a platform's stored credentials, so none may trigger a rotation even when two outlets carry them.</description>
+    <item>
+      <title>Railway suffers multi-hour deployment outage after database upgrade</title>
+      <link>https://example.invalid/outage</link>
+      <pubDate>Mon, 26 Oct 2026 09:00:00 GMT</pubDate>
+      <description><![CDATA[Deployments on Railway failed for about three hours on Monday after a database upgrade went wrong. The company said no customer data was affected and service is restored.]]></description>
+    </item>
+    <item>
+      <title>Phishing campaign impersonates Railway and Vercel to steal developer logins</title>
+      <link>https://example.invalid/phishing</link>
+      <pubDate>Mon, 26 Oct 2026 10:00:00 GMT</pubDate>
+      <description><![CDATA[Attackers are sending fake billing emails that imitate Railway and Vercel and lead to look-alike login pages that capture credentials. Neither company's systems were breached.]]></description>
+    </item>
+    <item>
+      <title>Acme Analytics breach exposes customer API keys; company was hosted on Railway</title>
+      <link>https://example.invalid/other-company</link>
+      <pubDate>Mon, 26 Oct 2026 11:00:00 GMT</pubDate>
+      <description><![CDATA[Acme Analytics said an attacker used a stolen employee laptop to access its admin panel and exposed customer API keys. Acme runs its services on Railway, which was not involved in the incident.]]></description>
+    </item>
+  </channel>
+</rss>

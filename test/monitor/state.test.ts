@@ -2,9 +2,25 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { createStateCipher, createStateStore } from '../../src/core/store.js';
 import { createMonitorState, createFileMonitorStateStore, createMemoryMonitorStateStore, pruneUsageHistory, usageKey } from '../../src/monitor/state.js';
 
 describe('monitor state', () => {
+  it('round trips encrypted monitor metadata through the injected state store', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'keysentry-monitor-encrypted-'));
+    try {
+      const encrypted = createStateStore({ cwd, cipher: createStateCipher(Buffer.alloc(32, 7)) });
+      const store = createFileMonitorStateStore(cwd, encrypted);
+      expect(await store.load()).toEqual(createMonitorState());
+      const state = createMonitorState(); state.keyRefs['fingerprint-private'] = 'private-provider-reference';
+      await store.save(state);
+      expect(await store.load()).toEqual(state);
+      const disk = await readFile(encrypted.paths.monitor, 'utf8');
+      expect(disk.startsWith('keysentry-encrypted:v1\n')).toBe(true);
+      expect(disk).not.toContain('private-provider-reference');
+      expect(disk).not.toContain('fingerprint-private');
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
   it('round trips only the monitor schema, without arbitrary response fields', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'keysentry-monitor-'));
     try {

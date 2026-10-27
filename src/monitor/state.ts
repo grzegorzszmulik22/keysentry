@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { createRedactor } from '../core/redact.js';
-import { readJson, statePaths, writeJsonAtomic } from '../core/store.js';
+import { readJson, statePaths, writeJsonAtomic, type StateStore } from '../core/store.js';
 import type { PendingAction, ProviderId, ServiceRef } from '../types.js';
 
 export interface UsageBucket { hour: string; costUsd: number; requests?: number; byModel?: Record<string, number> }
@@ -100,10 +100,10 @@ export function createMemoryMonitorStateStore(initial = createMonitorState()): M
 }
 
 /** cwd is the project directory, matching core.statePaths(). */
-export function createFileMonitorStateStore(cwd = process.cwd()): MonitorStateStore {
+export function createFileMonitorStateStore(cwd = process.cwd(), store?: StateStore): MonitorStateStore {
   const path = statePaths(cwd).monitor;
   return {
-    async load() { const state = await readJson<unknown>(path); return state === null ? createMonitorState() : snapshot(state); },
-    async save(state) { await writeJsonAtomic(path, snapshot(state)); },
+    async load() { const state = await (store ? store.readJson<unknown>('monitor', path) : readJson<unknown>(path)); return state === null ? createMonitorState() : snapshot(state); },
+    async save(state) { if (store) await store.writeJson('monitor', path, snapshot(state)); else await writeJsonAtomic(path, snapshot(state)); },
   };
 }

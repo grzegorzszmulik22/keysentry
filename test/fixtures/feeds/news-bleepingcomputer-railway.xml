@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>BleepingComputer</title>
+    <link>https://www.bleepingcomputer.com/</link>
+    <description>Recorded 2026-10-27 from the article page (the item had left the live feed); one item.</description>
+    <item>
+      <title>Railway warns devs to rotate secrets after potential breach</title>
+      <link>https://www.bleepingcomputer.com/news/security/railway-warns-devs-to-rotate-secrets-after-potential-breach/</link>
+      <pubDate>Thu, 22 Oct 2026 21:25:31 GMT</pubDate>
+      <description><![CDATA[Cloud platform Railway published an urgent warning to users after detecting suspicious activity on its systems that store customer environment variables earlier this week.]]></description>
+    </item>
+  </channel>
+</rss>
