@@ -18,7 +18,8 @@ function approval(overrides: Record<string, unknown> = {}) {
 }
 
 function disarm(timestamp = at) {
-  return { keyId: key.keyId, at: timestamp, sig: signDetached(key.privateKeyDer, Buffer.from('keysentry-disarm:v1\n' + canonicalJson({ at: timestamp }))).toString('base64') };
+  const body = { watcherId: 'project', keyId: key.keyId, at: timestamp };
+  return { ...body, sig: signDetached(key.privateKeyDer, Buffer.from('keysentry-disarm:v2\n' + canonicalJson(body))).toString('base64') };
 }
 
 function wrapper(payload: unknown, id = 'message1') {
@@ -32,7 +33,7 @@ function fixture(body = '', overrides: Record<string, unknown> = {}) {
     async verify() { return { ok: true, entries: events.length, checkpoints: 0 }; },
   };
   const http = new FakeHttp().on('GET', /\/json\?/, () => text(200, body)).on('POST', /ntfy\.sh\//, () => json(200, { id: 'published' }));
-  const relay = createRelay({ http, server: origin, topic, trustedKeyIds: [key.keyId],
+  const relay = createRelay({ http, server: origin, topic, trustedKeyIds: [key.keyId], watcherId: 'project',
     deviceKeys: async () => [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }],
     audit, now: () => new Date(at), ...overrides });
   return { relay, http, events };
@@ -52,7 +53,7 @@ describe('approval relay', () => {
     const signed = approval();
     const { relay, http } = fixture(wrapper({ type: 'keysentry-approval', v: 1, approval: signed }, 'nextMessage'));
     expect(await relay.poll(null)).toEqual({ approvals: [signed], disarms: [], cursor: 'nextMessage', ignored: 0 });
-    expect(http.calls[0]?.url).toBe(origin + '/' + topic + '/json?poll=1&since=10m');
+    expect(http.calls[0]?.url).toBe(origin + '/' + topic + '/json?poll=1&since=all');
   });
 
   test('approval timestamps accept canonical ISO seconds without milliseconds', async () => {
@@ -63,7 +64,7 @@ describe('approval relay', () => {
 
   test('disarm timestamps accept canonical ISO seconds without milliseconds', async () => {
     const signed = disarm('2026-10-27T10:00:00Z');
-    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 1, ...signed }), { now: () => new Date('2026-10-27T10:00:00Z') });
+    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 2, ...signed }), { now: () => new Date('2026-10-27T10:00:00Z') });
     expect((await relay.poll(null)).disarms).toEqual([signed]);
   });
 
@@ -136,26 +137,32 @@ describe('approval relay', () => {
 
   test('signed disarm messages are verified with their own prefix and returned once per relay instance', async () => {
     const signed = disarm();
-    const { relay, events } = fixture(wrapper({ type: 'keysentry-disarm', v: 1, ...signed }));
+    const { relay, events } = fixture(wrapper({ type: 'keysentry-disarm', v: 2, ...signed }));
     expect((await relay.poll(null)).disarms).toEqual([signed]);
     expect((await relay.poll(null)).ignored).toBe(1);
     expect(events.at(-1)?.kind).toBe('approvals:relay-ignored');
   });
 
-  test.each(['2026-10-27T11:49:59.999Z', '2026-10-27T12:10:00.001Z', 'bad-date'])('disarm rejects timestamps outside the ten minute window: %s', async timestamp => {
-    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 1, ...disarm(timestamp) }));
+  test('disarm rejects a malformed timestamp', async () => {
+    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 2, ...disarm('bad-date') }));
     const result = await relay.poll(null);
     expect(result.disarms).toEqual([]);
     expect(result.ignored).toBe(1);
   });
 
-  test.each(['2026-10-27T11:50:00.000Z', '2026-10-27T12:10:00.000Z'])('disarm accepts the ten minute boundary: %s', async timestamp => {
-    expect((await fixture(wrapper({ type: 'keysentry-disarm', v: 1, ...disarm(timestamp) })).relay.poll(null)).disarms).toHaveLength(1);
+  test.each(['2026-10-27T11:49:59.999Z', '2026-10-27T12:10:00.001Z'])('disarm has no ten minute freshness deadline: %s', async timestamp => {
+    expect((await fixture(wrapper({ type: 'keysentry-disarm', v: 2, ...disarm(timestamp) })).relay.poll(null)).disarms).toHaveLength(1);
+  });
+
+  test.each(['2026-10-27T11:49:59.999Z', '2026-10-27T12:10:00.001Z'])('approval still rejects a timestamp outside the ten minute window: %s', async timestamp => {
+    const result = await fixture(wrapper({ type: 'keysentry-approval', v: 1, approval: approval({ at: timestamp }) })).relay.poll(null);
+    expect(result.approvals).toEqual([]);
+    expect(result.ignored).toBe(1);
   });
 
   test('an approval signature cannot be substituted for a disarm signature', async () => {
     const signed = approval();
-    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 1, keyId: signed.keyId, at, sig: signed.sig }));
+    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 2, watcherId: 'project', keyId: signed.keyId, at, sig: signed.sig }));
     expect((await relay.poll(null)).ignored).toBe(1);
   });
 
@@ -185,7 +192,7 @@ describe('approval relay', () => {
     let fail = true;
     const audit = { async append() { if (fail) { fail = false; throw new Error('private-audit-data'); } } };
     const signed = disarm();
-    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 1, ...signed }) + '\nbad-json', { audit });
+    const { relay } = fixture(wrapper({ type: 'keysentry-disarm', v: 2, ...signed }) + '\nbad-json', { audit });
     await expect(relay.poll(null)).rejects.toThrow('Unable to record the approval relay outcome.');
     expect((await relay.poll(null)).disarms).toEqual([signed]);
   });

@@ -26,10 +26,11 @@ function decodeEntities(value: string): string {
 /** Feed text is untrusted even when it arrives from a configured official source. */
 export function sanitizeFeedText(value: string, maxLength: number): string {
   return decodeEntities(value)
+    .normalize('NFKC')
     // Excluding both delimiters keeps an unterminated sequence of '<' characters linear to scan.
     .replace(/<[^<>]*>/g, ' ')
     .replace(/[<>]/g, ' ')
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}]/gu, '')
     .replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 

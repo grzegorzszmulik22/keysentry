@@ -72,28 +72,41 @@ export const DEFAULT_SOURCES: readonly FeedSource[] = [
 
 // Negative cues win even if the story also contains apparent exposure language.
 const DECEPTIVE_CAMPAIGN = /\b(?:phishing|impersonat\w*|look[\s-]?alike|fake\s+(?:billing\s+)?emails?|scams?)\b/i;
-const DENIAL = /\b(?:was|were|is|are)\s+not\s+(?:involved|breached)\b|\bno\s+customer\s+data\s+was\s+affected\b|\bneither\b[^.!?]{0,100}\bsystems\s+were\s+breached\b/i;
+const DENIAL = /\b(?:was|were|is|are)\s+not\s+(?:involved|breached|affected|impacted)\b|\bnot\s+(?:affected|impacted)\b|\b(?:denies|denied|no)\s+(?:a\s+)?(?:data\s+)?breach\b|\bno\s+customer\s+data\s+was\s+affected\b|\bneither\b[^.!?]{0,100}\bsystems\s+were\s+breached\b/i;
 const EXPOSURE_DENIAL = /\b(?:not|never|none|(?:was|were|has|have|had|is|are|did|does|do)n['’]t)\b[^.!?]{0,60}\b(?:accessed|exposed|stolen|decrypted|compromised)\b|\bno\s+(?:customer\s+)?(?:data|secrets?|(?:API\s+)?keys?|tokens?|credentials?|environment\s+variables)\b[^.!?]{0,60}\b(?:accessed|exposed|stolen|decrypted|compromised)\b/i;
 const CREDENTIAL = /\b(?:customer\s+)?(?:environment\s+variables|(?:API\s+)?keys?|tokens?|credentials?|secrets?)\b/i;
 const EXPOSURE = /\b(?:accessed|gained\s+access|expos(?:ed|es|ure)|stol(?:e|en)|decrypted|obtained\s+the\s+decrypted\s+contents)\b/i;
 const OWN_SYSTEM = /\b(?:own\s+systems|(?:its|their)\s+systems|systems\s+that\s+store\s+customer)\b/i;
 const BREACH_CONTEXT = /\b(?:breach|security\s+incident|suspicious\s+activity|anomalous\s+activity)\b/i;
 const ROTATION_REQUEST = /\b(?:urges?|warns?|asks?|advises?|recommends?)\b[^.!?]{0,100}\brotate\b/i;
-const INSTRUCTIONAL_TITLE = /\b(?:tutorial|how\s+to|guide\s+to|tips\s+for|protect\b[^.!?]{0,60}\bfrom)\b/i;
+const INSTRUCTIONAL_TITLE = /\b(?:tutorial|how\s+to|prepare|guides?|introducing|announcing|best\s+practices|checklist|webinar|tips\s+for|protect\b[^.!?]{0,60}\bfrom)\b/i;
 const PRODUCT_FEATURE = /\b(?:features?|now\s+lets|authenticated\s+dashboard)\b/i;
 // Capitalization keeps generic phrases ("potential breach") from becoming named-company subjects.
-const NAMED_BREACHED_SUBJECT = /\b([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*){0,4})(?:['’]s)?\s+(?:(?:was|were|has\s+been|have\s+been)\s+)?(?:[Bb]reach(?:ed)?|[Cc]ompromised|[Ee]xposes?|[Ll]eaks?)\b/g;
+const NAMED_BREACHED_SUBJECT = /\b([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*){0,4})(?:['’]s)?\s+(?:(?:was|were|has\s+been|have\s+been)\s+)?(?:[Dd]ata\s+)?(?:[Bb]reach(?:ed)?|[Cc]ompromised|[Ee]xposes?|[Ll]eaks?)\b/g;
 const BREACH_AT_SUBJECT = /\b(?:[Bb]reach|[Ii]ncident|[Cc]ompromise)\s+(?:at|of|affecting|involving)\s+(?:(?:customer|company|tenant|client)\s+)?([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*){0,4})/g;
+
+function excludedAdvisory(title: string, summary: string): boolean {
+  const text = `${title} ${summary}`;
+  return DECEPTIVE_CAMPAIGN.test(text) || DENIAL.test(text) || EXPOSURE_DENIAL.test(text)
+    || INSTRUCTIONAL_TITLE.test(title);
+}
+
+function thirdPartySubject(title: string): boolean {
+  // "GitHub Actions" is the platform name; a singular Action or its workflows are components.
+  const subjectText = title.replace(/\bGitHub Actions\b/g, 'GitHub');
+  return /\b(?:actions?|workflows?|packages?|libraries|library|dependenc(?:y|ies)|extensions?|plugins?|apps?|integrations?|worms?|malware|campaigns?|user\s+accounts)\b/i.test(subjectText)
+    || /\bcustomers?\s+(?:(?:was|were|has\s+been|have\s+been)\s+)?(?:breach(?:ed)?|compromised)\b/i.test(subjectText);
+}
 
 function credentialExposure(title: string, summary: string, hosts: readonly HostId[]): boolean {
   // A single boolean cannot express different exposure claims for multiple named platforms.
   if (hosts.length !== 1) return false;
   const text = `${title} ${summary}`;
-  if (DECEPTIVE_CAMPAIGN.test(text) || DENIAL.test(text) || EXPOSURE_DENIAL.test(text)
-    || INSTRUCTIONAL_TITLE.test(title)) return false;
+  if (excludedAdvisory(title, summary) || thirdPartySubject(title)
+    || (thirdPartySubject(summary) && /\b(?:third[\s-]party|supply[\s-]chain|malicious)\b/i.test(summary))) return false;
   if (PRODUCT_FEATURE.test(text) && !BREACH_CONTEXT.test(text)) return false;
   for (const subjectRule of [NAMED_BREACHED_SUBJECT, BREACH_AT_SUBJECT]) {
-    for (const match of title.matchAll(subjectRule)) {
+    for (const match of text.matchAll(subjectRule)) {
       if (!mentionsHost(hosts[0]!, match[1]!)) return false;
     }
   }
@@ -116,17 +129,19 @@ export function classifyItem(item: FeedItem, source: FeedSource, itemKey: (id: s
   const summary = sanitizeFeedText(item.summary, 600);
   const mentioned = PLATFORM_HOSTS.filter(host => mentionsHost(host, title));
   const covered = mentioned.some(host => source.hosts.includes(host));
-  const texts = feedItemTexts(item);
+  const texts = feedItemTexts(item).map(text => sanitizeFeedText(text, 600));
   const security = isSecurityAdvisory(title, texts);
   // News mentions can alert (including an outage); they still need explicit exposure to corroborate.
   if (source.kind === 'news' ? !covered : !security) return null;
   // Official feeds also discuss other platforms; those titles cannot speak officially for their owner.
   if (source.kind === 'official' && mentioned.some(host => !source.hosts.includes(host))) return null;
+  // Excluded posts cannot supply the official half of a corroboration either.
+  if (source.kind === 'official' && excludedAdvisory(title, summary)) return null;
   const exposure = credentialExposure(title, summary, source.kind === 'official' ? source.hosts : mentioned);
   return {
     sourceId: source.id, kind: source.kind, outlet: source.outlet, owner: source.owner,
     itemKey: itemKey(item.id), title, link: item.link, publishedAt: item.publishedAt,
     credentialExposure: exposure,
-    confidence: source.kind === 'official' && HIGH_CONFIDENCE_TITLE.test(title) ? 'high' : security || exposure ? 'medium' : 'low',
+    confidence: source.kind === 'official' && HIGH_CONFIDENCE_TITLE.test(title) && exposure ? 'high' : security || exposure ? 'medium' : 'low',
   };
 }

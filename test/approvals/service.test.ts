@@ -150,11 +150,149 @@ describe('action binding and approval lifecycle', () => {
     expect(events.filter((e) => e.kind === 'approvals:approved')).toHaveLength(1);
   });
 
-  test('action IDs cannot be rebound or revived with a fresh challenge', async () => {
-    await service.request(action, false);
-    await expect(service.request({ ...action, clusterIds: ['other'] }, false)).rejects.toThrow();
-    await expect(service.request(action, false)).rejects.toThrow();
+  test('retrying an unexpired request returns the same version across service instances', async () => {
+    const first = await service.request(action, false);
+    now = new Date('2026-10-27T10:05:00.000Z');
+    expect(await createApprovalService(opts).request(action, false)).toEqual(first);
+    expect(events.filter(event => event.kind === 'approvals:requested')).toHaveLength(1);
     expect(await service.status(action.id)).toBe('pending');
+  });
+
+  test('changed action digests supersede the old challenge and device approval', async () => {
+    const first = await service.request(action, false);
+    const oldSignature = signed(first);
+    const second = await service.request({ ...action, clusterIds: ['other'], planHash: 'new-plan' }, false);
+    expect(second.digest).not.toBe(first.digest);
+    expect(second.challenge).not.toBe(first.challenge);
+    await expect(service.approveWithDevice(action.id, oldSignature)).rejects.toThrow();
+    await expect(service.approveWithPasskey(action.id, assertion(first))).rejects.toThrow();
+    expect(await createApprovalService(opts).status(action.id)).toBe('pending');
+    const saved = await opts.store.readJson<{ requests: { digest: string; status: string }[] }>('pending', join(opts.store.paths.dir, 'approvals.json'));
+    expect(saved!.requests).toMatchObject([{ digest: first.digest, status: 'superseded' }, { digest: second.digest, status: 'pending' }]);
+    expect(events.filter(event => event.kind === 'approvals:superseded')).toHaveLength(1);
+    await service.approveWithDevice(action.id, signed(second));
+  });
+
+  test('a page displaying an old digest cannot fetch or approve a replacement version', async () => {
+    const first = await service.request(action, false);
+    const second = await service.request({ ...action, planHash: 'changed-plan' }, false);
+    await expect(service.challenge(action.id, first.digest)).rejects.toThrow(/changed/);
+    await expect(service.approveWithPasskey(action.id, assertion(second), first.digest)).rejects.toThrow(/changed/);
+    expect(await service.status(action.id)).toBe('pending');
+    expect((await service.challenge(action.id, second.digest)).challenge).toBe(second.challenge);
+    await service.approveWithPasskey(action.id, assertion(second), second.digest);
+  });
+
+  test('an expired same-digest request cannot be renewed to reuse its device signature', async () => {
+    service = createApprovalService({ ...opts, requestTtlMs: 120_000 });
+    const request = await service.request(action, false);
+    now = new Date('2026-10-27T10:01:00.000Z');
+    const oldSignature = signed(request);
+    now = new Date('2026-10-27T10:03:00.000Z');
+    await expect(service.request(action, false)).rejects.toThrow();
+    await expect(service.approveWithDevice(action.id, oldSignature)).rejects.toThrow(/expired/);
+    expect(await service.status(action.id)).toBe('expired');
+  });
+
+  test('a request persisted before an audit failure can be retried without a new challenge', async () => {
+    const failed = createApprovalService({ ...opts, audit: { ...opts.audit, append: async () => { throw new Error('audit unavailable'); } } });
+    await expect(failed.request(action, false)).rejects.toThrow('audit unavailable');
+    const saved = await opts.store.readJson<{ requests: ApprovalRequest[] }>('pending', join(opts.store.paths.dir, 'approvals.json'));
+    const retry = await service.request(action, false);
+    expect(retry.challenge).toBe(saved!.requests[0]!.challenge);
+    expect(retry.expiresAt).toBe(saved!.requests[0]!.expiresAt);
+    expect(events.filter(event => event.kind === 'approvals:requested')).toHaveLength(1);
+  });
+
+  test('concurrent retries create only one pending request and challenge', async () => {
+    const requests = await Promise.all(Array.from({ length: 5 }, () => createApprovalService(opts).request(action, false)));
+    expect(new Set(requests.map(request => request.challenge)).size).toBe(1);
+    expect(events.filter(event => event.kind === 'approvals:requested')).toHaveLength(1);
+  });
+
+  test('request retries cannot change whether local device approval is required', async () => {
+    await service.request(action, true);
+    await expect(service.request(action, false)).rejects.toThrow();
+    await expect(service.challenge(action.id)).rejects.toThrow(/own computer/);
+  });
+
+  test('Actions requests remain approvable on the next scheduled check', async () => {
+    service = createApprovalService({ ...opts, mode: 'actions' });
+    const request = await service.request(action, false);
+    expect(request.expiresAt).toBe('2026-10-27T11:00:00.000Z');
+    now = new Date('2026-10-27T10:35:00.000Z');
+    await service.approveWithDevice(action.id, signed(request));
+    expect(await createApprovalService({ ...opts, mode: 'actions' }).status(action.id)).toBe('approved');
+  });
+
+  test('request lifetime can be configured and still expires at its deadline', async () => {
+    service = createApprovalService({ ...opts, requestTtlMs: 120_000 });
+    const request = await service.request(action, false);
+    expect(request.expiresAt).toBe('2026-10-27T10:02:00.000Z');
+    now = new Date(request.expiresAt);
+    await expect(service.approveWithDevice(action.id, signed(request))).rejects.toThrow(/expired/);
+  });
+
+  test('requests carry the cluster ids and hints that the action digest binds', async () => {
+    const clusters = [{ clusterId: 'cluster-a', hint: 'sk-test…abcd' }, { clusterId: 'cluster-b', hint: null }];
+    const describedAction = { ...action, clusters, planHash: 'planned-steps-and-consumers' };
+    const request = await service.request(describedAction, false);
+    expect(request.clusters).toEqual(clusters);
+    expect(actionDigest({ ...describedAction, clusters: [{ ...clusters[0]!, hint: 'different' }, clusters[1]!] })).not.toBe(request.digest);
+    clusters[0]!.hint = 'changed-by-caller';
+    expect((await createApprovalService(opts).request({ ...describedAction, clusters: request.clusters }, false)).clusters[0]!.hint).toBe('sk-test…abcd');
+  });
+
+  test('approved grants survive request expiry and restart until execution is recorded', async () => {
+    const request = await service.request({ ...action, planHash: 'exact-plan', clusters: [{ clusterId: 'cluster-a', hint: null }, { clusterId: 'cluster-b', hint: null }] }, false);
+    const grant = await service.approveWithDevice(action.id, signed(request));
+    now = new Date('2026-11-04T10:00:00.000Z');
+    service = createApprovalService(opts);
+    const approved = await service.approved();
+    expect(approved).toHaveLength(1);
+    expect(approved[0]).toMatchObject({ action: { ...action, planHash: 'exact-plan' }, request, grant });
+    approved[0]!.action.clusterIds.length = 0;
+    expect((await service.approved())[0]!.action.clusterIds).toEqual(action.clusterIds);
+    await service.markExecuted(action.id);
+    expect(await createApprovalService(opts).status(action.id)).toBe('executed');
+    expect(await service.approved()).toEqual([]);
+    await service.markExecuted(action.id);
+    expect(events.filter(event => event.kind === 'approvals:executed')).toHaveLength(1);
+    await expect(service.approveWithDevice(action.id, signed(request))).rejects.toThrow(/used/);
+  });
+
+  test('only an approved request can be marked executed', async () => {
+    await service.request(action, false);
+    await expect(service.markExecuted(action.id)).rejects.toThrow();
+    await expect(service.markExecuted('missing')).rejects.toThrow();
+    expect(await service.status(action.id)).toBe('pending');
+  });
+
+  test('an unknown execution id never enters the audit', async () => {
+    const unknown = 'unrecognized-value-never-for-audit';
+    await expect(service.markExecuted(unknown)).rejects.toThrow();
+    expect(JSON.stringify(events)).not.toContain(unknown);
+  });
+
+  test('a changed action removes the old grant from the execution queue', async () => {
+    const first = await service.request(action, false);
+    await service.approveWithDevice(action.id, signed(first));
+    await service.request({ ...action, planHash: 'revised-plan' }, false);
+    expect(await service.approved()).toEqual([]);
+    expect(await service.status(action.id)).toBe('pending');
+    await expect(service.markExecuted(action.id)).rejects.toThrow();
+  });
+
+  test('completion of an old version cannot consume a newer approved grant', async () => {
+    const first = await service.request(action, false);
+    await service.approveWithDevice(action.id, signed(first));
+    const next = await service.request({ ...action, planHash: 'new-version' }, false);
+    await service.approveWithDevice(action.id, signed(next));
+    await expect(service.markExecuted(action.id, first.digest)).rejects.toThrow(/changed/);
+    expect(await service.status(action.id)).toBe('approved');
+    expect((await service.approved())[0]!.grant.digest).toBe(next.digest);
+    await service.markExecuted(action.id, next.digest);
+    expect(await service.status(action.id)).toBe('executed');
   });
 
   test('non-string action IDs reject without poisoning saved approval state', async () => {
@@ -219,7 +357,7 @@ describe('action binding and approval lifecycle', () => {
 
   test('approval state is encrypted and safe display metadata omits challenge and cluster IDs', async () => {
     const request = await service.request(action, false);
-    expect(await service.describe(action.id)).toEqual({ kind: 'rotation', keyCount: 2, expiresAt: request.expiresAt, status: 'pending' });
+    expect(await service.describe(action.id)).toEqual({ kind: 'rotation', keyCount: 2, digest: request.digest, expiresAt: request.expiresAt, status: 'pending' });
     expect(await service.challenge(action.id)).toEqual({ challenge: request.challenge, rpId: 'example.org', allowCredentials: [{ type: 'public-key', id: baseCredential.id }] });
     const raw = await readFile(join(dir, '.keysentry', 'approvals.json'), 'utf8');
     expect(raw.startsWith('keysentry-encrypted:v1\n')).toBe(true);

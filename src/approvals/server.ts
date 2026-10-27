@@ -4,7 +4,7 @@ import { isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { BUILD_VERSION } from '../release/build-info.js';
 import { ApprovalError, type ApprovalService } from './service.js';
-import { APPROVE_JS, approvalPage, disarmedPage, disarmPage } from './page.js';
+import { APPROVE_JS, approvalPage, approvedOutcome, disarmedPage, disarmPage } from './page.js';
 
 type Service = Pick<ApprovalService, 'describe' | 'challenge' | 'approveWithPasskey' | 'recordDisarm'>;
 
@@ -15,7 +15,9 @@ export interface ApprovalServerOptions {
   publicOrigin: string;
   disarm: () => Promise<void>;
   rateLimitPerMinute?: number;
+  disarmRateLimitPerMinute?: number;
   trustProxyHops?: 0 | 1;
+  watcherCheckMinutes?: number;
   version?: string;
 }
 
@@ -112,8 +114,13 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
   const disarm = opts.disarm;
   const version = opts.version ?? BUILD_VERSION;
   const budget = opts.rateLimitPerMinute ?? 30;
+  const disarmBudget = opts.disarmRateLimitPerMinute ?? 10;
   const trustProxyHops = opts.trustProxyHops ?? 0;
-  if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535 || !Number.isFinite(budget) || budget <= 0 || !Number.isInteger(budget) || (trustProxyHops !== 0 && trustProxyHops !== 1)) throw new TypeError('Invalid approval server configuration.');
+  const watcherCheckMinutes = opts.watcherCheckMinutes ?? 10;
+  if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535
+    || !Number.isSafeInteger(budget) || budget <= 0 || !Number.isSafeInteger(disarmBudget) || disarmBudget <= 0
+    || !Number.isSafeInteger(watcherCheckMinutes) || watcherCheckMinutes <= 0
+    || (trustProxyHops !== 0 && trustProxyHops !== 1)) throw new TypeError('Invalid approval server configuration.');
   const headers: Record<string, string> = {
     'Content-Security-Policy': CSP,
     'X-Content-Type-Options': 'nosniff',
@@ -122,9 +129,17 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
     'Permissions-Policy': 'publickey-credentials-get=(self)',
   };
   if (origin.protocol === 'https:') headers['Strict-Transport-Security'] = 'max-age=31536000';
-  const buckets = new Map<string, { tokens: number; at: number }>();
+  type Bucket = { tokens: number; at: number };
+  // Each route group has its own capacity as well as its own token budget.
+  const approvalBuckets = new Map<string, Bucket>();
+  const disarmBuckets = new Map<string, Bucket>();
+  function limit(req: IncomingMessage): { budget: number; buckets: Map<string, Bucket> } {
+    return req.url === '/disarm' && (req.method === 'GET' || req.method === 'POST')
+      ? { budget: disarmBudget, buckets: disarmBuckets } : { budget, buckets: approvalBuckets };
+  }
 
-  function take(client: string): boolean {
+  function take(req: IncomingMessage, client: string): boolean {
+    const { budget, buckets } = limit(req);
     const now = Date.now();
     let bucket = buckets.get(client);
     if (!bucket) {
@@ -152,8 +167,8 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
     try {
       if (!validHost(req)) throw new HttpError(403, 'Request origin is not allowed.');
       const client = address(req, trustProxyHops);
-      if (!take(client)) {
-        res.setHeader('Retry-After', String(Math.ceil(60 / budget)));
+      if (!take(req, client)) {
+        res.setHeader('Retry-After', String(Math.ceil(60 / limit(req).budget)));
         throw new HttpError(429, 'Please wait before trying again.');
       }
       const path = req.url ?? '';
@@ -175,7 +190,7 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
         if (path === '/disarm') { send(res, 200, disarmPage(), 'text/html; charset=utf-8'); return; }
         const details = await service.describe(action![1]!);
         if (!details) { send(res, 404, 'Not found.\n'); return; }
-        send(res, 200, approvalPage(details), 'text/html; charset=utf-8');
+        send(res, 200, approvalPage(details, watcherCheckMinutes), 'text/html; charset=utf-8');
         return;
       }
       if (path === '/disarm') {
@@ -188,12 +203,13 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
         return;
       }
       const input = await jsonBody(req);
+      if (typeof input.digest !== 'string' || !/^[a-f0-9]{64}$/.test(input.digest)) throw new HttpError(400, 'Invalid request.');
       if (challenge) {
-        if (Object.keys(input).length !== 0) throw new HttpError(400, 'Invalid request.');
-        json(res, 200, await service.challenge(challenge[1]!));
+        if (Object.keys(input).length !== 1) throw new HttpError(400, 'Invalid request.');
+        json(res, 200, await service.challenge(challenge[1]!, input.digest));
         return;
       }
-      const fields = ['credentialId', 'clientDataJSON', 'authenticatorData', 'signature'];
+      const fields = ['digest', 'credentialId', 'clientDataJSON', 'authenticatorData', 'signature'];
       if (Object.keys(input).length !== fields.length || Object.keys(input).some((key) => !fields.includes(key))) throw new HttpError(400, 'Invalid assertion.');
       decode(input.credentialId, 1023);
       const approved = await service.approveWithPasskey(assertion![1]!, {
@@ -201,8 +217,8 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
         clientDataJSON: decode(input.clientDataJSON, 8192),
         authenticatorData: decode(input.authenticatorData, JSON_LIMIT),
         signature: decode(input.signature, 1024),
-      });
-      json(res, 200, { ok: true, text: 'Approved. This action can now proceed.', actionId: approved.actionId });
+      }, input.digest);
+      json(res, 200, { ok: true, text: approvedOutcome(watcherCheckMinutes), actionId: approved.actionId });
     } catch (error) {
       if (res.headersSent) { res.end(); return; }
       if (error instanceof HttpError) { send(res, error.status, `${error.message}\n`); return; }
@@ -217,7 +233,7 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
   const expectation = (req: IncomingMessage, res: ServerResponse) => {
     req.resume();
     if (!validHost(req)) { send(res, 403, 'Request origin is not allowed.\n'); return; }
-    if (!take(address(req, trustProxyHops))) { send(res, 429, 'Please wait before trying again.\n'); return; }
+    if (!take(req, address(req, trustProxyHops))) { send(res, 429, 'Please wait before trying again.\n'); return; }
     send(res, 417, 'Expectation failed.\n');
   };
   server.on('checkContinue', expectation);
@@ -229,7 +245,7 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
   }
   server.on('connect', (req, socket) => {
     if (!validHost(req)) { sendSocket(socket, 403, 'Request origin is not allowed.\n'); return; }
-    if (!take(address(req, trustProxyHops))) { sendSocket(socket, 429, 'Please wait before trying again.\n'); return; }
+    if (!take(req, address(req, trustProxyHops))) { sendSocket(socket, 429, 'Please wait before trying again.\n'); return; }
     const known = /^(?:\/healthz|\/static\/approve\.js|\/disarm)$/.test(req.url ?? '') || new RegExp(`^/a/${ID}(?:/challenge|/assert)?$`).test(req.url ?? '');
     sendSocket(socket, known ? 405 : 404, known ? 'Method not allowed.\n' : 'Not found.\n');
   });

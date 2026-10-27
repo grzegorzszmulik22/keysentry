@@ -9,7 +9,8 @@ import type { FeedSource, Incident, IncidentEvidence } from '../../src/types.js'
 
 const key = Buffer.alloc(32, 22);
 const itemKey = (id: string) => fingerprint(id, key);
-const now = new Date('2026-10-27T12:00:00Z');
+// Observe the recorded October 21-22 reports while they are inside the 72-hour evidence window.
+const now = new Date('2026-10-23T12:00:00Z');
 const fixture = (name: string) => parseFeed(readFileSync(new URL(`../fixtures/feeds/${name}`, import.meta.url), 'utf8'));
 const source = (url: string) => DEFAULT_SOURCES.find(value => value.url === url)!;
 const official = () => source('https://blog.railway.com/rss.xml');
@@ -23,6 +24,9 @@ const report = (name: string, outlet: FeedSource): IncidentEvidence => {
 const news = () => report('news-thehackernews-railway.xml', hackerNews());
 const independentNews = () => report('news-bleepingcomputer-railway.xml', bleepingComputer());
 const officialEvidence = () => fixture('railway-official-2026-10.xml')
+  // The feed fixture abbreviates the posts to descriptions without their exposure facts.
+  // Include the exposure/rotation scenario recorded in notes/phase2-facts.md for trigger tests.
+  .map(item => ({ ...item, summary: `${item.summary} Customer environment variables were accessed. Railway urges users to rotate credentials after the security incident.` }))
   .map(item => classifyItem(item, official(), itemKey)).filter((item): item is IncidentEvidence => item !== null);
 const titleItem = (title: string, summary = ''): FeedItem => ({
   id: title, title, summary, link: 'https://example.invalid/article', publishedAt: now.toISOString(),
@@ -64,9 +68,12 @@ describe('feed sources and classification', () => {
     }
   });
 
-  it('only official security incident, disclosure or breach titles have high confidence', () => {
+  it('only official security incident, disclosure or breach titles with exposure have high confidence', () => {
     expect(officialEvidence()).toHaveLength(4);
     expect(officialEvidence().every(e => e.confidence === 'high')).toBe(true);
+    for (const item of fixture('railway-official-2026-10.xml').slice(0, 4)) {
+      expect(classifyItem(item, official(), itemKey)).toMatchObject({ confidence: 'medium', credentialExposure: false });
+    }
     expect(classifyItem(titleItem('Security update'), official(), itemKey)).toMatchObject({ confidence: 'medium' });
     expect(classifyItem(titleItem('Deploy faster'), official(), itemKey)).toBeNull();
     expect(classifyItem(titleItem('Railway breach'), hackerNews(), itemKey)).toMatchObject({ confidence: 'medium', credentialExposure: false });
@@ -169,7 +176,7 @@ describe('incidents and corroboration', () => {
     expect(result.changed).toHaveLength(1);
     expect(result.triggered[0]).toMatchObject({ host: 'railway', openedAt: now.toISOString(), status: 'triggered',
       trigger: { at: now.toISOString(), rule: 'official' } });
-    expect(result.triggered[0]!.id).toMatch(/^inc-railway-20261027-[a-f0-9]{8}$/);
+    expect(result.triggered[0]!.id).toMatch(/^inc-railway-20261023-[a-f0-9]{8}$/);
     expect(result.triggered[0]!.evidence).toHaveLength(4);
   });
 
@@ -208,10 +215,10 @@ describe('incidents and corroboration', () => {
   });
 
   it('requires news timestamps no more than 72 hours apart, including the boundary', () => {
-    const one = { ...news(), publishedAt: '2026-10-23T12:00:00Z' };
-    const two = { ...independentNews(), publishedAt: '2026-10-26T12:00:00Z' };
+    const one = { ...news(), publishedAt: '2026-10-20T12:00:00Z' };
+    const two = { ...independentNews(), publishedAt: '2026-10-23T12:00:00Z' };
     expect(updateIncidents({ incidents: [] }, [one, two], now).triggered).toHaveLength(1);
-    expect(updateIncidents({ incidents: [] }, [one, { ...two, publishedAt: '2026-10-26T12:00:00.001Z' }], now).triggered).toEqual([]);
+    expect(updateIncidents({ incidents: [] }, [one, { ...two, publishedAt: '2026-10-23T12:00:00.001Z' }], now).triggered).toEqual([]);
     expect(updateIncidents({ incidents: [] }, [one, { ...two, publishedAt: null }], now).triggered).toEqual([]);
   });
 
@@ -229,7 +236,8 @@ describe('incidents and corroboration', () => {
   it('a triggered incident does not trigger again within its window and preserves its wave', () => {
     const first = updateIncidents({ incidents: [] }, officialEvidence(), now);
     first.incidents[0]!.waveId = 'wave-1';
-    const second = updateIncidents(first, [news()], new Date('2026-10-30T00:00:00Z'));
+    const later = new Date('2026-10-29T00:00:00Z');
+    const second = updateIncidents(first, [{ ...news(), publishedAt: later.toISOString() }], later);
     expect(second.triggered).toEqual([]);
     expect(second.incidents[0]).toMatchObject({ id: first.incidents[0]!.id, waveId: 'wave-1', trigger: first.incidents[0]!.trigger });
     expect(second.incidents[0]!.evidence).toHaveLength(5);
@@ -246,11 +254,11 @@ describe('incidents and corroboration', () => {
 
   it('closes the seven-day window from openedAt and creates a new incident at the exact boundary', () => {
     const first = updateIncidents({ incidents: [] }, [news()], now);
-    const later = new Date('2026-11-03T12:00:00Z');
+    const later = new Date('2026-10-30T12:00:00Z');
     const result = updateIncidents(first, [{ ...independentNews(), itemKey: itemKey('new report'), publishedAt: later.toISOString() }], later);
     expect(result.incidents).toHaveLength(2);
     expect(result.incidents[0]!.status).toBe('closed');
-    expect(result.incidents[1]!.id).toMatch(/^inc-railway-20261103-[a-f0-9]{8}$/);
+    expect(result.incidents[1]!.id).toMatch(/^inc-railway-20261030-[a-f0-9]{8}$/);
     expect(result.incidents[1]!.evidence).toHaveLength(1);
     expect(result.triggered).toEqual([]);
   });

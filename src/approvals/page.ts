@@ -1,4 +1,5 @@
 export interface ApprovalPageDetails {
+  digest: string;
   kind: string;
   keyCount: number;
   expiresAt: string;
@@ -13,8 +14,15 @@ function document(title: string, content: string, script = false): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title>${script ? '<script src="/static/approve.js" defer></script>' : ''}</head><body><main>${content}</main></body></html>`;
 }
 
-export function approvalPage(details: ApprovalPageDetails): string {
-  return document('Approve an action | keysentry', `<h1>Approve an action</h1><dl><dt>Action</dt><dd>${escapeHtml(details.kind)}</dd><dt>Keys</dt><dd>${details.keyCount} ${details.keyCount === 1 ? 'key' : 'keys'}</dd><dt>Expires</dt><dd><time>${escapeHtml(details.expiresAt)}</time></dd></dl><button id="approve" type="button"${details.status === 'pending' ? '' : ' disabled'}>Approve with a passkey</button><p id="result" role="status" aria-live="polite">${details.status === 'pending' ? '' : 'This request is no longer pending.'}</p><p><a href="/disarm">Turn off autopilot</a></p>`, true);
+export function approvedOutcome(watcherCheckMinutes: number): string {
+  return `Approved. The watcher will carry this out on its next check (within about ${watcherCheckMinutes} minutes).`;
+}
+
+export function approvalPage(details: ApprovalPageDetails, watcherCheckMinutes = 10): string {
+  const outcome = details.status === 'pending' ? '' : details.status === 'approved' ? approvedOutcome(watcherCheckMinutes)
+    : details.status === 'executed' ? 'Executed. The watcher has carried out this action.'
+    : details.status === 'superseded' ? 'This request was replaced by a newer version.' : 'This request is no longer pending.';
+  return document('Approve an action | keysentry', `<h1>Approve an action</h1><dl><dt>Action</dt><dd>${escapeHtml(details.kind)}</dd><dt>Keys</dt><dd>${details.keyCount} ${details.keyCount === 1 ? 'key' : 'keys'}</dd><dt>Expires</dt><dd><time>${escapeHtml(details.expiresAt)}</time></dd></dl><button id="approve" type="button" data-digest="${escapeHtml(details.digest)}"${details.status === 'pending' ? '' : ' disabled'}>Approve with a passkey</button><p id="result" role="status" aria-live="polite">${escapeHtml(outcome)}</p><p><a href="/disarm">Turn off autopilot</a></p>`, true);
 }
 
 export function disarmPage(): string {
@@ -55,7 +63,9 @@ export const APPROVE_JS = `'use strict';
     try {
       const actionPath = location.pathname;
       if (!/^\\/a\\/[A-Za-z0-9_-]{1,128}$/.test(actionPath)) throw new Error();
-      const options = await post(actionPath + '/challenge', {});
+      const digest = button.dataset.digest;
+      if (typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) throw new Error();
+      const options = await post(actionPath + '/challenge', { digest });
       if (!options) return;
       const credential = await navigator.credentials.get({ publicKey: {
         challenge: bytes(options.challenge), rpId: options.rpId,
@@ -64,6 +74,7 @@ export const APPROVE_JS = `'use strict';
       } });
       if (!credential) throw new Error();
       const approved = await post(actionPath + '/assert', {
+        digest,
         credentialId: base64url(credential.rawId),
         clientDataJSON: base64url(credential.response.clientDataJSON),
         authenticatorData: base64url(credential.response.authenticatorData),

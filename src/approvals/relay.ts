@@ -1,8 +1,9 @@
-import { canonicalJson, verifyDetached } from '../security/index.js';
+import { canonicalJson, signDetached, verifyDetached } from '../security/index.js';
+import type { DeviceKey } from '../security/index.js';
 import type { AuditLog, HttpClient } from '../types.js';
 
 export const APPROVAL_PREFIX = 'keysentry-approval:v1\n';
-export const DISARM_PREFIX = 'keysentry-disarm:v1\n';
+export const DISARM_PREFIX = 'keysentry-disarm:v2\n';
 
 export interface SignedDeviceApproval {
   actionId: string;
@@ -14,6 +15,7 @@ export interface SignedDeviceApproval {
 }
 
 export interface SignedDisarm {
+  watcherId: string;
   keyId: string;
   at: string;
   /** Base64 Ed25519 signature. */
@@ -26,6 +28,8 @@ export interface RelayOptions {
   topic: string;
   token?: string;
   trustedKeyIds: string[];
+  /** Required to accept or publish disarms; approval-only relays may omit it. */
+  watcherId?: string;
   /** Key IDs alone cannot verify signatures. Absent key material accepts no messages. */
   deviceKeys?: () => Promise<{ keyId: string; publicKeyDer: Buffer }[]>;
   audit: AuditLog;
@@ -42,9 +46,8 @@ export interface RelayPollResult {
 const MAX_RESPONSE = 4 * 1024 * 1024;
 const MAX_LINE = 16 * 1024;
 const WINDOW_MS = 10 * 60 * 1000;
-const MAX_DISARM_CACHE = 10_000;
 type IgnoreReason = 'message-too-large' | 'invalid-envelope' | 'invalid-message' | 'approval-not-verified'
-  | 'disarm-not-verified' | 'disarm-replay' | 'disarm-cache-full';
+  | 'disarm-not-verified' | 'disarm-replay';
 
 function* ndjsonLines(body: string): Generator<string> {
   let offset = 0;
@@ -77,7 +80,7 @@ function validAt(value: unknown): value is string {
   return canonical === value || canonical.replace('.000Z', 'Z') === value;
 }
 
-function validSigned(value: unknown): value is SignedDisarm & Record<string, unknown> {
+function validSigned(value: unknown): value is { keyId: string; at: string; sig: string } & Record<string, unknown> {
   if (!record(value) || typeof value.keyId !== 'string' || !/^[a-f0-9]{16}$/.test(value.keyId) || !validAt(value.at)) return false;
   if (typeof value.sig !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(value.sig)) return false;
   const decoded = Buffer.from(value.sig, 'base64');
@@ -91,7 +94,30 @@ function validApproval(value: unknown): value is SignedDeviceApproval {
 }
 
 function validDisarm(value: unknown): value is SignedDisarm {
-  return validSigned(value) && fields(value, ['keyId', 'at', 'sig']);
+  return validSigned(value) && fields(value, ['watcherId', 'keyId', 'at', 'sig']) && validWatcherId(value.watcherId);
+}
+
+function validWatcherId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function signDisarm(key: DeviceKey, input: { watcherId: string; at: string }): SignedDisarm {
+  if (!input || !validWatcherId(input.watcherId) || !validAt(input.at) || !key || !/^[a-f0-9]{16}$/.test(key.keyId)) {
+    throw new Error('Invalid disarm request.');
+  }
+  const body = { watcherId: input.watcherId, keyId: key.keyId, at: input.at };
+  try {
+    return { ...body, sig: signDetached(key.privateKeyDer, Buffer.from(DISARM_PREFIX + canonicalJson(body))).toString('base64') };
+  } catch { throw new Error('Unable to sign the disarm.'); }
+}
+
+/** Disarm only removes authority, so a valid watcher-bound request has no freshness deadline. */
+export function verifyDisarm(msg: unknown, trustedKeys: readonly { keyId: string; publicKeyDer: Buffer }[], watcherId: string): boolean {
+  if (!validWatcherId(watcherId) || !validDisarm(msg) || msg.watcherId !== watcherId) return false;
+  const key = trustedKeys.find(candidate => candidate.keyId === msg.keyId);
+  if (!key) return false;
+  const body = { watcherId: msg.watcherId, keyId: msg.keyId, at: msg.at };
+  return verifyDetached(key.publicKeyDer, Buffer.from(DISARM_PREFIX + canonicalJson(body)), Buffer.from(msg.sig, 'base64'));
 }
 
 function validWrapper(value: unknown, topic: string): value is Record<string, unknown> & { id: string; event: string } {
@@ -106,22 +132,26 @@ function validWrapper(value: unknown, topic: string): value is Record<string, un
  */
 export function createRelay(opts: RelayOptions): {
   publishApproval(signed: SignedDeviceApproval): Promise<void>;
+  publishDisarm(signed: SignedDisarm): Promise<void>;
   poll(since: string | null): Promise<RelayPollResult>;
 } {
   let server: URL;
   try { server = new URL(opts.server); } catch { throw new Error('Invalid approval relay configuration.'); }
   if (server.protocol !== 'https:' || server.username || server.password || server.pathname !== '/'
     || server.search || server.hash || !/^[A-Za-z0-9_-]{1,64}$/.test(opts.topic)
-    || (opts.token !== undefined && (typeof opts.token !== 'string' || /[\r\n\x00]/.test(opts.token)))) {
+    || (opts.token !== undefined && (typeof opts.token !== 'string' || /[\r\n\x00]/.test(opts.token)))
+    || (opts.watcherId !== undefined && !validWatcherId(opts.watcherId))) {
     throw new Error('Invalid approval relay configuration.');
   }
   if (!opts.audit || typeof opts.audit.append !== 'function') throw new Error('Invalid approval relay configuration.');
   const url = server.origin + '/' + opts.topic;
   const headers: Record<string, string> = opts.token ? { Authorization: `Bearer ${opts.token}` } : {};
   const trustedKeyIds = new Set(opts.trustedKeyIds);
+  const watcherId = opts.watcherId;
   const now = opts.now ?? (() => new Date());
   // Replay protection for disarm is deliberately local to this relay instance. Approval service owns durable approval replay state.
-  const usedDisarms = new Map<string, number>();
+  // Only trusted, verified signatures enter this set. They cannot age out without permitting a replay.
+  const usedDisarms = new Set<string>();
   let pollQueue: Promise<unknown> = Promise.resolve();
 
   function queuePoll(operation: () => Promise<RelayPollResult>): Promise<RelayPollResult> {
@@ -143,6 +173,16 @@ export function createRelay(opts: RelayOptions): {
       if (status < 200 || status >= 300) throw new Error('Unable to publish the approval.');
     },
 
+    async publishDisarm(signed) {
+      if (!validDisarm(signed) || signed.watcherId !== watcherId) throw new Error('Invalid signed disarm.');
+      try {
+        const response = await opts.http.request({ method: 'POST', url,
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify({ type: 'keysentry-disarm', v: 2, ...signed }) });
+        if (response.status < 200 || response.status >= 300) throw new Error();
+      } catch { throw new Error('Unable to publish the disarm.'); }
+    },
+
     poll(since) {
       return queuePoll(async () => {
         if (since !== null && (typeof since !== 'string' || since.length > 128 || !/^[A-Za-z0-9_-]+$/.test(since))) {
@@ -150,14 +190,15 @@ export function createRelay(opts: RelayOptions): {
         }
         let body: string;
         try {
-          const response = await opts.http.request({ method: 'GET', url: url + '/json?poll=1&since=' + encodeURIComponent(since ?? '10m'), headers: { ...headers } });
+          // A new watcher must read retained disarms even when they predate an approval's freshness window.
+          const response = await opts.http.request({ method: 'GET', url: url + '/json?poll=1&since=' + encodeURIComponent(since ?? (watcherId === undefined ? '10m' : 'all')), headers: { ...headers } });
           if (response.status < 200 || response.status >= 300) throw new Error('HTTP failure');
           body = response.text;
         } catch { throw new Error('Unable to poll the approval relay.'); }
         if (Buffer.byteLength(body, 'utf8') > MAX_RESPONSE) throw new Error('Approval relay response is too large.');
         const result: RelayPollResult = { approvals: [], disarms: [], cursor: since, ignored: 0 };
         const ignoredCounts = new Map<IgnoreReason, number>();
-        const pendingDisarms = new Map<string, number>();
+        const pendingDisarms = new Set<string>();
         function ignored(reason: IgnoreReason): void {
           result.ignored++;
           ignoredCounts.set(reason, (ignoredCounts.get(reason) ?? 0) + 1);
@@ -165,10 +206,10 @@ export function createRelay(opts: RelayOptions): {
         let keys: { keyId: string; publicKeyDer: Buffer }[];
         try { keys = opts.deviceKeys ? await opts.deviceKeys() : []; }
         catch { throw new Error('Unable to load approval relay device keys.'); }
-        const trustedKeys = new Map(keys.filter(key => trustedKeyIds.has(key.keyId)).map(key => [key.keyId, key.publicKeyDer]));
+        const trustedDevices = keys.filter(key => trustedKeyIds.has(key.keyId));
+        const trustedKeys = new Map(trustedDevices.map(key => [key.keyId, key.publicKeyDer]));
         const nowMs = now().getTime();
         if (!Number.isFinite(nowMs)) throw new Error('Unable to read the approval relay clock.');
-        for (const [sig, expiresAt] of usedDisarms) if (expiresAt < nowMs) usedDisarms.delete(sig);
 
         for (const line of ndjsonLines(body)) {
           if (!line.trim()) continue;
@@ -180,9 +221,9 @@ export function createRelay(opts: RelayOptions): {
           if (envelope.event !== 'message' || typeof envelope.message !== 'string') { ignored('invalid-envelope'); continue; }
           result.cursor = envelope.id;
           const payload = parseJson(envelope.message);
-          if (!record(payload) || payload.v !== 1) { ignored('invalid-message'); continue; }
+          if (!record(payload)) { ignored('invalid-message'); continue; }
 
-          if (payload.type === 'keysentry-approval' && fields(payload, ['type', 'v', 'approval']) && validApproval(payload.approval)) {
+          if (payload.type === 'keysentry-approval' && payload.v === 1 && fields(payload, ['type', 'v', 'approval']) && validApproval(payload.approval)) {
             const signed = payload.approval;
             const publicKey = trustedKeys.get(signed.keyId);
             const data = Buffer.from(APPROVAL_PREFIX + canonicalJson({ actionId: signed.actionId, digest: signed.digest, at: signed.at }));
@@ -190,29 +231,25 @@ export function createRelay(opts: RelayOptions): {
               ignored('approval-not-verified'); continue;
             }
             result.approvals.push(signed);
-          } else if (payload.type === 'keysentry-disarm' && fields(payload, ['type', 'v', 'keyId', 'at', 'sig'])) {
-            const signed = { keyId: payload.keyId, at: payload.at, sig: payload.sig };
-            if (!validDisarm(signed)) { ignored('disarm-not-verified'); continue; }
-            const publicKey = trustedKeys.get(signed.keyId);
-            const data = Buffer.from(DISARM_PREFIX + canonicalJson({ at: signed.at }));
-            if (!publicKey || Math.abs(Date.parse(signed.at) - nowMs) > WINDOW_MS || !verifyDetached(publicKey, data, Buffer.from(signed.sig, 'base64'))) {
+          } else if (payload.type === 'keysentry-disarm' && payload.v === 2 && fields(payload, ['type', 'v', 'watcherId', 'keyId', 'at', 'sig'])) {
+            const signed = { watcherId: payload.watcherId, keyId: payload.keyId, at: payload.at, sig: payload.sig };
+            if (!validDisarm(signed) || watcherId === undefined || !verifyDisarm(signed, trustedDevices, watcherId)) {
               ignored('disarm-not-verified'); continue;
             }
             if (usedDisarms.has(signed.sig) || pendingDisarms.has(signed.sig)) { ignored('disarm-replay'); continue; }
-            if (usedDisarms.size + pendingDisarms.size >= MAX_DISARM_CACHE) { ignored('disarm-cache-full'); continue; }
-            pendingDisarms.set(signed.sig, Date.parse(signed.at) + WINDOW_MS);
+            pendingDisarms.add(signed.sig);
             result.disarms.push(signed);
           } else {
             ignored('invalid-message');
           }
         }
-        // Seven fixed reasons cap audit writes regardless of the number of untrusted lines.
+        // Six fixed reasons cap audit writes regardless of the number of untrusted lines.
         for (const [reason, count] of ignoredCounts) {
           try {
             await opts.audit.append({ kind: 'approvals:relay-ignored', summary: 'Approval relay messages were ignored.', data: { reason, count } });
           } catch { throw new Error('Unable to record the approval relay outcome.'); }
         }
-        for (const [sig, expiresAt] of pendingDisarms) usedDisarms.set(sig, expiresAt);
+        for (const sig of pendingDisarms) usedDisarms.add(sig);
         return result;
       });
     },

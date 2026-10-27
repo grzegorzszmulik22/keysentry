@@ -4,9 +4,11 @@ import { canonicalJson, verifyDetached } from '../security/index.js';
 import type { ApprovalGrant, ApprovalRequest, AuditEvent, AuditLog, PasskeyCredential } from '../types.js';
 import { verifyAssertion } from './webauthn/index.js';
 import { transactApprovals } from './store.js';
-import type { ApprovalState, ApprovalStatus, StoredApproval } from './store.js';
+import type { ApprovalAction, ApprovalCluster, ApprovalState, ApprovalStatus, StoredApproval } from './store.js';
 
-export interface ApprovalAction { id: string; kind: string; clusterIds: string[]; planHash?: string }
+export type { ApprovalAction, ApprovalCluster } from './store.js';
+export interface ApprovalRequestDetails extends ApprovalRequest { clusters: ApprovalCluster[] }
+export interface ApprovedAction { action: ApprovalAction; request: ApprovalRequestDetails; grant: ApprovalGrant }
 export interface PasskeyAssertion { credentialId: string; clientDataJSON: Buffer; authenticatorData: Buffer; signature: Buffer }
 export interface DeviceApproval { keyId: string; digest: string; at: string; sig: string }
 export interface ApprovalServiceOptions {
@@ -17,17 +19,23 @@ export interface ApprovalServiceOptions {
   rpId: string;
   origins: string[];
   now?: () => Date;
+  mode?: 'interactive' | 'actions';
+  /** Defaults to ten minutes interactively, or sixty minutes in Actions mode. */
+  requestTtlMs?: number;
 }
-export interface ApprovalDescription { kind: string; keyCount: number; expiresAt: string; status: ApprovalStatus }
+export interface ApprovalDescription { kind: string; keyCount: number; digest: string; expiresAt: string; status: ApprovalStatus }
 export interface ApprovalChallenge { challenge: string; rpId: string; allowCredentials: { type: 'public-key'; id: string }[] }
 export interface ApprovalService {
-  request(action: ApprovalAction, widening: boolean): Promise<ApprovalRequest>;
-  approveWithPasskey(actionId: string, assertion: PasskeyAssertion): Promise<ApprovalGrant>;
+  request(action: ApprovalAction, widening: boolean): Promise<ApprovalRequestDetails>;
+  approveWithPasskey(actionId: string, assertion: PasskeyAssertion, expectedDigest?: string): Promise<ApprovalGrant>;
   approveWithDevice(actionId: string, signed: DeviceApproval): Promise<ApprovalGrant>;
   status(actionId: string): Promise<ApprovalStatus>;
   describe(actionId: string): Promise<ApprovalDescription | null>;
-  challenge(actionId: string): Promise<ApprovalChallenge>;
+  challenge(actionId: string, expectedDigest?: string): Promise<ApprovalChallenge>;
   recordDisarm(clientHash: string): Promise<void>;
+  /** Approved current versions remain available until their executor records completion. */
+  approved(): Promise<ApprovedAction[]>;
+  markExecuted(actionId: string, expectedDigest?: string): Promise<void>;
 }
 export class ApprovalError extends Error {
   readonly code = 'APPROVAL_REJECTED';
@@ -44,13 +52,29 @@ function actionCopy(action: ApprovalAction): ApprovalAction {
   if (!action || typeof action.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(action.id) || typeof action.kind !== 'string' || !action.kind.length || action.kind.length > 80 || /[\u0000-\u001f\u007f]/.test(action.kind) ||
       !Array.isArray(action.clusterIds) || action.clusterIds.length > 10000 || action.clusterIds.some((id) => typeof id !== 'string' || !id.length || id.length > 512) ||
       (action.planHash !== undefined && (typeof action.planHash !== 'string' || action.planHash.length > 512))) reject('This action description is not valid.');
-  return { id: action.id, kind: action.kind, clusterIds: [...action.clusterIds], ...(action.planHash === undefined ? {} : { planHash: action.planHash }) };
+  if (new Set(action.clusterIds).size !== action.clusterIds.length || (action.clusters !== undefined &&
+      (!Array.isArray(action.clusters) || action.clusters.length !== action.clusterIds.length || action.clusters.some((cluster, index) =>
+        !cluster || cluster.clusterId !== action.clusterIds[index] || (cluster.hint !== null &&
+          (typeof cluster.hint !== 'string' || cluster.hint.length > 80 || /[\u0000-\u001f\u007f]/.test(cluster.hint))))))) reject('This action description is not valid.');
+  return { id: action.id, kind: action.kind, clusterIds: [...action.clusterIds],
+    ...(action.clusters === undefined ? {} : { clusters: action.clusters.map(cluster => ({ clusterId: cluster.clusterId, hint: cluster.hint })) }),
+    ...(action.planHash === undefined ? {} : { planHash: action.planHash }) };
 }
 export function actionDigest(action: ApprovalAction): string { return sha256(canonicalJson(actionCopy(action))); }
+function requestCopy(request: StoredApproval): ApprovalRequestDetails {
+  return { actionId: request.actionId, digest: request.digest, createdAt: request.createdAt, expiresAt: request.expiresAt,
+    challenge: request.challenge, widening: request.widening, clusters: structuredClone(request.clusters ?? []) };
+}
+function currentRequest(state: ApprovalState, actionId: string): StoredApproval | undefined {
+  return state.requests.find(request => request.actionId === actionId && request.status !== 'superseded');
+}
 
 export function createApprovalService(opts: ApprovalServiceOptions): ApprovalService {
   const now = opts.now ?? (() => new Date());
   if (!opts.rpId || !opts.origins.length) throw new TypeError('An approval RP ID and trusted origins are required.');
+  const requestTtlMs = opts.requestTtlMs ?? (opts.mode === 'actions' ? 60 * 60 * 1000 : TEN_MINUTES);
+  if ((opts.mode !== undefined && opts.mode !== 'interactive' && opts.mode !== 'actions') ||
+      !Number.isSafeInteger(requestTtlMs) || requestTtlMs <= 0 || requestTtlMs > SEVEN_DAYS) throw new TypeError('The approval request lifetime is not valid.');
   // Configuration is copied so later caller mutations cannot widen allowed origins.
   const origins = [...opts.origins];
   const event = (kind: string, actionId?: string): AuditEvent => ({ kind: `approvals:${kind}`, summary: `Approval ${kind.replaceAll('-', ' ')}.`, ...(actionId ? { data: { actionId } } : {}) });
@@ -88,11 +112,14 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       return result as T;
     });
   }
-  function pending(state: ApprovalState, actionId: string, events: AuditEvent[]): StoredApproval {
-    const request = state.requests.find((r) => r.actionId === actionId);
+  function pending(state: ApprovalState, actionId: string, events: AuditEvent[], expectedDigest?: string): StoredApproval {
+    const request = currentRequest(state, actionId);
     if (!request) { events.push(event('rejected')); return reject('This approval request was not found.'); }
+    if (expectedDigest !== undefined && expectedDigest !== request.digest) {
+      events.push(event('rejected', request.actionId)); return reject('This approval request has changed. Open it again to review the current action.');
+    }
     if (request.status === 'expired') { events.push(event('rejected', actionId)); return reject('This approval request has expired.'); }
-    if (request.status === 'approved' || state.usedChallenges.includes(request.challenge)) {
+    if (request.status === 'approved' || request.status === 'executed' || state.usedChallenges.includes(request.challenge)) {
       events.push(event('replay', actionId));
       return reject('This approval has already been used.');
     }
@@ -126,20 +153,36 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
         let action: ApprovalAction;
         try { action = actionCopy(input); if (typeof widening !== 'boolean') reject(); }
         catch { events.push(event('rejected')); return reject('This action description is not valid.'); }
-        if (state.requests.some((r) => r.actionId === action.id)) { events.push(event('rejected', action.id)); return reject('This action already has an approval request.'); }
-        if (state.requests.filter((r) => r.status === 'pending').length >= 100) { events.push(event('rejected')); return reject('There are already 100 pending approval requests.'); }
+        const digest = actionDigest(action);
+        const existing = currentRequest(state, action.id);
+        if (existing?.digest === digest && existing.widening !== widening) {
+          events.push(event('rejected', action.id)); return reject('This approval request has different authorization requirements.');
+        }
+        if (existing?.digest === digest && existing.status === 'pending') {
+          existing.action = action;
+          existing.clusters = action.clusters ?? action.clusterIds.map(clusterId => ({ clusterId, hint: null }));
+          return requestCopy(existing);
+        }
+        if (existing?.digest === digest) {
+          events.push(event('rejected', action.id)); return reject('This action already has an approval request.');
+        }
+        const pendingCount = state.requests.filter((r) => r.status === 'pending').length - (existing?.status === 'pending' ? 1 : 0);
+        if (pendingCount >= 100) { events.push(event('rejected')); return reject('There are already 100 pending approval requests.'); }
+        if (existing) { existing.status = 'superseded'; events.push(event('superseded', action.id)); }
         let challenge: string;
         do { challenge = randomBytes(32).toString('base64url'); }
         while (state.requests.some((r) => r.challenge === challenge) || state.usedChallenges.includes(challenge));
-        const request: ApprovalRequest = { actionId: action.id, digest: actionDigest(action), createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + TEN_MINUTES).toISOString(), challenge, widening };
-        state.requests.push({ ...request, kind: action.kind, keyCount: action.clusterIds.length, status: 'pending', attempts: 0 });
+        const request: StoredApproval = { actionId: action.id, digest, createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + requestTtlMs).toISOString(), challenge, widening,
+          kind: action.kind, keyCount: action.clusterIds.length, status: 'pending', attempts: 0, action,
+          clusters: action.clusters ?? action.clusterIds.map(clusterId => ({ clusterId, hint: null })) };
+        state.requests.push(request);
         events.push(event('requested', action.id));
-        return { ...request };
+        return requestCopy(request);
       });
     },
-    approveWithPasskey(actionId, input) {
+    approveWithPasskey(actionId, input, expectedDigest) {
       return transaction(async (state, events, at) => {
-        const request = pending(state, actionId, events);
+        const request = pending(state, actionId, events, expectedDigest);
         if (request.widening) return attemptFailed(request, events, WIDENING, 'widening-refused');
         try {
           const credential = (await registered(state)).find((c) => c.id === input?.credentialId);
@@ -173,20 +216,20 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     },
     status(actionId) {
       return transaction(async (state, events) => {
-        const request = state.requests.find((r) => r.actionId === actionId);
+        const request = currentRequest(state, actionId);
         if (!request) { events.push(event('rejected')); return reject('This approval request was not found.'); }
         return request.status;
       });
     },
     describe(actionId) {
       return transaction(async (state) => {
-        const request = state.requests.find((r) => r.actionId === actionId);
-        return request ? { kind: request.kind, keyCount: request.keyCount, expiresAt: request.expiresAt, status: request.status } : null;
+        const request = currentRequest(state, actionId);
+        return request ? { kind: request.kind, keyCount: request.keyCount, digest: request.digest, expiresAt: request.expiresAt, status: request.status } : null;
       });
     },
-    challenge(actionId) {
+    challenge(actionId, expectedDigest) {
       return transaction(async (state, events) => {
-        const request = pending(state, actionId, events);
+        const request = pending(state, actionId, events, expectedDigest);
         if (request.widening) { events.push(event('widening-refused', actionId)); return reject(WIDENING); }
         const credentials = await registered(state);
         return { challenge: request.challenge, rpId: opts.rpId, allowCredentials: credentials.map((c) => ({ type: 'public-key' as const, id: c.id })) };
@@ -197,6 +240,35 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
         if (!/^[a-f0-9]{64}$/.test(clientHash)) reject();
         events.push({ kind: 'approvals:disarm', summary: 'Autopilot was disarmed.', data: { clientHash } });
       }, false); // Disarming has already happened; retain its audit even when an older entry cannot flush.
+    },
+    approved() {
+      return transaction(async (state) => {
+        const approved: ApprovedAction[] = [];
+        for (const request of state.requests) {
+          if (request.status !== 'approved' || !request.grant || !request.action) continue;
+          const action = actionCopy(request.action);
+          if (action.id !== request.actionId || actionDigest(action) !== request.digest || request.grant.actionId !== request.actionId || request.grant.digest !== request.digest) {
+            reject('Saved approval metadata could not be verified.');
+          }
+          approved.push({ action, request: requestCopy(request), grant: structuredClone(request.grant) });
+        }
+        return approved;
+      });
+    },
+    markExecuted(actionId, expectedDigest) {
+      return transaction(async (state, events, at) => {
+        const request = currentRequest(state, actionId);
+        if (request && expectedDigest !== undefined && request.digest !== expectedDigest) {
+          events.push(event('rejected', request.actionId)); return reject('This approval request has changed. Its newer version has not been marked executed.');
+        }
+        if (request?.status === 'executed') return;
+        if (!request || request.status !== 'approved' || !request.grant) {
+          events.push(event('rejected', request?.actionId)); return reject('This action has no approval to execute.');
+        }
+        request.status = 'executed';
+        request.executedAt = at.toISOString();
+        events.push(event('executed', actionId));
+      });
     },
   };
 }

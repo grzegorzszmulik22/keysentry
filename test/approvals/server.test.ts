@@ -13,6 +13,7 @@ import { generateDeviceKey, signDetached } from '../../src/security/index.js';
 import type { AuditLog, PasskeyCredential } from '../../src/types.js';
 
 const origin = 'https://approvals.example.org';
+const digest = '0'.repeat(64);
 const servers: ReturnType<typeof createApprovalServer>[] = [];
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -23,7 +24,7 @@ afterEach(async () => {
 
 function service() {
   return {
-    describe: vi.fn(async () => ({ kind: 'rotate', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status: 'pending' as const })),
+    describe: vi.fn(async () => ({ digest, kind: 'rotate', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status: 'pending' as const })),
     challenge: vi.fn(async () => ({ challenge: 'YWJj', rpId: 'approvals.example.org', allowCredentials: [{ type: 'public-key' as const, id: 'Y3JlZA' }] })),
     approveWithPasskey: vi.fn(async () => ({ actionId: 'action-1', digest: '0'.repeat(64), at: '2026-10-27T12:00:00.000Z', by: { kind: 'passkey' as const, credentialId: 'Y3JlZA' } })),
     recordDisarm: vi.fn(async () => undefined),
@@ -51,8 +52,8 @@ function call(port: number, path: string, options: { method?: string; headers?: 
   });
 }
 
-const post = { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: '{}' };
-const assertion = JSON.stringify({ credentialId: 'Y3JlZA', clientDataJSON: 'Y2xpZW50', authenticatorData: 'YXV0aA', signature: 'c2ln' });
+const post = { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ digest }) };
+const assertion = JSON.stringify({ digest, credentialId: 'Y3JlZA', clientDataJSON: 'Y2xpZW50', authenticatorData: 'YXV0aA', signature: 'c2ln' });
 
 function raw(port: number, input: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -91,7 +92,7 @@ test('Host must match the public origin even when forwarded headers claim otherw
 
 test('approval page escapes metadata and the script is served separately', async () => {
   const svc = service();
-  svc.describe.mockResolvedValue({ kind: '<script>alert("value")</script>', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status: 'pending' });
+  svc.describe.mockResolvedValue({ digest, kind: '<script>alert("value")</script>', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status: 'pending' });
   const { port } = await start({ service: svc });
   const page = await call(port, '/a/action-1');
   expect(page.status).toBe(200);
@@ -100,6 +101,7 @@ test('approval page escapes metadata and the script is served separately', async
   expect(page.body).toContain('3 keys');
   expect(page.body).toContain('2026-10-27T12:10:00.000Z');
   expect(page.body).toContain('<script src="/static/approve.js" defer></script>');
+  expect(page.body).toContain(`data-digest="${digest}"`);
   expect((await call(port, '/static/approve.js')).headers['content-type']).toContain('javascript');
 });
 
@@ -117,10 +119,11 @@ test('challenge and assertion routes decode only the bounded canonical base64url
   const challenge = await call(port, '/a/action-1/challenge', post);
   expect(challenge.status).toBe(200);
   expect(JSON.parse(challenge.body)).toEqual({ challenge: 'YWJj', rpId: 'approvals.example.org', allowCredentials: [{ type: 'public-key', id: 'Y3JlZA' }] });
+  expect(svc.challenge).toHaveBeenCalledWith('action-1', digest);
   const result = await call(port, '/a/action-1/assert', { ...post, body: assertion });
   expect(result.status).toBe(200);
   expect(JSON.parse(result.body)).toMatchObject({ ok: true });
-  expect(svc.approveWithPasskey).toHaveBeenCalledWith('action-1', { credentialId: 'Y3JlZA', clientDataJSON: Buffer.from('client'), authenticatorData: Buffer.from('auth'), signature: Buffer.from('sig') });
+  expect(svc.approveWithPasskey).toHaveBeenCalledWith('action-1', { credentialId: 'Y3JlZA', clientDataJSON: Buffer.from('client'), authenticatorData: Buffer.from('auth'), signature: Buffer.from('sig') }, digest);
   for (const body of ['null', '[]', '{', '{"credentialId":"x"}', assertion.replace('Y2xpZW50', 'Y2xpZW50='), assertion.replace('YXV0aA', 'YXV0aB')]) {
     const response = await call(port, '/a/action-1/assert', { ...post, body });
     expect(response.status).toBe(400);
@@ -138,6 +141,52 @@ test('service rejections show safe outcome text and unexpected errors reveal no 
   const failed = await call(port, '/a/action-1/assert', { ...post, body: assertion });
   expect(failed.status).toBe(500);
   expect(failed.body).not.toContain('private-value');
+});
+
+test('challenge and assertion endpoints require the displayed canonical digest', async () => {
+  const { port, svc } = await start({ rateLimitPerMinute: 100 });
+  for (const invalid of [undefined, null, 0, '', 'a'.repeat(63), 'A'.repeat(64), 'g'.repeat(64)]) {
+    const fields = invalid === undefined ? {} : { digest: invalid };
+    expect((await call(port, '/a/action-1/challenge', { ...post, body: JSON.stringify(fields) })).status).toBe(400);
+    expect((await call(port, '/a/action-1/assert', { ...post, body: JSON.stringify({ ...JSON.parse(assertion), ...fields, ...(invalid === undefined ? { digest: undefined } : {}) }) })).status).toBe(400);
+  }
+  expect(svc.challenge).not.toHaveBeenCalled();
+  expect(svc.approveWithPasskey).not.toHaveBeenCalled();
+});
+
+test('a stale page cannot get a challenge or approve a replacement version of the same action', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'keysentry-approval-stale-page-'));
+  tempDirs.push(cwd);
+  const key = generateDeviceKey();
+  const credential: PasskeyCredential = {
+    id: Buffer.from('version-credential').toString('base64url'),
+    publicKeyCose: Buffer.concat([Buffer.from('a4010103272006215820', 'hex'), key.publicKeyDer.subarray(-32)]).toString('base64url'),
+    alg: -8, signCount: 0, backupEligible: false, rpId: 'approvals.example.org', origins: [origin], label: 'Test key', createdAt: '2026-10-27T12:00:00.000Z',
+  };
+  const audit: AuditLog = { append: async () => undefined, checkpoint: async () => undefined, verify: async () => ({ ok: true, entries: 0, checkpoints: 0 }) };
+  const svc = createApprovalService({
+    store: createStateStore({ cwd, cipher: createStateCipher(Buffer.alloc(32, 20)) }), audit, credentials: async () => [credential], deviceKeys: async () => [], rpId: credential.rpId, origins: [origin], now: () => new Date('2026-10-27T12:00:00.000Z'),
+  });
+  const action = { id: 'versioned-action', kind: 'rotate', clusterIds: ['cluster-1'] };
+  const first = await svc.request(action, false);
+  const { port } = await start({ service: svc });
+  const page = await call(port, '/a/versioned-action');
+  const displayedDigest = /data-digest="([a-f0-9]{64})"/.exec(page.body)?.[1];
+  expect(displayedDigest).toBe(first.digest);
+  const changedAction = { ...action, clusterIds: ['cluster-1', 'cluster-2'] };
+  const replacement = await svc.request(changedAction, false);
+  expect((await call(port, '/a/versioned-action/challenge', { ...post, body: JSON.stringify({ digest: displayedDigest }) })).status).toBe(403);
+  expect(await svc.request(changedAction, false)).toEqual(replacement);
+  expect(await svc.status(action.id)).toBe('pending');
+  const options = JSON.parse((await call(port, '/a/versioned-action/challenge', { ...post, body: JSON.stringify({ digest: replacement.digest }) })).body);
+  const clientDataJSON = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: options.challenge, origin }));
+  const authenticatorData = Buffer.concat([createHash('sha256').update(credential.rpId).digest(), Buffer.from([0x05, 0, 0, 0, 1])]);
+  const signature = signDetached(key.privateKeyDer, Buffer.concat([authenticatorData, createHash('sha256').update(clientDataJSON).digest()]));
+  const signed = { credentialId: credential.id, clientDataJSON: clientDataJSON.toString('base64url'), authenticatorData: authenticatorData.toString('base64url'), signature: signature.toString('base64url') };
+  expect((await call(port, '/a/versioned-action/assert', { ...post, body: JSON.stringify({ ...signed, digest: displayedDigest }) })).status).toBe(403);
+  expect(await svc.status(action.id)).toBe('pending');
+  expect(await svc.approved()).toEqual([]);
+  expect((await call(port, '/a/versioned-action/assert', { ...post, body: JSON.stringify({ ...signed, digest: replacement.digest }) })).status).toBe(200);
 });
 
 test('HTTP expectation failures carry the same security headers', async () => {
@@ -187,21 +236,21 @@ test('real service approves one signed passkey response over HTTP and rejects it
   const svc = createApprovalService({
     store: createStateStore({ cwd, cipher: createStateCipher(Buffer.alloc(32, 19)) }), audit, credentials: async () => [credential], deviceKeys: async () => [], rpId: credential.rpId, origins: [origin], now: () => now,
   });
-  await svc.request({ id: 'real-action', kind: 'rotate', clusterIds: ['cluster-1'] }, false);
+  const requested = await svc.request({ id: 'real-action', kind: 'rotate', clusterIds: ['cluster-1'] }, false);
   const { port } = await start({ service: svc });
-  const options = JSON.parse((await call(port, '/a/real-action/challenge', post)).body);
+  const options = JSON.parse((await call(port, '/a/real-action/challenge', { ...post, body: JSON.stringify({ digest: requested.digest }) })).body);
   const clientDataJSON = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: options.challenge, origin }));
   const auth = Buffer.concat([createHash('sha256').update(credential.rpId).digest(), Buffer.from([0x05, 0, 0, 0, 1])]);
   const signature = signDetached(key.privateKeyDer, Buffer.concat([auth, createHash('sha256').update(clientDataJSON).digest()]));
-  const body = JSON.stringify({ credentialId: credential.id, clientDataJSON: clientDataJSON.toString('base64url'), authenticatorData: auth.toString('base64url'), signature: signature.toString('base64url') });
+  const body = JSON.stringify({ digest: requested.digest, credentialId: credential.id, clientDataJSON: clientDataJSON.toString('base64url'), authenticatorData: auth.toString('base64url'), signature: signature.toString('base64url') });
   expect((await call(port, '/a/real-action/assert', { ...post, body })).status).toBe(200);
   expect(await svc.status('real-action')).toBe('approved');
   expect((await call(port, '/a/real-action/assert', { ...post, body })).status).toBe(403);
   const terminal = await call(port, '/a/real-action');
   expect(terminal.body).toContain('disabled');
-  await svc.request({ id: 'expired-action', kind: 'rotate', clusterIds: ['cluster-1'] }, false);
+  const expired = await svc.request({ id: 'expired-action', kind: 'rotate', clusterIds: ['cluster-1'] }, false);
   now = new Date('2026-10-27T12:10:00.000Z');
-  expect((await call(port, '/a/expired-action/challenge', post)).status).toBe(403);
+  expect((await call(port, '/a/expired-action/challenge', { ...post, body: JSON.stringify({ digest: expired.digest }) })).status).toBe(403);
   expect(await svc.status('expired-action')).toBe('expired');
 });
 
@@ -245,6 +294,73 @@ test('rate limit returns 429 after the budget and refills over time', async () =
   expect((await call(port, '/healthz')).status).toBe(200);
 });
 
+test('approval traffic cannot consume either disarm route budget', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const { port, disarm } = await start({ rateLimitPerMinute: 2 });
+  expect((await call(port, '/healthz')).status).toBe(200);
+  expect((await call(port, '/healthz')).status).toBe(200);
+  expect((await call(port, '/healthz')).status).toBe(429);
+  expect((await call(port, '/disarm')).status).toBe(200);
+  const response = await call(port, '/disarm', {
+    method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'confirm=DISARM',
+  });
+  expect(response.status).toBe(200);
+  expect(disarm).toHaveBeenCalledTimes(1);
+});
+
+test('GET and POST disarm share ten tokens per minute without consuming approval tokens', async () => {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const { port, disarm } = await start({ rateLimitPerMinute: 1 });
+  for (let i = 0; i < 9; i++) expect((await call(port, '/disarm')).status).toBe(200);
+  expect((await call(port, '/disarm', {
+    method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'confirm=DISARM',
+  })).status).toBe(200);
+  const limited = await call(port, '/disarm');
+  expect(limited.status).toBe(429);
+  expect(limited.headers['retry-after']).toBe('6');
+  expect((await call(port, '/healthz')).status).toBe(200);
+  now.mockReturnValue(1_006_000);
+  expect((await call(port, '/disarm')).status).toBe(200);
+  expect(disarm).toHaveBeenCalledTimes(1);
+});
+
+test('disarm budgets are configurable and separate for clients behind the trusted proxy', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const { port } = await start({ rateLimitPerMinute: 1, disarmRateLimitPerMinute: 1, trustProxyHops: 1 });
+  const one = { 'X-Forwarded-For': '198.51.100.1' };
+  const two = { 'X-Forwarded-For': '198.51.100.2' };
+  expect((await call(port, '/disarm', { headers: one })).status).toBe(200);
+  expect((await call(port, '/disarm', { headers: one })).status).toBe(429);
+  expect((await call(port, '/disarm', { headers: two })).status).toBe(200);
+  expect((await call(port, '/healthz', { headers: one })).status).toBe(200);
+});
+
+test('approval outcomes and the approved page explain the configured watcher check delay', async () => {
+  const svc = service();
+  const { port } = await start({ service: svc, watcherCheckMinutes: 3 });
+  const outcome = 'Approved. The watcher will carry this out on its next check (within about 3 minutes).';
+  const approved = await call(port, '/a/action-1/assert', { ...post, body: assertion });
+  expect(JSON.parse(approved.body).text).toBe(outcome);
+  svc.describe.mockResolvedValue({ digest, kind: 'rotate', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status: 'approved' } as never);
+  const page = await call(port, '/a/action-1');
+  expect(page.body).toContain(outcome);
+  expect(page.body).toContain('disabled');
+});
+
+test('executed and superseded pages distinguish their terminal outcomes', async () => {
+  const svc = service();
+  const { port } = await start({ service: svc });
+  for (const [status, text] of [
+    ['executed', 'Executed. The watcher has carried out this action.'],
+    ['superseded', 'This request was replaced by a newer version.'],
+  ]) {
+    svc.describe.mockResolvedValue({ digest, kind: 'rotate', keyCount: 3, expiresAt: '2026-10-27T12:10:00.000Z', status } as never);
+    const page = await call(port, '/a/action-1');
+    expect(page.body).toContain(text);
+    expect(page.body).toContain('disabled');
+  }
+});
+
 test('forwarded addresses cannot bypass the bucket unless exactly one proxy hop is trusted', async () => {
   const local = await start({ rateLimitPerMinute: 1 });
   expect((await call(local.port, '/healthz', { headers: { 'X-Forwarded-For': '198.51.100.1' } })).status).toBe(200);
@@ -253,6 +369,26 @@ test('forwarded addresses cannot bypass the bucket unless exactly one proxy hop 
   expect((await call(proxied.port, '/healthz', { headers: { 'X-Forwarded-For': '198.51.100.1, 198.51.100.20' } })).status).toBe(200);
   expect((await call(proxied.port, '/healthz', { headers: { 'X-Forwarded-For': '198.51.100.2, 198.51.100.20' } })).status).toBe(429);
   expect((await call(proxied.port, '/healthz', { headers: { 'X-Forwarded-For': '198.51.100.21' } })).status).toBe(200);
+});
+
+test('invalid or oversized forwarding headers fall back to the socket client budget', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const { port } = await start({ rateLimitPerMinute: 1, trustProxyHops: 1 });
+  expect((await call(port, '/healthz')).status).toBe(200);
+  for (const forwarded of ['198.51.100.1, invalid', 'not-an-address', '198.51.100.1,' + ' '.repeat(4096) + '198.51.100.2']) {
+    expect((await call(port, '/healthz', { headers: { 'X-Forwarded-For': forwarded } })).status).toBe(429);
+  }
+});
+
+test('expectation handling charges the selected route budget', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const { port } = await start({ rateLimitPerMinute: 1, disarmRateLimitPerMinute: 1 });
+  expect((await call(port, '/healthz')).status).toBe(200);
+  const response = await call(port, '/disarm', {
+    method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/x-www-form-urlencoded', Expect: '100-continue' }, body: 'confirm=DISARM',
+  });
+  expect(response.status).toBe(417);
+  expect((await call(port, '/disarm')).status).toBe(429);
 });
 
 test('HTTP localhost omits HSTS and invalid public origins are refused', async () => {
@@ -267,7 +403,7 @@ test('static approval script performs the passkey ceremony and shows the result 
   const { port } = await start();
   const script = (await call(port, '/static/approve.js')).body;
   let click: (() => Promise<void>) | undefined;
-  const button = { disabled: false, addEventListener: (_event: string, fn: () => Promise<void>) => { click = fn; } };
+  const button = { disabled: false, dataset: { digest }, addEventListener: (_event: string, fn: () => Promise<void>) => { click = fn; } };
   const result = { textContent: '' };
   const fetches: { path: string; options: { body: string } }[] = [];
   let requested: unknown;
@@ -290,6 +426,7 @@ test('static approval script performs the passkey ceremony and shows the result 
   await click!();
   expect(requested).toMatchObject({ publicKey: { rpId: 'approvals.example.org', userVerification: 'required' } });
   expect(fetches.map((item) => item.path)).toEqual(['/a/action-1/challenge', '/a/action-1/assert']);
-  expect(JSON.parse(fetches[1]!.options.body)).toEqual({ credentialId: 'Y3JlZA', clientDataJSON: 'Y2xpZW50', authenticatorData: 'YXV0aA', signature: 'c2ln' });
+  expect(JSON.parse(fetches[0]!.options.body)).toEqual({ digest });
+  expect(JSON.parse(fetches[1]!.options.body)).toEqual({ digest, credentialId: 'Y3JlZA', clientDataJSON: 'Y2xpZW50', authenticatorData: 'YXV0aA', signature: 'c2ln' });
   expect(result.textContent).toBe('Approved.');
 });

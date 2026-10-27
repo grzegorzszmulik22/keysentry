@@ -3,13 +3,19 @@ import { z } from 'zod';
 import type { StateStore } from '../core/store.js';
 import type { ApprovalGrant, ApprovalRequest, AuditEvent } from '../types.js';
 
-export type ApprovalStatus = 'pending' | 'approved' | 'expired' | 'rejected';
+export type ApprovalStatus = 'pending' | 'approved' | 'expired' | 'rejected' | 'superseded' | 'executed';
+export interface ApprovalCluster { clusterId: string; hint: string | null }
+export interface ApprovalAction { id: string; kind: string; clusterIds: string[]; clusters?: ApprovalCluster[]; planHash?: string }
 export interface StoredApproval extends ApprovalRequest {
   kind: string;
   keyCount: number;
   status: ApprovalStatus;
   attempts: number;
   grant?: ApprovalGrant;
+  /** Absent on requests saved before action metadata was retained. */
+  action?: ApprovalAction;
+  clusters?: ApprovalCluster[];
+  executedAt?: string;
 }
 export interface ApprovalState {
   v: 1;
@@ -21,6 +27,9 @@ export interface ApprovalState {
 }
 
 const date = z.string().datetime();
+const cluster = z.object({ clusterId: z.string().min(1).max(512), hint: z.string().max(80).nullable() }).strict();
+const action = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), kind: z.string().min(1).max(80),
+  clusterIds: z.array(z.string().min(1).max(512)).max(10000), clusters: z.array(cluster).max(10000).optional(), planHash: z.string().max(512).optional() }).strict();
 const grant = z.object({ actionId: z.string(), digest: z.string().regex(/^[a-f0-9]{64}$/), at: date,
   by: z.discriminatedUnion('kind', [z.object({ kind: z.literal('passkey'), credentialId: z.string() }).strict(), z.object({ kind: z.literal('device'), keyId: z.string() }).strict()]) }).strict();
 const stateSchema = z.object({
@@ -28,8 +37,9 @@ const stateSchema = z.object({
   requests: z.array(z.object({
     actionId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), digest: z.string().regex(/^[a-f0-9]{64}$/), createdAt: date, expiresAt: date,
     challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/), widening: z.boolean(), kind: z.string().min(1).max(80),
-    keyCount: z.number().int().min(0).max(10000), status: z.enum(['pending', 'approved', 'expired', 'rejected']),
+    keyCount: z.number().int().min(0).max(10000), status: z.enum(['pending', 'approved', 'expired', 'rejected', 'superseded', 'executed']),
     attempts: z.number().int().min(0).max(5), grant: grant.optional(),
+    action: action.optional(), clusters: z.array(cluster).max(10000).optional(), executedAt: date.optional(),
   }).strict()),
   usedChallenges: z.array(z.string().regex(/^[A-Za-z0-9_-]{43}$/)),
   usedDeviceApprovals: z.array(z.string().regex(/^[a-f0-9]{64}$/)),
@@ -50,7 +60,8 @@ export function transactApprovals<T>(store: StateStore, operation: (state: Appro
       const parsed = stateSchema.safeParse(raw);
       if (!parsed.success) throw new Error('Saved approval state could not be read.');
       state = parsed.data;
-      if (new Set(state.requests.map((r) => r.actionId)).size !== state.requests.length || new Set(state.requests.map((r) => r.challenge)).size !== state.requests.length) {
+      const current = state.requests.filter((r) => r.status !== 'superseded');
+      if (new Set(current.map((r) => r.actionId)).size !== current.length || new Set(state.requests.map((r) => r.challenge)).size !== state.requests.length) {
         throw new Error('Saved approval state could not be read.');
       }
     }
