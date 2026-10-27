@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock('node:child_process', () => ({ spawn }));
+// The shared version query is covered with real helper integration in index-file.test.ts.
+vi.mock('../../src/firstrun/git.js', () => ({ gitScanOptions: async () => ['--no-lazy-fetch'] }));
 import { defaultGitRunner } from '../../src/guard/guard.js';
 
 function fakeChild() {
@@ -36,11 +38,12 @@ describe('default staged diff runner', () => {
     expect(result).toEqual({ code: 0 });
     const [command, args, opts] = spawn.mock.calls[0]!;
     expect(command).toBe('git');
-    expect(args).toEqual(['-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', 'diff', '--cached']);
+    expect(args).toEqual(['--no-lazy-fetch', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', 'diff', '--cached']);
     expect(opts).toMatchObject({ cwd: 'test-root', shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
     expect(Object.keys(opts.env).sort()).toEqual(Object.keys(opts.env).filter((key) => [
       'PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT',
       'GIT_PAGER', 'GIT_OPTIONAL_LOCKS', 'LC_ALL',
+      'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     ].includes(key)).sort());
     expect(opts.env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
       GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' });

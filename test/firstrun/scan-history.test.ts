@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { defaultGitRunner, scanHistory, type GitRunner } from '../../src/firstrun/scan-history.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { scanHistory, type GitRunner } from '../../src/firstrun/scan-history.js';
 
 const spawn = vi.hoisted(() => vi.fn());
 vi.mock('node:child_process', () => ({ spawn }));
@@ -22,7 +22,7 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); spawn.mockReset(); }
 describe('first-run history', () => {
   it('classifies only added lines and records the path, line, commit and time', async () => {
     const git: GitRunner = async (args, opts) => {
-      expect(args).toEqual(['log', '--all', '-p', '--no-color', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--src-prefix=a/', '--dst-prefix=b/', '-U0', '--diff-filter=AM', '--format=%x00%H%x00%cI']);
+      expect(args).toEqual(['log', '--all', '-p', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--src-prefix=a/', '--dst-prefix=b/', '-U0', '--diff-filter=AM', '--format=%x00%H%x00%cI']);
       expect(opts.cwd).toBe('/project');
       return stream([header(), 'diff --git a/.env b/.env', '--- a/.env', '+++ b/.env', '@@ -0,0 +7,3 @@',
         `-REMOVED=${key}`, `+export OPENAI_API_KEY="${key}" # inline`, '+PORT=3000', '+API_TOKEN=${API_TOKEN}',
@@ -102,6 +102,16 @@ describe('first-run history', () => {
     expect(result.hits[0]).toMatchObject({ path: '.env', line: 2 });
   });
 
+  it('scans text marked binary or -diff in attributes while still skipping NUL content', async () => {
+    const git: GitRunner = async (args, opts) => stream(args.includes('--text') ? [
+      header(), 'diff --git a/config.json b/config.json', '+++ b/config.json', '@@ -0,0 +1 @@', `+{"API_KEY":"${key}"}`,
+      'diff --git a/blob b/blob', '+++ b/blob', '@@ -0,0 +1 @@', `+NUL\0API_KEY=${key}`,
+    ] : [header(), 'diff --git a/config.json b/config.json', 'Binary files /dev/null and b/config.json differ'])(args, opts);
+    const result = await scanHistory('/project', { git });
+    expect(result.complete).toBe(true);
+    expect(result.hits).toMatchObject([{ kind: 'history', path: 'config.json', provider: 'openai', value: key }]);
+  });
+
   it('returns an incomplete local scan when git is missing or fails without reflecting errors', async () => {
     const result = await scanHistory('/project', { git: async () => { throw new Error(key); } });
     expect(result).toMatchObject({ commits: 0, complete: false, hits: [] });
@@ -137,9 +147,20 @@ describe('first-run history', () => {
 });
 
 describe('default git runner', () => {
+  let defaultGitRunner: GitRunner;
+  let scanDefaultHistory: typeof scanHistory;
+  beforeEach(async () => {
+    vi.resetModules();
+    ({ defaultGitRunner, scanHistory: scanDefaultHistory } = await import('../../src/firstrun/scan-history.js'));
+  });
   function child() {
     const process = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true) });
-    spawn.mockReturnValue(process);
+    spawn.mockImplementation((_command: string, args: string[]) => {
+      if (!args.includes('version')) return process;
+      const version = Object.assign(new EventEmitter(), { stdout: new PassThrough(), kill: vi.fn(() => true) });
+      queueMicrotask(() => { version.stdout.end('git version 2.45.0\n'); version.emit('close', 0); });
+      return version;
+    });
     return process;
   }
 
@@ -155,7 +176,7 @@ describe('default git runner', () => {
     proc.emit('close', 0);
     expect(await promise).toEqual({ code: 0 });
     expect(lines).toEqual(['one', 'two', 'last']);
-    const [command, args, opts] = spawn.mock.calls[0]!;
+    const [command, args, opts] = spawn.mock.calls.find(([, args]) => (args as string[]).includes('log'))!;
     expect(command).toBe('git');
     expect(args).toEqual(['--no-lazy-fetch', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', 'log', '--all']);
     expect(opts).toMatchObject({ cwd: '/project', shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -169,6 +190,7 @@ describe('default git runner', () => {
     const proc = child();
     const controller = new AbortController();
     const promise = defaultGitRunner(['log'], { cwd: '/project', onLine: () => undefined, signal: controller.signal });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     controller.abort();
     proc.emit('error', new Error(key));
     expect(await promise).toEqual({ code: 1 });
@@ -177,7 +199,7 @@ describe('default git runner', () => {
 
   it('preserves added-line numbers after skipping oversized streamed diff lines', async () => {
     const proc = child();
-    const promise = scanHistory('/project');
+    const promise = scanDefaultHistory('/project');
     proc.stdout.write(`${header()}\n+++ b/.env\n@@ -0,0 +1,2 @@\n+KEY=`);
     for (let index = 0; index < 10; index++) proc.stdout.write('x'.repeat(4096));
     proc.stdout.end(`\n+KEY=${key}\n`);

@@ -35,7 +35,8 @@ test('every https literal in network-calling modules is allow-listed or display-
       for (const match of source.matchAll(/https:\/\/([^/'"\s`<>]+)/g)) {
         literals++;
         checked++;
-        const authority = match[1]!;
+        // Literals in comments may be followed by sentence punctuation that is not part of the host.
+        const authority = match[1]!.replace(/[).,;:]+$/, '');
         const hosts = authority.includes('${') ? templateHosts[authority] : [new URL(`https://${authority}`).hostname];
         expect(hosts, `Unreviewed URL host template in ${path}: ${authority}`).toBeDefined();
         for (const host of hosts ?? []) {

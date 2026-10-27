@@ -5,6 +5,7 @@ import { lstat, open } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { classify, createRedactor, makeHint } from '../core/index.js';
+import { gitScanOptions } from '../firstrun/git.js';
 import type { ProviderId } from '../types.js';
 
 export type GitRunner = (args: string[], opts: {
@@ -21,8 +22,15 @@ const GIT_ERROR = 'Unable to check staged changes. The commit was not checked.';
 
 /** Small streaming runner, independent of the parallel first-run module. */
 export const defaultGitRunner: GitRunner = async (args, opts) => {
+  if (opts.signal.aborted) throw new Error(GIT_ERROR);
+  let scanOptions: string[];
+  try { scanOptions = await gitScanOptions(opts); }
+  catch { throw new Error(GIT_ERROR); }
   const env: NodeJS.ProcessEnv = {};
-  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE']) {
+  // Git hooks can commit a temporary index and use relocated repository/object
+  // directories. Keep this context while excluding executable/config overrides.
+  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'GIT_INDEX_FILE',
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
     const key = Object.keys(process.env).find((key) => key.toLowerCase() === name.toLowerCase());
     if (key !== undefined) env[name] = process.env[key];
   }
@@ -32,7 +40,7 @@ export const defaultGitRunner: GitRunner = async (args, opts) => {
   });
   return new Promise<{ code: number }>((fulfil, reject) => {
     if (opts.signal.aborted) { reject(new Error(GIT_ERROR)); return; }
-    const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+    const child = spawn('git', [...scanOptions, '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
       '-c', 'core.fsmonitor=false', ...args], {
       cwd: opts.cwd, shell: false, windowsHide: true, env, stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -237,6 +245,7 @@ export async function guardStaged(root: string, git: GitRunner = defaultGitRunne
   let pathAllowed = false;
   let pem: { line: number; type: string; value: string } | null = null;
   function scanAdded(text: string, addedLine: number): void {
+    if (text.includes('\0')) { pem = null; return; }
     const seen = new Set<string>();
     function check(name: string, value: string, location = addedLine): void {
       const detected = classify(name, value);
@@ -299,7 +308,7 @@ export async function guardStaged(root: string, git: GitRunner = defaultGitRunne
   const timer = setTimeout(() => controller.abort(), 20_000);
   timer.unref();
   try {
-    const result = await git(['diff', '--cached', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
+    const result = await git(['diff', '--cached', '--text', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
       '--src-prefix=a/', '--dst-prefix=b/', '--'], { cwd: resolve(root), onLine, signal: controller.signal });
     if (result.code !== 0 || controller.signal.aborted || oldLeft > 0 || newLeft > 0) throw new Error(GIT_ERROR);
   } catch { throw new Error(GIT_ERROR); }

@@ -1,13 +1,21 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import { classifyCandidate, extractCandidates, isDotenvPath, isTemplate, type RawHit } from './scan-files.js';
+import { gitScanOptions, GitVersionError } from './git.js';
 
 export type GitRunner = (args: string[], opts: { cwd: string; onLine: (line: string) => void; signal: AbortSignal }) => Promise<{ code: number }>;
 export interface HistoryScan { commits: number; complete: boolean; hits: RawHit[]; note?: string }
 const MAX_LINE_BYTES = 4096;
 
 /** Git output stays in a bounded line buffer; stderr is drained without retaining or printing it. */
-export const defaultGitRunner: GitRunner = (args, opts) => new Promise((resolve) => {
+export const defaultGitRunner: GitRunner = async (args, opts) => {
+  let scanOptions: string[];
+  try { scanOptions = await gitScanOptions(opts); }
+  catch (error) {
+    if (error instanceof GitVersionError) throw error;
+    return { code: 1 };
+  }
+  return new Promise((resolve) => {
   if (opts.signal.aborted) { resolve({ code: 1 }); return; }
   const env: NodeJS.ProcessEnv = {};
   for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE']) {
@@ -17,7 +25,7 @@ export const defaultGitRunner: GitRunner = (args, opts) => new Promise((resolve)
   Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' });
   let child: ChildProcessByStdio<null, Readable, Readable>;
   try {
-    child = spawn('git', ['--no-lazy-fetch', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', ...args], {
+    child = spawn('git', [...scanOptions, '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', ...args], {
       cwd: opts.cwd, env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch { resolve({ code: 1 }); return; }
@@ -77,7 +85,8 @@ export const defaultGitRunner: GitRunner = (args, opts) => new Promise((resolve)
   child.once('close', (code) => { clearTimeout(killTimer); finish(code ?? 1); });
   opts.signal.addEventListener('abort', abort, { once: true });
   if (opts.signal.aborted) abort();
-});
+  });
+};
 
 function gitPath(text: string): string | null {
   let path = text;
@@ -181,7 +190,7 @@ export async function scanHistory(root: string, opts: { budgetMs?: number; maxCo
       removeAbort = () => controller.signal.removeEventListener('abort', stop);
     });
     const git = opts.git ?? defaultGitRunner;
-    const execution = git(['log', '--all', '-p', '--no-color', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--src-prefix=a/', '--dst-prefix=b/', '-U0', '--diff-filter=AM', '--format=%x00%H%x00%cI'], {
+    const execution = git(['log', '--all', '-p', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--src-prefix=a/', '--dst-prefix=b/', '-U0', '--diff-filter=AM', '--format=%x00%H%x00%cI'], {
       cwd: root, onLine, signal: controller.signal,
     });
     const { code } = await Promise.race([execution, aborted]);
@@ -189,7 +198,10 @@ export async function scanHistory(root: string, opts: { budgetMs?: number; maxCo
     if (!result.complete) result.note = controller.signal.aborted
       ? `Git history scan stopped; scanned the last ${result.commits} commits.`
       : `Git history is unavailable or incomplete; scanned ${result.commits} commits.`;
-  } catch { result.note = `Git history is unavailable or incomplete; scanned ${result.commits} commits.`; }
+  } catch (error) {
+    result.note = error instanceof GitVersionError ? error.message
+      : `Git history is unavailable or incomplete; scanned ${result.commits} commits.`;
+  }
   finally { accepting = false; multiline = null; clearTimeout(timer); removeAbort(); }
   return result;
 }

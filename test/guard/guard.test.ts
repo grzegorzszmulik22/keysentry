@@ -45,6 +45,18 @@ describe('staged guard', () => {
     expect(invoked).not.toContain(openai);
   });
 
+  it('scans text marked binary or -diff by attributes and skips NUL content', async () => {
+    const git: GitRunner = async (args, opts) => {
+      const source = args.includes('--text')
+        ? [diff('binary.env', [`KEY=${openai}`]), diff('no-diff.env', [`KEY=${github}`]),
+          diff('blob.bin', [`\0KEY=${openai}`])].join('\n')
+        : 'diff --git a/binary.env b/binary.env\nBinary files a/binary.env and b/binary.env differ';
+      for (const line of source.split('\n')) opts.onLine(line);
+      return { code: 0 };
+    };
+    expect((await guardStaged(root, git)).blocked.map(({ path }) => path)).toEqual(['binary.env', 'no-diff.env']);
+  });
+
   it('counts new-side lines across deletions and several hunks and ignores removed values', async () => {
     const source = ['diff --git a/.env b/.env', '--- a/.env', '+++ b/.env', '@@ -2,2 +2,1 @@',
       `-OPENAI_API_KEY=${openai}`, '-OLD=1', '+PORT=3000', '@@ -20,0 +20,2 @@',

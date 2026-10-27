@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
-import { chmod, link, lstat, mkdir, open, readFile, unlink } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { constants } from 'node:fs';
+import { access, chmod, link, lstat, mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { GitRunner } from './guard.js';
 
@@ -118,10 +119,31 @@ async function isOwnHook(path: string, size: number): Promise<boolean> {
   return size === Buffer.byteLength(HOOK) && await readFile(path, 'utf8') === HOOK;
 }
 
+/** Check the executable lookup without running a command or shell. */
+async function keysentryOnPath(root: string): Promise<boolean> {
+  const pathEntry = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'path');
+  if (pathEntry?.[1] === undefined) return false;
+  // The fixed hook uses POSIX sh, including Git for Windows. Its lookup does
+  // not use cmd.exe's PATHEXT expansion for .cmd/.bat wrappers.
+  const extensions = process.platform === 'win32' ? ['', '.exe'] : [''];
+  for (const entry of pathEntry[1].split(delimiter)) {
+    const directory = process.platform === 'win32' ? entry.replace(/^"(.*)"$/, '$1') : entry;
+    for (const extension of extensions) {
+      const candidate = resolve(root, directory, `keysentry${extension}`);
+      try {
+        if (!(await stat(candidate)).isFile()) continue;
+        await access(candidate, constants.X_OK);
+        return true;
+      } catch { /* Missing or non-executable entries do not resolve the command. */ }
+    }
+  }
+  return false;
+}
+
 export async function installHook(
   root: string,
   opts: { force?: boolean; binPath: string; git?: GitRunner },
-): Promise<{ path: string; replaced: boolean }> {
+): Promise<{ path: string; replaced: boolean; onPath: boolean }> {
   const path = await hookPath(root, opts.git ?? queryGit);
   const current = await existing(path);
   const backup = `${path}.keysentry-backup`;
@@ -131,10 +153,9 @@ export async function installHook(
     if (!current.isFile()) throw new Error('The existing pre-commit hook is not a regular file; it was left unchanged.');
     if (await isOwnHook(path, current.size)) {
       if (process.platform !== 'win32') {
-        await chmod(dirname(path), 0o755);
         await chmod(path, 0o755);
       }
-      return { path, replaced: false };
+      return { path, replaced: false, onPath: await keysentryOnPath(resolve(root)) };
     }
     if (!opts.force) throw new Error('An existing pre-commit hook was left unchanged. Use --force to preserve and replace it.');
     if (await existing(backup)) throw new Error('A pre-commit.keysentry-backup already exists; the existing hook was left unchanged.');
@@ -146,7 +167,6 @@ export async function installHook(
   }
 
   await mkdir(dirname(path), { recursive: true, mode: 0o755 });
-  if (process.platform !== 'win32') await chmod(dirname(path), 0o755);
   try {
     const file = await open(path, 'wx', 0o755);
     try {
@@ -165,7 +185,7 @@ export async function installHook(
   if (replaced) {
     console.warn('The previous hook is preserved as pre-commit.keysentry-backup. To run both checks, call that backup from a custom pre-commit hook before keysentry guard --staged.');
   }
-  return { path, replaced };
+  return { path, replaced, onPath: await keysentryOnPath(resolve(root)) };
 }
 
 export async function uninstallHook(root: string, git: GitRunner = queryGit): Promise<void> {

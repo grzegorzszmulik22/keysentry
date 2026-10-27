@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { installHook, uninstallHook } from '../../src/guard/hook.js';
@@ -35,15 +35,17 @@ describe('pre-commit hook installation', () => {
   let root: string;
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'keysentry-hook-'));
+    vi.stubEnv('PATH', root);
   });
   afterEach(async () => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
   it('installs fixed readable hook text without interpolating binPath', async () => {
     const result = await installHook(root, { binPath: '/private/user/$(touch bad); keysentry', git: fakeGit() });
-    expect(result).toEqual({ path: join(root, '.git', 'hooks', 'pre-commit'), replaced: false });
+    expect(result).toEqual({ path: join(root, '.git', 'hooks', 'pre-commit'), replaced: false, onPath: false });
     expect(await readFile(result.path, 'utf8')).toBe(SCRIPT);
     if (process.platform !== 'win32') {
       expect((await stat(result.path)).mode & 0o777).toBe(0o755);
@@ -87,7 +89,7 @@ describe('pre-commit hook installation', () => {
     await writeFile(hook, '#!/bin/sh\necho existing\n', { mode: 0o751 });
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const result = await installHook(root, { force: true, binPath: 'keysentry', git: fakeGit() });
-    expect(result).toEqual({ path: hook, replaced: true });
+    expect(result).toEqual({ path: hook, replaced: true, onPath: false });
     expect(await readFile(`${hook}.keysentry-backup`, 'utf8')).toBe('#!/bin/sh\necho existing\n');
     expect(await readFile(hook, 'utf8')).toBe(SCRIPT);
     expect(warning).toHaveBeenCalledWith(expect.stringMatching(/pre-commit\.keysentry-backup.*before.*keysentry|before.*keysentry.*pre-commit\.keysentry-backup/i));
@@ -107,7 +109,7 @@ describe('pre-commit hook installation', () => {
     const opts = { binPath: 'keysentry', git: fakeGit() };
     const first = await installHook(root, opts);
     await writeFile(`${first.path}.keysentry-backup`, 'preserved');
-    expect(await installHook(root, opts)).toEqual({ path: first.path, replaced: false });
+    expect(await installHook(root, opts)).toEqual({ path: first.path, replaced: false, onPath: false });
     expect(await readFile(`${first.path}.keysentry-backup`, 'utf8')).toBe('preserved');
   });
 
@@ -121,6 +123,47 @@ describe('pre-commit hook installation', () => {
     await expect(installHook(root, { force: true, binPath: 'keysentry', git: fakeGit() })).rejects.toThrow(/symbolic link|symlink/i);
     expect((await lstat(hook)).isSymbolicLink()).toBe(true);
     expect(await readFile(join(target, 'kept'), 'utf8')).toBe('unchanged');
+  });
+
+  it('reports when keysentry can be resolved on PATH, including an idempotent install', async () => {
+    const executable = join(root, process.platform === 'win32' ? 'keysentry.exe' : 'keysentry');
+    await writeFile(executable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const opts = { binPath: 'an-unrelated-binary', git: fakeGit() };
+    expect(await installHook(root, opts)).toMatchObject({ onPath: true });
+    await rm(executable);
+    expect(await installHook(root, opts)).toMatchObject({ onPath: false });
+  });
+
+  it('does not mistake a cmd-only wrapper for the command used by the POSIX hook', async () => {
+    await writeFile(join(root, 'keysentry.cmd'), '@echo off\r\nexit /b 0\r\n');
+    vi.stubEnv('PATHEXT', '.COM;.EXE;.BAT;.CMD');
+    expect(await installHook(root, { binPath: 'keysentry', git: fakeGit() })).toMatchObject({ onPath: false });
+  });
+
+  it('does not treat a directory or a non-executable file as a PATH command', async () => {
+    await mkdir(join(root, 'keysentry'));
+    const opts = { binPath: 'keysentry', git: fakeGit() };
+    expect(await installHook(root, opts)).toMatchObject({ onPath: false });
+    if (process.platform !== 'win32') {
+      await rm(join(root, 'keysentry'), { recursive: true });
+      await writeFile(join(root, 'keysentry'), '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+      expect(await installHook(root, opts)).toMatchObject({ onPath: false });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('preserves existing hooks-directory modes for new, repeated and forced installs', async () => {
+    const configured = join(root, 'shared-hooks');
+    await mkdir(configured);
+    await chmod(configured, 0o700);
+    const opts = { binPath: 'keysentry', git: fakeGit('.git', configured) };
+    const first = await installHook(root, opts);
+    expect((await stat(configured)).mode & 0o777).toBe(0o700);
+    await installHook(root, opts);
+    expect((await stat(configured)).mode & 0o777).toBe(0o700);
+    await writeFile(first.path, '#!/bin/sh\nexit 0\n');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await installHook(root, { ...opts, force: true });
+    expect((await stat(configured)).mode & 0o777).toBe(0o700);
   });
 
   it('refuses an existing backup symlink without changing the hook', async () => {
