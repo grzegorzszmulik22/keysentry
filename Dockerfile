@@ -17,7 +17,7 @@ LABEL org.opencontainers.image.source="https://github.com/grzenio22/keysentry" \
 WORKDIR /app
 COPY --from=build /build/dist-release/out/keysentry.mjs /build/dist-release/out/release-manifest.json /app/
 COPY --from=build /build/LICENSE /build/NOTICE /app/
-COPY --from=build --chown=65532:65532 /watcher-state/ /data/
+COPY --from=build --chown=65532:65532 --chmod=0700 /watcher-state/ /data/
 ENV KEYSENTRY_STATE_DIR=/data KEYSENTRY_VAULT=encrypted-file NODE_ENV=production
 USER 65532
 VOLUME /data

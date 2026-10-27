@@ -31,7 +31,7 @@ describe('watcher deployment contracts (static; no Docker or platform calls)', (
     expect(final.match(/^COPY .+$/gm)).toEqual([
       'COPY --from=build /build/dist-release/out/keysentry.mjs /build/dist-release/out/release-manifest.json /app/',
       'COPY --from=build /build/LICENSE /build/NOTICE /app/',
-      'COPY --from=build --chown=65532:65532 /watcher-state/ /data/',
+      'COPY --from=build --chown=65532:65532 --chmod=0700 /watcher-state/ /data/',
     ]);
     expect(dockerfile).toContain('chmod 0700 /watcher-state');
     expect(final).toContain('KEYSENTRY_STATE_DIR=/data');
