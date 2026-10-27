@@ -308,6 +308,12 @@ export interface RotationReport {
   deployments: { serviceKey: string; deploymentId: string | null; state: DeployState | 'skipped' | 'unconfirmed' }[];
   /** Human-readable diff of planned writes (names and hints only). */
   diff: string[];
+  /** Overall outcome (phase 1: optional until every producer sets it). */
+  status?: 'complete' | 'grace-pending' | 'partial' | 'failed' | 'dry-run';
+  /** Old keys kept valid during the grace period; `keysentry finish` or `undo` settles them. */
+  pendingRevocations?: { clusterId: string; deadline: string; undoAvailable: boolean }[];
+  /** Keys that may exist at a provider without being recorded (crash between create and store). Never revoked by guesswork. */
+  orphanSuspects?: { clusterId: string; provider: ProviderId; keyRef: string; createdAt?: string }[];
 }
 
 export interface JournalEntry {
@@ -315,7 +321,23 @@ export interface JournalEntry {
   planId: string;
   clusterId?: string;
   serviceKey?: string;
-  event: 'plan-start' | 'created' | 'written' | 'redeploy' | 'deploy-result' | 'verified' | 'revoked' | 'failed' | 'plan-end';
+  event:
+    | 'plan-start'
+    | 'created'
+    | 'written'
+    | 'redeploy'
+    | 'deploy-result'
+    | 'verified'
+    | 'revoked'
+    | 'failed'
+    | 'plan-end'
+    | 'value-stored'
+    | 'grace-start'
+    | 'grace-end'
+    | 'undo'
+    | 'resume'
+    | 'shredded'
+    | 'orphan-suspected';
   data?: Record<string, unknown>;
 }
 
@@ -398,3 +420,102 @@ export class RotationAbortedError extends Error {
 export interface Notifier {
   notify(title: string, body: string, signal?: Signal): Promise<void>;
 }
+
+// ---------------------------------------------------------------- phase 1: vault
+export type VaultBackendId = 'macos-keychain' | 'windows-dpapi' | 'linux-secret-service' | 'encrypted-file' | 'env' | 'memory';
+
+/** Where keysentry keeps its own keys and the user's tokens. Values are opaque bytes. */
+export interface Vault {
+  readonly backend: VaultBackendId;
+  /** Plain-English note shown by doctor when the backend is weaker than an OS credential store. */
+  readonly weakness?: string;
+  get(name: string): Promise<Buffer | null>;
+  set(name: string, value: Buffer): Promise<void>;
+  delete(name: string): Promise<boolean>;
+  list(prefix?: string): Promise<string[]>;
+}
+
+/** read: tokens used for scan and monitor; write: tokens used only after a human approves a change. */
+export type TokenRole = 'read' | 'write';
+
+export interface CredentialSource {
+  get(name: string, role: TokenRole): Promise<{ value: string; source: 'vault' | 'env' } | null>;
+}
+
+// ---------------------------------------------------------------- phase 1: security
+export interface StateCipher {
+  seal(kind: string, plaintext: Buffer): Buffer;
+  open(kind: string, sealed: Buffer): Buffer;
+}
+
+export interface AuditEvent {
+  kind: string;
+  summary: string;
+  data?: Record<string, unknown>;
+}
+
+export interface AuditVerifyResult {
+  ok: boolean;
+  entries: number;
+  checkpoints: number;
+  firstBadSeq?: number;
+  problem?: string;
+  truncatedSinceLastKnownHead?: boolean;
+}
+
+export interface AuditLog {
+  append(e: AuditEvent): Promise<void>;
+  checkpoint(): Promise<void>;
+  verify(): Promise<AuditVerifyResult>;
+}
+
+// ---------------------------------------------------------------- phase 1: network
+export interface EgressRule {
+  /** Exact host, or `*.example.com` for subdomains on a dot boundary. */
+  host: string;
+  purpose: string;
+  /** Host or provider id, `'feed'`, `'release'` or `'user'`. Redirects may only stay within one owner. */
+  owner: string;
+}
+
+export interface NetworkReceiptEntry {
+  at: string;
+  host: string;
+  method: string;
+  purpose: string;
+  allowed: boolean;
+  status?: number;
+}
+
+export interface NetworkReceipt {
+  record(e: NetworkReceiptEntry): Promise<void>;
+  summarize(sinceIso?: string): Promise<{ host: string; purpose: string; count: number; blocked: number; lastAt: string }[]>;
+}
+
+// ---------------------------------------------------------------- phase 1: in-flight values
+/** New and old secret values during a rotation, encrypted under a per-plan key and shredded when the plan ends. */
+export interface InFlightStore {
+  put(planId: string, slot: string, value: string): Promise<void>;
+  get(planId: string, slot: string): Promise<string | null>;
+  slots(planId: string): Promise<string[]>;
+  shred(planId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------- phase 1: rotation recovery
+export type GraceDecision = 'revoke' | 'undo' | 'defer';
+
+export interface GraceInfo {
+  planId: string;
+  deadline: string;
+  clusters: { clusterId: string; hint: string | null; undoAvailable: boolean }[];
+}
+
+export type CrashPoint =
+  | 'after-create'
+  | 'after-store'
+  | 'after-write'
+  | 'after-redeploy'
+  | 'after-deploy-result'
+  | 'after-verify'
+  | 'before-revoke'
+  | 'after-revoke';

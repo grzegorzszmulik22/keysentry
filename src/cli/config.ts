@@ -39,13 +39,13 @@ const repository = nonempty.refine(value => {
 /** Configuration intentionally has no fields for host or provider secrets. */
 export const configSchema = z.object({
   hosts: z.object({
-    railway: z.object({ enabled: z.boolean().optional(), projectIds: list.optional(), tokenType: z.enum(['account', 'project']).optional() }).strict().default({}),
-    vercel: z.object({ enabled: z.boolean().optional(), teamId: nonempty.optional(), targets: z.array(z.enum(['production', 'preview', 'development'])).min(1).optional() }).strict().default({}),
-    render: z.object({ enabled: z.boolean().optional() }).strict().default({}),
-    fly: z.object({ enabled: z.boolean().optional(), org: nonempty.optional(), apps: list.optional() }).strict().default({}),
-    github: z.object({ enabled: z.boolean().optional(), repos: z.array(repository).default([]) }).strict().default({}),
-    dotenv: z.object({ enabled: z.boolean().optional(), roots: list.default(['.']), includeTemplates: z.boolean().default(false) }).strict().default({}),
-  }).strict().default({}),
+    railway: z.object({ enabled: z.boolean().optional(), projectIds: list.optional(), tokenType: z.enum(['account', 'project']).optional() }).strict().prefault({}),
+    vercel: z.object({ enabled: z.boolean().optional(), teamId: nonempty.optional(), targets: z.array(z.enum(['production', 'preview', 'development'])).min(1).optional() }).strict().prefault({}),
+    render: z.object({ enabled: z.boolean().optional() }).strict().prefault({}),
+    fly: z.object({ enabled: z.boolean().optional(), org: nonempty.optional(), apps: list.optional() }).strict().prefault({}),
+    github: z.object({ enabled: z.boolean().optional(), repos: z.array(repository).default([]) }).strict().prefault({}),
+    dotenv: z.object({ enabled: z.boolean().optional(), roots: list.default(['.']), includeTemplates: z.boolean().default(false) }).strict().prefault({}),
+  }).strict().prefault({}),
   rotation: z.object({
     revoke: z.enum(['after-deploy', 'immediately', 'never']).default('after-deploy'),
     redeploy: z.boolean().default(true),
@@ -55,7 +55,7 @@ export const configSchema = z.object({
     verifyRetries: z.number().int().nonnegative().default(4),
     deployTimeoutMs: positive.int().default(600_000),
     pollIntervalMs: positive.int().default(5_000),
-  }).strict().default({}),
+  }).strict().prefault({}),
   monitor: z.object({
     interval: positive.default(300),
     autoExecute: z.boolean().default(false),
@@ -67,12 +67,12 @@ export const configSchema = z.object({
     rules: z.object({
       canary_triggered: rule.optional(), usage_anomaly: rule.optional(), leak_detected: rule.optional(),
       revoked_upstream: rule.optional(), host_breach_advisory: rule.optional(),
-    }).strict().default({}),
+    }).strict().prefault({}),
     feeds: z.array(z.object({ url: safeUrl, host: hostId.optional() }).strict()).optional(),
     github: z.object({ repos: z.array(repository).default([]) }).strict().optional(),
-    usage: z.object({ floorUsd: z.number().finite().nonnegative().optional(), hourlyBudgets: z.record(z.number().finite().nonnegative()).optional() }).strict().optional(),
+    usage: z.object({ floorUsd: z.number().finite().nonnegative().optional(), hourlyBudgets: z.record(z.string(), z.number().finite().nonnegative()).optional() }).strict().optional(),
     webhooks: z.array(safeUrl).default([]),
-  }).strict().default({}),
+  }).strict().prefault({}),
 }).strict();
 
 export type ConfigSettings = z.infer<typeof configSchema>;

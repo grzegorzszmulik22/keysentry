@@ -1,0 +1,12 @@
+keysentry
+Copyright 2026 The keysentry authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Release bundles include the following third-party packages, each under its own licence (MIT unless noted);
+their licence comments are kept inline in the bundle:
+- commander (MIT)
+- fast-xml-parser and its dependencies (MIT)
+- libsodium-wrappers / libsodium.js (ISC)
+- yaml (ISC)
+- zod (MIT)

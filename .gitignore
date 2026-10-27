@@ -3,3 +3,4 @@ dist/
 .keysentry/
 logs/
 *.log
+dist-release/
