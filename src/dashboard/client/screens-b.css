@@ -1,1 +1,23 @@
-/* screens-b: styles owned by dashboard task 6b */
+.screen-b { display: grid; gap: var(--space-6); min-width: 0; }
+.screen-b > p { margin-bottom: 0; }
+.b-section { min-width: 0; padding-block: var(--space-4); border-top: 1px solid var(--line); }
+.b-section > :last-child { margin-bottom: 0; }
+.b-form { max-width: 72ch; }
+.b-field { display: flex; flex-direction: column; gap: var(--space-2); max-width: 72ch; margin-block: var(--space-3); }
+.b-field:has(input[type="checkbox"]) { flex-direction: row-reverse; justify-content: flex-end; align-items: flex-start; gap: var(--space-3); }
+.b-field input[type="checkbox"] { flex-shrink: 0; width: 20px; height: 20px; margin-top: var(--space-1); accent-color: var(--brass); }
+.b-field > input:not([type="checkbox"]), .b-field > select { width: 100%; }
+.b-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin-block: var(--space-4); }
+.b-feedback:empty { display: none; }
+.screen-b fieldset { min-width: 0; margin: 0; padding: var(--space-4) var(--space-6); border: 1px solid var(--control-line); border-radius: var(--radius-control); }
+.screen-b legend { padding-inline: var(--space-2); font-weight: 600; }
+.b-countdown { display: flex; align-items: center; gap: var(--space-3); margin-block: var(--space-4); }
+.b-grace-ring { width: 48px; height: 48px; flex-shrink: 0; transform: rotate(-90deg); }
+.b-grace-ring circle { fill: none; stroke: var(--brass); stroke-width: 3; }
+.b-grace-ring.counting circle { transition: stroke-dashoffset 1s linear; }
+.b-readiness-card { display: block; width: 100%; max-width: 960px; height: auto; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface); }
+.b-cap-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: var(--space-3); }
+.b-cap-row > .b-field { flex: 1 1 160px; }
+.b-cap-row > .button { margin-bottom: var(--space-3); }
+@media (prefers-reduced-motion: reduce) { .b-grace-ring.counting circle { transition: none; } }
+@media (max-width: 480px) { .b-actions > .button { width: 100%; } .screen-b fieldset { padding: var(--space-3); } }

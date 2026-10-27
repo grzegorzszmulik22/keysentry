@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+// blob: images only: the readiness card preview is rendered as an <img> from a Blob URL of the SVG, never as markup.
+export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 export class DashboardError extends Error {
   constructor(readonly status: number, message: string) { super(message); this.name = 'DashboardError'; }

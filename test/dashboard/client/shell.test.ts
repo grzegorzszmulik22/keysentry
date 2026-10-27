@@ -20,7 +20,15 @@ beforeEach(() => {
   configureSession(session);
   vi.stubGlobal('crypto', webcrypto);
 });
-afterEach(() => { if (typeof disposeComponents === 'function') disposeComponents(document.body); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(async () => {
+  if (typeof disposeComponents === 'function') disposeComponents(document.body);
+  document.body.replaceChildren();
+  vi.useRealTimers();
+  // Screens registered at boot start their own requests; let them settle against this test's fetch stub before the
+  // next test installs its own, so no late request consumes another test's queued responses.
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  vi.unstubAllGlobals(); vi.restoreAllMocks();
+});
 
 describe('dashboard shell and routing', () => {
   it('fetches the session, renders navigation and placeholder screens', async () => {
@@ -44,7 +52,7 @@ describe('dashboard shell and routing', () => {
     const root = document.createElement('div'); document.body.append(root);
     const app = await boot(root);
     expect(root.textContent).toContain('Read-only');
-    expect(root.textContent).toContain('Changes are unavailable in this session.');
+    expect(root.textContent).toContain('To make changes, run keysentry ui in your own terminal.');
     expect([...root.querySelectorAll('button')].some(b => b.textContent === 'Register passkey')).toBe(false);
     app.destroy();
   });

@@ -34,7 +34,12 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   const main = document.createElement('main'); main.className = 'page'; main.id = 'main-content';
   skip.addEventListener('click', event => { event.preventDefault(); main.querySelector<HTMLElement>('h1')?.focus(); });
   if (session.readOnly) {
-    const readOnly = notice('info', 'Read-only', 'Changes are unavailable in this session.'); readOnly.classList.add('read-only-notice'); content.append(readOnly);
+    const readOnly = notice('info', 'Read-only', 'This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.'); readOnly.classList.add('read-only-notice');
+    // The router replaces page children on navigation; keep this notice below its heading.
+    new MutationObserver(() => {
+      const heading = main.querySelector('h1');
+      if (heading && heading.nextSibling !== readOnly) heading.after(readOnly);
+    }).observe(main, { childList: true });
   } else if (session.passkeys === 0) {
     const enrollment = notice('info', 'Register a passkey', 'Changes require a passkey with user verification. Register one on this device before making a change.');
     const status = document.createElement('p'); status.setAttribute('role', 'status');

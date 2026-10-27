@@ -177,7 +177,7 @@ describe('dashboard HTTP boundary', () => {
     const d = await start();
     const replies = [await req(d.port, '/'), await req(d.port, '/api/session'), await req(d.port, '/wrong', { headers: { Host: 'evil' } }), await req(d.port, `/${new URL(d.url).search}`)];
     for (const response of replies) {
-      expect(response.headers['content-security-policy']).toBe("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+      expect(response.headers['content-security-policy']).toBe("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
       expect(response.headers['x-content-type-options']).toBe('nosniff');
       expect(response.headers['referrer-policy']).toBe('no-referrer');
       expect(response.headers['cache-control']).toBe('no-store');

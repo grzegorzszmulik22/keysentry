@@ -57,3 +57,13 @@ read-only mode.
 | `settings/update` | `Partial<settings>` | the new settings |
 | `spend-limits/apply` | `{ clusterIds: string[] }` | `{ applied: { clusterId: string; limitUsd: number }[]; skipped: { clusterId: string; reason: string }[] }` |
 | `reveal` | `{ clusterId: string }` | `{ value: string }` (only for readable values; the screen masks it and offers copy with 30 s clipboard clear) |
+
+## Notification channel settings (`notifications/add`)
+
+Field names follow `src/notify/channels`: Telegram `botToken`, `chatId`; Discord and Slack `webhookUrl`; ntfy
+`server`, `topic`, optional `token`; generic webhook `url`; Resend `apiKey`, `from`, `to`; SMTP `host`, `port`
+(`"465"` or `"587"`, converted to a number by the handler), `username`, `password`, `from`, `to`; console: none.
+Secret fields (`botToken`, `webhookUrl`, `token`, `url`, `apiKey`, `password`) go to the vault, never to config. The
+handler validates every field again (the screen's checks are a convenience) and so do `autopilot/arm` (positive
+`maxServices`, `validDays` 1–365, `graceMinutes` ≥ 0, a drill in the last 24 hours) and `settings/update`.
+`autopilot/disarm` must also cancel any arming that is still in progress, so a disarm always wins.
