@@ -237,6 +237,12 @@ export interface ProviderAdapter {
   verify(value: string, ctx: ProviderContext): Promise<VerifyResult>;
   /** Required for auto, atomic-roll and generate methods. */
   rotate?(oldValue: string, ctx: ProviderContext): Promise<RotationResult>;
+  /**
+   * Create a replacement for the key identified by `oldKeyRef` without its plaintext (autopilot adoption of
+   * write-only consumers). Same owner, scope and limits as the old key where the provider exposes them; throws an
+   * error with code GUIDED_ROTATION_REQUIRED (before any mutation) when that cannot be guaranteed.
+   */
+  rotateByRef?(oldKeyRef: string, ctx: ProviderContext): Promise<RotationResult>;
   /** Revoke/disable a key by provider ref. Required for auto. */
   revoke?(keyRef: string, ctx: ProviderContext): Promise<void>;
   /** Shown for guided rotation and as a fallback when an automatic step fails. */
