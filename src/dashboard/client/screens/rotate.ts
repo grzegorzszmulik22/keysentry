@@ -2,6 +2,7 @@ import { get, post, postWithPasskey } from '../api.js';
 import type { DashboardSession } from '../api.js';
 import { button, confirmAction, emptyState, table } from '../components.js';
 import { actions, dateTime, el, field, input, lifetime, list, message, paragraph, scrollTable, section, status, taskButton } from './components-b.js';
+import { providerName } from './components-a.js';
 
 interface KeyChoice { id: string; provider: string; hint: string | null; method: string }
 interface Preview { planId: string; planHash: string; changes: string[]; steps: { clusterId: string; hint: string | null; method: string; services: string[] }[]; warnings: string[] }
@@ -18,7 +19,7 @@ export async function renderRotate(session: DashboardSession): Promise<HTMLEleme
   for (const key of keys) {
     const choice = input(key.id, 'checkbox'); choice.checked = key.id === preselected; if (choice.checked) selected.add(key.id);
     choice.addEventListener('change', () => { if (choice.checked) selected.add(key.id); else selected.delete(key.id); });
-    choices.append(field(`${key.provider} · ${key.hint ?? 'Hint unavailable'} · ${key.method}`, choice));
+    choices.append(field(`${providerName(key.provider)} · ${key.hint ?? 'Hint unavailable'} · ${key.method}`, choice));
   }
   if (!keys.length) choices.append(emptyState('No keys to rotate yet. Connect a platform and scan your keys.'));
   const previewDetail = el('div'); const progress = el('div'); let active = rotations.active; let progressSnapshot: string | undefined;

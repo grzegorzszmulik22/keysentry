@@ -10,6 +10,7 @@ import { createConsoleChannel, createDiscordChannel, createDispatcher, createNtf
 import { rulesForUserUrls } from '../net/index.js';
 import { promptVaultValue, type PromptIO } from './prompts.js';
 import { CliError } from './errors.js';
+import { configSchema } from './config.js';
 
 export interface NotifyChannelSettings {
   id: string; kind: NotifyChannelKind; server?: string; from?: string; to?: string[]; host?: string; port?: 465 | 587;
@@ -30,7 +31,84 @@ const kinds: readonly NotifyChannelKind[] = ['telegram', 'discord', 'slack', 'nt
 const identifier = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const secretName = (id: string, field: string) => `notify/${id}/${field}`;
 const messagePath = (store: StateStore) => join(store.paths.dir, 'notification-messages.json');
-interface MessageCache { messages: SignedNotifyMessage[]; lastSuccessAt: string | null }
+interface MessageCache { messages: SignedNotifyMessage[]; lastSuccessAt: string | null; channelSuccessAt?: Record<string, string> }
+
+/** Shared application operations for the terminal and passkey-gated dashboard. */
+export async function addNotificationChannel(context: NotificationContext, setting: NotifyChannelSettings, secrets: ReadonlyMap<string, string>): Promise<void> {
+  validId(setting.id);
+  if (!kinds.includes(setting.kind) || context.settings.length >= 50 || context.settings.some(item => item.id === setting.id) || (await context.vault.list(`notify/${setting.id}/`)).length) throw new CliError('That notification channel id cannot be added.');
+  if (!configSchema.safeParse({ notify: { channels: [setting] } }).success) throw new CliError('The notification channel settings are invalid.');
+  if (setting.kind === 'resend' || setting.kind === 'smtp') {
+    const email = (value: string) => /^[^<>\s@]+@[^<>\s@]+$/.test(value.match(/^[^<>]*<([^<>]+)>$/)?.[1] ?? value);
+    if (!setting.from || !email(setting.from) || !setting.to?.length || setting.to.length > 50 || setting.to.some(value => !email(value))) throw new CliError('Use valid sender and recipient email addresses.');
+  }
+  for (const [field, value] of secrets) {
+    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(field) || !value || Buffer.byteLength(value) > 16_384 || /[\x00-\x1f\x7f]/.test(value)) throw new CliError('The notification setting contains unsupported characters or is too long.');
+    context.redactor.register(value);
+  }
+  const staged: Vault = { ...context.vault, get: async name => {
+    const field = name.startsWith(`notify/${setting.id}/`) ? name.slice(`notify/${setting.id}/`.length) : undefined;
+    return field !== undefined && secrets.has(field) ? Buffer.from(secrets.get(field)!) : context.vault.get(name);
+  } };
+  await notificationEgress([setting], staged); await createNotificationChannels([setting], { ...context, vault: staged });
+  const written: string[] = [];
+  try {
+    for (const [field, secret] of secrets) {
+      const name = secretName(setting.id, field); const bytes = Buffer.from(secret);
+      try { await context.vault.set(name, bytes); written.push(name); } finally { bytes.fill(0); }
+    }
+    await context.saveSettings([...context.settings, setting]);
+  } catch {
+    for (const name of written) try { await context.vault.delete(name); } catch { /* Preserve the fixed failure. */ }
+    throw new CliError('The notification channel could not be saved.');
+  }
+  await audit(context, 'notify-add', 'Notification channel added locally.');
+}
+
+export async function removeNotificationChannel(context: NotificationContext, id: string): Promise<boolean> {
+  validId(id);
+  if (!context.settings.some(setting => setting.id === id)) return false;
+  await context.saveSettings(context.settings.filter(setting => setting.id !== id));
+  for (const name of await context.vault.list(`notify/${id}/`)) await context.vault.delete(name);
+  await audit(context, 'notify-remove', 'Notification channel removed locally.');
+  return true;
+}
+
+export async function testNotificationChannels(context: NotificationContext): Promise<{ delivered: string[]; failed: { id: string; reason: string }[]; code: string }> {
+  const channels: NotifyChannel[] = [];
+  for (const setting of context.settings) {
+    try { channels.push(...await createNotificationChannels([setting], context)); }
+    catch { channels.push({ id: setting.id, kind: setting.kind, async send() { throw new Error('Notification configuration is incomplete.'); } }); }
+  }
+  const key = await context.deviceKey();
+  try {
+    const message = signMessage({ id: randomUUID(), at: (context.now?.() ?? new Date()).toISOString(), kind: 'test', severity: 'info', title: 'Notification test',
+      lines: ['keysentry can reach this notification channel.'] }, key);
+    const result = await createDispatcher(channels, { log: context.log, now: context.now, retries: 1 }).send(message);
+    await cacheNotificationMessage(context, message, result.delivered.length > 0, result.delivered);
+    await audit(context, 'notify-test', 'Signed notification test completed.');
+    return { ...result, code: message.code };
+  } finally { key.privateKeyDer.fill(0); }
+}
+
+export async function verifyNotification(context: NotificationContext, input: { code: string } | { message: SignedNotifyMessage }): Promise<{ valid: true; id: string; keyId: string; code: string }> {
+  let message: SignedNotifyMessage;
+  if ('message' in input) message = input.message;
+  else {
+    const code = input.code.toUpperCase();
+    if (!/^[A-Z2-7]{4}-[A-Z2-7]{4}$/.test(code)) throw new CliError('That notification code was not found in local saved messages. Use --file for a signed message received elsewhere.');
+    const cache = await context.store.readJson<MessageCache>('plan', messagePath(context.store));
+    const found = cache?.messages.find(item => item.code === code);
+    if (!found) throw new CliError('That notification code was not found in local saved messages. Use --file for a signed message received elsewhere.');
+    message = found;
+  }
+  const key = await context.deviceKey();
+  try {
+    const trusted = [key.publicKeyDer, ...await context.watcherPublicKeys?.() ?? []];
+    if (!trusted.some(publicKey => verifyMessage(message, publicKey))) throw new CliError('The notification signature did not verify with a trusted local key.');
+    return { valid: true, id: message.id, keyId: message.keyId, code: message.code };
+  } finally { key.privateKeyDer.fill(0); }
+}
 
 function validId(id: string): void {
   if (!identifier.test(id) || id === 'relay') throw new CliError('Use a channel id with 1 to 64 letters, numbers, underscores or dashes. The id relay is reserved.');
@@ -99,10 +177,12 @@ function localOnly(opts: { relay?: boolean; remote?: boolean | string }): void {
 async function audit(context: NotificationContext, kind: string, summary: string): Promise<void> {
   await context.audit?.append({ kind, summary });
 }
-export async function cacheNotificationMessage(context: Pick<NotificationContext, 'store' | 'now'>, message: SignedNotifyMessage, delivered: boolean): Promise<void> {
+export async function cacheNotificationMessage(context: Pick<NotificationContext, 'store' | 'now'>, message: SignedNotifyMessage, delivered: boolean, deliveredIds: readonly string[] = []): Promise<void> {
   const previous = await context.store.readJson<MessageCache>('plan', messagePath(context.store));
+  const at = (context.now?.() ?? new Date()).toISOString();
   await context.store.writeJson('plan', messagePath(context.store), { messages: [...(previous?.messages ?? []), message].slice(-100),
-    lastSuccessAt: delivered ? (context.now?.() ?? new Date()).toISOString() : previous?.lastSuccessAt ?? null } satisfies MessageCache);
+    lastSuccessAt: delivered ? at : previous?.lastSuccessAt ?? null,
+    channelSuccessAt: { ...previous?.channelSuccessAt, ...Object.fromEntries(deliveredIds.map(id => [id, at])) } } satisfies MessageCache);
 }
 
 export function registerNotificationCommands(program: Command, options: NotificationCommandsOptions): void {
@@ -140,24 +220,7 @@ export function registerNotificationCommands(program: Command, options: Notifica
         }
         case 'console': break;
       }
-      // Validate before committing any vault or configuration change.
-      const staged: Vault = { ...context.vault, get: async name => {
-        const field = name.startsWith(`notify/${id}/`) ? name.slice(`notify/${id}/`.length) : undefined;
-        return field !== undefined && secrets.has(field) ? Buffer.from(secrets.get(field)!) : context.vault.get(name);
-      } };
-      await notificationEgress([setting], staged); await createNotificationChannels([setting], { ...context, vault: staged });
-      const written: string[] = [];
-      try {
-        for (const [field, secret] of secrets) {
-          const name = secretName(id, field); const bytes = Buffer.from(secret);
-          try { await context.vault.set(name, bytes); written.push(name); } finally { bytes.fill(0); }
-        }
-        await context.saveSettings([...context.settings, setting]);
-      } catch {
-        for (const name of written) try { await context.vault.delete(name); } catch { /* Preserve the original fixed error. */ }
-        throw new CliError('The notification channel could not be saved.');
-      }
-      await audit(context, 'notify-add', 'Notification channel added locally.');
+      await addNotificationChannel(context, setting, secrets);
       options.emit({ id, kind, added: true }, `Notification channel ${id} added.`);
     });
   notify.command('list').description('List configured channel ids and kinds').action(async () => {
@@ -169,32 +232,19 @@ export function registerNotificationCommands(program: Command, options: Notifica
     .action(async (id: string, opts: { relay?: boolean; remote?: boolean | string }) => {
       options.human('remove a notification channel'); localOnly(opts); validId(id);
       const context = await options.getContext();
-      if (!context.settings.some(setting => setting.id === id)) throw new CliError('That notification channel was not found.');
-      await context.saveSettings(context.settings.filter(setting => setting.id !== id));
-      for (const name of await context.vault.list(`notify/${id}/`)) await context.vault.delete(name);
-      await audit(context, 'notify-remove', 'Notification channel removed locally.');
+      if (!await removeNotificationChannel(context, id)) throw new CliError('That notification channel was not found.');
       options.emit({ id, removed: true }, `Notification channel ${id} removed.`);
     });
   notify.command('test').description('Send a signed test to every channel').action(async () => {
     options.human('test notification channels');
-    const context = await options.getContext(); const channels: NotifyChannel[] = [];
-    for (const setting of context.settings) {
-      try { channels.push(...await createNotificationChannels([setting], context)); }
-      catch {
-        channels.push({ id: setting.id, kind: setting.kind, async send() { throw new Error('Notification configuration is incomplete.'); } });
-      }
-    }
-    const message = signMessage({ id: randomUUID(), at: (context.now?.() ?? new Date()).toISOString(), kind: 'test', severity: 'info', title: 'Notification test',
-      lines: ['keysentry can reach this notification channel.'] }, await context.deviceKey());
-    const result = await createDispatcher(channels, { log: context.log, now: context.now, retries: 1 }).send(message);
-    await cacheNotificationMessage(context, message, result.delivered.length > 0);
-    await audit(context, 'notify-test', 'Signed notification test completed.');
-    options.emit({ ...result, code: message.code }, channels.length ? `Delivered: ${result.delivered.join(', ') || 'none'}\nFailed: ${result.failed.map(item => item.id).join(', ') || 'none'}\nVerification code: ${message.code}` : 'No notification channels are configured.');
+    const context = await options.getContext();
+    const result = await testNotificationChannels(context);
+    options.emit(result, context.settings.length ? `Delivered: ${result.delivered.join(', ') || 'none'}\nFailed: ${result.failed.map(item => item.id).join(', ') || 'none'}\nVerification code: ${result.code}` : 'No notification channels are configured.');
   });
   notify.command('verify [code]').description('Verify a saved message code or a signed JSON message')
     .option('--file <json>', 'Read one signed notification JSON file').action(async (code: string | undefined, opts: { file?: string }) => {
       if (!!code === !!opts.file) throw new CliError('Provide a saved notification code or --file with signed JSON.');
-      const context = await options.getContext(); let message: SignedNotifyMessage;
+      const context = await options.getContext(); let message: SignedNotifyMessage | undefined;
       if (opts.file) {
         let handle;
         try {
@@ -205,16 +255,8 @@ export function registerNotificationCommands(program: Command, options: Notifica
           message = JSON.parse(buffer.subarray(0, read.bytesRead).toString('utf8')) as SignedNotifyMessage;
         } catch (error) { if (error instanceof CliError) throw error; throw new CliError('The signed notification file could not be read.'); }
         finally { await handle?.close(); }
-      } else {
-        const normalized = code!.toUpperCase();
-        if (!/^[A-Z2-7]{4}-[A-Z2-7]{4}$/.test(normalized)) throw new CliError('That notification code was not found in local saved messages. Use --file for a signed message received elsewhere.');
-        const cache = await context.store.readJson<MessageCache>('plan', messagePath(context.store));
-        const found = cache?.messages.find(item => item.code === normalized);
-        if (!found) throw new CliError('That notification code was not found in local saved messages. Use --file for a signed message received elsewhere.');
-        message = found;
       }
-      const key = await context.deviceKey(); const trusted = [key.publicKeyDer, ...await context.watcherPublicKeys?.() ?? []];
-      if (!trusted.some(publicKey => verifyMessage(message, publicKey))) throw new CliError('The notification signature did not verify with a trusted local key.');
-      options.emit({ valid: true, id: message.id, keyId: message.keyId, code: message.code }, `Notification signature verified. Code: ${message.code}`);
+      const result = await verifyNotification(context, message ? { message } : { code: code! });
+      options.emit(result, `Notification signature verified. Code: ${result.code}`);
     });
 }

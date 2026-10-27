@@ -9,7 +9,7 @@ export function sameToken(actual: string | undefined, expected: string): boolean
 }
 
 /** One dashboard launch grants one browser session; nothing is persisted to disk. */
-export function createSession(opts: { idleMs: number; now?: () => number }) {
+export function createSession(opts: { idleMs: number; now?: () => number; port: () => number }) {
   const now = opts.now ?? Date.now;
   const token = randomBytes(32).toString('base64url');
   const tokenExpires = now() + 120_000;
@@ -17,6 +17,7 @@ export function createSession(opts: { idleMs: number; now?: () => number }) {
   let active: (DashboardSession & { expires: number }) | null = null;
   return {
     token,
+    get cookieName(): string { return `ks_session_${opts.port()}`; },
     exchange(value: string): DashboardSession | null {
       if (consumed || now() >= tokenExpires || !sameToken(value, token)) return null;
       consumed = true;
@@ -26,8 +27,9 @@ export function createSession(opts: { idleMs: number; now?: () => number }) {
     authenticate(cookie: string | undefined): DashboardSession | null {
       if (!active) return null;
       if (now() >= active.expires) { active = null; return null; }
-      const values = (cookie ?? '').split(';').map(s => s.trim()).filter(s => s.startsWith('ks_session='));
-      if (values.length !== 1 || !sameToken(values[0]!.slice('ks_session='.length), active.id)) return null;
+      const prefix = `${this.cookieName}=`;
+      const values = (cookie ?? '').split(';').map(s => s.trim()).filter(s => s.startsWith(prefix));
+      if (values.length !== 1 || !sameToken(values[0]!.slice(prefix.length), active.id)) return null;
       active.expires = now() + opts.idleMs;
       return { id: active.id, csrf: active.csrf };
     },

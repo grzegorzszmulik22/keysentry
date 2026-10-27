@@ -24,6 +24,8 @@ export interface AutopilotManagerOptions {
   store: StateStore; audit: AuditLog; projectId: string; deviceKey: () => Promise<DeviceKey>;
   scan: () => Promise<Inventory>; rotateCluster: (clusterId: string) => Promise<RotationReport>;
   assertHuman: (action: string) => void;
+  /** Stops dashboard arming when a concurrent disarm has superseded it. */
+  assertActive?: () => void | Promise<void>;
   confirmAdoption?: (question: string) => Promise<boolean>;
   emitEligibility?: (rows: EligibilityRow[]) => void;
   settings?: { graceMinutes?: number; maxServices?: number; healthChecks?: ArmedPlan['healthChecks'] };
@@ -56,9 +58,20 @@ function completeReport(report: RotationReport): boolean {
     && report.deployments.every(deploy => deploy.state === 'success');
 }
 
+// Managers created for separate HTTP requests share the same state transition
+// queue. A disarm invalidates pending arming before waiting for its final write.
+const transitions = new WeakMap<StateStore, { epoch: number; tail: Promise<unknown> }>();
+
 /** CLI-owned persistence and supervised authorization. The watcher never receives this signer. */
 export function createAutopilotManager(opts: AutopilotManagerOptions) {
   const now = opts.now ?? (() => new Date());
+  let transition = transitions.get(opts.store);
+  if (!transition) { transition = { epoch: 0, tail: Promise.resolve() }; transitions.set(opts.store, transition); }
+  const shared = transition;
+  function serial<T>(operation: () => Promise<T>): Promise<T> {
+    const result = shared.tail.then(operation, operation);
+    shared.tail = result.catch(() => undefined); return result;
+  }
   const planPath = join(opts.store.paths.dir, 'armed-plan.json');
   const statePath = join(opts.store.paths.dir, 'autopilot.json');
   async function loadPlan(): Promise<ArmedPlan | null> { return opts.store.readJson<ArmedPlan>('plan', planPath); }
@@ -93,19 +106,30 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     if (checked.plan.projectId !== opts.projectId) throw new CliError('The armed plan belongs to another project.');
     return checked.plan;
   }
-  async function saveSigned(body: Omit<ArmedPlan, 'signer' | 'sig'>, state: AutopilotState, kind: string, activate = true): Promise<ArmedPlan> {
-    const signed = signArmedPlan(body, await opts.deviceKey());
-    await opts.store.writeJson('plan', planPath, signed);
-    state.armedPlanId = signed.id;
-    if (activate) { state.disarmed = false; delete state.disarmedAt; }
-    delete state.adoptionUpdates; delete state.adoptionUpdatesPlanId; delete state.adoptionNoticeSent;
-    await saveState(state);
-    await opts.audit.append({ kind: `autopilot:${kind}`, summary: kind === 'arm' ? 'Autopilot armed.' : 'Autopilot plan replaced.',
-      data: { planId: signed.id, clusters: signed.clusters.length, hosts: signed.hosts.length } });
-    return signed;
+  async function saveSigned(body: Omit<ArmedPlan, 'signer' | 'sig'>, state: AutopilotState, kind: string, activate = true,
+    active: () => void | Promise<void> = () => opts.assertActive?.()): Promise<ArmedPlan> {
+    return serial(async () => {
+      await active();
+      const sourceKey = await opts.deviceKey();
+      const key = { ...sourceKey, privateKeyDer: Buffer.from(sourceKey.privateKeyDer) };
+      let signed: ArmedPlan;
+      try { signed = signArmedPlan(body, key); } finally { key.privateKeyDer.fill(0); }
+      await active();
+      await opts.store.writeJson('plan', planPath, signed);
+      state.armedPlanId = signed.id;
+      if (activate) { state.disarmed = false; delete state.disarmedAt; }
+      delete state.adoptionUpdates; delete state.adoptionUpdatesPlanId; delete state.adoptionNoticeSent;
+      await active();
+      await saveState(state);
+      await active();
+      await opts.audit.append({ kind: `autopilot:${kind}`, summary: kind === 'arm' ? 'Autopilot armed.' : 'Autopilot plan replaced.',
+        data: { planId: signed.id, clusters: signed.clusters.length, hosts: signed.hosts.length } });
+      return signed;
+    });
   }
 
-  async function refreshAdoptionUpdates(updates: AdoptionUpdates, options: { inventory?: Inventory; reports?: RotationReport[] } = {}, activate = false): Promise<ArmedPlan | null> {
+  async function refreshAdoptionUpdates(updates: AdoptionUpdates, options: { inventory?: Inventory; reports?: RotationReport[] } = {}, activate = false,
+    active?: () => void | Promise<void>): Promise<ArmedPlan | null> {
     const state = await loadState();
     const current = await loadPlan();
     updates = state.adoptionUpdatesPlanId === current?.id ? { ...state.adoptionUpdates, ...updates } : { ...updates };
@@ -141,12 +165,18 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     const { signer: _signer, sig: _sig, ...body } = plan;
     body.id = `arm-${now().toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(4).toString('hex')}`;
     body.createdAt = now().toISOString(); body.clusters = clusters;
-    return saveSigned(body, state, 'refresh', activate);
+    return saveSigned(body, state, 'refresh', activate, active);
   }
   const applyAdoptionUpdates = (updates: AdoptionUpdates, options: { inventory?: Inventory; reports?: RotationReport[] } = {}) => refreshAdoptionUpdates(updates, options);
 
   async function arm(options: ArmOptions = {}): Promise<{ plan: ArmedPlan; refused: { clusterId: string; reason: string }[] }> {
     opts.assertHuman('arm automatic rotations'); localOnly(options);
+    const epoch = shared.epoch;
+    const active = async () => {
+      if (epoch !== shared.epoch) throw new CliError('Arming was cancelled because autopilot was disarmed.');
+      await opts.assertActive?.();
+      if (epoch !== shared.epoch) throw new CliError('Arming was cancelled because autopilot was disarmed.');
+    };
     let inventory = structuredClone(await opts.scan());
     const previous = await loadPlan();
     const state = await loadState();
@@ -174,7 +204,7 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     if (options.refresh) {
       const plan = await trustedPlan();
       if (!state.adoptionUpdates || state.adoptionUpdatesPlanId !== plan.id) throw new CliError('There are no adopted-key updates for this armed plan.');
-      const refreshed = await refreshAdoptionUpdates(state.adoptionUpdates, { inventory }, true);
+      const refreshed = await refreshAdoptionUpdates(state.adoptionUpdates, { inventory }, true, active);
       return { plan: refreshed!, refused: [] };
     }
     const graceMinutes = options.graceMinutes ?? opts.settings?.graceMinutes ?? 15;
@@ -196,6 +226,7 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
       if (!autopilotEligibility(potential).eligible) { selectedIds.push(id); continue; }
       const hint = cluster.hint ?? cluster.consumers[0]?.varName ?? cluster.provider;
       if (!await opts.confirmAdoption?.(`This will rotate ${hint} now so keysentry knows the new value. Rotate now? [y/N]`)) { selectedIds.push(id); continue; }
+      await active();
       const report = await opts.rotateCluster(id);
       const step = report.steps.find(s => s.clusterId === id);
       if (!completeReport(report) || !step?.newFingerprint || !step.newKeyRef
@@ -223,18 +254,21 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
       hosts: options.hosts ?? inventory.hosts, now: now(), options: resolvedOptions });
     if (!built.plan.clusters.length) throw new CliError('No selected keys are eligible for autopilot. Review the eligibility reasons.');
     const existed = await loadPlan();
-    const plan = await saveSigned(built.plan, state, existed ? 'rearm' : 'arm');
+    const plan = await saveSigned(built.plan, state, existed ? 'rearm' : 'arm', true, active);
     return { plan, refused: built.refused };
   }
 
   async function disarm(options: { relay?: boolean } = {}): Promise<{ disarmed: true; relay: boolean }> {
     opts.assertHuman('disarm automatic rotations');
-    const state = await loadState(); state.disarmed = true; state.disarmedAt = now().toISOString();
-    await saveState(state);
+    shared.epoch++;
+    await serial(async () => {
+      const state = await loadState(); state.disarmed = true; state.disarmedAt = now().toISOString();
+      await saveState(state);
+    });
     await opts.audit.append({ kind: 'autopilot:disarm', summary: 'Autopilot disarmed.', data: { relay: options.relay === true } });
     if (options.relay) {
       if (!opts.relayDisarm) throw new CliError('Autopilot is disarmed locally. Configure the watcher relay to also disarm it remotely.');
-      const key = await opts.deviceKey(); const body = { keyId: key.keyId, at: now().toISOString() };
+      const key = await opts.deviceKey(); const body = { watcherId: opts.projectId, keyId: key.keyId, at: now().toISOString() };
       const signed = { ...body, sig: signDetached(key.privateKeyDer, Buffer.from(DISARM_PREFIX + canonicalJson(body))).toString('base64') };
       try { await opts.relayDisarm(signed); }
       catch { throw new CliError('Autopilot is disarmed locally. The relay delivery failed; disarm the watcher directly or try again.'); }

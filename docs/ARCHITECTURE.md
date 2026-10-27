@@ -1,6 +1,6 @@
 # keysentry architecture and module specs
 
-keysentry is a local CLI with an optional self-hosted watcher. It finds known copies of secrets across a
+keysentry is a local CLI and loopback dashboard with an optional self-hosted watcher. It finds known copies of secrets across a
 team's hosts, rotates them in a safe order with one redeploy per service, verifies the new keys, revokes the old ones,
 and monitors keys so it can contain or rotate them when it sees suspicious use.
 
@@ -18,7 +18,7 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 5. **No secrets in URLs or query strings.** Use headers/bodies.
 6. **Fail closed.** If verification of a new key fails, stop that step, do not revoke the old key, report clearly.
 7. Monitoring actions are rate-limited (cooldown per cluster, max automatic rotations per day) to prevent loops.
-8. **Human approval gates mutations.** Mutation entry points refuse known coding-agent environments and require stdin/stdout TTYs, including with `--yes`. Build write-role adapters only after this check and human confirmation. Read commands use read-role credentials.
+8. **Human approval gates mutations.** Manual CLI mutations refuse known coding-agent environments and require stdin/stdout TTYs, including with `--yes`. Dashboard changes require a fresh user-verified passkey bound to the exact route and body; agent-marked launches are read-only. Disarm requires no passkey. The unattended watcher refuses agent markers without requiring a TTY and acts only inside signed authorization or a specific approval. Build write-role adapters after authorization; reads use read-role credentials.
 9. **All outbound HTTP is guarded.** Adapters, detectors, notifications and release verification share the injected egress-checked `HttpClient`; every attempted request records only host, purpose, method, timestamp and result metadata.
 
 ## Layout and ownership
@@ -40,7 +40,12 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 | `src/notify/` | signed messages, channels and delivery retries | phase 2 |
 | `src/approvals/` | WebAuthn verification, action-bound approval service, relay and minimal HTTP server | phase 2 |
 | `src/watcher/`, `deploy/` | sealed deployment configuration, serialized runtime, container and platform templates | phase 2 |
-| `src/cli/`, `README.md` | CLI integration, configuration, prompts and e2e tests | phase 1, wave 3 |
+| `src/firstrun/` | bounded local file/history scan, deployment inference and value-free summary | phase 3 |
+| `src/guard/` | staged-secret detection, fixture allow-list and optional fixed pre-commit hook | phase 3 |
+| `src/hygiene/` | observed age, rotation reminders, usage-qualified unused hints, spending caps and digest | phase 3 |
+| `src/report/` | shared readiness score, private-by-default SVG card and incident timeline | phase 3 |
+| `src/dashboard/` | loopback transport, sessions/passkey gate, bundled client screens and generated assets | phase 3 |
+| `src/cli/`, `README.md` | CLI/runtime integration, dashboard handlers, configuration, prompts and e2e tests | phases 1-3 |
 
 Tests live in `test/<module>/*.test.ts`. Each module exports its public API from `src/<module>/index.ts`.
 
@@ -222,8 +227,8 @@ After adopted-key rotations, the runner returns `adoptionUpdates`. The local CLI
 state store and re-sign with the device key. A watcher cannot forge a device authorization: it retains the updates
 and reports `re-arm to refresh adopted keys`. Local `arm --refresh` reviews and signs updates for the same CLI/local
 `watch` store; it does not import updates from a separate deployed watcher. Remote renewal must reconcile the
-original watcher's encrypted state and matching keys before re-arming. Remote update export/import and dashboard
-reconciliation remain phase 3 gaps. Manual rotations must also apply adoption updates before treating the old
+original watcher's encrypted state and matching keys before re-arming. Remote update export/import and live-state
+migration remain unavailable in the local dashboard. Manual rotations must also apply adoption updates before treating the old
 authorization as current.
 
 ### Sources and incident decisions (`src/feeds/`, `src/autopilot/{sources,incidents}.ts`)
@@ -282,8 +287,9 @@ public read/write. A relay may delay or suppress a valid message and cannot re-a
 `passkey register` binds a temporary server to `127.0.0.1` but opens `localhost` at a random port, with RP ID
 `localhost`, a one-time URL token, exact Host/Origin checks, strict CSP and a bundled static script. It shuts
 down after success, five minutes or Ctrl-C. Public-origin enrollment must happen on that origin; the current
-approval server has no `/register` route and dashboard enrollment remains phase 3. Arming and channel/passkey
-changes are local human mutations; remote approval cannot widen policy.
+approval server has no `/register` route. The phase 3 local dashboard enrolls passkeys for `localhost` only;
+public-origin enrollment is still separate. Arming and channel/passkey changes use local human authorization,
+through the CLI or the dashboard passkey gate where offered; relay approval cannot widen policy.
 
 The minimal approval server exposes health, approval challenges/assertions and disarm only. It checks exact
 Host and POST Origin, caps requests, rate-limits callers and serves no secret values. HTTPS termination and
@@ -310,7 +316,7 @@ disarm and stop the old watcher, retain a secure backup of its unchanged encrypt
 protected separately for recovery/audit, and prepare the new setup against a fresh private directory or volume.
 Supply all five new secret settings to the replacement. Leave the old volume unchanged; a new key/passphrase must
 not be substituted against it. Unlock keys remain outside state. There is no phase 2 live-state migration or
-remote adoption export/import flow; the later dashboard must address that reconciliation explicitly.
+remote adoption export/import flow; the local dashboard does not migrate that state automatically.
 
 The serialized tick resumes waves, polls the relay, reads sources, persists incident decisions, handles waves
 and approval requests, settles grace, runs detectors and sends a daily heartbeat. Persisted acknowledgments and
@@ -318,8 +324,116 @@ the original start/delivery anchors survive scheduled restarts. No successful no
 authorization, unwritable state or clock skew beyond 300 seconds forces alert-only. The watcher excludes its own
 operating credential names from automatic work; an incident on its own platform requests guided rotation.
 
-`watch --once` provides scheduled execution with a fresh safety check before its final settlement. Templates
+`watch` and `watch --once` refuse detected coding-agent environments but do not require a TTY. They use the signed
+armed plan and specific approvals rather than treating an interactive terminal as authorization for unattended
+effects. `watch --once` provides scheduled execution with a fresh safety check before its final settlement. Templates
 cover Railway, Fly, Render, Docker Compose and Actions; they do not deploy automatically. The container runs
 non-root with a read-only root and a private writable state volume. Image publication/digests, live platform
 permissions and browser ceremonies remain release integration checks. Actions scheduling delay, dropped runs
 and cache eviction are operational limits, not a real-time guarantee.
+
+## Phase 3: first run, dashboard and everyday reports
+
+### Local first run (`src/firstrun/`, `src/cli/first-run.ts`)
+
+The default CLI action scans the selected project without constructing the credentialed runtime. It needs no
+token, config, vault or existing state and makes no network calls. The scanner reads bounded local candidate
+files, deployment configuration evidence and a bounded streamed Git history. Git runs without a shell, with a
+minimal environment and disabled hooks, external diff/text conversion, signature helpers and lazy fetching.
+Missing Git or an exhausted budget produces an incomplete-history qualification and the actual commit count.
+
+`RawHit` values are transient scanner inputs. `buildFirstRun` consumes them, clusters by keyed fingerprint,
+deletes each hit's value field and returns only metadata/hints. A fresh unsaved project uses a random per-run
+fingerprint key; an already initialized project can reuse its project key. Working-tree/history locations remain
+distinct, including history-only keys removed from current files. Deployment tags are inferred possibilities,
+not API-verified deployments. Binary/oversized content, ignored directories, unavailable history objects and
+unsupported source encodings remain outside coverage.
+
+`--no-save` writes nothing. Otherwise the CLI asks before creating `.keysentry/`. Before vault initialization,
+an explicitly saved first-run report is plaintext metadata/hints, not credential storage; with an initialized
+runtime the report uses the encrypted store. The terminal summary offers
+ordered next steps; an interactive desktop terminal can offer to open the local dashboard. Package acquisition
+by `npx` is distinct from the scanner's offline execution.
+
+### Dashboard transport and authorization (`src/dashboard/server/`)
+
+`startDashboard({ api, readOnly, passkeys, ... })` binds `127.0.0.1` on a random port and opens
+`http://localhost:<port>/?t=<token>`. A random 32-byte token expires after two minutes and is exchanged once for
+an `HttpOnly; SameSite=Strict; Path=/` session cookie named `ks_session_<port>`. Port-specific names prevent a
+second dashboard from replacing the first dashboard's localhost cookie. They do not establish browser origin
+isolation between localhost ports. Session expiry and shutdown use a 15-minute rolling idle limit by default.
+
+Exact Host checks constrain rebinding; every POST needs the exact localhost Origin and the session CSRF token.
+There is no CORS. Requests have bounded JSON bodies and assets resolve only through the generated in-package
+asset table. The CSP permits only bundled scripts/styles and local data/Blob images, with no inline code,
+external fonts/resources, framing or base override. A readiness SVG is a Blob-backed image, never inserted markup.
+
+The `DashboardApi` maps route names to method, `mutating` and handler. The authoritative shapes and mutation
+classification are in [dashboard-api.md](design/dashboard-api.md). All changed-state routes and `reveal` are
+passkey-gated POSTs. Preview, drill, timeline, card, notification verification and disarm are input-bearing
+nonmutating POSTs; they still require CSRF/Origin. Disarm remains available in read-only mode and invalidates
+any arming still in progress so an older arm cannot win after it.
+
+The gate reuses phase 2 WebAuthn verification. Challenges bind session, exact route and canonical-body SHA-256
+digest, expire after two minutes and are single-use. Assertions require user verification and an accepted
+counter; credentials are JSON vault entries under `passkey/<id>`. First enrollment requires a user-verified
+registration. Additional enrollment requires an existing passkey. RP ID is `localhost`; the client-data origin
+must match the current full origin, including its random port. A portless localhost marker allows a registered
+credential to be reused across dashboard restarts while assertion verification still checks the current origin.
+
+Agent-marked `ui` launches automatically set read-only and display the notice below the screen heading. In that
+mode the server refuses all changes and enrollment. A passkey prevents a browser-driving agent from supplying
+user verification through ordinary page clicks; it is not a protection against unrestricted same-user tools,
+compromised browser/authenticator implementations or a user approving an unwanted prompt.
+
+### Shared runtime handlers (`src/cli/`)
+
+`createDashboardApi(runtime)` implements every documented route and validates each body independently of client
+validation. It delegates scans, planning, drill, rotation, recovery, vault operations and reports to the same
+runtime functions used by terminal commands. Passkey verification authorizes that specific dashboard operation;
+it does not remove normal CLI terminal gates. Write-role adapters are rebuilt for approved effects. Dashboard
+rotation leaves grace pending so the user can choose finish, undo or later without a server-side terminal prompt.
+
+Normal API responses, logs and audit entries contain no values. `reveal` is the explicit exception: it rereads
+only a readable consumer, returns the requested value in memory after passkey authorization and audits only its
+variable name and cluster ID. Write-only values cannot be revealed. The browser clears reveals on disposal;
+clipboard copies attempt clearing after 30 seconds, subject to browser permissions and page lifetime. Token
+forms submit a passkey-bound body directly to vault storage and clear their input fields without echoing values.
+
+### Guard, hygiene and reports
+
+`src/guard/` checks staged added lines with a bounded injected Git runner. `.keysentry-allow` accepts narrow path
+globs or synthetic-value hashes; plaintext secrets never enter it. `formatGuardStaged` owns staged output and
+exit status. Hook install/uninstall are human mutations and respect Git's hook path. The installed fixed shell
+script resolves `keysentry` on PATH, calls `guard --staged`, downloads nothing and reports when the executable
+is unavailable. It cannot prove that unrecognized or reconstructed secrets are absent.
+
+`src/hygiene/` persists keyed first-seen and last-rotation metadata in encrypted `hygiene.json` using StateStore
+kind `monitor`. Age is observation age; unreadable fingerprints cannot establish stable key age. Rotation
+reminders default to 90 days. Unused status needs explicit continuous usage coverage, rather than treating
+missing observations as zero. Spend-limit planning supports OpenRouter only, preserves tighter limits and needs
+a configured per-key cap, key reference and usage evidence. Applying a proposal refreshes inputs and uses
+write-role credentials after authorization; it is not an aggregate budget or an atomic conditional provider write.
+
+`buildDigest` produces one value-free summary from recorded inventory, hygiene, incidents, waves and signals.
+Preview stays local; sending uses the configured signed notification channels. Digest-day settings are
+preferences and do not install an operating-system scheduler.
+
+`src/report/readiness.ts` is the single scoring implementation used by CLI drills and cards. `renderCard`
+returns self-contained SVG with score/branding by default; platform and completed-rotation counts are separate
+opt-ins. No key names, hints, values or project names enter a card. `buildTimeline` consumes only the caller's
+selected plan/wave journal and audit events; Markdown rendering escapes text and cannot invent missing events.
+Exports remain local unless the user shares them.
+
+### Browser build and verification
+
+The client is framework-free TypeScript with separate DOM-only checking in `tsconfig.client.json`. All screens
+use the fixed route contract and shared components, provider display names and design tokens from
+[dashboard.md](design/dashboard.md). `node scripts/build-ui.mjs` deterministically transpiles JS/CSS/HTML into
+`src/dashboard/generated/assets.ts`; `--check` verifies the committed asset table matches sources. No runtime
+asset build or dependency download occurs when starting the dashboard.
+
+Server types use `npx tsc -p tsconfig.json --noEmit`; browser types use `npx tsc -p tsconfig.client.json`. The
+sandbox suites exercise fake HTTP/vault/hosts/providers, happy-dom screen behavior and a fake authenticator
+driving loopback connect, preview, rotation, grace and finish. Real accounts, browser/authenticator behavior,
+platform watcher operation and packed-package/release validation remain integration work.

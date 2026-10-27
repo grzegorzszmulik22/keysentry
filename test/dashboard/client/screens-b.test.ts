@@ -69,6 +69,11 @@ afterEach(async () => {
 });
 
 describe('rotation screen', () => {
+  it('uses provider display names in key choices', async () => {
+    await open('rotate');
+    expect(field('key-one').closest('label')?.textContent).toContain('OpenAI');
+    expect(field('key-two').closest('label')?.textContent).toContain('OpenRouter');
+  });
   it('preselects the key from the hash and confirms the exact preview before the passkey', async () => {
     await open('rotate?key=key-one');
     expect(field('key-one').checked).toBe(true);
@@ -141,6 +146,15 @@ describe('rotation screen', () => {
 });
 
 describe('autopilot screen', () => {
+  it('uses provider display names for eligibility and adoption confirmation', async () => {
+    await open('autopilot');
+    expect(field('key-one').closest('label')?.textContent).toContain('OpenAI');
+    expect(field('key-two').closest('label')?.textContent).toContain('OpenRouter');
+    const adopt = field('adopt-key-two'); adopt.checked = true; adopt.dispatchEvent(new Event('change', { bubbles: true }));
+    control('Arm autopilot').click(); await tick();
+    expect(document.querySelector('dialog')?.textContent).toContain('This rotates OpenRouter');
+    await accept('Cancel');
+  });
   it('shows the armed scope, eligibility reasons and waves', async () => {
     await open('autopilot'); expect(outlet.textContent).toContain('armed for 2 keys');
     expect(outlet.textContent).toContain('Railway'); expect(outlet.textContent).toContain('Fly');

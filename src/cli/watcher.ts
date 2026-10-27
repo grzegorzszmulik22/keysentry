@@ -4,6 +4,7 @@ import type { StateStore } from '../core/index.js';
 import { fingerprint } from '../core/index.js';
 import { DEFAULT_SOURCES, classifyItem, isAlertOnly, resumeWaves, runAutopilot, settleWaves, updateIncidents, verifyArmedPlan } from '../autopilot/index.js';
 import type { AutopilotDeps, AutopilotState } from '../autopilot/index.js';
+import { filterNewItems, type IncidentsState } from '../autopilot/incidents.js';
 import { ApprovalError, createApprovalServer, createApprovalService, createRelay } from '../approvals/index.js';
 import type { SignedDeviceApproval, SignedDisarm } from '../approvals/index.js';
 import { fetchFeed, type FeedCache } from '../feeds/index.js';
@@ -22,6 +23,8 @@ export type { WatcherSetupDependencies, WatcherDeploymentSecrets, WatcherPlatfor
 
 export interface WatchRuntimeDependencies {
   store: StateStore; audit: AuditLog; http: HttpClient; log: Logger; rotation: RotateOptions; fingerprintKey: Buffer;
+  /** The configured project identity binds signed relay disarms to this watcher. */
+  projectId?: string;
   signingKey(): Promise<DeviceKey>;
   deviceKeys(): Promise<{ keyId: string; publicKeyDer: Buffer }[]>;
   passkeys(): Promise<PasskeyCredential[]>;
@@ -199,7 +202,8 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       { ...await runner(), trustedKeyIds, env, selfCheck: current });
     await updated(result.adoptionUpdates);
   }
-  const relay = deps.relay ? createRelay({ ...deps.relay, http: clock.http, trustedKeyIds, deviceKeys: deps.deviceKeys, audit: deps.audit, now }) : undefined;
+  const relay = deps.relay ? createRelay({ ...deps.relay, http: clock.http, trustedKeyIds, watcherId: deps.projectId,
+    deviceKeys: deps.deviceKeys, audit: deps.audit, now }) : undefined;
   const relayState = await deps.store.readJson<{ cursor: string | null; pendingApprovals?: SignedDeviceApproval[]; pendingDisarms?: SignedDisarm[] }>('pending', path(deps.store, 'watcher-relay.json')) ?? { cursor: null };
   relayState.pendingApprovals ??= []; relayState.pendingDisarms ??= [];
   const saveRelay = () => deps.store.writeJson('pending', path(deps.store, 'watcher-relay.json'), relayState);
@@ -234,31 +238,44 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       },
       async disarm(input: unknown) {
         const message = input as SignedDisarm;
-        if (!state.disarmed) await disarm();
-        else await saveState();
+        // Saved inboxes may predate project-bound disarms. Never apply an old
+        // or foreign recipient after an upgrade or a moved state directory.
+        if (deps.projectId && message.watcherId === deps.projectId) {
+          if (!state.disarmed) await disarm();
+          else await saveState();
+        }
         relayState.pendingDisarms = relayState.pendingDisarms!.filter(item => item.sig !== message.sig);
         await saveRelay();
       },
     } } : {}),
     async fetchSources() {
       const evidence: IncidentEvidence[] = [];
+      const incidentFile = path(deps.store, 'watcher-incidents.json');
+      let incidentState = await deps.store.readJson<IncidentsState>('plan', incidentFile) ?? { incidents: [] };
+      const itemKey = (value: string) => fingerprint(value, deps.fingerprintKey);
       const results = await Promise.allSettled((deps.sources ?? DEFAULT_SOURCES).map(async source => {
         const feed = await fetchFeed(clock.http, source, sourceCache[source.id] ?? {});
         sourceCache[source.id] = { etag: feed.etag, lastModified: feed.lastModified };
-        return feed.items.map(item => classifyItem(item, source, value => fingerprint(value, deps.fingerprintKey))).filter((item): item is IncidentEvidence => item !== null);
+        if (feed.status !== 'ok') return [];
+        const filtered = filterNewItems(incidentState, source, feed.items, now(), itemKey);
+        incidentState = filtered.state;
+        return filtered.fresh.map(item => classifyItem(item, source, itemKey)).filter((item): item is IncidentEvidence => item !== null);
       }));
       for (const result of results) {
         if (result.status === 'fulfilled') evidence.push(...result.value);
         else deps.log.warn('The watcher could not read one configured source.');
       }
+      // Save seen-item baselines before validators: after a crash, a 304 must
+      // never hide content whose baseline had not reached durable state.
+      await deps.store.writeJson('plan', incidentFile, incidentState);
       await deps.store.writeJson('plan', path(deps.store, 'watcher-feeds.json'), sourceCache);
       return evidence;
     },
     async updateIncidents(evidence, at) {
       const file = path(deps.store, 'watcher-incidents.json');
-      const incidents = await deps.store.readJson<{ incidents: Incident[] }>('plan', file) ?? { incidents: [] };
+      const incidents = await deps.store.readJson<IncidentsState>('plan', file) ?? { incidents: [] };
       const result = updateIncidents(incidents, evidence, at);
-      await deps.store.writeJson('plan', file, { incidents: result.incidents });
+      await deps.store.writeJson('plan', file, { incidents: result.incidents, ...(result.sources ? { sources: result.sources } : {}) });
       return result;
     },
     async runAutopilot(incident) {

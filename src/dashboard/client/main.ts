@@ -33,21 +33,20 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   const content = document.createElement('div');
   const main = document.createElement('main'); main.className = 'page'; main.id = 'main-content';
   skip.addEventListener('click', event => { event.preventDefault(); main.querySelector<HTMLElement>('h1')?.focus(); });
+  let sessionNotice: HTMLElement | undefined;
   if (session.readOnly) {
     const readOnly = notice('info', 'Read-only', 'This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.'); readOnly.classList.add('read-only-notice');
-    // The router replaces page children on navigation; keep this notice below its heading.
-    new MutationObserver(() => {
-      const heading = main.querySelector('h1');
-      if (heading && heading.nextSibling !== readOnly) heading.after(readOnly);
-    }).observe(main, { childList: true });
+    sessionNotice = readOnly;
   } else if (session.passkeys === 0) {
     const enrollment = notice('info', 'Register a passkey', 'Changes require a passkey with user verification. Register one on this device before making a change.');
     const status = document.createElement('p'); status.setAttribute('role', 'status');
     const control = button('Register passkey', () => { control.disabled = true; void registerPasskey().then(() => { session.passkeys++; enrollment.replaceChildren(notice('ok', 'Passkey registered', 'Your passkey will be requested when you choose a change.')); }).catch(() => { status.textContent = 'Passkey registration was not completed. Try again.'; }).finally(() => { control.disabled = false; }); });
-    enrollment.append(control, status); content.append(enrollment);
+    enrollment.append(control, status); sessionNotice = enrollment;
   }
   content.append(main); body.append(nav, content); shell.append(skip, header, body); root.replaceChildren(shell);
   const router = createRouter(main, {}, route => {
+    // The router replaces the page on navigation; keep session guidance inside its padded column.
+    if (sessionNotice) main.querySelector('h1')?.after(sessionNotice);
     for (const anchor of shell.querySelectorAll<HTMLAnchorElement>('a[href^="#/"]')) {
       if (anchor.hash === `#/${route}`) anchor.setAttribute('aria-current', 'page'); else anchor.removeAttribute('aria-current');
     }

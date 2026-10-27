@@ -1,4 +1,5 @@
 import { CliError, RotationInterruptedError } from './errors.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -33,10 +34,14 @@ import { inventorySchema, planIdSchema, planSchema } from './schemas.js';
 import { humanizeServices, serviceLabel } from './display.js';
 import { hasInteractiveTerminal, promptSecret, revealSecret, promptPassphrase, promptGrace, confirmVaultFallback, confirmInventoryReplacement, confirmMissingManifest, promptVaultBackend, type RevealInfo, type PromptIO } from './prompts.js';
 import { RotationAbortedError } from '../types.js';
+import { readinessScore } from '../report/index.js';
+import { createHygieneState, createHygieneStateStore, updateFirstSeen, updateLastRotation } from '../hygiene/index.js';
+import { dashboardSettingsSchema } from './phase3-runtime.js';
 
 export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
 type Reveal = (info: RevealInfo, value: string) => Promise<boolean>;
 export interface RuntimeOptions {
+  firstRunGit?: import('../firstrun/index.js').GitRunner;
   cwd?: string; config?: string; env?: NodeJS.ProcessEnv; http?: HttpClient;
   settings?: ConfigSettings;
   trustedPlanKeyIds?: string[];
@@ -88,7 +93,15 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const userDir = resolve(options.userDir ?? join(homedir(), '.keysentry'));
   const interactive = (options.stdinIsTTY ?? !!process.stdin.isTTY) && (options.stdoutIsTTY ?? !!process.stdout.isTTY);
   const mutationContext = { env, stdinIsTTY: options.stdinIsTTY ?? !!process.stdin.isTTY, stdoutIsTTY: options.stdoutIsTTY ?? !!process.stdout.isTTY };
-  const assertHuman = (action: string) => assertHumanForMutation({ ...mutationContext, action });
+  // Entered only by passkey-gated dashboard handlers. Authorization follows this
+  // async operation, and cannot leak to a concurrent CLI/read request.
+  const dashboardAuthorization = new AsyncLocalStorage<boolean>();
+  const assertHuman = (action: string, allowPipedStdin = false) => assertHumanForMutation({ ...mutationContext, action, allowPipedStdin,
+    ...(dashboardAuthorization.getStore() ? { stdinIsTTY: true, stdoutIsTTY: true } : {}) });
+  const dashboardAction = async <T>(operation: () => Promise<T>): Promise<T> => {
+    assertHumanForMutation({ env, stdinIsTTY: true, stdoutIsTTY: true, action: 'make dashboard changes' });
+    return dashboardAuthorization.run(true, operation);
+  };
   const redactor = outputRedactor();
   const knownServices = new Map<string, ServiceRef>();
   const remember = (services: ServiceRef[]) => { for (const service of services) knownServices.set(serviceKey(service), service); };
@@ -250,6 +263,20 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const http = createGuardedHttp(transport, { rules, receipt,
     trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls], log });
   const config = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
+  try {
+    const saved = await store.readJson('monitor', join(paths.dir, 'dashboard-settings.json'));
+    if (saved !== null) {
+      const result = dashboardSettingsSchema.safeParse(saved);
+      if (!result.success) throw new CliError('Saved dashboard settings are invalid. Restore them before making changes.');
+      config.rotation.graceMs = result.data.graceMinutes * 60000;
+      config.settings.autopilot.graceMinutes = result.data.graceMinutes;
+      config.settings.autopilot.showHints = result.data.showHints;
+    }
+  } catch (error) {
+    // A read-only rescan can still rebuild observational inventory after key
+    // loss. The unreadable preferences stay intact for later recovery/reset.
+    if (!(error instanceof StateLockedError)) throw error;
+  }
   if (options.policy) config.monitor.policy = options.policy;
   if (options.feeds) config.monitor.feeds = options.feeds;
   const providers = options.providers ?? getProvider;
@@ -289,6 +316,16 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const hostMap = Object.fromEntries(hosts.map(host => [host.id, host])) as Partial<Record<HostId, HostAdapter>>;
   const providerList = () => (Object.keys(PROVIDER_CREDENTIALS) as ProviderId[]).map(providers);
   const grace = options.grace ?? (info => promptGrace(info, diagnostic, options.promptIO, options.now));
+  async function refreshConnections(): Promise<void> {
+    const fresh = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
+    config.providerCtx = fresh.providerCtx;
+    if (!options.hosts) {
+      config.hosts = fresh.hosts; config.disabledHosts = fresh.disabledHosts;
+      hosts.splice(0, hosts.length, ...wrapHosts(fresh.hosts));
+      for (const id of Object.keys(hostMap) as HostId[]) delete hostMap[id];
+      for (const host of hosts) hostMap[host.id] = host;
+    }
+  }
 
   /** Write credentials are fetched only after the calling operation's human gate. */
   async function adapters(role: TokenRole) {
@@ -322,6 +359,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function scan(allowReplacement = false): Promise<Inventory> {
+    await refreshConnections();
     let previousInventory: Inventory | null = null;
     let monitorState: MonitorState | undefined;
     let inventoryLocked = false; let monitorLocked = false;
@@ -384,6 +422,20 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     if (monitorLocked) await store.writeJson('monitor', paths.monitor, state, { replaceUndecryptable: true });
     if (inventoryLocked) await store.writeJson('inventory', paths.inventory, clean, { replaceUndecryptable: true });
     else await store.saveInventory(clean);
+    const hygieneStore = createHygieneStateStore(store);
+    let hygiene; let hygieneLocked = false;
+    try { hygiene = await hygieneStore.load(); }
+    catch (error) {
+      if (!(error instanceof StateLockedError) || !(inventoryLocked || monitorLocked)) throw error;
+      // The confirmed rebuild above applies to observational state only. Never
+      // replace plans, journals or recovery values when their keys are missing.
+      hygiene = createHygieneState(); hygieneLocked = true;
+    }
+    updateFirstSeen(hygiene, clean, (options.now ?? (() => new Date()))());
+    try { updateLastRotation(hygiene, await journal.read()); }
+    catch (error) { if (!(error instanceof StateLockedError)) throw error; }
+    if (hygieneLocked) await store.writeJson('monitor', join(paths.dir, 'hygiene.json'), hygiene, { replaceUndecryptable: true });
+    else await hygieneStore.save(hygiene);
     await audit.append({ kind: 'scan', summary: 'Scan saved.', data: { hosts: clean.hosts.length, services: clean.services.length, clusters: clean.clusters.length, errors: clean.errors.length } });
     return clean;
   }
@@ -449,7 +501,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       hosts: selected.hostMap, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: selected.providerCtx, journal,
       prompt: p => preserveAbort(() => prompt(p)), fingerprintKey, redactor, log,
       sleep: options.sleep, now: options.now,
-      inflight, crashHook: options.crashHook, grace: inheritInteraction && interactive ? grace : undefined,
+      inflight, crashHook: options.crashHook, grace: dashboardAuthorization.getStore() ? async () => 'defer' : inheritInteraction && interactive ? grace : undefined,
       reveal: reveal ? (info, value) => preserveAbort(() => reveal(info, value), true) : undefined,
     }, { ...config.rotation, dryRun: opts.execute !== true,
       ...(opts.revoke ? { revoke: opts.revoke } : {}), ...(opts.redeploy !== undefined ? { redeploy: opts.redeploy } : {}),
@@ -495,7 +547,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     await stateStore.save(state);
   }
 
-  function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'selfCheck' | 'lastNotificationSuccess'>> = {}) {
+  function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'selfCheck' | 'lastNotificationSuccess' | 'assertActive'>> = {}) {
     return createAutopilotManager({ store, audit, projectId, deviceKey: () => deviceKey(vault), assertHuman,
       scan: async () => rotationInventory(await scan()), rotateCluster: async clusterId => rotate(await plan({ clusterIds: [clusterId] }), {
         execute: true, prompt: options.prompt ?? (p => promptSecret(p, diagnostic, options.promptIO)),
@@ -677,23 +729,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const report = await execute(rotationPlan, inv, { execute: false });
     await recordDrill(store, { at: (options.now ?? (() => new Date()))(),
       passed: rotationInventory(inv).errors.length === 0 && report.steps.every(step => step.status !== 'failed') && report.deployments.every(deploy => deploy.state !== 'failed') });
-    const total = inv.clusters.length;
-    const automatic = inv.clusters.filter(cluster => cluster.method === 'generate' ||
-      cluster.method !== 'guided' && cluster.fingerprint !== null && PROVIDER_CREDENTIALS[cluster.provider].every(name => !!config.providerCtx.credentials[name])).length;
-    const sealed = inv.clusters.filter(cluster => cluster.fingerprint === null).length;
-    const duplicate = inv.clusters.filter(cluster => cluster.consumers.length > 1).length;
-    const missing = inv.clusters.filter(cluster => PROVIDER_CREDENTIALS[cluster.provider].some(name => !config.providerCtx.credentials[name])).length;
-    const manualDeploys = inv.services.filter(service => !hostMap[service.host]?.capabilities.redeploy || service.host === 'fly' || service.host === 'vercel' && service.environmentId !== 'production' || service.host === 'railway' && service.serviceId === '').length;
     const canaries = (await stateStore.load()).canaries.length;
-    const ratio = (count: number, denominator = total) => denominator ? count / denominator : 0;
-    const score = total ? Math.round(40 * ratio(automatic) + 15 * (1 - ratio(sealed)) + 15 * (1 - ratio(duplicate)) + 15 * (1 - ratio(missing)) + 10 * (1 - ratio(manualDeploys, inv.services.length)) + (canaries ? 5 : 0)) : 0;
-    return safe({ score: Math.max(0, Math.min(100, score)), elapsedMs: Math.round(performance.now() - start), reasons: [
-      `${automatic}/${total} clusters are currently auto-rotatable: automatic, atomic-roll, or generated (40 points).`,
-      `${sealed}/${total} clusters are sealed (15 points).`, `${duplicate}/${total} clusters have duplicate consumers (15 points).`,
-      `${missing}/${total} clusters lack configured admin credentials (15 points).`,
-      `${manualDeploys}/${inv.services.length} services require manual activation or have no redeploy support (10 points).`,
-      `${canaries} canaries configured (5 points).`,
-    ], report });
+    return safe({ ...readinessScore({ inventory: inv, canaries,
+      configuredCredentials: Object.keys(config.providerCtx.credentials).filter(name => !!config.providerCtx.credentials[name]),
+      redeploy: Object.fromEntries(hosts.map(host => [host.id, host.capabilities.redeploy])) }),
+      elapsedMs: Math.round(performance.now() - start), report });
   }
 
   async function recoveryInput(id?: string) {
@@ -721,7 +761,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     return { hosts: selected.hostMap, providers, providerCtx: selected.providerCtx, journal, fingerprintKey, redactor, log,
       prompt: options.prompt ?? (p => promptSecret(p, diagnostic, options.promptIO)), reveal: options.reveal,
       sleep: options.sleep, now: options.now, inflight, crashHook: options.crashHook,
-      grace: interactive ? grace : undefined };
+      grace: dashboardAuthorization.getStore() ? async () => 'defer' : interactive ? grace : undefined };
   }
 
   async function recover(mode: 'resume' | 'finish', id?: string, now = false) {
@@ -807,6 +847,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   return {
     config, paths, redactor, providers, safe, humanize, vault, store, inflight, audit, credentials, http, receipt, rules, userDir, interactive, assertHuman, mutationContext, assertStateResetSafe, prepareExecution,
+    dashboardAction, refreshConnections, firstRunGit: options.firstRunGit, now: options.now ?? (() => new Date()),
+    providerContext: async (role: TokenRole) => { if (role === 'read') await refreshConnections(); return (await adapters(role)).providerCtx; },
+    dashboardDisarm: command(() => createAutopilotManager({ store, audit, projectId, deviceKey: () => deviceKey(vault),
+      scan: async () => rotationInventory(await scan()), rotateCluster: async () => { throw new CliError('Disarm cannot rotate keys.'); },
+      assertHuman: () => {}, env, now: options.now }).disarm()),
     projectId, log, fingerprintKey, autopilotManager, signingKey: () => deviceKey(vault), recoveryDeps,
     httpForUrls: (urls: string[], purpose: string) => createGuardedHttp(transport, {
       rules: [...rules, ...rulesForUserUrls(urls, purpose)], receipt, log,
@@ -817,7 +862,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       assertActive?: () => Promise<void>) {
       let policy = context.alertOnly ? { ...config.monitor.policy, autoExecute: false, autoContain: false } : config.monitor.policy;
       if (policy.autoExecute || policy.autoContain) {
-        if (!options.watcherAuthorized) assertHuman('run automatic monitor actions');
+        assertHumanForMutation({ env, stdinIsTTY: true, stdoutIsTTY: true, action: 'run automatic monitor actions' });
         await prepareExecution();
       }
       const scanned = await scan();
@@ -866,15 +911,17 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     resetState: command(resetState), vaultList,
     async vaultStatus() { return { backend: vault.backend, ...(vault.weakness ? { weakness: vault.weakness } : {}), credentials: await vaultList(), supportedNames: [...CREDENTIAL_NAMES] }; },
     vaultSet: command(async (name: string, value: string, role: TokenRole = 'write', opts: { stdin?: boolean } = {}) => {
-      assertHumanForMutation({ ...mutationContext, action: 'store a credential', allowPipedStdin: opts.stdin === true }); const item = credentialName(name, role);
+      assertHuman('store a credential', opts.stdin === true); const item = credentialName(name, role);
       if (!value) throw new CliError('The credential value was empty. Nothing was stored.');
       redactor.register(value); const bytes = Buffer.from(value);
       try { await vault.set(item, bytes); } finally { bytes.fill(0); }
+      await refreshConnections();
       await audit.append({ kind: 'vault-set', summary: 'Credential stored.', data: { name, role } });
       return { name, role, stored: true };
     }),
     vaultRemove: command(async (name: string, role: TokenRole = 'write') => {
       assertHuman('remove a credential'); const removed = await vault.delete(credentialName(name, role));
+      await refreshConnections();
       await audit.append({ kind: 'vault-remove', summary: 'Credential removed.', data: { name, role } }); return { name, role, removed };
     }),
     vaultImportEnv: command(async () => {

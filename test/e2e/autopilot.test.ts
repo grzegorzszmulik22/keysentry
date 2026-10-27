@@ -113,7 +113,16 @@ async function fixture() {
   const recoveryDeps = { ...deps, trustedKeyIds: [key.keyId], env: {}, selfCheck };
   async function feed(fixtureName: string, sourceId: string) {
     const source = DEFAULT_SOURCES.find(candidate => candidate.id === sourceId)!;
-    const xml = await readFile(new URL(`../fixtures/feeds/${fixtureName}`, import.meta.url), 'utf8');
+    // Replay the recorded content as a newly published item for this rotation
+    // scenario. Historical-feed freshness is covered by the incidents tests.
+    const publishedAt = new Date(now().getTime() - 3_600_000).toUTCString();
+    let xml = (await readFile(new URL(`../fixtures/feeds/${fixtureName}`, import.meta.url), 'utf8'))
+      .replace(/<pubDate>[^<]*<\/pubDate>/g, `<pubDate>${publishedAt}</pubDate>`);
+    if (source.kind === 'official') {
+      // Recorded descriptions omit the article's exposure facts; this fresh
+      // scenario explicitly supplies the same claim as the incidents tests.
+      xml = xml.replace(/<\/description>/g, ' Customer environment variables were accessed. Railway urges users to rotate credentials after the security incident.</description>');
+    }
     transport.on('GET', new RegExp(`^${source.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), () => text(200, xml));
     const result = await fetchFeed(http, source, {});
     const evidence = result.items.map(item => classifyItem(item, source, id => fingerprint(`${source.id}:${id}`, fingerprintKey)))
@@ -132,7 +141,7 @@ async function fixture() {
 }
 
 describe('breach autopilot end to end', () => {
-  test('the recorded Railway advisory rotates armed keys with serial deployments, health checks, grace and revocation', async () => {
+  test('a fresh synthetic replay of the Railway advisory rotates armed keys with serial deployments, health checks, grace and revocation', async () => {
     const f = await fixture();
     const incidentUpdate = await f.feed('railway-official-2026-10.xml', 'railway-blog');
     expect(incidentUpdate.triggered).toHaveLength(1);

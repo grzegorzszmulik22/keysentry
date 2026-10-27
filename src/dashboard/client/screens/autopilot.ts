@@ -2,6 +2,7 @@ import { get, post, postWithPasskey } from '../api.js';
 import type { DashboardSession } from '../api.js';
 import { confirmAction, emptyState, table } from '../components.js';
 import { actions, dateTime, el, field, input, lifetime, list, message, numberInput, paragraph, scrollTable, section, status, taskButton, validNumber } from './components-b.js';
+import { hostName, providerName } from './components-a.js';
 
 interface Autopilot {
   state: 'off' | 'armed' | 'alert-only' | 'disarmed'; reasons: string[];
@@ -25,7 +26,6 @@ function coordinationFor(session: DashboardSession): Coordination {
   if (!coordination) { coordination = { offGeneration: 0, turningOff: false, listeners: new Set() }; sessions.set(session, coordination); }
   return coordination;
 }
-const platforms: Record<string, string> = { railway: 'Railway', fly: 'Fly', vercel: 'Vercel', render: 'Render', 'github-actions': 'GitHub Actions', dotenv: 'Local files' };
 
 export async function renderAutopilot(session: DashboardSession): Promise<HTMLElement> {
   const [initial, eligibility] = await Promise.all([get<Autopilot>('autopilot'), get<Eligibility>('autopilot/eligibility')]);
@@ -38,7 +38,7 @@ export async function renderAutopilot(session: DashboardSession): Promise<HTMLEl
     if (coordination.turningOff) stateText.textContent = 'Autopilot is turning off while an earlier request finishes.';
     else if (state.state === 'armed' && state.plan) {
       const expiry = new Date(state.plan.expiresAt); const until = Number.isFinite(expiry.getTime()) ? expiry.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : 'its expiry';
-      stateText.textContent = `Autopilot is armed for ${state.plan.keys} ${state.plan.keys === 1 ? 'key' : 'keys'} on ${state.plan.hosts.map(host => platforms[host] ?? host).join(' and ')} until ${until}.`;
+      stateText.textContent = `Autopilot is armed for ${state.plan.keys} ${state.plan.keys === 1 ? 'key' : 'keys'} on ${state.plan.hosts.map(hostName).join(' and ')} until ${until}.`;
     } else stateText.textContent = { off: 'Autopilot is off.', armed: 'Autopilot is armed; scope details are unavailable.', 'alert-only': 'Autopilot is in alert-only mode.', disarmed: 'Autopilot is disarmed.' }[state.state];
     stateNotes.replaceChildren(...(state.reasons.length ? [list(state.reasons)] : []));
     if (state.needsRefresh) stateNotes.append(paragraph('The armed plan needs a refresh. Review the key choices and run a drill before arming again.'));
@@ -47,7 +47,7 @@ export async function renderAutopilot(session: DashboardSession): Promise<HTMLEl
   const chosen = new Map<string, HTMLInputElement>(); const adoptions = new Map<string, HTMLInputElement>();
   const rows: (string | Node)[][] = eligibility.eligible.map(key => {
     const choose = input(key.id, 'checkbox'); choose.disabled = session.readOnly; chosen.set(key.id, choose);
-    const identity = field(`${key.provider} · ${key.hint ?? 'Hint unavailable'}`, choose); choose.addEventListener('change', () => updateArm());
+    const identity = field(`${providerName(key.provider)} · ${key.hint ?? 'Hint unavailable'}`, choose); choose.addEventListener('change', () => updateArm());
     let consent: Node = el('span', 'No adoption needed');
     if (key.needsAdoption) {
       const adopt = input(`adopt-${key.id}`, 'checkbox'); adopt.disabled = session.readOnly; adoptions.set(key.id, adopt);
@@ -72,7 +72,7 @@ export async function renderAutopilot(session: DashboardSession): Promise<HTMLEl
     if (!clusterIds.length || clusterIds.some(id => adoptions.has(id) && !adopt.includes(id))) { message(feedback, 'Review key choices', 'Choose at least one key. For each key that needs adoption, agree to rotate it now or leave it unselected.', 'attention'); return; }
     if (graceMinutes === null || maximum === null || days === null) { message(feedback, 'Check the numbers', 'Use a nonnegative grace period, a positive whole number of services, and 1 to 365 days.', 'attention'); return; }
     const changes = [`keysentry will arm autopilot for ${clusterIds.length} ${clusterIds.length === 1 ? 'key' : 'keys'} for ${days} days, with up to ${maximum} services per wave and ${graceMinutes} minutes of grace.`];
-    for (const id of adopt) { const key = eligibility.eligible.find(item => item.id === id)!; changes.push(`This rotates ${key.provider} ${key.hint ?? '(hint unavailable)'} now so keysentry can rotate it automatically later.`); }
+    for (const id of adopt) { const key = eligibility.eligible.find(item => item.id === id)!; changes.push(`This rotates ${providerName(key.provider)} ${key.hint ?? '(hint unavailable)'} now so keysentry can rotate it automatically later.`); }
     if (!await confirmAction({ title: 'Arm autopilot', changes, button: 'Arm autopilot', signal: scope.signal }) || scope.signal.aborted || armGeneration !== coordination.offGeneration || coordination.turningOff) return;
     // The confirmation and passkey can take time; the server also checks the last drill.
     if (!recent()) { updateArm(); message(feedback, 'Run another drill', 'The last drill is now more than 24 hours old.', 'attention'); return; }

@@ -130,6 +130,16 @@ describe('Task 6a dashboard screens', () => {
     clickText(page, 'Clear filters'); expect(page.querySelectorAll('.key-tag')).toHaveLength(3);
   });
 
+  it('keeps the key cabinet visible while the Filter disclosure starts closed', async () => {
+    const page = await open('keys');
+    const filters = page.querySelector<HTMLDetailsElement>('details');
+    expect(filters).not.toBeNull(); expect(filters!.open).toBe(false);
+    expect(filters!.querySelector('summary')?.textContent).toBe('Filter');
+    expect(filters!.querySelectorAll('fieldset')).toHaveLength(3);
+    expect(filters!.contains(page.querySelector('.screen-a-cabinet'))).toBe(false);
+    expect(page.querySelectorAll('.key-tag')).toHaveLength(3);
+  });
+
   it('reveals only after confirmation, and scrubs a retained panel on close', async () => {
     api.postWithPasskey.mockResolvedValue({ value: secret });
     const page = await open('keys'); page.querySelector<HTMLButtonElement>('.key-tag')!.click();
@@ -241,6 +251,23 @@ describe('Task 6a dashboard screens', () => {
       expect(notice!.textContent).toContain('This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.');
     };
     await vi.waitFor(check); app.router.navigate('network'); await vi.waitFor(() => expect(root.querySelector('h1')?.textContent).toBe('Network')); check(); app.destroy();
+  });
+
+  it('keeps passkey enrollment below the page heading across navigation', async () => {
+    api.fetchSession.mockResolvedValue({ ...session, passkeys: 0 });
+    api.registerPasskey.mockResolvedValue(undefined);
+    const root = document.createElement('div'); document.body.append(root);
+    const app = await boot(root); routers.push(app.router);
+    const check = () => {
+      const main = root.querySelector('main')!;
+      expect(main.querySelector('h1')?.nextElementSibling?.textContent).toContain('Register a passkey');
+      expect(main.querySelector('button')?.textContent).toBe('Register passkey');
+    };
+    check(); app.router.navigate('network');
+    await vi.waitFor(() => expect(root.querySelector('h1')?.textContent).toBe('Network')); check();
+    clickText(root, 'Register passkey');
+    await vi.waitFor(() => expect(root.textContent).toContain('Passkey registered'));
+    expect(app.session.passkeys).toBe(1); app.destroy();
   });
 
   it('offers a retry when a screen request fails without reflecting its error', async () => {

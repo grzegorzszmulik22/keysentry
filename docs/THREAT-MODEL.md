@@ -1,13 +1,13 @@
 # keysentry 1.0 threat model
 
 keysentry needs access to secret values to compare their copies and replace them. This is a local
-CLI and optional watcher that you host. You choose the projects and credentials they can
+CLI, loopback dashboard and optional watcher that you host. You choose the projects and credentials they can
 use. Its [trust promise](superpowers/specs/2026-10-27-trust-autopilot-design.md#3-the-trust-promise)
 guides the design; the [access guide](ACCESS.md) describes the actual integration permissions.
 
-This model covers 1.0 phases 1 and 2: vault storage, encrypted state, network restrictions, an audit log,
+This model covers 1.0 phases 1–3: vault storage, encrypted state, network restrictions, an audit log,
 rotation recovery, human confirmation, release tooling, signed breach autopilot, notifications, approvals and
-the self-hosted watcher. There has been **no external security
+the self-hosted watcher, plus local first run, the dashboard, guard, hygiene and shareable reports. There has been **no external security
 audit**. Adapter behaviour has **not yet been tested against live accounts**. Fake API tests and
 source review can check our decisions and formats, but cannot establish every provider's live
 permission or deployment behaviour.
@@ -26,14 +26,74 @@ permission or deployment behaviour.
 | Signed armed plan | Authorizes specific automatic rotations, consumer scope, limits and expiry. | Encrypted local/watcher state and sealed deployment configuration; verified against trusted device keys before effects. |
 | Approval credentials, challenges and grants | Authorize one narrowly bound action without sharing application secrets. | Public passkey credentials and single-use approval state in encrypted storage; challenges/assertions in the approval flow; signed device messages through the relay. |
 | Watcher deployment/state keys and vault passphrase | Unlock the sealed configuration, saved state and recovery values. | Platform secret settings and process memory; never beside encrypted state or in committed config. The watcher host can access them while running. |
+| First-run findings | Reveal key hints, file/history locations and possible deployment platforms. | Terminal/process memory; an explicitly saved pre-vault summary in `.keysentry/` is metadata, not encrypted credential storage. `--no-save` writes nothing. |
+| Dashboard sign-in token, session, CSRF token and passkey proof | Authorize local browser reads and exact changes. | One-time token in the initial localhost URL, then an HttpOnly session cookie; CSRF/proof in the local browser and server. They are never included in reports or receipts. |
+| Share card and timeline exports | May disclose preparation, infrastructure or incident timing even without key values. | Local SVG/Markdown or browser image/clipboard; external publication is the user's choice. Card platform/count statistics require separate opt-ins. |
 
 ## Boundaries and controls
 
-**Your terminal to the CLI.** Mutation requires the interactive human path. Known coding-agent
+**Your terminal to the CLI.** Manual mutation requires the interactive human path. Known coding-agent
 markers are refused even if a TTY is present. Read-only commands can be run by an agent at your
-request and return metadata, not values. There is no MCP server or agent skill in the phase-1
+request and return metadata, not values. `watch` and `watch --once` refuse those markers without requiring a TTY;
+their effects require signed armed-plan scope or a specific approval. There is no MCP server or agent skill in the
 product. Environment marker detection is an extra check; it is not an identity proof or an OS
 access boundary.
+
+**The project to first run and guard.** Token-free first run needs no vault or credentialed runtime. It reads
+bounded local candidate files and Git history without a network request, consumes transient plaintext into
+keyed fingerprints/hints and returns metadata. Git is spawned without a shell, hooks or external diff/text
+conversion helpers, using a minimal environment; lazy fetching is disabled. A per-run random key avoids a
+stable unsaved fingerprint identity. An initialized project can reuse its project key. `--no-save` writes
+nothing; creating `.keysentry/` first needs consent. Before vault initialization, an explicitly saved summary
+is plaintext metadata containing hints/locations, not plaintext credential values. Protect that directory as
+infrastructure information. Package acquisition by `npx` can contact the registry before this scanner runs.
+
+File size, count and history budgets, ignored directories, unavailable partial-clone objects, binary/encoded
+content and lightweight parsing limit coverage. Incomplete history is reported. Removing a value from current
+files does not remove it from Git history or revoke it. Guard uses the classifier on staged additions and can
+miss unknown or reconstructed values. Its optional hook calls an installed binary without downloading code;
+if that binary is missing, the commit is not checked. A user can also bypass a Git hook. Allow-list hashes are
+for synthetic fixtures only and permit offline guesses; broad path exceptions exempt everything they match.
+
+**The browser to the local dashboard.** The dashboard binds only `127.0.0.1`, opens as
+`http://localhost:<random port>` and exchanges a random, two-minute, single-use URL token for an HttpOnly,
+SameSite=Strict session cookie. Cookie names include the port to avoid cross-project replacement; cookies
+themselves are not isolated by port. Exact Host checks constrain DNS rebinding. POST requests also need the
+exact localhost Origin and session CSRF token. The server sends no CORS permissions, bounds JSON input and
+serves only bundled assets under a strict CSP with no inline scripts/styles or external resources. Authenticated
+idle sessions and the server expire after 15 minutes by default. The initial URL is a bearer credential until
+used or expired; a process able to steal it first can establish the browser session.
+
+Every dashboard change and explicit reveal requires a fresh passkey assertion with user verification, bound
+to that session, exact route and canonical request-body digest. A proof expires after two minutes and is
+consumed once; altered input, replay and clone-warning counters fail closed. First enrollment needs a
+user-verified registration through the authenticated session; additional enrollment also needs an existing
+passkey. Credential records are JSON vault entries under `passkey/<id>`. The relying party is `localhost` and
+the assertion origin must match the current full origin, including port. These controls rely on the browser,
+authenticator and the human reviewing the action, and do not identify which human enrolled the first credential.
+
+An agent driving ordinary browser controls can read metadata but cannot supply the required user verification
+to make a change. Agent-marked launches additionally run read-only, refusing mutations and enrollment on the
+server. Disarm deliberately works without a passkey even there and cancels arming still in progress. Someone
+with an authenticated dashboard session can therefore stop future automatic work, but cannot re-arm without
+authorization or restore already revoked keys. An unrestricted same-user agent or compromised browser is
+outside this page-level boundary; it may access storage/processes or manipulate the trusted code directly.
+
+Normal reads return only metadata/hints. Explicit reveal rereads a readable consumer, needs confirmation and
+passkey authorization, and audits only the variable name and cluster ID. Write-only values cannot be revealed.
+Revealed text is cleared when the page disposes it. Clipboard copy attempts clearing after 30 seconds, but
+browser permissions, tab closure/suspension, extensions or clipboard history can retain a copy. Clearing the
+current clipboard cannot remove copies already captured elsewhere. Same-user processes remain able to inspect
+an authorized browser or its memory. The session/passkey store has no cross-process transactional lock; one
+active dashboard writer per project is required.
+
+**Local reports to sharing.** The SVG card shares only score and branding by default; platform and
+completed-rotation counts require independent opt-ins. It has no values, hints, key names, project names,
+scripts, external references or arbitrary markup. The browser renders it as a Blob image, never injected SVG.
+A score describes recorded preparation, not proof of live recovery or a guarantee about security. Timeline
+Markdown escapes/redacts selected events but can still disclose incident times, service-related metadata or
+operational outcomes. Exports stay local until shared. Review exported metadata; a public post cannot be
+recalled by changing the local file. No card opt-in makes key values eligible for export.
 
 **The CLI to storage.** Credential values go to macOS Keychain, Windows DPAPI under the current
 user, or Linux Secret Service. If those are unavailable, the user must choose the encrypted-file
@@ -127,7 +187,8 @@ must correctly terminate TLS and configure proxy trust.
 
 Local registration binds to loopback, uses a one-time token, opens as localhost, checks Host/Origin, serves only a
 static script and closes after success or timeout. A localhost passkey is not a public-origin passkey. The server
-does not provide public `/register`; public enrollment remains a phase 3 dashboard feature. Browser/authenticator
+does not provide public `/register`; the phase 3 dashboard enrolls only at localhost, so public-origin enrollment
+remains unavailable here. Browser/authenticator
 implementation, the selected origin and the local supervised enrollment remain trust boundaries.
 
 **Watcher to its host.** The sealed config and encrypted state protect data at rest without their separately
@@ -179,7 +240,9 @@ operations still need maintainer validation before a release.
 | Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |
 | Watcher host | Read runtime memory or injected keys, modify code, roll back state or interrupt work. | Sealed configuration, separately supplied state/vault keys, private volume permissions and a non-root read-only image reduce filesystem exposure. The host remains trusted with running plaintext and can defeat these controls. Own-platform incidents request guided credential rotation. |
 | Same-user malware | Ask the OS vault for entries, read process memory or environment values, or replace files. | OS storage and encryption reduce exposure from files alone. They do not isolate keysentry from another process with your user's privileges in an unlocked session. |
-| AI coding agent | Invoke mutation commands or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive mutation checks, detected agent refusal, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
+| AI coding agent or agent-driven browser | Invoke mutation commands, click dashboard controls or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive CLI mutation checks, marker-triggered read-only dashboard, exact-action user-verified passkeys, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
+| Foreign web page or local process | Rebind a hostname, make cross-origin requests, steal a sign-in link or replay a dashboard action. | Loopback binding, exact Host/Origin, single-use expiring link, strict session cookie/CSRF checks, CSP and fresh route/body-bound passkey proofs constrain access. A stolen unused link can establish a session; same-user process/browser compromise is outside those controls. |
+| Recipient of a share card or timeline | Infer infrastructure, counts or incident timing from an export. | Card platform/counts are opt-in and names/hints/values never enter it; timelines escape and redact recorded events. Chosen metadata can still identify a deployment or event, and publication is irreversible from keysentry. |
 | keysentry maintainers | Ship an unsafe implementation or change the release trust list. | Open source, readable release code, explicit trust roots, release signatures, checksums, provenance workflows, and independent rebuilding enable review. Maintainers still control releases; a valid signature identifies the signer, not the safety of the code. There is no external audit yet. |
 
 ## What keysentry does not protect against
@@ -201,8 +264,8 @@ operations still need maintainer validation before a release.
 
 ## Later phases
 
-The trust design also describes a local dashboard, public-origin passkey enrollment, confidential cloud boxes,
-and team/enterprise roles. Those are later phases, not protections established by this work. No cloud box or control plane is
+The trust design also describes public-origin passkey enrollment, confidential cloud boxes,
+and team/enterprise roles. Those remain later work, not protections established by the local dashboard. No cloud box or control plane is
 deployed here, and there is no current claim that confidential hardware prevents operators or a
 cloud provider from accessing a running keysentry instance. Legacy monitor policy remains distinct from the
 signed armed-plan scope; enabling one does not authorize the other.

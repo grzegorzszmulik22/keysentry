@@ -29,7 +29,7 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
   validateApi(opts.api);
   const idleMs = opts.idleMs ?? 15 * 60_000;
   if (!Number.isFinite(idleMs) || idleMs <= 0 || idleMs > 2_147_483_647) throw new Error('Choose a positive dashboard idle time.');
-  const sessions = createSession({ idleMs, now: opts.now });
+  const sessions = createSession({ idleMs, now: opts.now, port: () => port });
   const passkeys = opts.passkeys ?? unavailablePasskeys;
   let port = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -67,7 +67,7 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
         const granted = sessions.exchange(params.get('t') ?? '');
         if (!granted) throw new DashboardError(401, 'Open keysentry again from your terminal.');
         touch();
-        res.setHeader('Set-Cookie', `ks_session=${granted.id}; HttpOnly; SameSite=Strict; Path=/`);
+        res.setHeader('Set-Cookie', `${sessions.cookieName}=${granted.id}; HttpOnly; SameSite=Strict; Path=/`);
         res.writeHead(303, { Location: '/' }); res.end(); return;
       }
       if (req.method === 'GET' && target === '/' && !session) {

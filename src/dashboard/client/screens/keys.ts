@@ -15,6 +15,8 @@ export async function renderKeys(session: DashboardSession): Promise<HTMLElement
     page.append(routeLink('Connect a platform', 'connect')); return page;
   }
   const filters = element('div', undefined, 'screen-a-filters');
+  const filterDisclosure = element('details', undefined, 'screen-a-filter-disclosure');
+  filterDisclosure.append(element('summary', 'Filter'), filters);
   const cabinet = element('div', undefined, 'screen-a-cabinet');
   const results = element('p', undefined, 'screen-a-muted'); results.setAttribute('role', 'status');
   const grid = element('div', undefined, 'key-grid'); grid.setAttribute('role', 'group'); grid.setAttribute('aria-label', 'Key cabinet');
@@ -96,5 +98,5 @@ export async function renderKeys(session: DashboardSession): Promise<HTMLElement
     renderTags();
   }, 'secondary'));
   page.addEventListener('keydown', event => { if (event.key === 'Escape' && selectedTag) { event.preventDefault(); close(); } });
-  cabinet.append(grid, detail); page.append(filters, results, cabinet); renderTags(); return page;
+  cabinet.append(grid, detail); page.append(filterDisclosure, results, cabinet); renderTags(); return page;
 }

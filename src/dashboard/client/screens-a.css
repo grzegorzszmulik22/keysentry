@@ -4,6 +4,8 @@
 .screen-a-muted { color: var(--muted); }
 .screen-a-links { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-block: var(--space-6); }
 .screen-a-state { font-weight: 600; }
+.screen-a-filter-disclosure { margin-block: var(--space-4); }
+.screen-a-filter-disclosure > summary { width: fit-content; min-height: 44px; padding-block: var(--space-2); cursor: pointer; font-weight: 600; }
 .screen-a .state-ok, .screen-a .key-tag[data-state="ok"] .key-tag-state { color: var(--ok); }
 .screen-a .state-attention, .screen-a .key-tag[data-state="attention"] .key-tag-state { color: var(--attention); }
 .screen-a .state-stop, .screen-a .key-tag[data-state="stop"] .key-tag-state { color: var(--stop); }

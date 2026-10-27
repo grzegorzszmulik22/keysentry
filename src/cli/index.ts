@@ -19,6 +19,8 @@ import { permissionOptionsForBin } from './sandbox-grants.js';
 export { permissionOptionsForBin } from './sandbox-grants.js';
 import { StateLockedError } from '../core/index.js';
 import { registerPhase2Commands, relaySettings, localDeviceKeys } from './phase2.js';
+import { registerPhase3Commands } from './phase3.js';
+import type { GitRunner } from '../firstrun/index.js';
 import { approveAutopilot } from './autopilot-approvals.js';
 import { listPasskeys } from './passkeys.js';
 import { bootstrapWatcher } from './watcher-bootstrap.js';
@@ -37,6 +39,10 @@ export interface CliOptions extends RuntimeOptions {
   promptIO?: PromptIO;
   confirmAdoption?: (question: string) => Promise<boolean>;
   openBrowser?: (url: string) => Promise<void>;
+  firstRunGit?: GitRunner;
+  guardGit?: GitRunner;
+  confirmFirstRunSave?: () => Promise<boolean>;
+  confirmDashboard?: () => Promise<boolean>;
 }
 
 function role(value: string): TokenRole {
@@ -150,6 +156,15 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     human, emit, diagnostic, interactive, json: () => !!program.opts().json, setExit: code => { exitCode = code; },
     env: options.env ?? process.env, now: options.now, promptIO: options.promptIO,
     confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser });
+  registerPhase3Commands(program, { getRuntime, peekRuntime: () => runtime,
+    firstRunSettings: () => ({ vault: options.vault ?? runtime?.vault, userDir: options.userDir,
+      env: options.env ?? runtime?.mutationContext.env ?? process.env, passphrase: options.passphrase }),
+    cwd: () => program.opts<{ cwd: string }>().cwd, human, emit, diagnostic, interactive,
+    json: () => !!program.opts().json, setExit: code => { exitCode = code; },
+    env: options.env ?? runtime?.mutationContext.env ?? process.env, promptIO: options.promptIO,
+    firstRunGit: options.firstRunGit, guardGit: options.guardGit,
+    confirmFirstRunSave: options.confirmFirstRunSave, confirmDashboard: options.confirmDashboard,
+    openBrowser: options.openBrowser });
 
   program.command('init').description('Create private local state and sample config without overwriting files').action(async () => {
     const rt = await getRuntime(); const result = await rt.init();
@@ -390,7 +405,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       emit(await rt.resetState(opts.force === true), 'Saved state reset. The audit log was kept.');
     });
 
-  try { if (!args.length) { program.outputHelp(); return 0; } await program.parseAsync(args, { from: 'user' }); }
+  try { await program.parseAsync(args, { from: 'user' }); }
   catch (error) {
     if (error instanceof CommanderError) {
       if (error.exitCode === 0) return 0;

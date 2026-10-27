@@ -87,6 +87,7 @@ it('relay disarm is signed with the local device key and local disarm survives d
     relayDisarm:async signed=>{ message=signed; throw new Error('channel unavailable'); }});
   await expect(manager.disarm({relay:true})).rejects.toThrow(/relay/i);
   expect((await manager.loadState()).disarmed).toBe(true);
+  expect(message).toMatchObject({ watcherId: 'project' });
   const {sig,...body}=message as {sig:string;keyId:string;at:string};
   expect(verifyDetached(f.key.publicKeyDer,Buffer.from(DISARM_PREFIX+canonicalJson(body)),Buffer.from(sig,'base64'))).toBe(true);
 });

@@ -7,13 +7,14 @@ import { buildInventory, createStateCipher, createStateStore } from '../../src/c
 import { buildArmedPlan, signArmedPlan } from '../../src/autopilot/index.js';
 import { canonicalJson, generateDeviceKey, verifyDetached } from '../../src/security/index.js';
 import { verifyMessage } from '../../src/notify/index.js';
+import { signDisarm } from '../../src/approvals/index.js';
 import type { FeedSource, PasskeyCredential, SignedNotifyMessage } from '../../src/types.js';
 import { FakeHttp, text } from '../helpers/fake-http.js';
 import { recoveryFixture } from '../rotate/recovery-fixture.js';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
-async function fixture() {
+async function fixture(options: { coldStart?: boolean; exposure?: boolean } = {}) {
   const f = await recoveryFixture();
   const dir = await mkdtemp(join(tmpdir(), 'keysentry-watch-cli-')); dirs.push(dir);
   const store = createStateStore({ cwd: dir, cipher: createStateCipher(Buffer.alloc(32, 1)) });
@@ -22,14 +23,26 @@ async function fixture() {
   await store.writeJson('plan', join(store.paths.dir, 'armed-plan.json'), armed);
   await store.writeJson('plan', join(store.paths.dir, 'autopilot.json'), { armedPlanId: armed.id, disarmed: false, waves: [] });
   const source: FeedSource = { id: 'railway-blog', kind: 'official', hosts: ['railway'], url: 'https://blog.railway.com/rss.xml', owner: 'Railway', outlet: 'Railway' };
-  const xml = await readFile('test/fixtures/feeds/railway-official-2026-10.xml', 'utf8');
-  const http = new FakeHttp().on('GET', /blog\.railway\.com/, () => text(200, xml));
+  // Replay the recorded content as a fresh publication. Freshness and startup
+  // baselining have their own regressions below; these fixtures exercise waves.
+  const publishedAt = new Date(f.deps.now!().getTime() - 3_600_000).toUTCString();
+  const xml = (await readFile('test/fixtures/feeds/railway-official-2026-10.xml', 'utf8'))
+    .replace(/<pubDate>[^<]*<\/pubDate>/g, `<pubDate>${publishedAt}</pubDate>`)
+    // Abbreviated recorded descriptions omit the exposure facts. Include the
+    // explicit exposure/rotation scenario also used by the incidents tests.
+    .replace(/<\/description>/g, options.exposure === false ? '</description>'
+      : ' Customer environment variables were accessed. Railway urges users to rotate credentials after the security incident.</description>');
+  let feedBody = xml, feedStatus = 200;
+  const http = new FakeHttp().on('GET', /blog\.railway\.com/, () => text(feedStatus, feedBody));
+  if (!options.coldStart) await store.writeJson('plan', join(store.paths.dir, 'watcher-incidents.json'), { incidents: [], sources: {
+    [source.id]: { baselineAt: new Date(f.deps.now!().getTime() - 7_200_000).toISOString(), seenItemKeys: [], undatedFirstSeenAt: {} },
+  } });
   const messages: SignedNotifyMessage[] = [];
   const events: unknown[] = [];
   const audit = { async append(event: unknown) { events.push(event); }, async checkpoint() {}, async verify() { return { ok: true, entries: events.length, checkpoints: 0 }; } };
   let scans = 0; let gates = 0; let monitors = 0;
   const deps: WatchRuntimeDependencies = {
-    store, audit, http, log: f.deps.log, rotation: f.opts, now: f.deps.now, env: {}, fingerprintKey: f.deps.fingerprintKey,
+    store, audit, http, log: f.deps.log, rotation: f.opts, now: f.deps.now, env: {}, fingerprintKey: f.deps.fingerprintKey, projectId: 'project',
     signingKey: async () => key, deviceKeys: async () => [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }], passkeys: async () => [],
     channels: async () => [{ id: 'test', kind: 'console', async send(message) { messages.push(message); } }],
     sources: [source], engine: async () => f.deps,
@@ -39,8 +52,46 @@ async function fixture() {
     },
     async monitor() { monitors++; }, assertHuman() { gates++; },
   };
-  return { ...f, store, deps, messages, key, http, get scans() { return scans; }, get gates() { return gates; }, get monitors() { return monitors; } };
+  return { ...f, store, deps, messages, key, http, xml,
+    setFeed(body: string, status = 200) { feedBody = body; feedStatus = status; },
+    get scans() { return scans; }, get gates() { return gates; }, get monitors() { return monitors; } };
 }
+
+test('cold feeds baseline silently after content, survive restart, and trigger only a later fresh item', async () => {
+  const f = await fixture({ coldStart: true });
+  f.setFeed('', 304);
+  const first = await createWatchRuntime(f.deps); await first.tick();
+  const file = join(f.store.paths.dir, 'watcher-incidents.json');
+  expect((await f.store.readJson<{ sources?: object }>('plan', file))?.sources).toBeUndefined();
+  expect(first.state.waves).toHaveLength(0);
+  f.setFeed(f.xml);
+  await first.tick();
+  const baseline = await f.store.readJson<{ incidents: unknown[]; sources: Record<string, { seenItemKeys: string[] }> }>('plan', file);
+  expect(baseline?.sources['railway-blog']?.seenItemKeys.length).toBeGreaterThan(0);
+  expect(baseline?.incidents).toEqual([]);
+  expect(first.state.waves).toHaveLength(0);
+  expect(f.host.writes).toHaveLength(0);
+  const restarted = await createWatchRuntime(f.deps);
+  await restarted.tick();
+  expect(restarted.state.waves).toHaveLength(0);
+  f.clock.ms += 1000;
+  f.setFeed(f.xml.replace(/https:\/\/blog\.railway\.com\/p\//g, 'https://blog.railway.com/p/new-publication-'));
+  await restarted.tick();
+  expect(restarted.state.waves).toHaveLength(1);
+  expect(restarted.state.waves[0]?.status).toBe('grace');
+  const after = await f.store.readJson<{ sources: Record<string, { seenItemKeys: string[] }> }>('plan', file);
+  expect(after?.sources['railway-blog']?.seenItemKeys.length).toBeGreaterThan(baseline!.sources['railway-blog']!.seenItemKeys.length);
+});
+
+test('fresh abbreviated recorded summaries remain alerts without an explicit exposure claim', async () => {
+  const f = await fixture({ exposure: false });
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  const saved = await f.store.readJson<{ incidents: { status: string; evidence: { credentialExposure: boolean }[] }[] }>('plan', join(f.store.paths.dir, 'watcher-incidents.json'));
+  expect(saved?.incidents.length).toBeGreaterThan(0);
+  expect(saved?.incidents.every(incident => incident.status === 'alerted' && incident.evidence.every(item => !item.credentialExposure))).toBe(true);
+  expect(watcher.state.waves).toHaveLength(0);
+  expect(f.host.writes).toHaveLength(0);
+});
 
 test('watch composes guarded feed fetch, durable incidents, signed notifications and fresh settlement scans', async () => {
   const f = await fixture();
@@ -74,6 +125,28 @@ test('watch --once gates local mutations and returns the watcher exit status', a
   const f = await fixture();
   expect(await runWatch(f.deps, { once: true })).toBe(0);
   expect(f.gates).toBe(1);
+});
+
+test.each(['project', 'other-project'])('relay disarm is accepted only for this watcher project: %s', async watcherId => {
+  const f = await fixture();
+  f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+  f.deps.sources = [];
+  const signed = signDisarm(f.key, { watcherId, at: f.deps.now!().toISOString() });
+  f.http.on('GET', /ntfy\.sh/, () => text(200, JSON.stringify({ id: 'message-one', time: Math.floor(f.deps.now!().getTime() / 1000),
+    event: 'message', topic: 'saved-topic', message: JSON.stringify({ type: 'keysentry-disarm', v: 2, ...signed }) })));
+  const watcher = await createWatchRuntime(f.deps);
+  await watcher.tick();
+  expect(watcher.state.disarmed).toBe(watcherId === 'project');
+});
+
+test('a saved relay inbox cannot apply a disarm addressed to another project', async () => {
+  const f = await fixture();
+  f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' }; f.deps.sources = [];
+  await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'cursor-one', pendingApprovals: [],
+    pendingDisarms: [signDisarm(f.key, { watcherId: 'other-project', at: f.deps.now!().toISOString() })] });
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(watcher.state.disarmed).toBe(false);
+  expect(await f.store.readJson('pending', join(f.store.paths.dir, 'watcher-relay.json'))).toMatchObject({ pendingDisarms: [] });
 });
 
 test('watch fails closed when no notification channel delivers', async () => {
@@ -132,7 +205,7 @@ test('local adoption refresh waits for completed waves and reloads the replaced 
 test('a durable relay inbox applies a disarm before advancing to new messages', async () => {
   const f = await fixture(); f.deps.relay = { server: 'https://ntfy.sh', topic: 'setup-topic' };
   await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'old-cursor',
-    pendingApprovals: [], pendingDisarms: [{ keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
+    pendingApprovals: [], pendingDisarms: [{ watcherId: 'project', keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
   const watcher = await createWatchRuntime(f.deps); await watcher.tick();
   expect(watcher.state.disarmed).toBe(true);
   expect(f.http.calls.some(call => call.method === 'GET' && call.url.includes('ntfy.sh'))).toBe(false);
@@ -154,7 +227,7 @@ test('relay disarm retries a failed durable state write before acknowledging the
   const f = await fixture(); f.deps.relay = { server: 'https://ntfy.sh', topic: 'setup-topic' };
   f.http.on('POST', /ntfy\.sh/, () => text(200, '{}'));
   await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'old-cursor',
-    pendingApprovals: [], pendingDisarms: [{ keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
+    pendingApprovals: [], pendingDisarms: [{ watcherId: 'project', keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
   const write = f.store.writeJson.bind(f.store); let failed = false;
   f.store.writeJson = async (kind, file, value, options) => {
     if (!failed && file.endsWith('autopilot.json') && (value as { disarmed?: boolean }).disarmed) { failed = true; throw new Error('disk temporarily unavailable'); }

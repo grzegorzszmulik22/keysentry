@@ -59,7 +59,7 @@ describe('dashboard HTTP boundary', () => {
     const exchange = await req(d.port, `/${new URL(d.url).search}`);
     expect(exchange.status).toBe(303);
     expect(exchange.headers.location).toBe('/');
-    expect(exchange.headers['set-cookie']![0]).toMatch(/ks_session=.+; HttpOnly; SameSite=Strict; Path=\//);
+    expect(exchange.headers['set-cookie']![0]).toMatch(new RegExp(`^ks_session_${d.port}=.+; HttpOnly; SameSite=Strict; Path=/$`));
     expect(exchange.headers['set-cookie']![0]).not.toContain('Secure');
     expect((await req(d.port, `/${new URL(d.url).search}`)).status).toBe(401);
     const cookie = exchange.headers['set-cookie']![0]!.split(';')[0]!;
@@ -70,6 +70,20 @@ describe('dashboard HTTP boundary', () => {
     expect((await req(d.port, '/app/main.js', { headers: { Cookie: cookie } })).status).toBe(200);
     expect((await req(d.port, '/app/../../package.json', { headers: { Cookie: cookie } })).status).toBe(404);
     expect((await req(d.port, '/api/keys', { headers: { Cookie: cookie } })).json).toEqual({ count: 2 });
+  });
+
+  it('keeps dashboards on different ports authenticated in one browser cookie jar', async () => {
+    const first = await start();
+    const second = await start();
+    const firstAuth = await login(first);
+    const secondAuth = await login(second);
+    expect(firstAuth.cookie).toMatch(new RegExp(`^ks_session_${first.port}=`));
+    expect(secondAuth.cookie).toMatch(new RegExp(`^ks_session_${second.port}=`));
+    const cookie = `${firstAuth.cookie}; ${secondAuth.cookie}`;
+    expect((await req(first.port, '/api/session', { headers: { Cookie: cookie } })).status).toBe(200);
+    expect((await req(second.port, '/api/session', { headers: { Cookie: cookie } })).status).toBe(200);
+    expect((await req(first.port, '/api/session', { headers: { Cookie: secondAuth.cookie } })).status).toBe(401);
+    expect((await req(second.port, '/api/session', { headers: { Cookie: firstAuth.cookie } })).status).toBe(401);
   });
 
   it('refuses rebinding Host, foreign Origin and missing CSRF without calling handlers', async () => {

@@ -1,8 +1,39 @@
 # keysentry
 
-Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local CLI for routine rotation and monitoring.
+Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local CLI and dashboard for routine rotation and monitoring.
 
-> **Status: keysentry 1.0 phase 2: breach autopilot and a self-hosted watcher.** Adapters are tested against fakes built from vendor documentation, not yet against live accounts. Native vault helpers are also tested through fakes. Try dry runs and a drill on a staging project before relying on provider writes. Real-browser passkey ceremonies and deployed watcher operation still need integration checks. The dashboard, cloud boxes and token-free onboarding wizard are later phases. Release signing keys are not published yet.
+> **Status: keysentry 1.0 phase 3: local dashboard, token-free first run and everyday checks.** Adapters and native vault helpers are tested against fakes, not yet against live accounts or real credential stores. Try dry runs and a drill on a staging project before relying on provider writes. Real-browser passkey ceremonies, packed-package onboarding and deployed watcher operation still need integration checks. Cloud boxes and team features are later phases. Release signing keys are not published yet.
+
+## Try it in 30 seconds
+
+Run this in your project:
+
+```sh
+npx keysentry
+```
+
+The first-run scan needs no token, account, configuration or vault. It reads local environment/configuration files and bounded git history, then reports where it found keys, whether they appeared in commits, and possible deployment platforms inferred from project files. A key removed from today's files can still remain in git history and need rotation. Inferred deployment targets are suggestions, not verified live deployments.
+
+The scanner makes no network calls. `npx` may contact the package registry to obtain the package itself. keysentry asks before creating `.keysentry/`; an interactive desktop terminal also offers to open the dashboard. To keep the scan entirely unsaved, use:
+
+```sh
+npx keysentry --no-save
+```
+
+`--no-save` writes nothing. History scanning has a time and commit budget; the summary says how much was scanned when history is incomplete. The scan skips binary/oversized content and common dependency/build directories, so it cannot establish that a project contains no secrets.
+
+## Local dashboard
+
+```sh
+keysentry ui
+keysentry ui --read-only
+```
+
+The dashboard brings together the key map, platform connection guidance, rotation preview, drill, autopilot, approvals, activity, notifications and settings. Connect shows the narrowest supported token and explains both its permissions and what keysentry will use it for. Values entered there go to the vault, not the project configuration.
+
+Changes need a passkey with user verification so that an AI agent driving a browser cannot make them through the dashboard without your participation. The first visit offers passkey enrollment on `localhost`; later changes require a fresh assertion bound to that exact action and input. Explicitly revealing a readable value also needs a passkey. Disarm remains available without one, including in read-only mode. Launches with a detected coding-agent marker are automatically read-only.
+
+The server binds only to `127.0.0.1` and opens as `http://localhost:<random port>` with a single-use sign-in link. All assets are bundled locally; Host/Origin checks, CSRF tokens and a strict content policy protect requests. It shuts down after 15 idle minutes. Normal responses contain metadata and hints, not values; reveal is explicit and clipboard copy attempts to clear after 30 seconds. Browser permissions or closing the tab can prevent clipboard clearing. These controls do not isolate credentials from other software running as your OS user.
 
 ## The trust promise
 
@@ -37,7 +68,7 @@ npm run build
 node dist/cli/index.js --help
 ```
 
-The examples below use `keysentry` for the package CLI. From this checkout, substitute `node dist/cli/index.js` or `npm run dev --` for `keysentry`. A public one-command package onboarding flow is planned for phase 3. This checkout is licensed under [Apache-2.0](LICENSE).
+The examples below use `keysentry` for the package CLI. From this checkout, substitute `node dist/cli/index.js` or `npm run dev --` for `keysentry`. Package publication and packed-package verification remain release checks. This checkout is licensed under [Apache-2.0](LICENSE).
 
 ## Quick start
 
@@ -55,11 +86,54 @@ keysentry rotate
 
 Use either environment import or individual `vault set` commands. `init` creates project state and a sample configuration without overwriting an existing config. A local dotenv scan needs no host token. `scan` saves an encrypted inventory and prints the blast radius, including hosts it could not scan. `plan` saves an encrypted ordered plan and an optional readable runbook. `rotate` previews changes without writing to hosts or providers.
 
-Review the dry run, then run `keysentry rotate --execute` yourself. It prints the diff and requests the number of secrets before proceeding. `--yes` skips that question, but every mutation still requires an interactive human terminal and refuses known coding-agent environments. Use `--plan <id>` to execute a saved plan, or `--tier cloud,ai`, `--cluster <id>`, and `--host <id>` to narrow selection. Selecting a shared secret retains all known consumers, including those on other hosts.
+Review the dry run, then run `keysentry rotate --execute` yourself. It prints the diff and requests the number of secrets before proceeding. `--yes` skips that question, but CLI execution still requires an interactive human terminal and refuses known coding-agent environments. Use `--plan <id>` to execute a saved plan, or `--tier cloud,ai`, `--cluster <id>`, and `--host <id>` to narrow selection. Selecting a shared secret retains all known consumers, including those on other hosts.
 
 Guided providers show their dashboard and instructions, then request the replacement through hidden input. Use bracketed paste for multi-line PEM or JSON values, or enter `@<path>` to read a value from a file. File input removes one trailing newline. Input is not echoed. Delete any temporary secret file after use. Empty input skips the step; Ctrl-C or Esc aborts the rotation before further changes.
 
-Global flags are `--cwd <dir>`, `--config <path>`, `--json`, and `--verbose`. Config defaults to `keysentry.yaml` in the selected directory. JSON output excludes plaintext values. Errors use exit status 1; `scan --fail-on-findings` uses 2 for findings requiring attention. A partial scan does not establish that a host is clear. Plans touching a host with scan errors are blocked; unrelated plans may proceed with a warning.
+Global flags are `--cwd <dir>`, `--config <path>`, `--json`, and `--verbose`; the default first-run action also accepts `--no-save`. Config defaults to `keysentry.yaml` in the selected directory. JSON output excludes plaintext values. Errors use exit status 1; `scan --fail-on-findings` uses 2 for findings requiring attention. A partial scan does not establish that a host is clear. Plans touching a host with scan errors are blocked; unrelated plans may proceed with a warning.
+
+## Guard against committed keys
+
+```sh
+keysentry guard
+keysentry guard --history
+keysentry guard --staged
+keysentry guard install-hook
+keysentry guard uninstall-hook
+```
+
+Guard reports local findings; `--history` includes the bounded history scan, while `--staged` checks added staged lines and exits 1 when it would commit a detected secret. The optional pre-commit hook calls the installed `keysentry guard --staged`. It downloads nothing and prints a note if keysentry is unavailable. Hook installation/removal needs a human terminal, respects `core.hooksPath`, and preserves foreign hooks rather than silently replacing them.
+
+Synthetic fixtures can be exempted with repository-relative `path:<glob>` entries in `.keysentry-allow` or its supported fingerprint format. Commit that file so the exceptions travel with the repository. Keep path exceptions narrow and never allow-list a real credential; the guard is a detection aid, not a proof that every possible secret was found. See [the guard format and limits](notes/guard.md#keysentry-allow).
+
+## Key age, spending and weekly digest
+
+```sh
+keysentry hygiene
+keysentry spend-limits
+keysentry spend-limits --apply
+keysentry digest
+keysentry digest --send
+```
+
+Hygiene shows first-seen age, known copies and rotate-by dates, with a default 90-day rotation interval. First-seen means when keysentry observed a readable fingerprint, not when the provider created the key. Write-only keys cannot establish stable age. An unused-key hint appears only when the recorded usage has enough continuous coverage; absent evidence does not mean unused.
+
+Set rotation intervals, provider spending caps and digest preferences in the dashboard Settings screen. `spend-limits` previews eligible changes; `--apply` requires human approval and write-role credentials. This phase supports OpenRouter per-key caps only, preserves a known tighter limit, and reports other providers as unavailable. A provider cap is not an aggregate account budget; missing usage/reference/cap data can leave a key without a proposal.
+
+`digest` builds one calm summary of the recent period. `--send` sends it through configured notification channels after the human mutation check. A successful send means the channel accepted it, not that someone read it. A digest-day preference does not itself install a scheduler.
+
+## Readiness card and incident timeline
+
+```sh
+keysentry card --out readiness.svg
+keysentry card --out readiness.svg --share-platform --share-counts
+keysentry timeline <planId-or-waveId>
+keysentry timeline <planId-or-waveId> --out incident.md
+```
+
+The card is a self-contained SVG with the same readiness score as `keysentry drill`. By default it shares only the score and keysentry branding. `--share-platform` and `--share-counts` independently opt in to supported platform and completed-rotation statistics when available. It contains no key values, hints, names or project names. The dashboard offers an image preview, SVG download and PNG clipboard copy where the browser supports it.
+
+Timeline exports the selected plan or wave's recorded detection, decisions, writes, deployments, verification, grace and revocation events as Markdown. It cannot reconstruct events that were never recorded. Card and timeline exports are local files; review the metadata you choose to share before publishing them.
 
 ## Vault and credential roles
 
@@ -238,7 +312,7 @@ keysentry autopilot status
 
 `arm` lists eligible keys and explains exclusions. It requires a completed, passing drill from the last 24 hours. Use `--cluster <ids>` to narrow selection, `--valid-days <n>` to set the authorization lifetime, and `--health '<serviceKey>=https://app.example.com/health'` to add an application check. Defaults are 90 days, 15 minutes of grace and at most 10 services per wave. Non-secret defaults belong in the `autopilot` section of [keysentry.example.yaml](keysentry.example.yaml). The device key signs the plan, which is saved in encrypted state; re-arming replaces it and is audited.
 
-For a write-only key, `arm` offers a supervised adoption rotation. The prompt says plainly that this rotates the key now. You can decline it; that key then remains outside automatic coverage. Adoption records the replacement's fingerprint and provider key reference, rather than retaining its plaintext. After watcher rotations, status can show **re-arm to refresh adopted keys**. `keysentry arm --refresh` reviews and signs updates in the same local CLI/`watch` state store. A separate deployed watcher's adoption updates are not automatically imported into that store. Reconcile its original encrypted state and matching keys before re-arming or renewing that deployment; remote update import and dashboard reconciliation remain a phase 3 gap.
+For a write-only key, `arm` offers a supervised adoption rotation. The prompt says plainly that this rotates the key now. You can decline it; that key then remains outside automatic coverage. Adoption records the replacement's fingerprint and provider key reference, rather than retaining its plaintext. After watcher rotations, status can show **re-arm to refresh adopted keys**. `keysentry arm --refresh` reviews and signs updates in the same local CLI/`watch` state store. A separate deployed watcher's adoption updates are not automatically imported into that store. Reconcile its original encrypted state and matching keys before re-arming or renewing that deployment; remote update import and live-state migration remain unavailable.
 
 **News alone never rotates.** One uncorroborated report alerts and requests approval. A trigger needs a high-confidence official advisory, or credential-exposure reports corroborated by an official source or a second independent news owner naming the same platform. Each watcher reads the sources itself. An outage, a phishing story that merely mentions the platform, or a breach at another company is not authorization to rotate your keys.
 
@@ -256,7 +330,7 @@ keysentry watcher setup
 keysentry watcher status https://watcher.example.com
 ```
 
-Run one watcher per state directory. Locally it uses the same vault and state as the CLI. `watcher setup` guides token selection using the actual platform capabilities, creates deployment and state keys, seals the configuration, and points to the chosen template under [deploy/](deploy/README.md). Setup does not deploy anything. It warns when you would host the watcher on a platform it protects, because that platform also holds the watcher's own credentials.
+Run one watcher per state directory. Locally it uses the same vault and state as the CLI. `watch` and `watch --once` do not require a TTY, so they can run unattended with the required vault/state material. They still refuse detected coding-agent environments; automatic effects stay within signed armed-plan scope or a specific approval. `watcher setup` guides token selection using the actual platform capabilities, creates deployment and state keys, seals the configuration, and points to the chosen template under [deploy/](deploy/README.md). Setup does not deploy anything. It warns when you would host the watcher on a platform it protects, because that platform also holds the watcher's own credentials.
 
 Setup prints `KEYSENTRY_WATCHER_KEY`, `KEYSENTRY_STATE_KEY`, `KEYSENTRY_VAULT_PASSPHRASE`, the sealed `KEYSENTRY_WATCHER_CONFIG` and encrypted portable `KEYSENTRY_WATCHER_VAULT` once, only in an interactive terminal. Store all five values in your platform's secret settings only; add the portable-vault variable explicitly if your template lists only the first four. The portable vault supplies the chosen host/provider credentials, scope and signing material absent from the fixed sealed-config format. Do not put these values in command arguments, a committed configuration, logs or a JSON export. `KEYSENTRY_WATCHER_CONFIG_FILE` can point to a file containing the sealed configuration. The image keeps its encrypted vault and state under `KEYSENTRY_STATE_DIR=/data`; keep their keys and passphrase outside that directory. Existing POSIX state directories must have mode 0700, and the volume must persist across runs.
 
@@ -266,7 +340,7 @@ Each `watcher setup` creates a new deployment key, state key, vault passphrase a
 2. Disarm and stop the old watcher. Retain a secure backup of its unchanged encrypted volume and separately protected original keys for recovery and audit inspection.
 3. Prepare the new setup and use a fresh private state directory or volume with all five newly generated secret settings. Keep the old volume unchanged; do not point the new state key or passphrase at it, and never store an unlock key alongside encrypted state.
 
-Phase 2 has no dashboard or automatic export/import flow to reconcile remote adopted-key updates or migrate a live watcher. Keep the original deployment material available until that reconciliation and all pending recovery work are complete.
+The local dashboard does not provide automatic export/import of remote adopted-key updates or migration of a live watcher. Keep the original deployment material available until that reconciliation and all pending recovery work are complete.
 
 The templates cover Docker Compose, Railway, Fly, Render and scheduled GitHub Actions. They still require the release image/digest and platform checks described in [deploy/README.md](deploy/README.md). Scheduled Actions can run late or be skipped; caches can be evicted, and public-repository caches must be treated as public encrypted data. This mode cannot promise an exact response time.
 
@@ -301,7 +375,7 @@ Local registration serves a one-page app on a random port, binds to `127.0.0.1` 
 
 A passkey approval binds to one pending action and its digest, expires after ten minutes and is single-use. Device-key approval through `approve` works locally or publishes a signed approval through the configured relay; existing monitor approvals remain available. The relay cannot authorize a different action or expand an armed plan. Public ntfy topics are readable and writable by others: a random topic reduces discovery, while trusted signatures provide authorization.
 
-Passkeys are scoped to their relying party and origin. A localhost registration does not register a passkey for a public watcher. `passkey register --origin https://watcher.example.com` explains that registration must happen there. The current approval server has no `/register` page; public-origin enrollment is a phase 3 dashboard feature. Arming, adding/removing channels, registering/removing passkeys and watcher setup require the local human CLI and cannot be done through a relay.
+Passkeys are scoped to their relying party and origin. A localhost registration does not register a passkey for a public watcher. `passkey register --origin https://watcher.example.com` explains that registration must happen there. The current approval server has no `/register` page; the local dashboard enrolls only for `localhost`, not a public watcher origin. Arming, channel changes and passkey enrollment require the local human CLI or the passkey-gated local dashboard where offered; watcher setup uses the human CLI. Relay approvals cannot widen policy.
 
 ## Kill switch
 
@@ -312,7 +386,7 @@ keysentry disarm --relay
 
 Local disarm sets the saved off-state. With `--relay`, it also publishes a device-signed disarm to the watcher. Disarming needs no passkey. The approval server also has a Disarm page; remote delivery can be delayed, so check the watcher's status. Disarm stops new automatic effects and grace settlement; old keys that have not yet been revoked stay valid. It does not restore a key already revoked.
 
-Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-arming requires the local CLI and a new signed plan. When the watcher's own host has an incident, rotate its platform/provider credentials through the guided path; the watcher does not automatically replace its own operating credentials.
+Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-arming requires the local human CLI or a passkey-gated local dashboard action and a new signed plan. When the watcher's own host has an incident, rotate its platform/provider credentials through the guided path; the watcher does not automatically replace its own operating credentials.
 
 ## Safety model and limitations
 
@@ -328,6 +402,8 @@ Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-ar
 
 ```sh
 npx tsc -p tsconfig.json --noEmit
+npx tsc -p tsconfig.client.json
+node scripts/build-ui.mjs --check
 node tools/vitest-sandbox.mjs test
 ```
 

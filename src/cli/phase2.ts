@@ -14,6 +14,7 @@ import { promptVaultValue, type PromptIO } from './prompts.js';
 import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
 import { DEFAULT_SOURCES, verifyArmedPlan } from '../autopilot/index.js';
 import { CliError } from './errors.js';
+import { assertHumanForMutation } from '../safety/index.js';
 
 export interface Phase2CommandsOptions {
   getRuntime(watcher?: boolean): Promise<KeysentryRuntime>;
@@ -70,18 +71,14 @@ export async function configureApprovalRelay(rt: KeysentryRuntime, server: strin
   } finally { topic?.fill(0); }
 }
 
-export function registerPhase2Commands(program: Command, opts: Phase2CommandsOptions): void {
-  const channels = (rt: KeysentryRuntime) => createNotificationChannels(rt.config.settings.notify.channels,
-    { vault: rt.vault, http: rt.http, redactor: rt.redactor, receipt: rt.receipt, write: opts.diagnostic });
-  const manager = (rt: KeysentryRuntime) => rt.autopilotManager({
-    confirmAdoption: opts.confirmAdoption ?? (async question => {
-      opts.diagnostic(question); const answer = await promptVaultValue('y to rotate now', opts.diagnostic, opts.promptIO); return answer?.toLowerCase() === 'y';
-    }),
-    emitEligibility: rows => { if (!opts.json()) for (const row of rows) opts.diagnostic(`${row.clusterId} (${row.provider}): ${row.eligible ? 'eligible' : row.reason}`); },
+/** Shared local status and relay adapters for the terminal and dashboard. */
+export function createCliAutopilotManager(rt: KeysentryRuntime,
+  overrides: NonNullable<Parameters<KeysentryRuntime['autopilotManager']>[0]> = {}) {
+  return rt.autopilotManager({
     relayDisarm: async signed => {
       const relay = await relaySettings(rt); if (!relay) throw new CliError('Configure the watcher relay before using --relay.');
       const response = await rt.httpForUrls([relay.server], 'approval relay you configured').request({ method: 'POST', url: `${relay.server.replace(/\/$/, '')}/${relay.topic}`,
-        headers: { 'Content-Type': 'application/json', ...(relay.token ? { Authorization: `Bearer ${relay.token}` } : {}) }, body: JSON.stringify({ ...signed, type: 'keysentry-disarm', v: 1 }) });
+        headers: { 'Content-Type': 'application/json', ...(relay.token ? { Authorization: `Bearer ${relay.token}` } : {}) }, body: JSON.stringify({ ...signed, type: 'keysentry-disarm', v: 2 }) });
       if (response.status < 200 || response.status >= 300) throw new CliError('Relay delivery did not succeed.');
     },
     lastNotificationSuccess: async () => (await rt.store.readJson<{ lastSuccessAt: string | null }>('plan', join(rt.paths.dir, 'notification-messages.json')))?.lastSuccessAt ?? null,
@@ -89,10 +86,21 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       const tick = await rt.store.readJson<{ startedAt?: string; lastNotifySuccessAt?: string | null }>('plan', join(rt.paths.dir, 'watcher-tick.json'));
       if (!tick?.startedAt) return { ok: false, reasons: ['The watcher self-check has not run.'] };
       const plan = await rt.store.readJson('plan', join(rt.paths.dir, 'armed-plan.json'));
-      const keys = await localDeviceKeys(rt); const at = (opts.now ?? (() => new Date()))();
+      const keys = await localDeviceKeys(rt); const at = rt.now();
       return selfCheck({ startedAt: new Date(tick.startedAt), now: at, lastNotifySuccessAt: tick.lastNotifySuccessAt ?? null,
         stateWritable: true, armedValid: verifyArmedPlan(plan, { now: at, trustedKeyIds: keys.map(k => k.keyId) }).ok });
-    },
+    }, ...overrides,
+  });
+}
+
+export function registerPhase2Commands(program: Command, opts: Phase2CommandsOptions): void {
+  const channels = (rt: KeysentryRuntime) => createNotificationChannels(rt.config.settings.notify.channels,
+    { vault: rt.vault, http: rt.http, redactor: rt.redactor, receipt: rt.receipt, write: opts.diagnostic });
+  const manager = (rt: KeysentryRuntime) => createCliAutopilotManager(rt, {
+    confirmAdoption: opts.confirmAdoption ?? (async question => {
+      opts.diagnostic(question); const answer = await promptVaultValue('y to rotate now', opts.diagnostic, opts.promptIO); return answer?.toLowerCase() === 'y';
+    }),
+    emitEligibility: rows => { if (!opts.json()) for (const row of rows) opts.diagnostic(`${row.clusterId} (${row.provider}): ${row.eligible ? 'eligible' : row.reason}`); },
   });
   program.command('arm').description('Review keys and sign a local automatic-rotation plan')
     .option('--cluster <ids>', 'Cluster ids', collect).option('--hosts <ids>', 'Incident hosts', collect)
@@ -161,8 +169,11 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
   program.command('watch').description('Run the armed watcher with local or sealed deployment state')
     .option('--once', 'Poll once and settle eligible waves').option('--port <n>', 'Serve approval pages on this port', number)
     .action(async options => {
-      const sealedRequested = !!(opts.env.KEYSENTRY_WATCHER_CONFIG || opts.env.KEYSENTRY_WATCHER_CONFIG_FILE);
-      if (!sealedRequested) opts.human('run the watcher');
+      // Services may run without a terminal. Their authority is the signed armed
+      // plan or an approval, while an agent-marked process is always refused.
+      const watcherGuard = (action: string) => assertHumanForMutation({ env: opts.env,
+        stdinIsTTY: true, stdoutIsTTY: true, action });
+      watcherGuard('run the watcher');
       const rt = await opts.getRuntime(true); const sealed = opts.watcherConfig();
       if (!sealed) await rt.prepareExecution(opts.diagnostic);
       if (sealed) {
@@ -175,14 +186,14 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       }
       const publicKeys = sealed ? async () => sealed.devicePublicKeys.map(key => ({ keyId: key.keyId, publicKeyDer: Buffer.from(key.publicKeyDer, 'base64') })) : () => localDeviceKeys(rt);
       const sources: FeedSource[] = [...DEFAULT_SOURCES.filter(source => !sealed?.sources.disabled.includes(source.id)), ...sealed?.sources.extra ?? []];
-      opts.setExit(await runWatch({ store: rt.store, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation,
+      opts.setExit(await runWatch({ store: rt.store, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
         signingKey: rt.signingKey, fingerprintKey: rt.fingerprintKey, deviceKeys: publicKeys,
         passkeys: () => sealed ? Promise.resolve(sealed.passkeys) : listPasskeys(rt.store), channels: () => channels(rt),
         engine: async () => { const engine = await rt.recoveryDeps(); return { ...engine, prompt: async () => null, reveal: undefined, grace: undefined }; },
         freshInventory: rt.freshInventory, monitor: (context, notify, assertActive) => rt.watcherMonitor(context, { notify: async (_title, _body, signal) => {
           await notify({ id: randomUUID(), at: (opts.now ?? (() => new Date()))().toISOString(), kind: 'monitor', severity: 'warning',
             title: 'A monitor check needs your review', lines: signal ? [`Signal: ${signal.kind}.`] : ['Inspect pending actions on your registered computer.'] });
-        } }, assertActive), assertHuman: opts.human,
+        } }, assertActive), assertHuman: watcherGuard,
         sources, env: opts.env, now: opts.now, intervalSeconds: sealed?.intervalSeconds ?? rt.config.monitor.intervalMs / 1000,
         publicOrigin: sealed?.approvals.publicOrigin, relay: sealed?.approvals.relay ?? await relaySettings(rt),
         showHints: rt.config.settings.autopilot.showHints, sealed: !!sealed,
