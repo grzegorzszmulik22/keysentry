@@ -2,26 +2,29 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
-import { APPROVAL_REQUEST_PREFIX, createWatchRuntime, passkeysForWatcherOrigin, runWatch, type WatchRuntimeDependencies } from '../../src/cli/watcher.js';
+import { APPROVAL_REQUEST_PREFIX, approvalProxyHops, createWatchRuntime, passkeysForWatcherOrigin, runWatch, type WatchRuntimeDependencies } from '../../src/cli/watcher.js';
 import { buildInventory, createStateCipher, createStateStore } from '../../src/core/index.js';
-import { buildArmedPlan, signArmedPlan } from '../../src/autopilot/index.js';
-import { canonicalJson, generateDeviceKey, verifyDetached } from '../../src/security/index.js';
+import { buildArmedPlan, planHashFor, signArmedPlan } from '../../src/autopilot/index.js';
+import { buildPlan } from '../../src/core/index.js';
+import { canonicalJson, generateDeviceKey, signDetached, verifyDetached } from '../../src/security/index.js';
 import { verifyMessage } from '../../src/notify/index.js';
-import { signDisarm } from '../../src/approvals/index.js';
+import { APPROVAL_PREFIX, signDisarm } from '../../src/approvals/index.js';
 import type { FeedSource, PasskeyCredential, SignedNotifyMessage } from '../../src/types.js';
 import { FakeHttp, text } from '../helpers/fake-http.js';
 import { recoveryFixture } from '../rotate/recovery-fixture.js';
+import { createWatcherStateStore } from '../../src/cli/watcher-state.js';
+import { signWatcherResume } from '../../src/watcher/index.js';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
-async function fixture(options: { coldStart?: boolean; exposure?: boolean } = {}) {
+async function fixture(options: { coldStart?: boolean; exposure?: boolean; actions?: boolean; noState?: boolean; noArm?: boolean } = {}) {
   const f = await recoveryFixture();
   const dir = await mkdtemp(join(tmpdir(), 'keysentry-watch-cli-')); dirs.push(dir);
-  const store = createStateStore({ cwd: dir, cipher: createStateCipher(Buffer.alloc(32, 1)) });
+  const store = createWatcherStateStore(createStateStore({ cwd: dir, cipher: createStateCipher(Buffer.alloc(32, 1)) }), options.actions === true);
   const key = generateDeviceKey();
   const armed = signArmedPlan(buildArmedPlan({ projectId: 'project', inventory: f.inv, clusterIds: [f.clusterId], hosts: ['railway'], options: {}, now: f.deps.now!() }).plan, key);
-  await store.writeJson('plan', join(store.paths.dir, 'armed-plan.json'), armed);
-  await store.writeJson('plan', join(store.paths.dir, 'autopilot.json'), { armedPlanId: armed.id, disarmed: false, waves: [] });
+  if (!options.noArm) await store.writeJson('plan', join(store.paths.dir, 'armed-plan.json'), armed);
+  if (!options.noState && !options.noArm) await store.writeJson('plan', join(store.paths.dir, 'autopilot.json'), { armedPlanId: armed.id, disarmed: false, waves: [] });
   const source: FeedSource = { id: 'railway-blog', kind: 'official', hosts: ['railway'], url: 'https://blog.railway.com/rss.xml', owner: 'Railway', outlet: 'Railway' };
   // Replay the recorded content as a fresh publication. Freshness and startup
   // baselining have their own regressions below; these fixtures exercise waves.
@@ -42,7 +45,7 @@ async function fixture(options: { coldStart?: boolean; exposure?: boolean } = {}
   const audit = { async append(event: unknown) { events.push(event); }, async checkpoint() {}, async verify() { return { ok: true, entries: events.length, checkpoints: 0 }; } };
   let scans = 0; let gates = 0; let monitors = 0;
   const deps: WatchRuntimeDependencies = {
-    store, audit, http, log: f.deps.log, rotation: f.opts, now: f.deps.now, env: {}, fingerprintKey: f.deps.fingerprintKey, projectId: 'project',
+    store, audit, http, log: f.deps.log, rotation: f.opts, now: f.deps.now, env: options.actions ? { GITHUB_ACTIONS: 'true' } : {}, fingerprintKey: f.deps.fingerprintKey, projectId: 'project',
     signingKey: async () => key, deviceKeys: async () => [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }], passkeys: async () => [],
     channels: async () => [{ id: 'test', kind: 'console', async send(message) { messages.push(message); } }],
     sources: [source], engine: async () => f.deps,
@@ -142,6 +145,7 @@ test.each(['project', 'other-project'])('relay disarm is accepted only for this 
 test('a saved relay inbox cannot apply a disarm addressed to another project', async () => {
   const f = await fixture();
   f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' }; f.deps.sources = [];
+  f.http.on('GET', /ntfy\.sh/, () => text(200, ''));
   await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'cursor-one', pendingApprovals: [],
     pendingDisarms: [signDisarm(f.key, { watcherId: 'other-project', at: f.deps.now!().toISOString() })] });
   const watcher = await createWatchRuntime(f.deps); await watcher.tick();
@@ -204,11 +208,12 @@ test('local adoption refresh waits for completed waves and reloads the replaced 
 
 test('a durable relay inbox applies a disarm before advancing to new messages', async () => {
   const f = await fixture(); f.deps.relay = { server: 'https://ntfy.sh', topic: 'setup-topic' };
+  f.http.on('GET', /ntfy\.sh/, () => text(200, ''));
   await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'old-cursor',
-    pendingApprovals: [], pendingDisarms: [{ watcherId: 'project', keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
+    pendingApprovals: [], pendingDisarms: [signDisarm(f.key, { watcherId: 'project', at: f.deps.now!().toISOString() })] });
   const watcher = await createWatchRuntime(f.deps); await watcher.tick();
   expect(watcher.state.disarmed).toBe(true);
-  expect(f.http.calls.some(call => call.method === 'GET' && call.url.includes('ntfy.sh'))).toBe(false);
+  expect(f.http.calls.some(call => call.method === 'GET' && call.url.includes('ntfy.sh'))).toBe(true);
   expect(await f.store.readJson('pending', join(f.store.paths.dir, 'watcher-relay.json'))).toMatchObject({ cursor: 'old-cursor', pendingDisarms: [] });
 });
 
@@ -225,9 +230,10 @@ test('an idle watcher reloads a newly signed local re-arm instead of restoring i
 
 test('relay disarm retries a failed durable state write before acknowledging the inbox', async () => {
   const f = await fixture(); f.deps.relay = { server: 'https://ntfy.sh', topic: 'setup-topic' };
+  f.http.on('GET', /ntfy\.sh/, () => text(200, ''));
   f.http.on('POST', /ntfy\.sh/, () => text(200, '{}'));
   await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'old-cursor',
-    pendingApprovals: [], pendingDisarms: [{ watcherId: 'project', keyId: f.key.keyId, at: f.deps.now!().toISOString(), sig: 'authenticated-inbox-message' }] });
+    pendingApprovals: [], pendingDisarms: [signDisarm(f.key, { watcherId: 'project', at: f.deps.now!().toISOString() })] });
   const write = f.store.writeJson.bind(f.store); let failed = false;
   f.store.writeJson = async (kind, file, value, options) => {
     if (!failed && file.endsWith('autopilot.json') && (value as { disarmed?: boolean }).disarmed) { failed = true; throw new Error('disk temporarily unavailable'); }
@@ -289,4 +295,192 @@ test('monitor receives a fresh action guard that rejects a disarm during its wor
   };
   const watcher = await createWatchRuntime(f.deps); await watcher.tick();
   expect(guarded).toBe(true);
+});
+
+test('console delivery cannot renew the external notification self-check across restarts', async () => {
+  const f = await fixture(); f.deps.sources = [];
+  const first = await createWatchRuntime(f.deps); await first.tick();
+  f.clock.ms += 86_400_001;
+  await first.tick();
+  expect((await first.check()).ok).toBe(false);
+  const restarted = await createWatchRuntime(f.deps);
+  expect((await restarted.check()).ok).toBe(false);
+});
+
+test('trusted plan-bound approvals execute once and are marked executed after the wave reaches grace', async () => {
+  const f = await fixture(); f.deps.sources = [];
+  const watcher = await createWatchRuntime(f.deps);
+  const inventory = await f.deps.freshInventory();
+  const action = { id: 'approved-key', kind: 'autopilot', clusterIds: [f.clusterId],
+    planHash: planHashFor(buildPlan(inventory, { clusterIds: [f.clusterId] })) };
+  const request = await watcher.approvals.request(action, false);
+  const body = { actionId: action.id, digest: request.digest, at: f.deps.now!().toISOString() };
+  await watcher.approvals.approveWithDevice(action.id, { ...body, keyId: f.key.keyId,
+    sig: signDetached(f.key.privateKeyDer, Buffer.from(APPROVAL_PREFIX + canonicalJson(body))).toString('base64') });
+  await watcher.tick();
+  expect(f.host.writes.length).toBeGreaterThan(0);
+  expect(await watcher.approvals.status(action.id)).toBe('executed');
+  const writes = f.host.writes.length;
+  await watcher.tick();
+  expect(f.host.writes.length).toBe(writes);
+  expect(watcher.state.waves).toHaveLength(1);
+});
+
+test('relay ask failures retry on an idle tick without delaying the armed wave', async () => {
+  const f = await fixture();
+  f.deps.relay = { server: 'https://ntfy.sh', topic: 'setup-topic' };
+  let fail = true;
+  f.http.on('GET', /ntfy\.sh/, () => text(200, ''));
+  f.http.on('POST', /ntfy\.sh/, () => text(fail ? 503 : 200, '{}'));
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(watcher.state.waves).toHaveLength(1);
+  expect(watcher.state.pendingAsks?.length).toBeGreaterThan(0);
+  fail = false; f.clock.ms += 61_000; f.deps.sources = [];
+  await watcher.tick();
+  expect(watcher.state.pendingAsks).toEqual([]);
+});
+
+test('a local disarm received during provider rotation stops the following host write', async () => {
+  const f = await fixture();
+  const rotate = f.provider.rotate.bind(f.provider);
+  f.provider.rotate = async (...args) => {
+    const result = await rotate(...args);
+    const saved = await f.store.readJson<object>('plan', join(f.store.paths.dir, 'autopilot.json'));
+    await f.store.writeJson('plan', join(f.store.paths.dir, 'autopilot.json'), { ...saved, disarmed: true });
+    return result;
+  };
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(f.host.writes).toHaveLength(0);
+  expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+  expect(watcher.state.disarmed).toBe(true);
+});
+
+test('approval notifications offer the local command when the public origin has no registered passkey', async () => {
+  const f = await fixture({ exposure: false }); f.deps.publicOrigin = 'https://watcher.example';
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  const asks = f.messages.filter(message => message.actionId);
+  expect(asks.length).toBeGreaterThan(0);
+  for (const message of asks) {
+    expect(message.approveUrl).toBeUndefined();
+    expect(message.lines).toContain(`Approve with keysentry approve ${message.actionId} on your computer.`);
+  }
+});
+
+test('saved same-project relay disarms are authenticated again before durable application', async () => {
+  const f = await fixture(); f.deps.sources = []; f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+  f.http.on('GET', /ntfy\.sh/, () => text(200, ''));
+  await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: null, pendingApprovals: [],
+    pendingDisarms: [{ ...signDisarm(f.key, { watcherId: 'project', at: f.deps.now!().toISOString() }), sig: 'forged' }] });
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(watcher.state.disarmed).toBe(false);
+});
+
+test('Actions persists a missing-state pause and accepts only a trusted signed resume on its independent relay cursor', async () => {
+  const f = await fixture({ actions: true }); f.deps.sources = [];
+  f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+  let inbox = '';
+  f.http.on('GET', /ntfy\.sh/, () => text(200, inbox));
+  const first = await createWatchRuntime(f.deps);
+  expect((await first.check()).ok).toBe(false);
+  await first.tick();
+  expect(await f.store.readJson('plan', join(f.store.paths.dir, 'watcher-recovery.json'))).toMatchObject({ requiresResume: true });
+  const resumed = signWatcherResume({ watcherId: 'project', at: f.deps.now!().toISOString() }, f.key);
+  inbox = JSON.stringify({ id: 'resume-message', time: Math.floor(f.deps.now!().getTime() / 1000),
+    event: 'message', topic: 'saved-topic', message: JSON.stringify(resumed) });
+  f.clock.ms += 60_000;
+  const restarted = await createWatchRuntime(f.deps); await restarted.tick();
+  expect((await restarted.check()).ok).toBe(true);
+  expect(await f.store.readJson('pending', join(f.store.paths.dir, 'watcher-relay.json'))).toMatchObject({ resumeCursor: 'resume-message', pendingResumes: [] });
+  const recovery = await f.store.readJson<{ usedResumeSignatures: string[] }>('plan', join(f.store.paths.dir, 'watcher-recovery.json'));
+  expect(recovery?.usedResumeSignatures).toEqual([resumed.sig]);
+});
+
+test('Actions approval requests allow the scheduled watcher time to receive approval', async () => {
+  const f = await fixture({ actions: true });
+  const watcher = await createWatchRuntime(f.deps);
+  const request = await watcher.approvals.request({ id: 'scheduled-request', kind: 'autopilot', clusterIds: [] }, false);
+  expect(Date.parse(request.expiresAt) - Date.parse(request.createdAt)).toBe(3_600_000);
+});
+
+test('a cold Actions watcher initializes signed scope only after a new signed resume, preserving a concurrent disarm', async () => {
+  for (const disarmed of [false, true]) {
+    const f = await fixture({ actions: true, noState: true }); f.deps.sources = [];
+    f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+    let message = '';
+    f.http.on('GET', /ntfy\.sh/, () => text(200, message));
+    const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+    expect(await f.store.readJson('plan', join(f.store.paths.dir, 'autopilot.json'))).toBeNull();
+    if (disarmed) await watcher.disarm();
+    f.clock.ms += 60_000;
+    const resume = signWatcherResume({ watcherId: 'project', at: f.deps.now!().toISOString() }, f.key);
+    message = JSON.stringify({ id: 'resume', time: Math.floor(f.clock.ms / 1000), event: 'message', topic: 'saved-topic', message: JSON.stringify(resume) });
+    await watcher.tick();
+    expect(watcher.state.disarmed).toBe(disarmed);
+    if (!disarmed) expect((await watcher.check()).ok).toBe(true);
+  }
+});
+
+test('a retained resume from before a new cache-loss episode cannot release its pause', async () => {
+  const f = await fixture({ actions: true, noState: true }); f.deps.sources = [];
+  f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+  const resume = signWatcherResume({ watcherId: 'project', at: new Date(f.clock.ms - 60_000).toISOString() }, f.key);
+  f.http.on('GET', /ntfy\.sh/, () => text(200, JSON.stringify({ id: 'old-resume', time: Math.floor(f.clock.ms / 1000),
+    event: 'message', topic: 'saved-topic', message: JSON.stringify(resume) })));
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect((await watcher.check()).ok).toBe(false);
+  expect(await f.store.readJson('plan', join(f.store.paths.dir, 'watcher-recovery.json'))).toMatchObject({ requiresResume: true });
+});
+
+test('an approved action without an arm executes and settles through the same rails', async () => {
+  const f = await fixture({ noArm: true }); f.deps.sources = [];
+  const watcher = await createWatchRuntime(f.deps);
+  const inventory = await f.deps.freshInventory();
+  const action = { id: 'approved-no-arm', kind: 'autopilot', clusterIds: [f.clusterId],
+    planHash: planHashFor(buildPlan(inventory, { clusterIds: [f.clusterId] })) };
+  const request = await watcher.approvals.request(action, false);
+  const body = { actionId: action.id, digest: request.digest, at: f.deps.now!().toISOString() };
+  await watcher.approvals.approveWithDevice(action.id, { ...body, keyId: f.key.keyId,
+    sig: signDetached(f.key.privateKeyDer, Buffer.from(APPROVAL_PREFIX + canonicalJson(body))).toString('base64') });
+  await watcher.tick();
+  expect(f.host.writes.length).toBeGreaterThan(0);
+  f.clock.ms += 901_000;
+  await watcher.settle();
+  expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
+});
+
+test('a pending approval cannot prevent polling and applying a newer disarm', async () => {
+  const f = await fixture(); f.deps.sources = []; f.deps.relay = { server: 'https://ntfy.sh', topic: 'saved-topic' };
+  await f.store.writeJson('pending', join(f.store.paths.dir, 'watcher-relay.json'), { cursor: 'earlier', pendingApprovals: [
+    { actionId: 'unknown', digest: '0'.repeat(64), at: f.deps.now!().toISOString(), keyId: f.key.keyId, sig: 'old-approval' }], pendingDisarms: [] });
+  const signed = signDisarm(f.key, { watcherId: 'project', at: f.deps.now!().toISOString() });
+  f.http.on('GET', /ntfy\.sh/, () => text(200, JSON.stringify({ id: 'new-disarm', time: Math.floor(f.clock.ms / 1000), event: 'message', topic: 'saved-topic',
+    message: JSON.stringify({ type: 'keysentry-disarm', v: 2, ...signed }) })));
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(watcher.state.disarmed).toBe(true);
+});
+
+test.each([
+  ['https://watcher.fly.dev', {}, 1], ['https://watcher.up.railway.app', {}, 1], ['https://watcher.onrender.com', {}, 1],
+  ['https://custom.example', { RAILWAY_ENVIRONMENT: 'production' }, 1], ['http://localhost:9999', {}, 0],
+  ['https://custom.example', {}, 0], ['https://evilfly.dev', {}, 0],
+] as const)('approval forwarding trust is limited to hosted HTTPS ingress: %s', (origin, env, hops) => {
+  expect(approvalProxyHops(origin, env)).toBe(hops);
+});
+
+test('an own-platform incident still executes app keys and names operating credentials in coverage', async () => {
+  const f = await fixture(); f.deps.env = { RAILWAY_ENVIRONMENT: 'production' };
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  expect(watcher.state.waves).toHaveLength(1);
+  expect(f.host.writes.length).toBeGreaterThan(0);
+  const coverage = f.messages.find(message => message.kind === 'autopilot:own-credentials');
+  expect(coverage?.lines.join('\n')).toContain('RAILWAY_TOKEN');
+});
+
+test('approval URLs are included only for passkeys registered to the exact public origin', async () => {
+  const f = await fixture({ exposure: false }); f.deps.publicOrigin = 'https://watcher.example';
+  f.deps.passkeys = async () => [{ id: 'credential', publicKeyCose: 'cose', alg: -7, signCount: 0, backupEligible: false,
+    rpId: 'watcher.example', origins: ['https://watcher.example'], label: 'watcher', createdAt: f.deps.now!().toISOString() }];
+  const watcher = await createWatchRuntime(f.deps); await watcher.tick();
+  const message = f.messages.find(message => message.actionId)!;
+  expect(message.approveUrl).toBe(`https://watcher.example/a/${message.actionId}`);
 });

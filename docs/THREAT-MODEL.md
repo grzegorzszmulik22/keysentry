@@ -147,30 +147,40 @@ deployment needs an explicit activation decision. Cloudflare's atomic roll inval
 token immediately and cannot provide overlap or restore it.
 
 **Feeds to automatic authorization.** News and official feeds are untrusted input. Size caps, defensive XML parsing,
-sanitized text, per-source platform rules and publisher-owner corroboration reduce accidental triggers. A single
-news report raises an alert and approval request; news without credential-exposure evidence never rotates.
+sanitized text, per-source platform rules and publisher-owner corroboration reduce accidental triggers. The first
+successful content read establishes a silent baseline. Later evidence must be unseen; dated items must fall within
+72 hours and cannot be future-dated. A single news report raises an alert and approval request; news without
+credential-exposure evidence never rotates. Official reports also require credential exposure in the platform's
+own systems, excluding denials, instructional titles and third-party package or Action compromises.
 A high-confidence official advisory or the defined corroborated evidence can trigger only inside a valid,
 unexpired device-signed plan. This is not proof that the reporting source is truthful. Compromise of an official
 feed, or collusion between sources counted as independent, can still supply misleading eligible evidence.
 
 Current inventory is checked against every armed consumer. New/removed consumers, changed fingerprints and scope
-growth request approval. Autopilot excludes payment, database, encryption, wallet/private keys, atomic rolls,
+growth request approval. Any scan error holds automatic rotation and deferred revocation. Autopilot excludes payment, database, encryption, wallet/private keys, atomic rolls,
 guided methods and generated secrets outside the exact-name allow-list. Write-only adoption is a supervised real
 rotation that records a fingerprint and provider reference; watcher adoption updates need a locally re-signed
 plan. Deferred settlement uses a fresh read-role scan. Hosts can still omit a consumer or lie about deployment.
 
-**Watcher to applications.** One wave per incident, serial deployments, replacement verification, application
+**Watcher to applications.** One wave per incident, a default 30-day host cooldown for follow-up reports, serial deployments, replacement verification, application
 health checks, grace and a wave-wide revocation hold limit cascading changes. Signature/time/scope checks repeat
 at automatic boundaries. Failure stops the wave; revocations already attempted during an interrupted settlement
 cannot be undone atomically. Next-deploy revocation needs signed maximum-deadline acceptance; early activation
 detection is not implemented. Disarm and `KEYSENTRY_ALERT_ONLY=1` stop automatic effects and settlement, without
-restoring keys already revoked. A remote disarm may be delayed by its transport.
+restoring keys already revoked. Relay disarm signatures bind the trusted device, target watcher and timestamp;
+verified disarms do not expire by age. The watcher polls before and between automatic effects, including during
+recovery. This cannot interrupt an already running HTTP request. A remote disarm may be delayed by its transport.
 
-The watcher falls back to alert-only when its notification window, state writability, armed-plan validity or clock
-checks fail. Delivery means a channel accepted the message, not that a person read it. An attacker who controls
-the channel can suppress alerts after acceptance. Scheduled Actions can be delayed or skipped, and encrypted
-cached state can be evicted or rolled back. One writer per state directory is required; there is no distributed
-lock or rollback-resistant generation counter.
+The watcher falls back to alert-only when its external-notification window, state writability, armed-plan validity
+or clock checks fail. Console output does not satisfy the notification window and hosted configurations exclude
+console channels. Delivery means an external channel accepted the message, not that a person read it. An attacker
+who controls the channel can suppress alerts after acceptance. Scheduled Actions can be delayed or skipped, and
+encrypted cached state can be evicted or rolled back. Missing Actions state, including a first run, starts paused;
+`keysentry autopilot resume --relay` publishes a trusted, watcher-bound, single-use recovery message. Resume clears
+only the missing-state hold, preserving explicit disarm and signed scope. Authenticated sequence numbers reject
+lower or missing records after a newer sequence has been observed in the process. Restoring an entire older cache
+across runs cannot be detected by that cache alone; it requires a separately retained newer sequence. There is no
+independent remote sequence anchor. One writer per state directory is required; there is no distributed lock.
 
 **Messages and approvals.** Notification signatures bind the full message to a locally trusted device/watcher
 public key. The short code is a lookup/check aid, not an approval credential. Notifications contain no secret
@@ -178,25 +188,33 @@ values and hints are opt-in; operators may still learn names, counts and timing.
 hide context, so signature verification requires the complete signed object. A valid signature proves the
 signer, not that the proposed action is safe.
 
-Passkey approvals bind exact action ID and digest to a random, ten-minute, single-use challenge and require user
-verification. Device approvals also bind the digest and time. Trusted keys, replay tracking and freshness protect
+Passkey approvals bind exact action ID and digest to a random single-use challenge and require user verification.
+Requests expire after ten minutes by default, or 60 minutes for Actions deployments. The digest binds the actual
+planned keys, consumers and steps. Device approvals also bind the digest and time. Trusted keys, replay tracking and freshness protect
 relay messages; relay topic secrecy is not authorization. Adding coverage, channels or credentials requires the
-local human CLI and cannot be done through the relay. Disarming requires no passkey. The approval server exposes
+local human CLI and cannot be done through the relay. Relay approval verifies the watcher-signed request and asks
+for confirmation after showing the keys and available hints. The watcher executes service-approved grants on its
+next check through the same scan, eligibility, deployment and revocation rails; local `approve` uses that executor
+directly. A grant remains available while execution is held, and only a durably completed or grace-pending action
+is marked executed. Guided changes still need a person. Disarming requires no passkey. The approval server exposes
 only bounded health/approval/disarm routes with exact Host/Origin checks, strict CSP and rate limits. Deployment
 must correctly terminate TLS and configure proxy trust.
 
 Local registration binds to loopback, uses a one-time token, opens as localhost, checks Host/Origin, serves only a
 static script and closes after success or timeout. A localhost passkey is not a public-origin passkey. The server
 does not provide public `/register`; the phase 3 dashboard enrolls only at localhost, so public-origin enrollment
-remains unavailable here. Browser/authenticator
+remains unavailable here. Notifications carry an approval-page URL only when a passkey for the watcher's public
+origin is registered; otherwise they direct the user to the local approval command. Browser/authenticator
 implementation, the selected origin and the local supervised enrollment remain trust boundaries.
 
 **Watcher to its host.** The sealed config and encrypted state protect data at rest without their separately
 supplied keys; the running host has both keys and process access. The image runs non-root with a read-only root
 and a private writable volume; POSIX state directories with group/other permissions are refused. A host operator
 or compromised host can still read memory, steal injected secrets, alter the running code or roll back files.
-The watcher excludes its operating credentials from automatic rotation and asks for guided changes when its own
-platform has an incident. Hosting the watcher on a different platform can reduce shared exposure, but does not
+Setup exports only credentials needed by enabled hosts and armed providers, asks separately before including each
+environment-sourced credential, and prints the exported names. The watcher excludes its operating credentials from
+automatic rotation and names them for local changes when its own platform has an incident. It still rotates or
+requests approval for the other covered keys. Hosting the watcher on a different platform can reduce shared exposure, but does not
 remove either host's trust boundary.
 
 **The audit log to the vault.** Entries form a SHA-256 chain, and each entry carries an HMAC-SHA256
@@ -236,9 +254,9 @@ operations still need maintainer validation before a release.
 | Malicious package or build tool | Read credentials or change released code. | Locked source dependencies, ignored install scripts, bundled releases with no install hooks/dependencies, reviewable code, and reproducibility checks. A bundled malicious dependency still runs with the CLI's effective access; a compromised toolchain can produce consistently bad output. |
 | Breached hosting platform | Read values it already hosts, lie about state, or undo an update. | Scope credentials narrowly, track every known consumer, verify and revoke in order. A platform can expose keys it holds and fake a successful deployment; keysentry cannot repair that trust boundary. |
 | Breached notification channel | Read, suppress, alter or replay alerts; lure the user into taking action. | Signed watcher messages contain no values, hints are opt-in, and trusted-key verification detects edits. A message grants no approval. The operator can suppress delivery or retain metadata; legacy monitor webhook messages do not gain signature guarantees merely by using the same channel. |
-| News feed author | Publish a misleading story, replay an old item or abuse a platform mention to provoke changes. | Bounded parsing, evidence classification, publisher-owner corroboration and incident deduplication limit triggers. News alone alerts; only signed-plan scope can execute. Incorrect official evidence or colluding independent owners remain possible. |
+| News feed author | Publish a misleading story, replay an old item or abuse a platform mention to provoke changes. | Bounded parsing, first-read baselines, freshness checks, platform-subject exposure rules, publisher-owner corroboration and incident cooldowns limit triggers. Uncorroborated news alerts; automatic rotation requires signed-plan scope. Incorrect official evidence or colluding independent owners remain possible. |
 | Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |
-| Watcher host | Read runtime memory or injected keys, modify code, roll back state or interrupt work. | Sealed configuration, separately supplied state/vault keys, private volume permissions and a non-root read-only image reduce filesystem exposure. The host remains trusted with running plaintext and can defeat these controls. Own-platform incidents request guided credential rotation. |
+| Watcher host | Read runtime memory or injected keys, modify code, roll back state or interrupt work. | Sealed configuration, separately supplied state/vault keys, scoped credential export, private volume permissions and a non-root read-only image reduce filesystem exposure. The host remains trusted with running plaintext and can defeat these controls. Own-platform incidents continue other covered rotations and request local changes for operating credentials. |
 | Same-user malware | Ask the OS vault for entries, read process memory or environment values, or replace files. | OS storage and encryption reduce exposure from files alone. They do not isolate keysentry from another process with your user's privileges in an unlocked session. |
 | AI coding agent or agent-driven browser | Invoke mutation commands, click dashboard controls or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive CLI mutation checks, marker-triggered read-only dashboard, exact-action user-verified passkeys, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
 | Foreign web page or local process | Rebind a hostname, make cross-origin requests, steal a sign-in link or replay a dashboard action. | Loopback binding, exact Host/Origin, single-use expiring link, strict session cookie/CSRF checks, CSP and fresh route/body-bound passkey proofs constrain access. A stolen unused link can establish a session; same-user process/browser compromise is outside those controls. |

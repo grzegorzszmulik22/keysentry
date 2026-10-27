@@ -105,7 +105,7 @@ test('guard --staged prints the guard formatter and its blocked exit status', as
     return { code: 0 };
   };
   expect(await runCli(['--cwd', cwd, 'guard', '--staged'], { ...c.options, guardGit })).toBe(1);
-  expect(c.output.join('\n')).toContain('Commit stopped: 1 secrets would be committed.');
+  expect(c.output.join('\n')).toContain('Commit stopped: 1 secret would be committed.');
   expect(c.output.join('\n')).toContain('.env:1');
   expect(c.output.join('\n')).not.toContain(value);
 });

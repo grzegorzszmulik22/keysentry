@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
 import { RotationAbortedError, type GraceDecision, type GraceInfo, type GuidedPrompt, type ProviderId, type VaultBackendId } from '../types.js';
 import { getProvider } from '../providers/index.js';
+import { providerName } from './provider-names.js';
 
 /** Separate the terminal from diagnostics so an explicit reveal never reaches a log sink. */
 export interface PromptIO {
@@ -263,7 +264,7 @@ function validateValue(value: string | null): string | null {
 
 /** Hidden input stays in memory; @file contents are read without printing the value or path. */
 export async function promptSecret(prompt: GuidedPrompt, write: (text: string) => void, io: PromptIO = {}): Promise<string | null> {
-  write(`${prompt.provider}: ${prompt.guidance.url}\n${prompt.guidance.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`);
+  write(`${providerName(prompt.provider)}: ${prompt.guidance.url}\n${prompt.guidance.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`);
   const tty = terminal(io);
   if (!tty) { write('Guided step skipped: hidden input requires an interactive terminal.'); return null; }
   write('Enter the new value (hidden), paste a multi-line value with bracketed paste, or type @<path> to read a file. Press Enter with an empty value to skip.');

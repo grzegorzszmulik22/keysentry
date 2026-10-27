@@ -6,6 +6,7 @@ import {
   buildArmedPlan, classifyItem, DEFAULT_SOURCES, runAutopilot, settleWaves, signArmedPlan, updateIncidents,
   type AutopilotDeps, type AutopilotState,
 } from '../../src/autopilot/index.js';
+import { filterNewItems, type IncidentsState } from '../../src/autopilot/incidents.js';
 import { createApprovalService } from '../../src/approvals/index.js';
 import { buildInventory, createRedactor, createStateCipher, createStateStore, fingerprint, serviceKey } from '../../src/core/index.js';
 import { fetchFeed } from '../../src/feeds/index.js';
@@ -103,14 +104,15 @@ async function fixture() {
     options: { dryRun: false, revoke: 'after-deploy', redeploy: true, deployTimeoutMs: 100, pollIntervalMs: 1,
       revokeUnconfirmed: false, acceptUnplannedSealed: false, allowGenerate: true, verifyRetries: 0 },
     async notify(message) { const result = await dispatcher.send(signMessage(message, key)); expect(result.delivered).toEqual(['test-webhook']); },
-    async requestApproval(clusterIds, _reasons, actionId) {
+    async requestApproval(clusterIds, _reasons, actionId, action) {
       const id = actionId ?? `approval-e2e-${approvalIds.length}`;
-      await approvalService.request({ id, kind: 'autopilot-rotation', clusterIds }, false); approvalIds.push(id); return id;
+      await approvalService.request(action ?? { id, kind: 'autopilot-rotation', clusterIds }, false); approvalIds.push(id); return id;
     }, audit,
     async saveState(saved) { await store.writeJson('monitor', join(store.paths.dir, 'autopilot.json'), saved); },
   };
   const selfCheck = { ok: true, reasons: [] as string[] };
   const recoveryDeps = { ...deps, trustedKeyIds: [key.keyId], env: {}, selfCheck };
+  let incidentState: IncidentsState = { incidents: [] };
   async function feed(fixtureName: string, sourceId: string) {
     const source = DEFAULT_SOURCES.find(candidate => candidate.id === sourceId)!;
     // Replay the recorded content as a newly published item for this rotation
@@ -125,10 +127,16 @@ async function fixture() {
     }
     transport.on('GET', new RegExp(`^${source.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), () => text(200, xml));
     const result = await fetchFeed(http, source, {});
-    const evidence = result.items.map(item => classifyItem(item, source, id => fingerprint(`${source.id}:${id}`, fingerprintKey)))
+    const itemKey = (id: string) => fingerprint(id, fingerprintKey);
+    // These publications arrive after an earlier successful empty read. Use
+    // the same keyed identity for baseline filtering and classification.
+    if (!incidentState.sources?.[source.id]) incidentState = filterNewItems(incidentState, source, [], new Date(now().getTime() - 7_200_000), itemKey).state;
+    const filtered = filterNewItems(incidentState, source, result.items, now(), itemKey);
+    const evidence = filtered.fresh.map(item => classifyItem(item, source, itemKey))
       .filter((item): item is NonNullable<typeof item> => item !== null);
-    const updated = updateIncidents({ incidents: [] }, evidence, now());
-    await store.writeJson('monitor', join(store.paths.dir, 'incidents.json'), { incidents: updated.incidents });
+    const updated = updateIncidents(filtered.state, evidence, now());
+    incidentState = { incidents: updated.incidents, sources: updated.sources };
+    await store.writeJson('monitor', join(store.paths.dir, 'incidents.json'), incidentState);
     return updated;
   }
   const run = (incident: Incident) => runAutopilot({ incident, armed, trustedKeyIds: [key.keyId], inventory, state,

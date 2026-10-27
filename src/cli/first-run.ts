@@ -8,6 +8,7 @@ import { deriveKeyFromPassphrase, openBytes } from '../security/index.js';
 import { createEnvVault, createLinuxSecretServiceVault, createMacosKeychainVault, createWindowsDpapiVault, validateVaultName } from '../vault/index.js';
 import type { KeysentryRuntime } from './runtime.js';
 import { CliError } from './errors.js';
+import { providerName } from './provider-names.js';
 
 export interface FirstRunOptions {
   cwd: string;
@@ -182,7 +183,7 @@ export function formatFirstRun(result: FirstRunResult): string {
     `Scanned ${count(result.scannedFiles, 'file')} and ${count(result.scannedCommits, 'commit')}${result.historyComplete ? '.' : '; history scan is incomplete.'}`,
     committed ? `${count(committed, 'key')} appeared in git history. Removing a file does not remove its history; rotate these keys.` : 'No keys found in the scanned git history.',
     ...(hosts.length ? [`Possible deployment platforms: ${hosts.join(', ')} (from project configuration).`] : []),
-    ...result.findings.map(finding => `${finding.provider}: ${finding.hint ?? '(hidden)'} — ${finding.locations.map(location => `${location.path}${location.line === undefined ? '' : `:${location.line}`}${location.kind === 'history' ? ' (git history)' : ''}`).join(', ')}`),
+    ...result.findings.map(finding => `${providerName(finding.provider)}: ${finding.hint ?? '(hidden)'} — ${finding.locations.map(location => `${location.path}${location.line === undefined ? '' : `:${location.line}`}${location.kind === 'history' ? ' (git history)' : ''}`).join(', ')}`),
     ...(result.nextSteps.length ? ['', 'Next steps:', ...result.nextSteps.map(step => `- ${step}`)] : []),
     '', 'First run reads local files and git history. No network calls, token or account are needed.',
   ];

@@ -312,6 +312,6 @@ export async function guardStaged(root: string, git: GitRunner = defaultGitRunne
 export function formatGuardStaged(result: GuardResult): { output: string; exitCode: 0 | 1 } {
   if (result.blocked.length === 0) return { output: '', exitCode: 0 };
   const lines = result.blocked.map((hit) => `${printable(hit.path)}:${hit.line}  ${hit.provider}  ${hit.hint === null ? '(hidden)' : printable(hit.hint)}`);
-  lines.push(`Commit stopped: ${result.blocked.length} secrets would be committed. Remove them, or add a test value to .keysentry-allow.`);
+  lines.push(`Commit stopped: ${result.blocked.length} ${result.blocked.length === 1 ? 'secret' : 'secrets'} would be committed. Remove them, or add a test value to .keysentry-allow.`);
   return { output: lines.join('\n') + '\n', exitCode: 1 };
 }

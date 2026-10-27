@@ -4,17 +4,19 @@ import { join, resolve } from 'node:path';
 import type { KeysentryRuntime } from './runtime.js';
 import type { ArmedPlan, FeedSource } from '../types.js';
 import type { WatcherConfig } from '../watcher/index.js';
-import { selfCheck } from '../watcher/index.js';
+import { createWatcherResumeRelay, detectPlatform, selfCheck } from '../watcher/index.js';
 import { createNotificationChannels, registerNotificationCommands } from './notifications.js';
 import { saveNotificationSettings, saveNotificationRelay } from './config.js';
 import { createPasskeyManager, listPasskeys, openPasskeyBrowser } from './passkeys.js';
-import { buildWatcherSetupConfig, runWatch, setupWatcher, watcherStatus, type WatcherPlatform } from './watcher.js';
+import { buildWatcherSetupConfig, createWatchRuntime, runWatch, setupWatcher, watcherStatus, type WatcherPlatform } from './watcher.js';
+import { createWatcherStateStore } from './watcher-state.js';
 import { prepareWatcherDeployment } from './watcher-bootstrap.js';
 import { promptVaultValue, type PromptIO } from './prompts.js';
 import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
 import { DEFAULT_SOURCES, verifyArmedPlan } from '../autopilot/index.js';
 import { CliError } from './errors.js';
 import { assertHumanForMutation } from '../safety/index.js';
+import { providerName } from './display.js';
 
 export interface Phase2CommandsOptions {
   getRuntime(watcher?: boolean): Promise<KeysentryRuntime>;
@@ -75,6 +77,12 @@ export async function configureApprovalRelay(rt: KeysentryRuntime, server: strin
 export function createCliAutopilotManager(rt: KeysentryRuntime,
   overrides: NonNullable<Parameters<KeysentryRuntime['autopilotManager']>[0]> = {}) {
   return rt.autopilotManager({
+    relayResume: async signed => {
+      const relay = await relaySettings(rt); if (!relay) throw new CliError('Configure the watcher relay before using --relay.');
+      await createWatcherResumeRelay({ ...relay, watcherId: rt.projectId,
+        http: rt.httpForUrls([relay.server], 'approval relay you configured'),
+        trustedKeyIds: (await localDeviceKeys(rt)).map(key => key.keyId), deviceKeys: () => localDeviceKeys(rt), now: rt.now }).publishResume(signed);
+    },
     relayDisarm: async signed => {
       const relay = await relaySettings(rt); if (!relay) throw new CliError('Configure the watcher relay before using --relay.');
       const response = await rt.httpForUrls([relay.server], 'approval relay you configured').request({ method: 'POST', url: `${relay.server.replace(/\/$/, '')}/${relay.topic}`,
@@ -83,14 +91,33 @@ export function createCliAutopilotManager(rt: KeysentryRuntime,
     },
     lastNotificationSuccess: async () => (await rt.store.readJson<{ lastSuccessAt: string | null }>('plan', join(rt.paths.dir, 'notification-messages.json')))?.lastSuccessAt ?? null,
     selfCheck: async () => {
-      const tick = await rt.store.readJson<{ startedAt?: string; lastNotifySuccessAt?: string | null }>('plan', join(rt.paths.dir, 'watcher-tick.json'));
+      const tick = await rt.store.readJson<{ startedAt?: string; lastExternalSuccessAt?: string | null }>('plan', join(rt.paths.dir, 'watcher-tick.json'));
       if (!tick?.startedAt) return { ok: false, reasons: ['The watcher self-check has not run.'] };
       const plan = await rt.store.readJson('plan', join(rt.paths.dir, 'armed-plan.json'));
       const keys = await localDeviceKeys(rt); const at = rt.now();
-      return selfCheck({ startedAt: new Date(tick.startedAt), now: at, lastNotifySuccessAt: tick.lastNotifySuccessAt ?? null,
+      return selfCheck({ startedAt: new Date(tick.startedAt), now: at, lastExternalSuccessAt: tick.lastExternalSuccessAt ?? null,
         stateWritable: true, armedValid: verifyArmedPlan(plan, { now: at, trustedKeyIds: keys.map(k => k.keyId) }).ok });
     }, ...overrides,
   });
+}
+
+/** The terminal's local approval uses the same executor, inventory checks and deferred-grace rails as watch. */
+export async function executeLocalApprovedAction(rt: KeysentryRuntime, actionId: string): Promise<{ executed: boolean; reason?: string }> {
+  const watcher = await createWatchRuntime({ store: rt.store, audit: rt.audit, http: rt.http, log: rt.log,
+    rotation: rt.config.rotation, fingerprintKey: rt.fingerprintKey, projectId: rt.projectId,
+    signingKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
+    channels: () => createNotificationChannels(rt.config.settings.notify.channels,
+      { vault: rt.vault, http: rt.http, redactor: rt.redactor, receipt: rt.receipt }),
+    engine: async () => { const engine = await rt.recoveryDeps(); return { ...engine, prompt: async () => null, reveal: undefined, grace: undefined }; },
+    freshInventory: rt.freshInventory, monitor: async () => {}, assertHuman: rt.assertHuman,
+    sources: [], env: rt.mutationContext.env, now: rt.now, showHints: rt.config.settings.autopilot.showHints,
+    applyAdoptionUpdates: async updates => { await rt.autopilotManager().applyAdoptionUpdates(updates); },
+    integrityCheck: async () => {
+      const result = await checkLocalIntegrity(); const ok = result.status === 'dev' || result.status === 'ok';
+      return { ok, reasons: ok ? [] : ['The watcher installation integrity could not be verified.'] };
+    },
+  });
+  return watcher.executeApprovedAction(actionId);
 }
 
 export function registerPhase2Commands(program: Command, opts: Phase2CommandsOptions): void {
@@ -100,7 +127,7 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
     confirmAdoption: opts.confirmAdoption ?? (async question => {
       opts.diagnostic(question); const answer = await promptVaultValue('y to rotate now', opts.diagnostic, opts.promptIO); return answer?.toLowerCase() === 'y';
     }),
-    emitEligibility: rows => { if (!opts.json()) for (const row of rows) opts.diagnostic(`${row.clusterId} (${row.provider}): ${row.eligible ? 'eligible' : row.reason}`); },
+    emitEligibility: rows => { if (!opts.json()) for (const row of rows) opts.diagnostic(`${row.clusterId} (${providerName(row.provider)}): ${row.eligible ? 'eligible' : row.reason}`); },
   });
   program.command('arm').description('Review keys and sign a local automatic-rotation plan')
     .option('--cluster <ids>', 'Cluster ids', collect).option('--hosts <ids>', 'Incident hosts', collect)
@@ -116,7 +143,7 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
     });
   program.command('disarm').description('Pause automatic rotations; no passkey needed').option('--relay', 'Also send a signed disarm to the watcher')
     .action(async options => { opts.human('disarm automatic rotations'); const rt = await opts.getRuntime();
-      opts.emit(await manager(rt).disarm(options), options.relay ? 'Autopilot disarmed locally and on the watcher relay.' : 'Autopilot disarmed locally.'); });
+      opts.emit(await manager(rt).disarm(options), options.relay ? 'Autopilot disarmed locally. The signed disarm was published; the watcher applies it on its next check.' : 'Autopilot disarmed locally.'); });
   program.command('autopilot').description('Inspect armed plans and waves').command('status').action(async () => {
     const rt = await opts.getRuntime(); opts.emit(await manager(rt).status());
   });
@@ -157,7 +184,12 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       const outputDir = resolve(rt.config.cwd, options.output ?? `.keysentry/watcher-setup-${Date.now()}`);
       const result = await setupWatcher({ assertHuman: opts.human, interactive: opts.interactive(), json: opts.json(), vault: rt.vault, audit: rt.audit,
         config, outputDir, writeTerminal: text => (opts.promptIO?.output ?? process.stdout).write(`${text}\n`),
-        prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir }, secrets),
+        prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir,
+          confirmEnvironmentCredential: async name => {
+            opts.diagnostic(`Copy ${name} from your environment into the hosted watcher? [y/N]`);
+            const answer = await promptVaultValue(`y to copy ${name}`, opts.diagnostic, opts.promptIO);
+            return /^(?:y|yes)$/i.test(answer ?? '');
+          } }, secrets),
       }, { platform: options.platform as WatcherPlatform });
       opts.emit(result, `Watcher deployment prepared. Template: ${result.template}`);
     });
@@ -175,18 +207,20 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
         stdinIsTTY: true, stdoutIsTTY: true, action });
       watcherGuard('run the watcher');
       const rt = await opts.getRuntime(true); const sealed = opts.watcherConfig();
+      const actions = detectPlatform(opts.env).platform === 'github-actions';
+      const watchStore = createWatcherStateStore(rt.store, actions);
       if (!sealed) await rt.prepareExecution(opts.diagnostic);
       if (sealed) {
-        const existing = await rt.store.readJson<ArmedPlan>('plan', join(rt.paths.dir, 'armed-plan.json'));
+        const existing = await watchStore.readJson<ArmedPlan>('plan', join(rt.paths.dir, 'armed-plan.json'));
         if (existing && existing.id !== sealed.armed?.id) throw new CliError('This state directory belongs to another armed plan. Finish or undo its rotations using the original setup, then deploy the new setup with a fresh private state directory.');
         if (!existing && sealed.armed) {
-          await rt.store.writeJson('plan', join(rt.paths.dir, 'armed-plan.json'), sealed.armed);
-          await rt.store.writeJson('plan', join(rt.paths.dir, 'autopilot.json'), { armedPlanId: sealed.armed.id, disarmed: false, waves: [] });
+          await watchStore.writeJson('plan', join(rt.paths.dir, 'armed-plan.json'), sealed.armed);
+          if (!actions) await watchStore.writeJson('plan', join(rt.paths.dir, 'autopilot.json'), { armedPlanId: sealed.armed.id, disarmed: false, waves: [] });
         }
       }
       const publicKeys = sealed ? async () => sealed.devicePublicKeys.map(key => ({ keyId: key.keyId, publicKeyDer: Buffer.from(key.publicKeyDer, 'base64') })) : () => localDeviceKeys(rt);
       const sources: FeedSource[] = [...DEFAULT_SOURCES.filter(source => !sealed?.sources.disabled.includes(source.id)), ...sealed?.sources.extra ?? []];
-      opts.setExit(await runWatch({ store: rt.store, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
+      opts.setExit(await runWatch({ store: watchStore, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
         signingKey: rt.signingKey, fingerprintKey: rt.fingerprintKey, deviceKeys: publicKeys,
         passkeys: () => sealed ? Promise.resolve(sealed.passkeys) : listPasskeys(rt.store), channels: () => channels(rt),
         engine: async () => { const engine = await rt.recoveryDeps(); return { ...engine, prompt: async () => null, reveal: undefined, grace: undefined }; },

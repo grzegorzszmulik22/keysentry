@@ -10,7 +10,7 @@ import { confirmAction, confirmRotation, confirmStateReset, hasInteractiveTermin
 import { createRuntime, type KeysentryRuntime, type PlanFilters, type RuntimeOptions } from './runtime.js';
 import { hostIdSchema, tierSchema } from './schemas.js';
 import { CliError, RotationInterruptedError } from './errors.js';
-import { serviceLabel } from './display.js';
+import { providerName, serviceLabel } from './display.js';
 import { loadConfigMetadata } from './config.js';
 import { inspectAudit, inspectNetwork, inspectRelease } from './inspection.js';
 import { AgentRefusalError, assertHumanForMutation, maybeReexecWithPermissions } from '../safety/index.js';
@@ -18,10 +18,11 @@ import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
 import { permissionOptionsForBin } from './sandbox-grants.js';
 export { permissionOptionsForBin } from './sandbox-grants.js';
 import { StateLockedError } from '../core/index.js';
-import { registerPhase2Commands, relaySettings, localDeviceKeys } from './phase2.js';
+import { createCliAutopilotManager, executeLocalApprovedAction, registerPhase2Commands, relaySettings, localDeviceKeys } from './phase2.js';
 import { registerPhase3Commands } from './phase3.js';
 import type { GitRunner } from '../firstrun/index.js';
 import { approveAutopilot } from './autopilot-approvals.js';
+import { approvedOutcome } from '../approvals/index.js';
 import { listPasskeys } from './passkeys.js';
 import { bootstrapWatcher } from './watcher-bootstrap.js';
 import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
@@ -156,6 +157,14 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     human, emit, diagnostic, interactive, json: () => !!program.opts().json, setExit: code => { exitCode = code; },
     env: options.env ?? process.env, now: options.now, promptIO: options.promptIO,
     confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser });
+  program.commands.find(command => command.name() === 'autopilot')!.command('resume')
+    .description('Publish a signed recovery message for a paused Actions watcher')
+    .option('--relay', 'Send recovery through the configured watcher relay')
+    .action(async (opts: { relay?: boolean }) => {
+      human('resume the watcher through its relay'); const rt = await getRuntime();
+      emit(await createCliAutopilotManager(rt).resume(opts),
+        'Signed resume message published. The watcher checks it on its next check; local disarm and other holds still apply.');
+    });
   registerPhase3Commands(program, { getRuntime, peekRuntime: () => runtime,
     firstRunSettings: () => ({ vault: options.vault ?? runtime?.vault, userDir: options.userDir,
       env: options.env ?? runtime?.mutationContext.env ?? process.env, passphrase: options.passphrase }),
@@ -269,7 +278,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
     });
   program.command('actions').description('List pending monitor actions').action(async () => { const rt = await getRuntime(); emit(await rt.pendingActions()); });
-  program.command('approve <id>').description('Review, confirm, and execute a pending rotation or containment action')
+  program.command('approve <id>').description('Review and execute a pending action, or publish watcher approval with --relay')
     .option('--yes', 'Skip typing the action id after reviewing the action')
     .option('--relay', 'Publish a signed approval to the configured watcher relay')
     .action(async (id: string, opts: { yes?: boolean; relay?: boolean }) => {
@@ -280,13 +289,27 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       http: relay ? rt.httpForUrls([relay.server], 'approval relay you configured') : rt.http,
       deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
       watcherPublicKeys: async () => { const key = await rt.vault.get('watcher/signing/public'); return key ? [key] : []; },
-      now: options.now, relay, assertHuman: human });
-    if (approved) { emit(approved, opts.relay ? 'Signed approval published to the watcher relay.' : 'Autopilot action approved locally.'); return; }
+      now: options.now, relay, assertHuman: human,
+      review: request => diagnostic([`Autopilot action ${request.actionId}:`,
+        ...request.clusters.map(cluster => `  ${cluster.clusterId}${cluster.hint ? ` (${cluster.hint})` : ''}`)].join('\n')),
+      confirm: actionId => opts.yes && !opts.relay ? Promise.resolve(true)
+        : (options.confirmAction ?? (id => confirmAction(id, diagnostic, options.promptIO)))(actionId),
+      executeApprovedAction: async actionId => {
+        await rt.prepareExecution(diagnostic);
+        return executeLocalApprovedAction(rt, actionId);
+      } });
+    if (approved) {
+      const text = approved.status === 'cancelled' ? 'Approval cancelled.'
+        : approved.status === 'published' ? `Signed approval published to the watcher relay. ${approvedOutcome(approved.watcherCheckMinutes ?? 10)}`
+          : approved.status === 'executed' ? 'Autopilot action executed.'
+            : `Autopilot action approved. ${approved.reason ?? 'The grant remains available for the watcher.'}`;
+      emit(approved, text); return;
+    }
     const review = await rt.reviewAction(id);
     await rt.prepareExecution(diagnostic);
     const rotation = review.action.action === 'rotate' || review.action.action === 'breach-mode';
     diagnostic([`Action ${review.action.id}: ${review.action.action} ${review.action.clusterIds.length} secret cluster(s).`,
-      ...review.plan.steps.map(step => `${step.provider} (${step.method}): ${step.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}`),
+      ...review.plan.steps.map(step => `${providerName(step.provider)} (${step.method}): ${step.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}`),
       rotation ? 'Creates replacements, writes consumers, redeploys supported services, then revokes old keys after deployment.' : 'Disables or caps the selected keys at the provider; consumers may stop working.',
       `revokeUnconfirmed: ${review.revokeUnconfirmed}${review.revokeUnconfirmed ? ' — old keys may be revoked before manual restarts or other unconfirmed activation.' : ' — old keys are retained when activation is unconfirmed.'}`,
       review.requiresInteractive ? 'Interactive atomic-roll recovery is required; the old key dies when its replacement is created.' : '',

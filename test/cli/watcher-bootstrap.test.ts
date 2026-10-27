@@ -8,7 +8,7 @@ import { configSchema } from '../../src/cli/config.js';
 import { createRuntime } from '../../src/cli/runtime.js';
 import { generateDeviceKey } from '../../src/security/index.js';
 import { signArmedPlan } from '../../src/autopilot/index.js';
-import { createEncryptedFileVault } from '../../src/vault/index.js';
+import { createCredentialSource, createEncryptedFileVault, createEnvVault } from '../../src/vault/index.js';
 import { sealWatcherConfig, type WatcherConfig } from '../../src/watcher/index.js';
 import { createFakeVault } from '../helpers/fake-vault.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
@@ -44,8 +44,99 @@ async function fixture() {
     KEYSENTRY_VAULT_PASSPHRASE: 'planted-vault-passphrase', KEYSENTRY_WATCHER_CONFIG: sealWatcherConfig(config, deploy),
     KEYSENTRY_WATCHER_VAULT: prepared.vaultBlob, KEYSENTRY_STATE_DIR: join(dir, 'state'),
   };
-  return { dir, config, key, device, fp, state, deploy, prepared, env };
+  return { dir, config, key, device, fp, state, deploy, prepared, env, sourceVault, settings };
 }
+
+test('deployment exports only enabled host credentials and credentials for armed providers', async () => {
+  const f = await fixture();
+  for (const name of ['CLOUDFLARE_ADMIN_TOKEN', 'VERCEL_TOKEN', 'GITHUB_TOKEN', 'FLY_API_TOKEN', 'OPENAI_ADMIN_KEY', 'ANTHROPIC_ADMIN_KEY']) {
+    await f.sourceVault.set(`cred/${name}`, Buffer.from(`planted-${name}`));
+  }
+  f.settings.hosts.vercel.enabled = false;
+  f.config.armed = signArmedPlan({ v: 1, id: 'arm-20261027-12345678', projectId: f.config.projectId,
+    createdAt: '2026-10-27T12:00:00.000Z', expiresAt: '2027-01-25T12:00:00.000Z', hosts: ['railway'],
+    clusters: [{ clusterId: 'openai-key', provider: 'openai', method: 'auto', consumers: [{ serviceKey: 'railway:p/e/s', varName: 'OPENAI_API_KEY', fingerprint: 'openai-fingerprint' }] }],
+    maxServicesPerWave: 10, graceSeconds: 900, healthChecks: [], nextDeployAcceptance: [], quiet: {} }, f.device);
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, settings: f.settings,
+    outputDir: join(f.dir, 'scoped'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(names).toEqual(expect.arrayContaining(['cred/RAILWAY_TOKEN', 'cred/RAILWAY_TOKEN@read', 'cred/OPENAI_ADMIN_KEY']));
+  for (const name of ['CLOUDFLARE_ADMIN_TOKEN', 'VERCEL_TOKEN', 'GITHUB_TOKEN', 'FLY_API_TOKEN', 'ANTHROPIC_ADMIN_KEY']) expect(names).not.toContain(`cred/${name}`);
+  expect(result.exportedCredentialNames).toEqual(['OPENAI_ADMIN_KEY', 'RAILWAY_TOKEN', 'RAILWAY_TOKEN@read']);
+});
+
+test('deployment does not silently export environment fallback credentials', async () => {
+  const f = await fixture();
+  await f.sourceVault.delete('cred/RAILWAY_TOKEN'); await f.sourceVault.delete('cred/RAILWAY_TOKEN@read');
+  const credentials = createCredentialSource(f.sourceVault, { RAILWAY_TOKEN: 'planted-shell-token', GITHUB_TOKEN: 'planted-personal-token' });
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, credentials, settings: f.settings,
+    outputDir: join(f.dir, 'no-env-consent'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(names).not.toContain('cred/RAILWAY_TOKEN'); expect(names).not.toContain('cred/GITHUB_TOKEN');
+  expect(result.exportedCredentialNames).toEqual([]);
+});
+
+test('deployment asks once per required environment name and exports only accepted names', async () => {
+  const f = await fixture();
+  await f.sourceVault.delete('cred/RAILWAY_TOKEN'); await f.sourceVault.delete('cred/RAILWAY_TOKEN@read');
+  f.settings.hosts.vercel.enabled = true;
+  const credentials = createCredentialSource(f.sourceVault, { RAILWAY_TOKEN: 'planted-shell-token', VERCEL_TOKEN: 'planted-vercel-token', GITHUB_TOKEN: 'planted-personal-token' });
+  const asked: string[] = [];
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, credentials, settings: f.settings,
+    confirmEnvironmentCredential: async name => { asked.push(name); return name === 'RAILWAY_TOKEN'; },
+    outputDir: join(f.dir, 'consented-env'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(asked).toEqual(['RAILWAY_TOKEN', 'VERCEL_TOKEN']);
+  expect(names).toContain('cred/RAILWAY_TOKEN'); expect(names).not.toContain('cred/VERCEL_TOKEN'); expect(names).not.toContain('cred/GITHUB_TOKEN');
+  expect(result.exportedCredentialNames).toEqual(['RAILWAY_TOKEN']);
+});
+
+test('deployment asks for actual read-role environment variable names in an environment vault', async () => {
+  const f = await fixture();
+  const sourceVault = createEnvVault({ KEYSENTRY_FINGERPRINT_KEY: f.fp.toString('base64'), RAILWAY_TOKEN_READ: 'planted-read-token', RAILWAY_TOKEN: 'planted-write-token' });
+  const asked: string[] = [];
+  const result = await prepareWatcherDeployment({ sourceVault, credentials: createCredentialSource(sourceVault, {}), settings: f.settings,
+    confirmEnvironmentCredential: async name => { asked.push(name); return name === 'RAILWAY_TOKEN_READ'; },
+    outputDir: join(f.dir, 'env-vault'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  expect(asked.sort()).toEqual(['RAILWAY_TOKEN', 'RAILWAY_TOKEN_READ']);
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(names).toContain('cred/RAILWAY_TOKEN@read'); expect(names).not.toContain('cred/RAILWAY_TOKEN');
+});
+
+test('deployment keeps the configured Railway token type and separate read role', async () => {
+  const f = await fixture();
+  f.settings.hosts.railway.tokenType = 'project';
+  await f.sourceVault.set('cred/RAILWAY_PROJECT_TOKEN', Buffer.from('planted-project-token'));
+  await f.sourceVault.set('cred/RAILWAY_PROJECT_TOKEN@read', Buffer.from('planted-project-read-token'));
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, settings: f.settings,
+    outputDir: join(f.dir, 'project-token'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(names).toEqual(expect.arrayContaining(['cred/RAILWAY_PROJECT_TOKEN', 'cred/RAILWAY_PROJECT_TOKEN@read']));
+  expect(names).not.toContain('cred/RAILWAY_TOKEN'); expect(names).not.toContain('cred/RAILWAY_TOKEN@read');
+  expect(result.exportedCredentialNames).toEqual(['RAILWAY_PROJECT_TOKEN', 'RAILWAY_PROJECT_TOKEN@read']);
+});
+
+test('deployment copies only active notification secrets and removes console from portable settings', async () => {
+  const f = await fixture();
+  f.settings.notify.channels = [{ id: 'terminal', kind: 'console' }, { id: 'phone', kind: 'ntfy' }];
+  f.config.notify.channels = [{ kind: 'ntfy', settings: { id: 'phone', server: 'https://ntfy.sh', topic: 'planted-private-topic' } }];
+  await f.sourceVault.set('notify/unused/token', Buffer.from('planted-unused-token'));
+  await f.sourceVault.set('notify/terminal/token', Buffer.from('planted-terminal-token'));
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, settings: f.settings,
+    outputDir: join(f.dir, 'notification-scope'), openVault: fastVault }, { config: f.config, watcherKey: f.key,
+    stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const vault = fastVault({ path: result.vaultPath, passphrase: async () => Buffer.from('planted-vault-passphrase') });
+  expect(await vault.get('notify/phone/topic')).toEqual(Buffer.from('planted-private-topic'));
+  expect(await vault.get('notify/unused/token')).toBeNull(); expect(await vault.get('notify/terminal/token')).toBeNull();
+  const raw = await vault.get('watcher/runtime-settings');
+  try { expect(JSON.parse(raw!.toString()).settings.notify.channels.map((channel: { kind: string }) => channel.kind)).toEqual(['ntfy']); }
+  finally { raw?.fill(0); }
+});
 
 test('deployment vault encrypts credentials and carries watcher signing key without copying local device or state keys', async () => {
   const f = await fixture();

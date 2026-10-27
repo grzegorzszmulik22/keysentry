@@ -12,6 +12,9 @@ import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
 import { createFakeVault } from '../helpers/fake-vault.js';
 import { createFakeInFlight } from '../helpers/fake-inflight.js';
+import { createApprovalService } from '../../src/approvals/index.js';
+import { buildPlan } from '../../src/core/index.js';
+import { planHashFor } from '../../src/autopilot/index.js';
 
 // Phase 1 uses an injected vault and encrypted state; tests never open the OS store.
 const vaults = new Map<string, ReturnType<typeof createFakeVault>>();
@@ -46,6 +49,29 @@ async function fixture(guided = false, yaml?: string) {
 }
 
 describe('CLI commands', () => {
+  it('approve executes a local autopilot grant through the watcher executor and records completion', async () => {
+    const f = await fixture();
+    f.runtime.config.settings.notify.channels = [{ id: 'terminal', kind: 'console' }];
+    await f.runtime.drill();
+    await f.runtime.autopilotManager().arm({ graceMinutes: 0 });
+    const inventory = await f.runtime.freshInventory();
+    const clusterIds = inventory.clusters.map(cluster => cluster.id);
+    const action = { id: 'local-autopilot-action', kind: 'autopilot', clusterIds,
+      clusters: inventory.clusters.map(cluster => ({ clusterId: cluster.id, hint: cluster.hint })),
+      planHash: planHashFor(buildPlan(inventory, { clusterIds })) };
+    const key = await f.runtime.signingKey();
+    const service = createApprovalService({ store: f.runtime.store, audit: f.runtime.audit, credentials: async () => [],
+      deviceKeys: async () => [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }], rpId: 'localhost', origins: ['http://localhost'] });
+    const request = await service.request(action, false);
+    await f.runtime.store.writeJson('pending', join(f.runtime.paths.dir, 'watcher-approvals.json'), { actions: [{ action, request }] });
+    expect(await runCli(['approve', action.id, '--yes'], f.io), f.errors.join('\n')).toBe(0);
+    expect(f.host.writes).toHaveLength(2);
+    expect(f.host.peek('one', 'OPENROUTER_API_KEY')).not.toBe(f.key.value);
+    expect(await service.status(action.id)).toBe('executed');
+    expect(f.output.join('\n')).toContain('Autopilot action executed.');
+    expect([...f.output, ...f.errors].join('\n')).not.toContain(f.key.value);
+  });
+
   it('creates private local state and preserves existing configuration', async () => {
     const f = await fixture();
     expect(await runCli(['init', '--json'], f.io)).toBe(0);

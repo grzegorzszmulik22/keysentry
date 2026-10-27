@@ -6,6 +6,7 @@ import { createStateCipher, createStateStore, buildInventory } from '../../src/c
 import { generateDeviceKey, verifyDetached, canonicalJson } from '../../src/security/index.js';
 import { verifyArmedPlan } from '../../src/autopilot/index.js';
 import { DISARM_PREFIX } from '../../src/approvals/index.js';
+import { verifyWatcherResume } from '../../src/watcher/index.js';
 import { createAutopilotManager, recordDrill } from '../../src/cli/autopilot.js';
 import { svc } from '../helpers/fakes.js';
 import type { Inventory, RotationReport } from '../../src/types.js';
@@ -90,6 +91,30 @@ it('relay disarm is signed with the local device key and local disarm survives d
   expect(message).toMatchObject({ watcherId: 'project' });
   const {sig,...body}=message as {sig:string;keyId:string;at:string};
   expect(verifyDetached(f.key.publicKeyDer,Buffer.from(DISARM_PREFIX+canonicalJson(body)),Buffer.from(sig,'base64'))).toBe(true);
+});
+
+it('resume publishes a watcher-bound recovery message without clearing local disarm', async () => {
+  const f = await fixture(); let published: unknown;
+  const manager = createAutopilotManager({ store: f.store, projectId: 'project', deviceKey: async () => f.key,
+    assertHuman: () => {}, scan: async () => f.inventory, rotateCluster: async () => { throw new Error('unexpected'); },
+    audit: { append: async () => {}, checkpoint: async () => {}, verify: async () => ({ ok: true, entries: 0, checkpoints: 0 }) }, now: () => at,
+    relayResume: async signed => { published = signed; } });
+  await manager.disarm();
+  expect(await manager.resume({ relay: true })).toEqual({ published: true });
+  expect(verifyWatcherResume(published, { watcherId: 'project', trustedKeyIds: [f.key.keyId],
+    deviceKeys: [{ keyId: f.key.keyId, publicKeyDer: f.key.publicKeyDer }], now: at }).ok).toBe(true);
+  expect((await manager.loadState()).disarmed).toBe(true);
+});
+
+it('resume refuses an unavailable relay and reports failed publication', async () => {
+  const f = await fixture();
+  await expect(f.manager.resume({ relay: true })).rejects.toThrow(/relay/i);
+  await expect(f.manager.resume({})).rejects.toThrow(/--relay/);
+  const manager = createAutopilotManager({ store: f.store, projectId: 'project', deviceKey: async () => f.key,
+    assertHuman: () => {}, scan: async () => f.inventory, rotateCluster: async () => { throw new Error('unexpected'); },
+    audit: { append: async () => {}, checkpoint: async () => {}, verify: async () => ({ ok: true, entries: 0, checkpoints: 0 }) }, now: () => at,
+    relayResume: async () => { throw new Error('transport detail'); } });
+  await expect(manager.resume({ relay: true })).rejects.toThrow('The resume message could not be published. Try again or inspect the watcher directly.');
 });
 
 it('adoption asks for a real rotation and records its new provider ref and fingerprint',async()=>{

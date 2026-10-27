@@ -1,7 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { CredentialSource, Vault } from '../types.js';
-import { CREDENTIAL_NAMES, createEncryptedFileVault } from '../vault/index.js';
+import type { CredentialSource, TokenRole, Vault } from '../types.js';
+import { credentialVaultName, createEncryptedFileVault } from '../vault/index.js';
+import { PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { deviceKeyFromPrivate } from '../security/index.js';
 import { loadWatcherConfigFromEnv, type WatcherConfig } from '../watcher/index.js';
 import { configSchema, type ConfigSettings } from './config.js';
@@ -17,13 +18,15 @@ export interface WatcherDeploymentOptions {
   credentials?: CredentialSource;
   settings: ConfigSettings;
   outputDir: string;
+  /** A shell credential may leave this computer only after consent for its exact variable name. */
+  confirmEnvironmentCredential?: (name: string) => Promise<boolean>;
   /** Vault factory injection keeps native stores and expensive KDF parameters out of unit tests. */
   openVault?: VaultFactory;
 }
 
 /** Build the encrypted, portable vault without exporting the local device or state key. */
 export async function prepareWatcherDeployment(options: WatcherDeploymentOptions, input: WatcherDeploymentSecrets): Promise<{
-  vaultPath: string; vaultBlob: string;
+  vaultPath: string; vaultBlob: string; exportedCredentialNames: string[];
 }> {
   const dir = resolve(options.outputDir);
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -32,6 +35,7 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   const vault = (options.openVault ?? createEncryptedFileVault)({ path: vaultPath, passphrase: async () => Buffer.from(input.vaultPassphrase) });
   const settings = configSchema.parse(options.settings);
+  settings.notify.channels = settings.notify.channels.filter(channel => channel.kind !== 'console');
   const projectId = input.config.projectId;
   if (!/^[a-f0-9]{16}$/.test(projectId)) throw new CliError('The watcher project identity is invalid.');
   const fp = await options.sourceVault.get(`project/${projectId}/key/fingerprint`);
@@ -45,25 +49,65 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
     await vault.set('watcher/signing/private', input.watcherKey.privateKeyDer);
     await vault.set('watcher/signing/public', input.watcherKey.publicKeyDer);
     await vault.set('watcher/runtime-settings', Buffer.from(JSON.stringify({ projectId, settings })));
-    const names = (await options.sourceVault.list()).filter(name => name.startsWith('cred/') || name.startsWith('notify/'));
-    for (const name of names) {
+    const exported = new Set<string>();
+    const environmentConsent = new Map<string, boolean>();
+    async function consent(name: string): Promise<boolean> {
+      if (!environmentConsent.has(name)) environmentConsent.set(name, await options.confirmEnvironmentCredential?.(name) ?? false);
+      return environmentConsent.get(name)!;
+    }
+    async function exportRole(name: string, role: TokenRole): Promise<boolean> {
+      // Preserve exact vault roles. A read may reuse the write entry, so it does
+      // not create a second copy of the same token under a different role.
+      const candidates = role === 'read' ? [credentialVaultName(name, 'read'), credentialVaultName(name, 'write')] : [credentialVaultName(name, 'write')];
+      for (const entry of candidates) {
+        const value = await options.sourceVault.get(entry);
+        if (value === null) continue;
+        try {
+          const environmentName = entry.endsWith('@read') ? `${name}_READ` : name;
+          if (options.sourceVault.backend === 'env' && !await consent(environmentName)) return false;
+          await vault.set(entry, value); exported.add(entry.slice('cred/'.length)); return true;
+        } finally { value.fill(0); }
+      }
+      const credential = await options.credentials?.get(name, role);
+      if (!credential) return false;
+      // CredentialSource's environment fallback is the ordinary variable; a
+      // dedicated NAME_READ value is handled by an environment vault above.
+      if (credential.source === 'env' && !await consent(name)) return false;
+      const entry = credentialVaultName(name, credential.source === 'env' ? 'write' : role);
+      const value = Buffer.from(credential.value);
+      try { await vault.set(entry, value); exported.add(entry.slice('cred/'.length)); return true; }
+      finally { value.fill(0); }
+    }
+    async function exportCredential(name: string): Promise<void> {
+      for (const role of ['read', 'write'] as const) await exportRole(name, role);
+    }
+    if (settings.hosts.railway.enabled !== false) {
+      const names = settings.hosts.railway.tokenType === 'project' ? ['RAILWAY_PROJECT_TOKEN']
+        : settings.hosts.railway.tokenType === 'account' ? ['RAILWAY_TOKEN'] : ['RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN'];
+      for (const role of ['read', 'write'] as const) for (const name of names) if (await exportRole(name, role)) break;
+    }
+    if (settings.hosts.vercel.enabled !== false) await exportCredential('VERCEL_TOKEN');
+    if (settings.hosts.render.enabled !== false) await exportCredential('RENDER_API_KEY');
+    if (settings.hosts.fly.enabled !== false && (settings.hosts.fly.org || settings.hosts.fly.apps?.length)) await exportCredential('FLY_API_TOKEN');
+    if (settings.hosts.github.enabled !== false && settings.hosts.github.repos.length) await exportCredential('GITHUB_TOKEN');
+    for (const name of new Set(input.config.armed?.clusters.flatMap(cluster => PROVIDER_CREDENTIALS[cluster.provider]) ?? [])) await exportCredential(name);
+    const channelIds = new Set(input.config.notify.channels.filter(channel => channel.kind !== 'console').map(channel => channel.settings.id));
+    const notificationNames = (await options.sourceVault.list('notify/')).filter(name => {
+      const id = name.split('/')[1];
+      return id === 'relay' ? input.config.approvals.relay !== null : channelIds.has(id);
+    });
+    for (const name of notificationNames) {
       const value = await options.sourceVault.get(name);
       if (value === null) continue;
-      try { await vault.set(name, value); } finally { value.fill(0); }
-    }
-    // Environment fallback credentials have no source-vault entry. Resolve both
-    // roles explicitly, preserving separate read-only credentials when available.
-    if (options.credentials) for (const name of CREDENTIAL_NAMES) for (const role of ['read', 'write'] as const) {
-      const credential = await options.credentials.get(name, role);
-      if (!credential) continue;
-      const bytes = Buffer.from(credential.value);
-      try { await vault.set(`cred/${name}${role === 'read' ? '@read' : ''}`, bytes); }
-      finally { bytes.fill(0); }
+      try {
+        if (options.sourceVault.backend === 'env' && !await consent(`KEYSENTRY_VAULT_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`)) continue;
+        await vault.set(name, value); exported.add(name);
+      } finally { value.fill(0); }
     }
     const encrypted = await readFile(vaultPath);
     try {
       if (encrypted.length > MAX_VAULT_BYTES) throw new CliError('The encrypted deployment vault is too large.');
-      return { vaultPath, vaultBlob: encrypted.toString('base64') };
+      return { vaultPath, vaultBlob: encrypted.toString('base64'), exportedCredentialNames: [...exported].sort() };
     } finally { encrypted.fill(0); }
   } finally { fp.fill(0); }
 }

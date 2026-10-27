@@ -27,6 +27,8 @@ import type {
 } from '../types.js';
 import { loadConfig, loadConfigMetadata, type ConfigSettings } from './config.js';
 import { createAutopilotManager, recordDrill, type AutopilotManagerOptions } from './autopilot.js';
+import { createWatcherStateStore } from './watcher-state.js';
+import { humanizeProviderNames } from './provider-names.js';
 import { notificationEgress } from './notifications.js';
 import { persistManualAdoption, reconcileAutopilotRecovery } from './adoption-recovery.js';
 import { verifyArmedPlan } from '../autopilot/index.js';
@@ -105,7 +107,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const redactor = outputRedactor();
   const knownServices = new Map<string, ServiceRef>();
   const remember = (services: ServiceRef[]) => { for (const service of services) knownServices.set(serviceKey(service), service); };
-  const humanize = (text: string) => humanizeServices(text, [...knownServices.values()]);
+  const humanize = (text: string) => humanizeProviderNames(humanizeServices(text, [...knownServices.values()]));
   const baseLog = options.log ?? createLogger({ redactor, level: options.verbose ? 'debug' : 'info', json: options.json });
   const logValue = (input: unknown): unknown => {
     if (typeof input === 'string') return redactor.redact(humanize(input));
@@ -215,7 +217,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     },
   };
   // Every caller, including monitor/recovery and embedders, receives the mirrored journal.
-  const store: StateStore = { ...baseStore, journal: () => journal };
+  const store: StateStore = createWatcherStateStore({ ...baseStore, journal: () => journal }, env.GITHUB_ACTIONS === 'true' && options.watcherAuthorized === true);
   const inflight = options.inflight ?? createInFlightStore({ dir: join(paths.dir, 'inflight'), vault, projectId });
   const credentials = createCredentialSource(vault, env);
   const receipt = createFileReceipt(join(paths.dir, 'network.jsonl'));
@@ -547,7 +549,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     await stateStore.save(state);
   }
 
-  function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'selfCheck' | 'lastNotificationSuccess' | 'assertActive'>> = {}) {
+  function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'relayResume' | 'selfCheck' | 'lastNotificationSuccess' | 'assertActive'>> = {}) {
     return createAutopilotManager({ store, audit, projectId, deviceKey: () => deviceKey(vault), assertHuman,
       scan: async () => rotationInventory(await scan()), rotateCluster: async clusterId => rotate(await plan({ clusterIds: [clusterId] }), {
         execute: true, prompt: options.prompt ?? (p => promptSecret(p, diagnostic, options.promptIO)),

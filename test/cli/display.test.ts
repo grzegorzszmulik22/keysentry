@@ -1,11 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { serviceKey } from '../../src/core/index.js';
-import { humanizeServices, serviceLabel } from '../../src/cli/display.js';
+import { humanizeServices, providerName, serviceLabel } from '../../src/cli/display.js';
 import type { ServiceRef } from '../../src/types.js';
 
 function service(overrides: Partial<ServiceRef> = {}): ServiceRef {
   return { host: 'railway', projectId: 'project-id', projectName: 'backend', serviceId: 'service-id', serviceName: 'api', environmentId: 'environment-id', environmentName: 'production', ...overrides };
 }
+
+describe('provider display names', () => {
+  it('uses product and secret-category names in terminal output', () => {
+    expect(providerName('openai')).toBe('OpenAI');
+    expect(providerName('openrouter')).toBe('OpenRouter');
+    expect(providerName('github')).toBe('GitHub');
+    expect(providerName('private-key')).toBe('Private key');
+    expect(providerName('app-secret')).toBe('App secret');
+    expect(providerName('unknown')).toBe('Unknown provider');
+    expect(providerName('future-provider')).toBe('future-provider');
+  });
+});
 
 describe('human service labels', () => {
   it('uses project and service names with the environment', () => {

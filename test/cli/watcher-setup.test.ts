@@ -94,6 +94,25 @@ test('watcher setup prints the encrypted vault bootstrap once without returning 
   expect(JSON.stringify(result)).not.toContain(vaultBlob);
 });
 
+test('hosted watcher setup removes console channels from both sealed and prepared configuration', async () => {
+  const f = await fixture();
+  f.deps.config.notify.channels = [{ kind: 'console', settings: { id: 'terminal' } }, { kind: 'ntfy', settings: { id: 'phone', server: 'https://ntfy.sh', topic: 'private-topic' } }];
+  let preparedKinds: string[] = [];
+  const result = await setupWatcher({ ...f.deps, async prepareDeployment(input) { preparedKinds = input.config.notify.channels.map(channel => channel.kind); } });
+  const deployKey = f.output.join('\n').match(/^KEYSENTRY_WATCHER_KEY=(.+)$/m)![1]!;
+  const sealed = openWatcherConfig((await readFile(result.sealedConfigPath, 'utf8')).trim(), Buffer.from(deployKey, 'base64'));
+  expect(sealed.notify.channels.map(channel => channel.kind)).toEqual(['ntfy']);
+  expect(preparedKinds).toEqual(['ntfy']);
+  expect(f.deps.config.notify.channels.map(channel => channel.kind)).toEqual(['console', 'ntfy']);
+});
+
+test('watcher setup names exported credentials without exposing their values', async () => {
+  const f = await fixture();
+  await setupWatcher({ ...f.deps, async prepareDeployment() { return { vaultBlob: 'encrypted-vault', exportedCredentialNames: ['OPENAI_ADMIN_KEY', 'RAILWAY_TOKEN@read'] }; } });
+  const output = f.output.join('\n');
+  expect(output).toContain('Exported credential names: OPENAI_ADMIN_KEY, RAILWAY_TOKEN@read.');
+});
+
 test('watcher status reads health through the injected HTTP client and compares versions', async () => {
   const http = new FakeHttp().on('GET', /^https:\/\/watcher\.example\/healthz$/, () => json(200, { ok: true, version: '1.0.0' }));
   expect(await watcherStatus(http, 'https://watcher.example', '1.0.0')).toEqual({ healthy: true, version: '1.0.0', localVersion: '1.0.0', versionMatches: true });

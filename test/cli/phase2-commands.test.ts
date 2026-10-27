@@ -7,6 +7,8 @@ import { createFakeVault } from '../helpers/fake-vault.js';
 import { FakeHttp, silentLogger, text } from '../helpers/fake-http.js';
 import { configureApprovalRelay } from '../../src/cli/phase2.js';
 import { loadConfigMetadata } from '../../src/cli/config.js';
+import { verifyWatcherResume } from '../../src/watcher/index.js';
+import { createApprovalService } from '../../src/approvals/index.js';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
@@ -59,6 +61,50 @@ test('remote disarm publishes the watcher-bound v2 envelope', async () => {
   expect(JSON.parse(c.http.calls.find(call => call.method === 'POST')!.body!)).toMatchObject({
     type: 'keysentry-disarm', v: 2, watcherId: c.runtime.projectId,
   });
+  expect(c.output.join('\n')).toMatch(/next check/);
+});
+
+test('autopilot resume publishes a watcher-bound recovery message and reports next-check delivery', async () => {
+  const c = await context();
+  c.runtime.config.settings.notify.relay = { server: 'https://ntfy.sh' };
+  await c.runtime.vault.set('notify/relay/topic', Buffer.from('saved-topic'));
+  c.http.on('POST', /ntfy\.sh/, () => text(200, '{}'));
+  expect(await runCli(['autopilot', 'resume', '--relay'], c.options)).toBe(0);
+  const message = JSON.parse(c.http.calls.find(call => call.method === 'POST')!.body!);
+  const key = await c.runtime.signingKey();
+  expect(verifyWatcherResume(message, { watcherId: c.runtime.projectId, trustedKeyIds: [key.keyId],
+    deviceKeys: [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }], now: c.runtime.now() }).ok).toBe(true);
+  expect(c.output.join('\n')).toMatch(/published.*next check/i);
+});
+
+test('autopilot resume refuses missing relay and publication failure without success output', async () => {
+  const c = await context();
+  expect(await runCli(['autopilot', 'resume', '--relay'], c.options)).toBe(1);
+  expect(c.output).toEqual([]);
+  c.runtime.config.settings.notify.relay = { server: 'https://ntfy.sh' };
+  await c.runtime.vault.set('notify/relay/topic', Buffer.from('saved-topic'));
+  c.http.on('POST', /ntfy\.sh/, () => text(503, 'unavailable'));
+  expect(await runCli(['autopilot', 'resume', '--relay'], c.options)).toBe(1);
+  expect(c.output).toEqual([]);
+});
+
+test('approve --relay displays the bound keys and still asks confirmation with --yes before publishing', async () => {
+  const c = await context();
+  c.runtime.config.settings.notify.relay = { server: 'https://ntfy.sh' };
+  await c.runtime.vault.set('notify/relay/topic', Buffer.from('saved-topic'));
+  const action = { id: 'relay-action', kind: 'autopilot', clusterIds: ['bound-cluster'],
+    clusters: [{ clusterId: 'bound-cluster', hint: 'sk-...last' }], planHash: 'a'.repeat(64) };
+  const key = await c.runtime.signingKey();
+  const service = createApprovalService({ store: c.runtime.store, audit: c.runtime.audit, credentials: async () => [],
+    deviceKeys: async () => [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }], rpId: 'localhost', origins: ['http://localhost'] });
+  const request = await service.request(action, false);
+  await c.runtime.store.writeJson('pending', join(c.runtime.paths.dir, 'watcher-approvals.json'), { actions: [{ action, request }] });
+  expect(await runCli(['approve', action.id, '--relay', '--yes'], { ...c.options, confirmAction: async id => {
+    expect(id).toBe(action.id); expect(c.errors.join('\n')).toContain('bound-cluster (sk-...last)'); return false;
+  } })).toBe(0);
+  expect(c.output.join('\n')).toContain('Approval cancelled.');
+  expect(c.http.calls).toEqual([]);
+  expect(await service.status(action.id)).toBe('pending');
 });
 
 test('new local-only mutations refuse coding-agent environments before work', async () => {

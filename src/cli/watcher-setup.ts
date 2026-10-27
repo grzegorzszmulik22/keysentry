@@ -27,7 +27,7 @@ export interface WatcherSetupDependencies {
   /** Dedicated terminal sink: never a logger, JSON writer, or captured command result. */
   writeTerminal(text: string): void;
   /** Initialize the portable encrypted vault/state before any deploy secrets are shown. */
-  prepareDeployment(input: WatcherDeploymentSecrets): Promise<void | { vaultBlob: string }>;
+  prepareDeployment(input: WatcherDeploymentSecrets): Promise<void | { vaultBlob: string; exportedCredentialNames?: string[] }>;
 }
 
 const TEMPLATES: Record<WatcherPlatform, string> = {
@@ -45,6 +45,7 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
   if (!deps.interactive || deps.json) throw new CliError('Watcher setup needs an interactive terminal and cannot print secrets in JSON.');
   const platform = options.platform ?? 'compose';
   if (!Object.hasOwn(TEMPLATES, platform)) throw new CliError('Choose compose, railway, fly, render, or github-actions for the watcher.');
+  const config: WatcherConfig = { ...deps.config, notify: { channels: deps.config.notify.channels.filter(channel => channel.kind !== 'console') } };
   const protectedHosts = deps.protectedHosts ?? deps.config.armed?.hosts ?? [];
   const deployKey = randomBytes(32), stateKey = randomBytes(32), vaultPassphrase = randomBytes(32);
   const watcherKey = generateDeviceKey();
@@ -52,15 +53,16 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
   const printablePassphrase = Buffer.from(vaultPassphrase.toString('base64url'));
   vaultPassphrase.fill(0);
   try {
-    const sealed = sealWatcherConfig(deps.config, deployKey);
+    const sealed = sealWatcherConfig(config, deployKey);
     const outputDir = resolve(deps.outputDir), sealedConfigPath = join(outputDir, 'watcher-config.sealed');
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     await writeFile(sealedConfigPath, `${sealed}\n`, { mode: 0o600, flag: 'wx' });
-    const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config: deps.config });
+    const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config });
     await deps.vault.set('watcher/signing/private', watcherKey.privateKeyDer);
     await deps.vault.set('watcher/signing/public', watcherKey.publicKeyDer);
     await deps.audit.append({ kind: 'watcher:setup', summary: 'Watcher deployment prepared.', data: { platform, watcherKeyId: watcherKey.keyId } });
     const write = deps.writeTerminal;
+    write(deployment?.exportedCredentialNames?.length ? `Exported credential names: ${deployment.exportedCredentialNames.join(', ')}.` : 'Exported credential names: none.');
     write('Store the following values in the platform\'s secret settings only. They are shown once. Keep a separate secure backup.');
     write(`KEYSENTRY_WATCHER_KEY=${deployKey.toString('base64')}`);
     write(`KEYSENTRY_STATE_KEY=${stateKey.toString('base64')}`);

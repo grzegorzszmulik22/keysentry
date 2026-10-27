@@ -6,8 +6,9 @@ import {
   adoptionNeeded, autopilotEligibility, buildArmedPlan, isAlertOnly, signArmedPlan, verifyArmedPlan,
   type AutopilotState, type SelfCheckResult,
 } from '../autopilot/index.js';
-import { DISARM_PREFIX, type SignedDisarm } from '../approvals/index.js';
-import { canonicalJson, signDetached, type DeviceKey } from '../security/index.js';
+import { signDisarm, type SignedDisarm } from '../approvals/index.js';
+import { signWatcherResume, type SignedWatcherResume } from '../watcher/index.js';
+import { canonicalJson, type DeviceKey } from '../security/index.js';
 import type { ArmedCluster, ArmedPlan, AuditLog, Cluster, HostId, Inventory, RotationReport } from '../types.js';
 import { CliError } from './errors.js';
 
@@ -30,6 +31,7 @@ export interface AutopilotManagerOptions {
   emitEligibility?: (rows: EligibilityRow[]) => void;
   settings?: { graceMinutes?: number; maxServices?: number; healthChecks?: ArmedPlan['healthChecks'] };
   relayDisarm?: (signed: SignedDisarm) => Promise<void>;
+  relayResume?: (signed: SignedWatcherResume) => Promise<void>;
   selfCheck?: () => Promise<SelfCheckResult>;
   lastNotificationSuccess?: () => Promise<string | null>;
   env?: NodeJS.ProcessEnv; now?: () => Date;
@@ -268,12 +270,22 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     await opts.audit.append({ kind: 'autopilot:disarm', summary: 'Autopilot disarmed.', data: { relay: options.relay === true } });
     if (options.relay) {
       if (!opts.relayDisarm) throw new CliError('Autopilot is disarmed locally. Configure the watcher relay to also disarm it remotely.');
-      const key = await opts.deviceKey(); const body = { watcherId: opts.projectId, keyId: key.keyId, at: now().toISOString() };
-      const signed = { ...body, sig: signDetached(key.privateKeyDer, Buffer.from(DISARM_PREFIX + canonicalJson(body))).toString('base64') };
+      const signed = signDisarm(await opts.deviceKey(), { watcherId: opts.projectId, at: now().toISOString() });
       try { await opts.relayDisarm(signed); }
       catch { throw new CliError('Autopilot is disarmed locally. The relay delivery failed; disarm the watcher directly or try again.'); }
     }
     return { disarmed: true, relay: options.relay === true };
+  }
+
+  async function resume(options: { relay?: boolean }): Promise<{ published: true }> {
+    opts.assertHuman('resume the watcher through its relay');
+    if (!options.relay) throw new CliError('Use keysentry autopilot resume --relay to review recovery on the watcher.');
+    if (!opts.relayResume) throw new CliError('Configure the watcher relay before using --relay.');
+    const signed = signWatcherResume({ watcherId: opts.projectId, at: now().toISOString() }, await opts.deviceKey());
+    try { await opts.relayResume(signed); }
+    catch { throw new CliError('The resume message could not be published. Try again or inspect the watcher directly.'); }
+    await opts.audit.append({ kind: 'autopilot:resume-published', summary: 'A signed watcher resume message was published.' });
+    return { published: true };
   }
 
   async function status() {
@@ -297,5 +309,5 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
       adoptionNotice: state.adoptionUpdates && Object.keys(state.adoptionUpdates).length ? 're-arm to refresh adopted keys' : null,
     };
   }
-  return { arm, disarm, status, loadPlan, loadState, saveState, applyAdoptionUpdates };
+  return { arm, disarm, resume, status, loadPlan, loadState, saveState, applyAdoptionUpdates };
 }

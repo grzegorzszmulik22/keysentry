@@ -2,6 +2,8 @@ import { posix, win32 } from 'node:path';
 import { serviceKey } from '../core/index.js';
 import type { ServiceRef } from '../types.js';
 
+export { providerName } from './provider-names.js';
+
 function absolute(value: string): boolean {
   return posix.isAbsolute(value) || win32.isAbsolute(value);
 }

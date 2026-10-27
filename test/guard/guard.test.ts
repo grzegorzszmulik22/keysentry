@@ -175,7 +175,7 @@ describe('staged guard', () => {
   it('formats the required blocked output and exit status and stays quiet for a clean diff', async () => {
     const result = await guardStaged(root, gitDiff(diff('.env', [`KEY=${openai}`], 9)));
     expect(formatGuardStaged(result)).toEqual({
-      output: '.env:9  openai  sk-proj…W1xY\nCommit stopped: 1 secrets would be committed. Remove them, or add a test value to .keysentry-allow.\n',
+      output: '.env:9  openai  sk-proj…W1xY\nCommit stopped: 1 secret would be committed. Remove them, or add a test value to .keysentry-allow.\n',
       exitCode: 1,
     });
     expect(formatGuardStaged({ blocked: [] })).toEqual({ output: '', exitCode: 0 });
