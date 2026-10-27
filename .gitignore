@@ -4,3 +4,6 @@ dist/
 logs/
 *.log
 dist-release/
+.terraform/
+*.tfstate
+*.tfstate.*
