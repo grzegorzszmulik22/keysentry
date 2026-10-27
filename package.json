@@ -22,7 +22,8 @@
     "bundle": "node scripts/build-bundle.mjs",
     "release:build": "node scripts/release-build.mjs",
     "release:check": "node scripts/check-reproducible.mjs",
-    "release:sign": "node scripts/sign-release.mjs"
+    "release:sign": "node scripts/sign-release.mjs",
+    "build:ui": "node scripts/build-ui.mjs"
   },
   "license": "Apache-2.0",
   "private": true,

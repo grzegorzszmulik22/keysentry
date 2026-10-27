@@ -669,3 +669,51 @@ export interface ApprovalGrant {
   at: string;
   by: { kind: 'passkey'; credentialId: string } | { kind: 'device'; keyId: string };
 }
+
+// ---------------------------------------------------------------- phase 3: first run and everyday features
+export interface FirstRunFinding {
+  id: string;
+  provider: ProviderId;
+  tier: RiskTier;
+  hint: string | null;
+  locations: {
+    kind: 'file' | 'history';
+    path: string;
+    line?: number;
+    commit?: string;
+    committedAt?: string;
+    /** False when the key was removed from the working tree but is still in git history. */
+    stillPresent: boolean;
+  }[];
+  inGitHistory: boolean;
+  likelyDeployedOn: HostId[];
+}
+
+/** The zero-token first run: local files and git history only, no network, no account. */
+export interface FirstRunResult {
+  scannedFiles: number;
+  scannedCommits: number;
+  historyComplete: boolean;
+  elapsedMs: number;
+  findings: FirstRunFinding[];
+  deployTargets: { host: HostId; evidence: string }[];
+  nextSteps: string[];
+}
+
+export interface KeyHygiene {
+  clusterId: string;
+  firstSeen: string;
+  ageDays: number;
+  copies: number;
+  rotateBy?: string;
+  unusedDays?: number;
+  spendLimitUsd?: number | null;
+}
+
+export interface TimelineEvent {
+  at: string;
+  kind: 'detected' | 'decided' | 'created' | 'written' | 'deployed' | 'verified' | 'grace' | 'revoked' | 'failed' | 'undone' | 'notified';
+  summary: string;
+  clusterId?: string;
+  serviceKey?: string;
+}

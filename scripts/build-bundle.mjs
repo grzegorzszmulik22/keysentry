@@ -2,6 +2,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildUiAssets } from './build-ui.mjs';
 
 export const REPOSITORY_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -38,6 +39,9 @@ export function normalizeBundleShebang(source) {
 
 export async function buildBundle({ outFile = resolve(REPOSITORY_ROOT, 'dist/keysentry.mjs'), env = process.env } = {}) {
   const pkg = JSON.parse(await readFile(resolve(REPOSITORY_ROOT, 'package.json'), 'utf8'));
+  // The bundle embeds the committed dashboard assets; refuse to release assets that do not match their sources.
+  const assets = await readFile(resolve(REPOSITORY_ROOT, 'src/dashboard/generated/assets.ts'), 'utf8').catch(() => '');
+  if (assets !== await buildUiAssets()) throw new Error('src/dashboard/generated/assets.ts is out of date. Run "npm run build:ui" and commit it.');
   await mkdir(dirname(outFile), { recursive: true });
   const define = {
     __KEYSENTRY_VERSION__: JSON.stringify(pkg.version),
