@@ -717,3 +717,59 @@ export interface TimelineEvent {
   clusterId?: string;
   serviceKey?: string;
 }
+
+// ---------------------------------------------------------------- phase 4: cloud box
+/** The Confidential Space token claims keysentry checks (paths as in Google's docs; see notes/phase4-facts.md §1c). */
+export interface AttestationClaims {
+  iss: string;
+  aud: string | string[];
+  exp: number;
+  iat: number;
+  nbf?: number;
+  eat_nonce?: string | string[];
+  secboot?: boolean;
+  dbgstat?: string;
+  hwmodel?: string;
+  swname?: string;
+  swversion?: string[];
+  google_service_accounts?: string[];
+  submods?: {
+    container?: { image_digest?: string; image_reference?: string; image_id?: string; restart_policy?: string;
+      env?: Record<string, string>; env_override?: Record<string, string>; cmd_override?: string[]; args?: string[] };
+    confidential_space?: { support_attributes?: string[]; monitoring_enabled?: { memory?: boolean } };
+    gce?: { project_id?: string; project_number?: string; zone?: string; instance_id?: string; instance_name?: string };
+  };
+}
+
+export interface AttestationPolicy {
+  audience: string;
+  projectIds: string[];
+  serviceAccounts: string[];
+  /** Digests allowed by the verified allow-list at the time of the check. */
+  allowedDigests: string[];
+  hardwareModels: ('GCP_INTEL_TDX' | 'GCP_AMD_SEV')[];
+  maxTokenAgeSeconds: number;
+  clockSkewSeconds: number;
+}
+
+export interface AttestationResult {
+  ok: boolean;
+  checks: { name: string; ok: boolean; detail: string }[];
+  /** base64url SHA-256 of the box's X25519 public key, as bound in the nonce. */
+  boxKeyHash: string | null;
+  claims: AttestationClaims | null;
+}
+
+export type BoxSealMode = 'standard' | 'byo-kms' | 'unlock-on-restart';
+
+/** One entry of the public, append-only, signed allow-list of box image digests. */
+export interface AllowListEntry {
+  seq: number;
+  digest: string;
+  reference: string;
+  addedAt: string;
+  reason: string;
+  prev: string;
+  hash: string;
+  sig: string;
+}

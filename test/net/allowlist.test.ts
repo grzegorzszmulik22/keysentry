@@ -27,7 +27,7 @@ test('every https literal in network-calling modules is allow-listed or display-
   };
   let literals = 0;
   // Phase 2 modules are scanned as soon as they exist.
-  for (const dir of ['src/hosts', 'src/providers', 'src/monitor', 'src/feeds', 'src/autopilot', 'src/notify', 'src/approvals', 'src/watcher']) {
+  for (const dir of ['src/hosts', 'src/providers', 'src/monitor', 'src/feeds', 'src/autopilot', 'src/notify', 'src/approvals', 'src/watcher', 'src/box']) {
     for (const path of await sources(dir)) {
       const source = await readFile(path, 'utf8');
       const occurrences = [...source.matchAll(/https:\/\//g)].length;

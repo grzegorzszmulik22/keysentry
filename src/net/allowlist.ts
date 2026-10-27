@@ -56,6 +56,11 @@ export const EGRESS_RULES: readonly EgressRule[] = [
   { host: 'feeds.feedburner.com', owner: 'feed', purpose: 'Security news feed (The Hacker News)' },
   { host: 'www.cisa.gov', owner: 'feed', purpose: 'Security news feed (CISA advisories)' },
   { host: 'www.helpnetsecurity.com', owner: 'feed', purpose: 'Security news feed (Help Net Security)' },
+  // Phase 4 cloud box (notes/phase4-facts.md): attestation keys for the CLI's verifier, and the box's own key release.
+  { host: 'www.googleapis.com', owner: 'box', purpose: 'Google signing keys for cloud box attestation checks' },
+  { host: 'confidentialcomputing.googleapis.com', owner: 'box', purpose: 'Confidential Space attestation discovery' },
+  { host: 'sts.googleapis.com', owner: 'box', purpose: 'Cloud box key release (token exchange inside the box)' },
+  { host: 'cloudkms.googleapis.com', owner: 'box', purpose: 'Cloud box key release (KMS decrypt inside the box)' },
   // Phase 2 notification channels (notes/phase2-facts.md §2). Webhook URLs themselves come from your settings.
   { host: 'api.telegram.org', owner: 'notify', purpose: 'Telegram notifications you configured' },
   { host: 'discord.com', owner: 'notify', purpose: 'Discord webhook notifications you configured' },
