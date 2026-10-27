@@ -571,6 +571,8 @@ export interface FeedSource {
   /** Publishing company: two news items corroborate each other only when their owners differ. */
   owner: string;
   maxBytes?: number;
+  /** Keep only items whose link starts with this prefix (e.g. Vercel security bulletins inside the KB feed). */
+  linkPrefix?: string;
 }
 
 export interface IncidentEvidence {
