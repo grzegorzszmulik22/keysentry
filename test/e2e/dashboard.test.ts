@@ -45,16 +45,16 @@ describe('dashboard end-to-end flow', () => {
     const runtime = await createRuntime({ cwd, userDir: join(cwd, '.user'), env: {}, vault, inflight: createFakeInFlight(),
       hosts: [host], providers: id => id === provider.id ? provider : getProvider(id), http: outbound, log: silentLogger,
       stdinIsTTY: false, stdoutIsTTY: false, sleep: async () => {}, firstRunGit: async () => ({ code: 0 }) });
-    const d = await startDashboard({ api: createDashboardApi(runtime), passkeys: createDashboardPasskeyStore(vault), readOnly: false }); dashboards.push(d);
+    const d = await startDashboard({ api: createDashboardApi(runtime), passkeys: createDashboardPasskeyStore(runtime.store, vault), readOnly: false }); dashboards.push(d);
     const exchanged = await http(d.port, `/${new URL(d.url).search}`);
     expect(exchanged.status).toBe(303);
     const cookie = exchanged.headers['set-cookie']![0]!.split(';')[0]!;
     const auth = { cookie, csrf: '' };
     const session = await http(d.port, '/api/session', auth); auth.csrf = session.body.csrf;
     const authenticator = createFakeAuthenticator();
-    const registration = await http(d.port, '/api/passkey/register/options', auth, {});
-    expect(registration.status).toBe(200);
-    expect((await http(d.port, '/api/passkey/register/finish', auth, authenticator.registration(registration.body.challenge, `http://localhost:${d.port}`))).body).toEqual({ registered: true });
+    // Registration is terminal-only; the fake models a credential already enrolled by that ceremony.
+    await createDashboardPasskeyStore(runtime.store, vault).add(authenticator.credential(['http://localhost']));
+    expect((await http(d.port, '/api/passkey/register/options', auth, {})).status).toBe(404);
     const responses: string[] = [];
     async function change(route: string, body: unknown) {
       const challenge = await http(d.port, '/api/passkey/challenge', auth, { route, bodyDigest: bodyDigest(body) });
@@ -89,8 +89,8 @@ describe('dashboard end-to-end flow', () => {
       expect(responses.join('\n')).not.toContain(value);
       expect(await readFile(runtime.paths.audit, 'utf8')).not.toContain(value);
     }
-    expect(await vault.list('passkey/')).toEqual([`passkey/${authenticator.id}`]);
-    expect((await createDashboardPasskeyStore(vault).list())[0]!.signCount).toBe(3);
+    expect(await vault.list('passkey/')).toEqual([]);
+    expect((await createDashboardPasskeyStore(runtime.store, vault).list())[0]!.signCount).toBe(3);
     expect(await runtime.audit.verify()).toMatchObject({ ok: true });
   });
 });

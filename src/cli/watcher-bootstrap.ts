@@ -153,7 +153,8 @@ async function importDeploymentVault(path: string, encoded: string | undefined):
 
 async function bindIdentity(stateDir: string, projectId: string): Promise<void> {
   const dir = join(stateDir, '.keysentry');
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+  try { await mkdir(dir, { recursive: true, mode: 0o700 }); }
+  catch { throw new CliError(`Could not prepare the directory ${dir}. Set KEYSENTRY_STATE_DIR to a writable directory.`); }
   const path = join(dir, 'project.json');
   try { await writeFile(path, JSON.stringify({ id: projectId }), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
@@ -177,9 +178,15 @@ export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherB
   try {
     const loaded = await loadWatcherConfigFromEnv(env, { cwd: options.cwd, platform: options.platform });
     deployKey = loaded.deployKey;
-    const userDir = join(loaded.stateDir, 'vault');
-    await mkdir(userDir, { recursive: true, mode: 0o700 });
-    const path = join(userDir, 'vault.enc');
+    const userDir = resolve(options.cwd ?? process.cwd(), env.KEYSENTRY_USER_DIR ?? join(loaded.stateDir, 'user'));
+    // Keep the existing durable vault location across upgrades. Runtime metadata
+    // belongs in user/, while changing the vault path would lose later updates.
+    const vaultDir = join(loaded.stateDir, 'vault');
+    for (const [directory, variable] of [[userDir, 'KEYSENTRY_USER_DIR'], [vaultDir, 'KEYSENTRY_STATE_DIR']] as const) {
+      try { await mkdir(directory, { recursive: true, mode: 0o700 }); }
+      catch { throw new CliError(`Could not prepare the directory ${directory}. Set ${variable} to a writable directory.`); }
+    }
+    const path = join(vaultDir, 'vault.enc');
     await importDeploymentVault(path, env.KEYSENTRY_WATCHER_VAULT);
     const vault = (options.openVault ?? createEncryptedFileVault)({ path,
       passphrase: async () => Buffer.from(env.KEYSENTRY_VAULT_PASSPHRASE!),

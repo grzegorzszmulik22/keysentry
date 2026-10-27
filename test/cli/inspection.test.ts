@@ -116,7 +116,8 @@ it('bin permissions include the adjacent release manifest without granting the i
   // H3: permission grants use the real module path, with an explicit seam for a synthetic installed bundle.
   const permissions = await cliModule.permissionOptionsForBin(['node', bundle, '--cwd', f.cwd], { KEYSENTRY_VAULT: 'memory' }, bundle);
   expect(permissions.readPaths).toContain(join(f.cwd, 'installation', 'release-manifest.json'));
-  expect(permissions.readPaths).toContain(bundle); expect(permissions.allowChildProcess).toBe(false);
+  // A bare invocation now runs Git for the first-run history scan.
+  expect(permissions.readPaths).toContain(bundle); expect(permissions.allowChildProcess).toBe(true);
   expect(permissions.writePaths).not.toContain(join(f.cwd, 'installation'));
 });
 

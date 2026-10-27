@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
-import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { lstat, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Inventory, Logger, Vault } from '../types.js';
@@ -11,6 +12,7 @@ import { inventorySchema } from './schemas.js';
 interface GrantDependencies {
   userDir?: string;
   loadInventory?: (metadata: ConfigMetadata, env: NodeJS.ProcessEnv, userDir: string) => Promise<Inventory | null>;
+  resolveHooksDirectory?: (cwd: string, env: NodeJS.ProcessEnv) => Promise<string>;
 }
 
 const silentLog: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -77,23 +79,68 @@ async function needsVaultHelper(env: NodeJS.ProcessEnv, userDir: string): Promis
   return !['env', 'encrypted-file', 'memory'].includes(selected ?? '');
 }
 
+async function resolveHooksDirectory(cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
+  // A first-run project need not be a repository. Avoid a child process when no
+  // repository metadata exists; the command itself will explain that condition.
+  let ancestor = cwd;
+  let repository = false;
+  while (true) {
+    try { await lstat(join(ancestor, '.git')); repository = true; break; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  if (!repository && !env.GIT_DIR) return join(cwd, '.git', 'hooks');
+  const childEnv: NodeJS.ProcessEnv = {
+    GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat',
+    GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C',
+  };
+  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR']) {
+    const entry = Object.entries(env).find(([key]) => key.toLowerCase() === name.toLowerCase());
+    if (entry) childEnv[name] = entry[1];
+  }
+  const output = await new Promise<string>((fulfil, reject) => {
+    execFile('git', ['-c', 'diff.external=', '-c', 'core.fsmonitor=false', 'rev-parse', '--git-path', 'hooks'],
+      { cwd, env: childEnv, shell: false, windowsHide: true, timeout: 5_000, maxBuffer: 32_768, encoding: 'utf8' },
+      (error, stdout) => error ? reject(new Error('Git hooks directory could not be read.')) : fulfil(stdout));
+  });
+  const path = output.replace(/\r?\n$/, '');
+  if (!path || /[\r\n\0]/.test(path)) throw new Error('Git returned an unsupported hooks path.');
+  return resolve(cwd, path);
+}
+
 /** Calculate filesystem grants before the executable enters Node's permission model. */
 export async function permissionOptionsForBin(argv: string[], env: NodeJS.ProcessEnv = process.env,
   bundlePath = fileURLToPath(import.meta.url), dependencies: GrantDependencies = {}) {
   const args = argv.slice(2);
-  const argument = (name: string) => {
-    const inline = args.find(value => value.startsWith(`${name}=`));
-    if (inline) return inline.slice(name.length + 1);
-    const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1];
+  const argument = (...names: string[]) => {
+    let selected: string | undefined;
+    // Commander retains the final scalar option, including mixed aliases and
+    // `--name=value` spelling. Grants must authorize that same destination.
+    for (let index = 0; index < args.length; index++) {
+      const value = args[index]!;
+      if (names.includes(value)) selected = args[++index];
+      else {
+        const name = names.find(name => value.startsWith(`${name}=`));
+        if (name) selected = value.slice(name.length + 1);
+      }
+    }
+    return selected;
   };
   const metadata = await loadConfigMetadata({ cwd: argument('--cwd'), config: argument('--config'), env });
-  const userDir = resolve(dependencies.userDir ?? join(homedir(), '.keysentry'));
+  const userDir = resolve(metadata.cwd, dependencies.userDir ?? env.KEYSENTRY_USER_DIR
+    ?? (env.KEYSENTRY_STATE_DIR ? join(env.KEYSENTRY_STATE_DIR, 'user') : join(homedir(), '.keysentry')));
   const directory = (path: string) => path.endsWith(sep) ? path : `${path}${sep}`;
   const bundle = resolve(bundlePath);
   const command = commandName(args);
   const writePaths = [directory(join(metadata.cwd, '.keysentry')), directory(userDir)];
   const extraReads: string[] = [];
   if (command === 'init') writePaths.push(metadata.configPath);
+  if (command === 'guard' && (args.includes('install-hook') || args.includes('uninstall-hook'))) {
+    const hooks = directory(resolve(await (dependencies.resolveHooksDirectory ?? resolveHooksDirectory)(metadata.cwd, env)));
+    writePaths.push(hooks); extraReads.push(hooks);
+  }
   if (command === 'notify' && (args.includes('add') || args.includes('remove'))) writePaths.push(metadata.configPath);
   if (command === 'watcher' && args.includes('setup') && args.some(value => value === '--relay-server' || value.startsWith('--relay-server='))) writePaths.push(metadata.configPath);
   if (command === 'watch' && env.KEYSENTRY_WATCHER_KEY) {
@@ -101,8 +148,10 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
     writePaths.push(directory(stateDir)); extraReads.push(directory(stateDir));
     if (env.KEYSENTRY_WATCHER_CONFIG_FILE) extraReads.push(resolve(metadata.cwd, env.KEYSENTRY_WATCHER_CONFIG_FILE));
   }
-  const output = argument('--output') ?? argument('-o');
+  const output = argument('--output', '-o');
   if (command === 'plan' && output) writePaths.push(resolve(metadata.cwd, output));
+  const reportOutput = argument('--out');
+  if ((command === 'card' || command === 'timeline') && reportOutput) writePaths.push(resolve(metadata.cwd, reportOutput));
   if (command === 'watcher' && args.includes('setup') && output) writePaths.push(directory(resolve(metadata.cwd, output)));
   const writesDotenv = ['approve', 'resume', 'finish', 'undo'].includes(command ?? '')
     || command === 'rotate' && args.includes('--execute')
@@ -124,6 +173,7 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
   return {
     readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), metadata.configPath, ...metadata.dotenvRoots.map(directory), ...extraReads],
     writePaths: [...new Set(writePaths)],
-    allowChildProcess: command === 'passkey' && args.includes('register') || await needsVaultHelper(env, userDir),
+    allowChildProcess: command === undefined || ['guard', 'ui', 'watch'].includes(command)
+      || command === 'passkey' && args.includes('register') || await needsVaultHelper(env, userDir),
   };
 }

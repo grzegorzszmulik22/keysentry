@@ -8,11 +8,17 @@ import { describeRuleSource } from '../net/index.js';
 import { adoptionNeeded, autopilotEligibility } from '../autopilot/index.js';
 import { transactApprovals } from '../approvals/store.js';
 import { canonicalJson } from '../security/index.js';
+import type { StateStore } from '../core/store.js';
+import { createPasskeyStore } from './passkey-store.js';
+import { actionDigest } from '../approvals/index.js';
+import type { ApprovalAction, StoredApproval } from '../approvals/store.js';
+import { providerName } from './provider-names.js';
+import { executeLocalApprovedAction } from './phase2.js';
 import { CREDENTIAL_NAMES } from '../vault/index.js';
 import type { DashboardApi } from '../dashboard/server/api.js';
 import type { PasskeyStore } from '../dashboard/server/passkey-gate.js';
 import { DashboardError } from '../dashboard/server/security.js';
-import type { FirstRunResult, HostId, PasskeyCredential, RotationPlan, RotationReport, Vault } from '../types.js';
+import type { ApprovalRequest, HostId, RotationPlan, Vault } from '../types.js';
 import type { KeysentryRuntime } from './runtime.js';
 import { createPhase3Runtime } from './phase3-runtime.js';
 import { planIdSchema } from './schemas.js';
@@ -37,12 +43,6 @@ const settingsInput = z.object({
 }).strict();
 const channelKind = z.enum(['telegram', 'discord', 'slack', 'ntfy', 'webhook', 'resend', 'smtp', 'console']);
 const channelInput = z.object({ kind: channelKind, label: text.max(80), settings: z.record(z.string(), text.max(16_384)) }).strict();
-const passkeyInput = z.object({
-  id: z.string().regex(/^[A-Za-z0-9_-]{1,1364}$/), publicKeyCose: z.string().regex(/^[A-Za-z0-9_-]{1,16384}$/),
-  alg: z.union([z.literal(-7), z.literal(-8), z.literal(-257)]), signCount: z.number().int().min(0).max(0xffffffff),
-  backupEligible: z.boolean(), rpId: z.literal('localhost'), origins: z.array(z.string().url()).min(1).max(100),
-  label: z.string().max(80), createdAt: z.string().datetime(),
-}).strict();
 
 function parse<S extends z.ZodType>(schema: S, value: unknown): z.output<S> {
   const result = schema.safeParse(value);
@@ -54,46 +54,15 @@ const hostCredentials: Partial<Record<HostId, string[]>> = {
   railway: ['RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN'], vercel: ['VERCEL_TOKEN'], render: ['RENDER_API_KEY'], fly: ['FLY_API_TOKEN'], 'github-actions': ['GITHUB_TOKEN'],
 };
 
-/** Dashboard credentials stay in the selected vault, never in a public state file. */
-export function createDashboardPasskeyStore(vault: Vault): PasskeyStore {
-  let queue: Promise<unknown> = Promise.resolve();
-  function serial<T>(operation: () => Promise<T>): Promise<T> {
-    const result = queue.then(operation, operation); queue = result.catch(() => undefined); return result;
-  }
-  async function list(): Promise<PasskeyCredential[]> {
-    const names = await vault.list('passkey/');
-    if (names.length > 100) throw new DashboardError(409, 'Saved passkeys could not be read.');
-    const result: PasskeyCredential[] = [];
-    for (const name of names) {
-      const bytes = await vault.get(name);
-      if (!bytes) throw new DashboardError(409, 'Saved passkeys could not be read.');
-      try {
-        if (bytes.length > 65_536) throw new Error();
-        const value = parse(passkeyInput, JSON.parse(bytes.toString('utf8')));
-        if (name !== `passkey/${value.id}`) throw new Error();
-        result.push(value);
-      } catch { throw new DashboardError(409, 'Saved passkeys could not be read.'); }
-      finally { bytes.fill(0); }
-    }
-    return result;
-  }
-  async function put(input: PasskeyCredential, update: boolean): Promise<void> {
-    const value = parse(passkeyInput, input); const existing = await list();
-    const previous = existing.find(item => item.id === value.id);
-    if (update ? !previous || previous.publicKeyCose !== value.publicKeyCose || previous.alg !== value.alg || previous.rpId !== value.rpId || value.signCount < previous.signCount : !!previous || existing.length >= 100) {
-      throw new DashboardError(409, 'This passkey cannot be saved.');
-    }
-    const bytes = Buffer.from(JSON.stringify(value));
-    try { await vault.set(`passkey/${value.id}`, bytes); } finally { bytes.fill(0); }
-  }
-  return { list, add: value => serial(() => put(value, false)), update: value => serial(() => put(value, true)) };
+/** The CLI ceremony and dashboard assertions use the same encrypted state record. */
+export function createDashboardPasskeyStore(store: StateStore, vault?: Vault): PasskeyStore {
+  return createPasskeyStore(store, vault);
 }
 
 /** Route handlers adapt the shared runtime; the dashboard server verifies the passkey before invoking a change. */
 export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
   const phase3 = createPhase3Runtime(runtime);
-  const passkeys = createDashboardPasskeyStore(runtime.vault);
-  let firstRun: FirstRunResult | null = null;
+  const passkeys = createDashboardPasskeyStore(runtime.store, runtime.vault);
   let armingEpoch = 0;
   const api: DashboardApi = {};
   const read = (name: string, handler: () => Promise<unknown>) => { api[name] = { method: 'GET', mutating: false, handler: async () => runtime.safe(await handler()) }; };
@@ -116,7 +85,7 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     };
   }
   read('overview', async () => {
-    const result = firstRun ?? await phase3.firstRun(); firstRun = result;
+    const result = await phase3.firstRun();
     const inv = await runtime.inventory(); const status = await autopilot();
     return { firstRun: result, connectedPlatforms: inv.hosts.filter(host => host !== 'dotenv'), keys: inv.clusters.length,
       inGitHistory: result.findings.filter(item => item.inGitHistory).length,
@@ -124,7 +93,7 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
       autopilot: status.state, nextSteps: result.nextSteps };
   });
   read('keys', async () => {
-    firstRun ??= await phase3.firstRun();
+    const firstRun = await phase3.firstRun();
     const inv = await runtime.inventory(); const hygiene = await phase3.hygiene(); const manager = createCliAutopilotManager(runtime);
     const plan = await manager.loadPlan(); const armed = !(await manager.loadState()).disarmed;
     return { keys: inv.clusters.map(cluster => {
@@ -148,20 +117,20 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
         if (credential) { runtime.redactor.register(credential.value); source ??= credential.source; if (!roles.includes(role)) roles.push(role); }
       }
       const info = TOKEN_CAPABILITIES[host]!;
-      platforms.push({ host, name: info.platform, connected: roles.length > 0, ...(source ? { source } : {}), roles, tokens: info.tokens, keysentryUses: info.keysentryUses });
+      platforms.push({ host, name: info.platform, connected: roles.length > 0, ...(source ? { source } : {}), availableRoles: ['read', ...(info.tokens.some(token => token.canWrite) ? ['write'] : [])], storedRoles: roles, tokens: info.tokens, keysentryUses: info.keysentryUses });
     }
     return { platforms };
   });
   read('access', async () => ({ items: (await runtime.doctor()).items }));
   read('network', async () => ({ allowed: runtime.rules.map(rule => ({ host: rule.host, purpose: rule.purpose, source: describeRuleSource(rule) })), receipt: await runtime.receipt.summarize() }));
   read('rotations', async () => {
-    const entries = await runtime.store.journal().read(); const latest = await runtime.store.readJson<RotationReport>('report', join(runtime.paths.dir, 'rotation-report.json'));
+    const entries = await runtime.store.journal().read();
     const inv = await runtime.inventory(); const active = [];
     for (const planId of new Set(entries.map(entry => entry.planId))) {
       const own = entries.filter(entry => entry.planId === planId); const end = own.filter(entry => entry.event === 'plan-end').at(-1);
       if (end?.data?.status === 'complete' || end?.data?.status === 'dry-run') continue;
       const grace = own.filter(entry => entry.event === 'grace-start').at(-1);
-      const report = latest?.planId === planId ? latest : undefined;
+      const report = await runtime.rotationReport(planId);
       active.push({ planId, status: report?.status ?? (grace ? 'grace-pending' : 'partial'), startedAt: own[0]!.at,
         ...(typeof grace?.data?.deadline === 'string' ? { deadline: grace.data.deadline } : {}),
         steps: (report?.steps ?? []).map(step => ({ clusterId: step.clusterId, hint: inv.clusters.find(cluster => cluster.id === step.clusterId)?.hint ?? null, status: step.status, warnings: step.warnings })) });
@@ -200,15 +169,41 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
   });
   read('approvals', async () => {
     const monitor = await runtime.pendingActions();
-    const pending = monitor.map(action => ({ id: action.id, kind: action.action, summary: `${action.clusterIds.length} keys need your review.`, createdAt: action.createdAt, source: 'monitor' as const }));
-    return transactApprovals(runtime.store, async state => ({ pending: [...pending, ...state.requests.filter(request => request.status === 'pending' && Date.parse(request.expiresAt) > runtime.now().getTime()).map(request => ({ id: request.actionId, kind: request.kind, summary: `${request.keyCount} keys need your review.`, createdAt: request.createdAt, expiresAt: request.expiresAt, source: 'autopilot' as const }))] }));
+    const pending = await Promise.all(monitor.map(async action => {
+      const review = await runtime.reviewAction(action.id);
+      const rotation = action.action === 'rotate' || action.action === 'breach-mode';
+      const changes = [rotation ? 'Create replacement keys, write their consumers and redeploy supported services, then revoke old keys after deployment.'
+        : 'Disable or cap the selected keys at the provider. Their consumers may stop working.',
+        ...review.plan.steps.map(step => `${providerName(step.provider)} (${step.method}): ${step.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}.`),
+        ...(rotation ? [review.revokeUnconfirmed ? 'Old keys may be revoked before manual restarts or other unconfirmed activation.' : 'Keep old keys when activation is unconfirmed.',
+          ...(review.requiresInteractive ? ['This action requires recovery in an interactive terminal.'] : []),
+          ...(review.manualRestarts.length ? [`Restart or activate manually: ${review.manualRestarts.map(serviceLabel).join(', ')}.`] : [])] : []),
+      ];
+      return { id: action.id, kind: action.action, summary: `${rotation ? 'Rotate' : 'Disable or cap'} ${action.clusterIds.length} selected ${action.clusterIds.length === 1 ? 'key' : 'keys'}.`, changes, reviewHash: review.reviewHash, createdAt: action.createdAt, source: 'monitor' as const };
+    }));
+    const requests = await transactApprovals(runtime.store, async state => state.requests.filter(request => request.status === 'pending' && Date.parse(request.expiresAt) > runtime.now().getTime()));
+    return { pending: [...pending, ...await Promise.all(requests.map(autopilotReview))] };
   });
+  async function autopilotReview(request: StoredApproval) {
+    const saved = await runtime.store.readJson<{ actions: { action: ApprovalAction; request: ApprovalRequest }[] }>('pending', join(runtime.paths.dir, 'watcher-approvals.json'));
+    const action = request.action ?? saved?.actions.find(entry => entry.action?.id === request.actionId && entry.request?.digest === request.digest)?.action;
+    if (!action || action.kind !== 'autopilot' || actionDigest(action) !== request.digest) throw new DashboardError(409, 'This approval has no current action details. Review it in your terminal.');
+    const inv = await runtime.inventory();
+    const changes = ['Autopilot will rotate these selected keys, write replacement values and redeploy supported services. Old keys are revoked after deployment and the configured grace period.',
+      ...action.clusterIds.map(id => {
+        const cluster = inv.clusters.find(cluster => cluster.id === id);
+        return cluster ? `${providerName(cluster.provider)} (${cluster.method}): ${cluster.consumers.map(consumer => `${serviceLabel(consumer.service)}:${consumer.varName}`).join(', ')}.` : `Selected key: ${id}.`;
+      }), `Rotation plan: ${action.planHash ?? 'unavailable'}.`];
+    return { id: request.actionId, kind: request.kind, summary: `Rotate ${request.keyCount} selected ${request.keyCount === 1 ? 'key' : 'keys'} with autopilot.`, changes,
+      reviewHash: createHash('sha256').update(canonicalJson({ action, digest: request.digest, expiresAt: request.expiresAt, changes })).digest('hex'),
+      createdAt: request.createdAt, expiresAt: request.expiresAt, source: 'autopilot' as const };
+  }
   read('settings', () => phase3.settings());
   read('hygiene', async () => ({ keys: await phase3.hygiene() }));
   post('rotate/preview', z.object({ clusterIds: ids }).strict(), false, async body => {
     const inv = await runtime.inventory();
     if (body.clusterIds.some(id => !inv.clusters.some(cluster => cluster.id === id))) throw new DashboardError(400, 'Select keys from the current inventory.');
-    const plan = await runtime.plan({ clusterIds: body.clusterIds }); const preview = await runtime.rotate(plan);
+    const plan = await runtime.plan({ clusterIds: body.clusterIds }, { preview: true }); const preview = await runtime.rotate(plan);
     return { planId: plan.id, planHash: planHash(plan), changes: preview.diff,
       steps: plan.steps.map(step => ({ clusterId: step.clusterId, hint: step.hint, method: step.method, services: step.consumers.map(consumer => serviceLabel(consumer.service)) })),
       warnings: preview.steps.flatMap(step => step.warnings) };
@@ -255,13 +250,20 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     const result = await testNotificationChannels(await notificationContext());
     return { delivered: result.delivered, failed: result.failed };
   });
-  post('approvals/approve', z.object({ id }).strict(), true, async body => {
+  post('approvals/approve', z.object({ id, reviewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(), true, async body => {
+    const pending = await transactApprovals(runtime.store, async state => state.requests.find(request => request.actionId === body.id && request.status === 'pending' && Date.parse(request.expiresAt) > runtime.now().getTime()));
+    if (pending) {
+      const review = await autopilotReview(pending);
+      if (review.reviewHash !== body.reviewHash) throw new DashboardError(409, 'The action changed. Review it again before approving.');
+    }
     const deviceKeys = async () => { const key = await runtime.signingKey(); try { return [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }]; } finally { key.privateKeyDer.fill(0); } };
-    const result = await approveAutopilot(body.id, {}, { store: runtime.store, audit: runtime.audit, http: runtime.http, deviceKey: runtime.signingKey,
-      deviceKeys, watcherPublicKeys: async () => [], passkeys: () => passkeys.list(), assertHuman: runtime.assertHuman });
+    const result = pending ? await approveAutopilot(body.id, { reviewDigest: pending.digest }, { store: runtime.store, audit: runtime.audit, http: runtime.http, deviceKey: runtime.signingKey,
+      deviceKeys, watcherPublicKeys: async () => [], passkeys: () => passkeys.list(), assertHuman: runtime.assertHuman,
+      now: runtime.now, confirm: async () => true, executeApprovedAction: actionId => executeLocalApprovedAction(runtime, actionId) }) : null;
     if (result) return { result: result.status };
     const review = await runtime.reviewAction(body.id);
-    const approved = await runtime.approve(body.id, { interactive: false, reviewHash: review.reviewHash, prompt: async () => null });
+    if (review.reviewHash !== body.reviewHash) throw new DashboardError(409, 'The action changed. Review it again before approving.');
+    const approved = await runtime.approve(body.id, { interactive: false, reviewHash: body.reviewHash, prompt: async () => null });
     const action = approved ? undefined : (await runtime.monitorStatus()).pendingActions.find(action => action.id === body.id);
     return { result: approved?.status ?? action?.status ?? 'not-available' };
   });

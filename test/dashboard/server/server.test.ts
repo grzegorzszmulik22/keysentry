@@ -74,6 +74,16 @@ describe('dashboard HTTP boundary', () => {
     expect((await req(d.port, '/api/keys', { headers: { Cookie: cookie } })).json).toEqual({ count: 2 });
   });
 
+  it('reports the one-time token use once, so the launcher file can be deleted at once', async () => {
+    const used = vi.fn();
+    const d = await start({ onTokenUsed: used });
+    expect(used).not.toHaveBeenCalled();
+    expect((await req(d.port, `/${new URL(d.url).search}`)).status).toBe(303);
+    expect(used).toHaveBeenCalledTimes(1);
+    expect((await req(d.port, `/${new URL(d.url).search}`)).status).toBe(401);
+    expect(used).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps dashboards on different ports authenticated in one browser cookie jar', async () => {
     const first = await start();
     const second = await start();

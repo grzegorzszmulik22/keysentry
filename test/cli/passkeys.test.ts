@@ -1,7 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { request } from 'node:http';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStateCipher, createStateStore } from '../../src/core/store.js';
@@ -147,48 +147,56 @@ test('manager stores encrypted credentials, lists public metadata, removes and a
   } });
   expect((await result).status).toBe('registered');
   const credentials = await listPasskeys(store); expect(credentials).toHaveLength(1); expect(credentials[0]!.label).toBe('My laptop');
+  expect(credentials[0]!.origins).toContain('http://localhost');
   expect(await readFile(join(store.paths.dir, 'passkeys.json'), 'utf8')).not.toContain('My laptop');
   expect(await manager.list()).toEqual([{ id: credentials[0]!.id, label: 'My laptop', rpId: 'localhost', createdAt: credentials[0]!.createdAt }]);
   expect(await manager.remove(credentials[0]!.id)).toEqual({ id: credentials[0]!.id, removed: true });
   expect(await listPasskeys(store)).toEqual([]); expect(events).toHaveLength(2); expect(assertHuman).toHaveBeenCalledTimes(3);
 });
-test('manager refuses remote mutation forms and public-origin registration explains dashboard availability', async () => {
+test('manager refuses remote mutation forms and explains that public registration is unavailable', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'keysentry-cli-passkeys-')); dirs.push(dir);
   const manager = createPasskeyManager({ store: createStateStore({ cwd: dir, cipher: createStateCipher(Buffer.alloc(32, 4)) }), audit: { append: async () => {} }, assertHuman: () => {} });
   await expect(manager.register({ relay: true })).rejects.toThrow(/local/i);
   await expect(manager.remove('id', { remote: true })).rejects.toThrow(/local/i);
   const publicResult = await manager.register({ origin: 'https://approvals.example.org' });
   expect(publicResult.status).toBe('public-origin');
-  expect(publicResult.message).toContain('phase 3'); expect(publicResult.message).not.toContain('/register');
+  expect(publicResult.message).toContain('Public-origin passkey registration is not available');
+  expect(publicResult.message).not.toContain('dashboard feature');
 });
 
 const browserUrl = `http://localhost:38493/register?token=${'A'.repeat(43)}`;
 test.each(['win32', 'darwin', 'linux'] as const)('browser opener uses the %s OS executable without a shell or credential environment', async platform => {
+  const dir = await mkdtemp(join(tmpdir(), 'keysentry-passkey-launcher-')); dirs.push(dir);
+  const launcher = join(dir, 'register.html');
+  await writeFile(launcher, '<!doctype html><title>Register</title>', { mode: 0o600 });
   const calls: unknown[][] = [];
   const execFile: NonNullable<Parameters<typeof openPasskeyBrowser>[1]>['execFile'] = (file, args, options, callback) => {
     calls.push([file, args, options]); callback(null);
   };
-  expect(await openPasskeyBrowser(browserUrl, { platform, execFile, env: { SystemRoot: 'C:\\Windows', PATH: 'untrusted-path', BROWSER: 'untrusted-command', OPENAI_API_KEY: 'planted-value', KEYSENTRY_VAULT_PASSPHRASE: 'planted-password', HOME: '/home/test', DISPLAY: ':0' } })).toBe(true);
+  expect(await openPasskeyBrowser(launcher, { platform, execFile, env: { SystemRoot: 'C:\\Windows', PATH: 'untrusted-path', BROWSER: 'untrusted-command', OPENAI_API_KEY: 'planted-value', KEYSENTRY_VAULT_PASSPHRASE: 'planted-password', HOME: '/home/test', DISPLAY: ':0' } })).toBe(true);
   expect(calls).toHaveLength(1);
   const [file, args, options] = calls[0]! as [string, string[], Record<string, unknown>];
   expect(file).toBe(platform === 'win32' ? 'C:\\Windows\\System32\\rundll32.exe' : platform === 'darwin' ? '/usr/bin/open' : '/usr/bin/xdg-open');
-  expect(args).toEqual(platform === 'win32' ? ['url.dll,FileProtocolHandler', browserUrl] : [browserUrl]);
+  expect(args).toEqual(platform === 'win32' ? ['url.dll,FileProtocolHandler', launcher] : [launcher]);
   expect(options.windowsHide).toBe(true); expect(options.shell).toBe(false);
   expect(JSON.stringify(options)).not.toContain('planted-'); expect(JSON.stringify(options)).not.toContain('untrusted');
   expect(Number(options.timeout)).toBeLessThanOrEqual(5000);
 });
-test('browser opener rejects arbitrary URLs before starting a child', async () => {
+test('browser opener rejects bearer URLs before starting a child', async () => {
   const execFile = vi.fn();
-  for (const url of ['https://example.org/', 'http://127.0.0.1:38493/register?token=' + 'A'.repeat(43), browserUrl + '&extra=x', browserUrl + '#fragment', browserUrl.replace('/register?', '/other?'), browserUrl.replace('localhost:', 'localhost.evil:'), browserUrl.replace('token=', 'token=invalid')]) {
+  for (const url of [browserUrl, 'https://example.org/', 'http://127.0.0.1:38493/register?token=' + 'A'.repeat(43), browserUrl + '&extra=x', browserUrl + '#fragment', browserUrl.replace('/register?', '/other?'), browserUrl.replace('localhost:', 'localhost.evil:'), browserUrl.replace('token=', 'token=invalid')]) {
     expect(await openPasskeyBrowser(url, { execFile })).toBe(false);
   }
   expect(execFile).not.toHaveBeenCalled();
 });
 test('browser opener quietly falls back when process creation fails or the platform is unsupported', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'keysentry-passkey-launcher-')); dirs.push(dir);
+  const launcher = join(dir, 'register.html');
+  await writeFile(launcher, '<!doctype html><title>Register</title>', { mode: 0o600 });
   const failed: NonNullable<Parameters<typeof openPasskeyBrowser>[1]>['execFile'] = (_file, _args, _options, callback) => callback(new Error('private details'));
-  expect(await openPasskeyBrowser(browserUrl, { platform: 'linux', execFile: failed })).toBe(false);
-  expect(await openPasskeyBrowser(browserUrl, { platform: 'linux', execFile: () => { throw new Error('private details'); } })).toBe(false);
+  expect(await openPasskeyBrowser(launcher, { platform: 'linux', execFile: failed })).toBe(false);
+  expect(await openPasskeyBrowser(launcher, { platform: 'linux', execFile: () => { throw new Error('private details'); } })).toBe(false);
   const execFile = vi.fn();
-  expect(await openPasskeyBrowser(browserUrl, { platform: 'freebsd', execFile })).toBe(false);
+  expect(await openPasskeyBrowser(launcher, { platform: 'freebsd', execFile })).toBe(false);
   expect(execFile).not.toHaveBeenCalled();
 });

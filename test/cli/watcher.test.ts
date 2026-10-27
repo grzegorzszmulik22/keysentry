@@ -9,7 +9,7 @@ import { buildPlan } from '../../src/core/index.js';
 import { canonicalJson, generateDeviceKey, signDetached, verifyDetached } from '../../src/security/index.js';
 import { verifyMessage } from '../../src/notify/index.js';
 import { APPROVAL_PREFIX, signDisarm } from '../../src/approvals/index.js';
-import type { FeedSource, PasskeyCredential, SignedNotifyMessage } from '../../src/types.js';
+import type { FeedSource, PasskeyCredential, RotationReport, SignedNotifyMessage } from '../../src/types.js';
 import { FakeHttp, text } from '../helpers/fake-http.js';
 import { recoveryFixture } from '../rotate/recovery-fixture.js';
 import { createWatcherStateStore } from '../../src/cli/watcher-state.js';
@@ -102,6 +102,8 @@ test('watch composes guarded feed fetch, durable incidents, signed notifications
   expect(await watcher.tick()).toEqual({ status: 'ok', errors: [], reasons: [] });
   expect(watcher.state.waves).toHaveLength(1);
   expect(watcher.state.waves[0]?.status).toBe('grace');
+  const planId = watcher.state.waves[0]!.planId;
+  expect(await f.store.readJson<RotationReport>('report', join(f.store.paths.dir, 'reports', `${planId}.json`))).toMatchObject({ planId, status: 'grace-pending' });
   expect(f.monitors).toBe(1);
   expect(f.messages.length).toBeGreaterThan(0);
   expect(f.messages.every(message => verifyMessage(message, f.key.publicKeyDer))).toBe(true);
@@ -111,6 +113,7 @@ test('watch composes guarded feed fetch, durable incidents, signed notifications
   expect(f.scans).toBeGreaterThan(scans);
   expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
   expect(watcher.state.waves[0]?.status).toBe('done');
+  expect(await f.store.readJson<RotationReport>('report', join(f.store.paths.dir, 'reports', `${planId}.json`))).toMatchObject({ planId, status: 'complete' });
   const incidents = await f.store.readJson<{ incidents: unknown[] }>('plan', join(f.store.paths.dir, 'watcher-incidents.json'));
   expect(incidents?.incidents).toHaveLength(1);
 });
@@ -324,6 +327,8 @@ test('trusted plan-bound approvals execute once and are marked executed after th
   await watcher.tick();
   expect(f.host.writes.length).toBe(writes);
   expect(watcher.state.waves).toHaveLength(1);
+  const planId = watcher.state.waves[0]!.planId;
+  expect(await f.store.readJson<RotationReport>('report', join(f.store.paths.dir, 'reports', `${planId}.json`))).toMatchObject({ planId, status: 'grace-pending' });
 });
 
 test('relay ask failures retry on an idle tick without delaying the armed wave', async () => {

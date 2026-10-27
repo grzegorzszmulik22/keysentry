@@ -92,7 +92,8 @@ function outputRedactor(): Redactor {
 
 export async function createRuntime(options: RuntimeOptions = {}) {
   const env = options.env ?? process.env;
-  const userDir = resolve(options.userDir ?? join(homedir(), '.keysentry'));
+  const userDir = resolve(options.cwd ?? process.cwd(), options.userDir ?? env.KEYSENTRY_USER_DIR
+    ?? (env.KEYSENTRY_STATE_DIR ? join(resolve(options.cwd ?? process.cwd(), env.KEYSENTRY_STATE_DIR), 'user') : join(homedir(), '.keysentry')));
   const interactive = (options.stdinIsTTY ?? !!process.stdin.isTTY) && (options.stdoutIsTTY ?? !!process.stdout.isTTY);
   const mutationContext = { env, stdinIsTTY: options.stdinIsTTY ?? !!process.stdin.isTTY, stdoutIsTTY: options.stdoutIsTTY ?? !!process.stdout.isTTY };
   // Entered only by passkey-gated dashboard handlers. Authorization follows this
@@ -121,6 +122,12 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const diagnostic = (text: string) => log.info(text);
   const metadata = await loadConfigMetadata(options);
   const paths = statePaths(metadata.cwd);
+  async function prepareDirectory(path: string, variable: string) {
+    try { await mkdir(path, { recursive: true, mode: 0o700 }); }
+    catch { throw new CliError(`Could not prepare the directory ${path}. Set ${variable} to a writable directory.`); }
+  }
+  await prepareDirectory(userDir, 'KEYSENTRY_USER_DIR');
+  await prepareDirectory(paths.dir, 'KEYSENTRY_STATE_DIR');
   const passphrase = options.passphrase ?? (async () => {
     if (!interactive) {
       if (!env.KEYSENTRY_VAULT_PASSPHRASE) throw new CliError('The encrypted file needs KEYSENTRY_VAULT_PASSPHRASE when no interactive terminal is available.');
@@ -451,10 +458,10 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     return safe(result.data);
   }
 
-  async function plan(filters?: PlanFilters): Promise<RotationPlan> {
+  async function plan(filters?: PlanFilters, opts: { preview?: boolean } = {}): Promise<RotationPlan> {
     const result = buildPlan(await inventory(), filters);
     await store.writeJson('plan', join(paths.plans, `${result.id}.json`), safe(result));
-    await audit.append({ kind: 'plan-saved', summary: 'Rotation plan saved.', data: { id: result.id, steps: result.steps.length } });
+    if (!opts.preview) await audit.append({ kind: 'plan-saved', summary: 'Rotation plan saved.', data: { id: result.id, steps: result.steps.length } });
     return result;
   }
 
@@ -499,8 +506,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         };
       },
     });
+    // A preview never writes the engine's lifecycle to the real rotation journal.
+    const previewJournal = { read: async () => [], append: async () => {} };
     const report = await executePlan(rotationPlan, inv, {
-      hosts: selected.hostMap, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: selected.providerCtx, journal,
+      hosts: selected.hostMap, providers: id => guardMutations(providers(id), ['rotate', 'revoke', 'cap']), providerCtx: selected.providerCtx,
+      journal: opts.execute === true ? journal : previewJournal,
       prompt: p => preserveAbort(() => prompt(p)), fingerprintKey, redactor, log,
       sleep: options.sleep, now: options.now,
       inflight, crashHook: options.crashHook, grace: dashboardAuthorization.getStore() ? async () => 'defer' : inheritInteraction && interactive ? grace : undefined,
@@ -512,9 +522,31 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       ...(opts.allowGenerate !== undefined ? { allowGenerate: opts.allowGenerate } : {}),
       ...(opts.verifyRetries !== undefined ? { verifyRetries: opts.verifyRetries } : {}),
     });
-    await store.writeJson('report', join(paths.dir, 'rotation-report.json'), safe(report));
+    await saveRotationReport(report);
+    if (report.dryRun) await audit.append({ kind: 'previewed', summary: 'Rotation plan previewed.', data: { planId: report.planId } });
     if (aborted) throw new RotationInterruptedError(safe(report));
     return report;
+  }
+
+  async function saveRotationReport(report: RotationReport) {
+    if (!planIdSchema.safeParse(report.planId).success) throw new CliError('Invalid plan identifier.');
+    // Reopening a saved executing plan without --execute is still a preview.
+    // Preserve its real progress even when the preview uses the same plan id.
+    if (report.dryRun && (await rotationReport(report.planId))?.dryRun === false) return;
+    await store.writeJson('report', join(paths.dir, 'reports', `${report.planId}.json`), safe(report));
+    // Keep the last real report for upgrades and existing integrations. Previews
+    // and drills cannot replace this pointer to a real rotation.
+    if (!report.dryRun) await store.writeJson('report', join(paths.dir, 'rotation-report.json'), safe(report));
+  }
+
+  async function rotationReport(planId?: string): Promise<RotationReport | null> {
+    if (planId !== undefined) {
+      if (!planIdSchema.safeParse(planId).success) throw new CliError('Invalid plan identifier.');
+      const report = await store.readJson<RotationReport>('report', join(paths.dir, 'reports', `${planId}.json`));
+      if (report) return report;
+    }
+    const legacy = await store.readJson<RotationReport>('report', join(paths.dir, 'rotation-report.json'));
+    return legacy && !legacy.dryRun && (planId === undefined || legacy.planId === planId) ? legacy : null;
   }
 
   async function rotate(rotationPlan: RotationPlan, opts: ExecutionOptions = {}): Promise<RotationReport> {
@@ -774,7 +806,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const deps = await recoveryDeps();
     const opts = { ...config.rotation, dryRun: false, early: now };
     const report = mode === 'resume' ? await resumeRotation(input, deps, opts) : await finishRotation(input, deps, opts);
-    await store.writeJson('report', join(paths.dir, 'rotation-report.json'), safe(report));
+    await saveRotationReport(report);
     await rememberKeyRefs(report, input.plan);
     await scan();
     await refreshManualAdoption(report);
@@ -888,7 +920,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         notifier: notifier ?? config.monitor.notifier, rotate: async () => { throw new CliError('Monitor actions require approval.'); },
         feeds: config.monitor.feeds, github: config.monitor.github, usageOptions: config.monitor.usageOptions });
     },
-    scan: command(() => scan(true)), inventory: command(inventory), plan: command(plan), loadPlan, rotate: command(rotate),
+    scan: command(() => scan(true)), inventory: command(inventory), plan: command(plan), loadPlan, rotationReport, saveRotationReport, rotate: command(rotate),
     monitorOnce: command(monitorOnce), monitor, reviewAction, checkpoint: () => audit.checkpoint(),
     createCanary: command(plant), drill: command(readiness),
     resume: command((id?: string) => recover('resume', id)), finish: command((id?: string, now: boolean = false) => recover('finish', id, now)),

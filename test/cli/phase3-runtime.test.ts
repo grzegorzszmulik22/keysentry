@@ -70,6 +70,17 @@ test('dashboard first run rescans with the project key and caches the result for
   expect(await api.firstRun()).toBe(summary);
 });
 
+test('dashboard first run refreshes changed files within sixty seconds', async () => {
+  const { rt, api, value } = await setup();
+  let now = new Date('2026-10-27T12:00:00.000Z');
+  vi.spyOn(rt, 'now').mockImplementation(() => now);
+  await writeFile(join(rt.config.cwd, '.env'), `OPENROUTER_API_KEY=${value}\n`);
+  expect((await api.firstRun()).findings).toHaveLength(1);
+  await writeFile(join(rt.config.cwd, '.env'), '');
+  now = new Date(now.getTime() + 60_000);
+  expect((await api.firstRun()).findings).toHaveLength(0);
+});
+
 test('timeline selects only the requested plan and verifies audit before reading it', async () => {
   const { rt, api } = await setup();
   const id = 'plan-20261027120000-abcd', other = 'plan-20261027120000-abce';

@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
-import { lstat, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, unlink, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { execFile } from 'node:child_process';
 import { win32 } from 'node:path';
@@ -47,14 +48,10 @@ async function ask(question: string, opts: Phase3CommandsOptions, defaultYes = f
   } finally { prompt.close(); }
 }
 
-/** Open only a generated local dashboard URL, without inheriting credential variables. */
+/** Open a local launcher file, without putting the sign-in token in child arguments. */
 export async function openDashboardBrowser(value: string, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
-  let url: URL;
-  try { url = new URL(value); } catch { return false; }
-  const port = Number(url.port);
-  if (url.protocol !== 'http:' || url.hostname !== 'localhost' || !Number.isInteger(port) || port < 1024 || port > 65535
-    || url.username || url.password || url.pathname !== '/' || url.hash || url.searchParams.size !== 1
-    || !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('t') ?? '') || url.href !== value) return false;
+  if (!isAbsolute(value) || !value.endsWith('.html') || /[\x00-\x1f\x7f]/.test(value)) return false;
+  try { const info = await lstat(value); if (!info.isFile() || info.isSymbolicLink()) return false; } catch { return false; }
   const childEnv: NodeJS.ProcessEnv = {};
   let file: string, args: string[];
   if (process.platform === 'win32') {
@@ -88,17 +85,41 @@ async function writeNew(cwd: string, file: string, text: string): Promise<string
 
 export function registerPhase3Commands(program: Command, opts: Phase3CommandsOptions): void {
   const reports = async () => createPhase3Runtime(await opts.getRuntime());
-  const openDashboard = async (readOnly = false) => {
+  const openDashboard = async (readOnly = false, printUrl = false) => {
+    if (printUrl && (!opts.interactive() || detectAgentEnvironment(opts.env))) throw new CliError('--print-url requires an interactive human terminal.');
     const rt = await opts.getRuntime();
-    const dashboard = await startDashboard({ api: createDashboardApi(rt),
+    let path: string | undefined;
+    let used = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const removeLauncher = async () => { used = true; clearTimeout(timer); if (path) await unlink(path).catch(() => {}); };
+    const dashboardOptions = { api: createDashboardApi(rt),
       readOnly: readOnly || detectAgentEnvironment(opts.env) !== null,
-      passkeys: createDashboardPasskeyStore(rt.vault) });
-    opts.emit({ url: dashboard.url, port: dashboard.port }, `Dashboard: ${dashboard.url}`);
-    try {
-      if (opts.openBrowser) await opts.openBrowser(dashboard.url);
-      else if (!await openDashboardBrowser(dashboard.url, opts.env)) throw new Error();
+      passkeys: createDashboardPasskeyStore(rt.store, rt.vault),
+      onTokenUsed: removeLauncher,
+      onError: (name: string) => {
+        const errorClass = /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name) ? name : 'Error';
+        opts.diagnostic(`Dashboard request failed: ${errorClass}`);
+      },
+    };
+    const dashboard = await startDashboard(dashboardOptions);
+    const url = new URL(dashboard.url);
+    if (url.protocol !== 'http:' || url.hostname !== 'localhost' || url.pathname !== '/' || url.hash || url.searchParams.size !== 1
+      || !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('t') ?? '') || url.username || url.password) {
+      await dashboard.close(); throw new CliError('The dashboard sign-in link could not be created.');
     }
-    catch { opts.diagnostic('The browser could not be opened. Open the dashboard address above in your browser.'); }
+    path = join(rt.userDir, `dashboard-${randomUUID()}.html`);
+    const target = dashboard.url.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
+    try {
+      await writeFile(path, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${target}"><title>Open keysentry</title></head><body><p><a href="${target}" rel="noreferrer">Open keysentry</a></p></body></html>\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    } catch { await dashboard.close(); throw new CliError(`The dashboard launcher could not be created in ${rt.userDir}. Set KEYSENTRY_USER_DIR to a writable directory.`); }
+    if (used) await removeLauncher();
+    else { timer = setTimeout(() => { void removeLauncher(); }, 120_000); timer.unref(); }
+    opts.emit({ path, port: dashboard.port, ...(printUrl ? { url: dashboard.url } : {}) }, printUrl ? `Dashboard: ${dashboard.url}` : `Dashboard: ${path}`);
+    try {
+      if (opts.openBrowser) await opts.openBrowser(path);
+      else if (!await openDashboardBrowser(path, opts.env)) throw new Error();
+    }
+    catch { opts.diagnostic('The browser could not be opened. Open the dashboard file shown above in your browser within two minutes.'); }
   };
 
   program.option('--no-save', 'Scan without saving any first-run state').allowExcessArguments(false);
@@ -128,10 +149,11 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
   });
 
   program.command('ui').description('Open the local dashboard; changes require a passkey')
-    .option('--read-only', 'Browse without making changes')
-    .action(async options => { await openDashboard(options.readOnly === true); });
+    .option('--read-only', 'Browse with no key changes')
+    .option('--print-url', 'Print the one-time URL at an interactive human terminal')
+    .action(async options => { await openDashboard(options.readOnly === true, options.printUrl === true); });
 
-  const guard = program.command('guard').description('Check the working tree and git history for keys')
+  const guard = program.command('guard').description('Check the working tree for keys; --history includes git history')
     .option('--staged', 'Check only the staged diff and stop commits containing keys')
     .option('--history', 'Include git history')
     .action(async options => {
@@ -142,8 +164,8 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
         if (formatted.output || opts.json()) opts.emit(result, formatted.output.trimEnd());
         opts.setExit(formatted.exitCode);
       } else {
-        const first = await runFirstRun({ ...opts.firstRunSettings(), cwd: opts.cwd(), noSave: true, runtime: opts.peekRuntime(), git: opts.firstRunGit });
-        opts.emit(first.result, formatFirstRun(first.result));
+        const first = await runFirstRun({ ...opts.firstRunSettings(), cwd: opts.cwd(), noSave: true, includeHistory: options.history === true, runtime: opts.peekRuntime(), git: opts.firstRunGit });
+        opts.emit(first.result, formatFirstRun(first.result, options.history === true));
         if (first.result.findings.length) opts.setExit(1);
       }
     });
@@ -151,8 +173,10 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
     .option('--force', 'Keep a backup and replace a foreign hook')
     .action(async options => {
       opts.human('install the pre-commit hook');
-      opts.emit(await installHook(opts.cwd(), { force: options.force === true, binPath: 'keysentry', git: opts.guardGit }),
+      const result = await installHook(opts.cwd(), { force: options.force === true, binPath: 'keysentry', git: opts.guardGit });
+      opts.emit(result,
         'Pre-commit check installed. Run keysentry guard uninstall-hook to remove it.');
+      if (!result.onPath) opts.diagnostic('The hook calls keysentry from your PATH; install it with npm install -g keysentry so commits are checked.');
     });
   guard.command('uninstall-hook').description('Remove only the unmodified keysentry pre-commit hook')
     .action(async () => {

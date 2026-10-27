@@ -17,7 +17,7 @@ export interface StatePaths {
   plans: string;
 }
 
-export type StateKind = 'inventory' | 'plan' | 'report' | 'monitor' | 'journal' | 'pending' | 'canary' | 'doctor' | 'legacy';
+export type StateKind = 'inventory' | 'plan' | 'report' | 'monitor' | 'journal' | 'pending' | 'canary' | 'doctor' | 'legacy' | 'passkeys';
 
 export interface StateStore {
   paths: StatePaths;
@@ -691,6 +691,7 @@ export function createStateStore(opts: StateStoreOptions): StateStore {
           if (entry.name === 'inventory.json') kind = 'inventory';
           else if (entry.name === 'monitor.json') kind = 'monitor';
           else if (entry.name === 'rotation-report.json') kind = 'report';
+          else if (entry.name === 'passkeys.json') kind = 'passkeys';
           else if (/^pending.*\.json$/.test(entry.name)) kind = 'pending';
           else if (/^canar(?:y|ies).*\.json$/.test(entry.name)) kind = 'canary';
           if (kind) files.push({ path: join(paths.dir, entry.name), kind });

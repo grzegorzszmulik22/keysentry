@@ -214,7 +214,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       const rt = await getRuntime();
       if (opts.revoke && !['after-deploy', 'immediately', 'never'].includes(opts.revoke)) throw new CliError('Invalid revocation policy; use after-deploy, immediately, or never.');
       if (opts.plan && (opts.tier || opts.cluster || opts.host)) throw new CliError('Select a saved plan or filters.');
-      const rotationPlan = opts.plan ? await rt.loadPlan(opts.plan) : await rt.plan(filters(opts));
+      const rotationPlan = opts.plan ? await rt.loadPlan(opts.plan) : await rt.plan(filters(opts), { preview: opts.execute !== true });
       const redeploy = command.getOptionValueSource('redeploy') === 'cli' ? opts.redeploy as boolean : undefined;
       const rotationOptions = { revoke: opts.revoke, redeploy,
         revokeUnconfirmed: command.getOptionValueSource('revokeUnconfirmed') === 'cli' ? opts.revokeUnconfirmed as boolean : undefined,
@@ -288,7 +288,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     const relay = await relaySettings(rt);
     const approved = await approveAutopilot(id, opts, { store: rt.store, audit: rt.audit,
       http: relay ? rt.httpForUrls([relay.server], 'approval relay you configured') : rt.http,
-      deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
+      deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
       watcherPublicKeys: async () => { const key = await rt.vault.get('watcher/signing/public'); return key ? [key] : []; },
       now: options.now, relay, assertHuman: human,
       review: request => diagnostic([`Autopilot action ${request.actionId}:`,
@@ -474,6 +474,8 @@ export function isExecutableEntry(entry: string | undefined, modulePath = fileUR
 
 if (isExecutableEntry(process.argv[1])) {
   const main = async () => {
+    // The parent resolved grants, including worktree hooks, before re-exec.
+    if (process.permission) return runCli();
     const bundlePath = fileURLToPath(import.meta.url);
     const permissions = await permissionOptionsForBin(process.argv, process.env, bundlePath);
     const result = await maybeReexecWithPermissions({ argv: process.argv, env: process.env, execPath: process.execPath,

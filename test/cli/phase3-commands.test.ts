@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCli } from '../../src/cli/index.js';
@@ -27,6 +27,7 @@ vi.mock('node:child_process', async importOriginal => ({
 
 const dirs: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers(); vi.unstubAllEnvs();
   dashboard.options.length = 0; browser.calls.length = 0;
   for (const cwd of dirs.splice(0)) await rm(cwd, { recursive: true, force: true });
 });
@@ -117,6 +118,28 @@ test('clean staged guard returns zero without output', async () => {
   expect(await readdir(cwd)).toEqual([]);
 });
 
+test('plain guard skips history while --history includes it', async () => {
+  const cwd = await directory(), c = capture();
+  const git = vi.fn(noHistory);
+  expect(await runCli(['--cwd', cwd, 'guard'], { ...c.options, firstRunGit: git })).toBe(0);
+  expect(git).not.toHaveBeenCalled();
+  expect(c.output.join('\n')).toContain('working tree');
+  expect(await runCli(['--cwd', cwd, 'guard', '--history'], { ...c.options, firstRunGit: git })).toBe(0);
+  expect(git).toHaveBeenCalled();
+});
+
+test('hook installation warns when keysentry cannot be found on PATH', async () => {
+  const c = await fixture();
+  vi.stubEnv('PATH', '');
+  const guardGit: GitRunner = async (args, opts) => {
+    if (args[0] === 'config') return { code: 1 };
+    opts.onLine('.git'); return { code: 0 };
+  };
+  expect(await runCli(['guard', 'install-hook'], { ...c.options, guardGit })).toBe(0);
+  expect(c.errors).toContain('The hook calls keysentry from your PATH; install it with npm install -g keysentry so commits are checked.');
+  expect(await readFile(join(c.cwd, '.git', 'hooks', 'pre-commit'), 'utf8')).toContain('guard --staged');
+});
+
 test('new mutations refuse an agent before changing state or writing files', async () => {
   const cwd = await directory(), c = capture();
   for (const args of [['guard', 'install-hook'], ['guard', 'uninstall-hook'], ['digest', '--send'], ['spend-limits', '--apply'], ['card', '--out', 'card.svg'], ['timeline', 'plan-one', '--out', 'timeline.md']]) {
@@ -134,6 +157,14 @@ test('hygiene and spend preview call the shared phase 3 runtime without changes'
   c.output.length = 0;
   expect(await runCli(['spend-limits', '--json'], c.options)).toBe(0);
   expect(c.errors).toEqual([]);
+});
+
+test('a CLI rotation preview writes only its previewed action to the audit', async () => {
+  const c = await fixture(); await c.runtime.scan();
+  const before = (await readFile(c.runtime.paths.audit, 'utf8')).trim().split('\n').length;
+  expect(await runCli(['rotate'], c.options)).toBe(0);
+  const events = (await readFile(c.runtime.paths.audit, 'utf8')).trim().split('\n').slice(before).map(line => JSON.parse(line));
+  expect(events.filter(event => event.kind !== 'checkpoint').map(event => event.kind)).toEqual(['previewed']);
 });
 
 test('card output is a standalone SVG and writing refuses an existing file', async () => {
@@ -167,7 +198,46 @@ test.each([{}, { CODEX_THREAD_ID: 'present' }])('ui uses persistent passkeys and
   expect(dashboard.options).toHaveLength(1);
   expect(dashboard.options[0]!.readOnly).toBe(!!env.CODEX_THREAD_ID);
   expect(dashboard.options[0]!.passkeys).toBeDefined();
-  expect(opened).toEqual([`http://localhost:34567/?t=${'a'.repeat(43)}`]);
+  expect(opened).toHaveLength(1);
+  const html = await readFile(opened[0]!, 'utf8');
+  expect(html).toContain(`http://localhost:34567/?t=${'a'.repeat(43)}`);
+  expect(html).toContain('http-equiv="refresh"');
+  expect(html).toContain('<a href=');
+  expect(c.output.join('\n')).not.toContain('a'.repeat(43));
+  expect(c.output.join('\n')).toContain(opened[0]);
+  if (process.platform !== 'win32') expect((await stat(opened[0]!)).mode & 0o777).toBe(0o600);
+});
+
+test('ui removes the launcher after token use and logs only the failure class', async () => {
+  const c = await fixture(); let path = '';
+  expect(await runCli(['ui'], { ...c.options, openBrowser: async value => { path = value; } })).toBe(0);
+  const options = dashboard.options[0] as DashboardOptions & { onTokenUsed(): Promise<void>; onError(errorClass: string): void };
+  options.onError('TypeError');
+  expect(c.errors).toContain('Dashboard request failed: TypeError');
+  await options.onTokenUsed();
+  await expect(stat(path)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('ui expires the private launcher after two minutes and keeps its token out of JSON and argv', async () => {
+  const c = await fixture();
+  vi.useFakeTimers();
+  expect(await runCli(['ui', '--json'], c.options)).toBe(0);
+  const output = JSON.parse(c.output.at(-1)!) as { path: string; port: number };
+  expect(output.path).toContain('dashboard-');
+  expect(await readFile(output.path, 'utf8')).toContain('a'.repeat(43));
+  expect(c.output.join('\n') + JSON.stringify(browser.calls)).not.toContain('a'.repeat(43));
+  await vi.advanceTimersByTimeAsync(120_000);
+  vi.useRealTimers();
+  await vi.waitFor(async () => { await expect(stat(output.path)).rejects.toMatchObject({ code: 'ENOENT' }); });
+});
+
+test('ui prints a URL only when explicitly requested at an interactive terminal', async () => {
+  const c = await fixture();
+  expect(await runCli(['ui', '--print-url'], { ...c.options, openBrowser: async () => {} })).toBe(0);
+  expect(c.output.join('\n')).toContain('a'.repeat(43));
+  c.output.length = 0;
+  expect(await runCli(['ui', '--print-url'], { ...c.options, stdinIsTTY: false, stdoutIsTTY: false })).toBe(1);
+  expect(c.output.join('\n')).not.toContain('a'.repeat(43));
 });
 
 test('ui --read-only keeps the explicit choice in a normal terminal', async () => {
@@ -184,11 +254,12 @@ test('dashboard browser opener rejects foreign or altered addresses before start
 });
 
 test('dashboard browser opener uses a fixed executable, no shell and no credential environment', async () => {
-  const url = `http://localhost:34567/?t=${'a'.repeat(43)}`;
-  expect(await openDashboardBrowser(url, { OPENAI_API_KEY: 'never-a-child-secret', PATH: 'untrusted', BROWSER: 'untrusted', SystemRoot: 'C:\\Windows', HOME: '/home/example' })).toBe(true);
+  const path = join(await directory(), 'dashboard.html');
+  await writeFile(path, '<!doctype html>');
+  expect(await openDashboardBrowser(path, { OPENAI_API_KEY: 'never-a-child-secret', PATH: 'untrusted', BROWSER: 'untrusted', SystemRoot: 'C:\\Windows', HOME: '/home/example' })).toBe(true);
   expect(browser.calls).toHaveLength(1);
   expect(browser.calls[0]!.options.shell).toBe(false);
-  expect(browser.calls[0]!.args).toContain(url);
+  expect(browser.calls[0]!.args).toContain(path);
   expect(JSON.stringify(browser.calls)).not.toMatch(/never-a-child-secret|untrusted/);
 });
 

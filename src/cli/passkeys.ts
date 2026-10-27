@@ -1,22 +1,17 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile as nodeExecFile, type ExecFileOptions } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { join, win32 } from 'node:path';
-import { z } from 'zod';
+import { lstat, unlink, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, win32 } from 'node:path';
 import type { StateStore } from '../core/store.js';
-import type { AuditLog, PasskeyCredential } from '../types.js';
+import type { AuditLog, PasskeyCredential, Vault } from '../types.js';
 import { verifyRegistration } from '../approvals/index.js';
 import { CliError } from './errors.js';
+import { createPasskeyStore } from './passkey-store.js';
 
 const CSP = "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const FIVE_MINUTES = 5 * 60_000;
 const BODY_LIMIT = 128 * 1024;
-const credentialsSchema = z.object({ v: z.literal(1), credentials: z.array(z.object({
-  id: z.string().regex(/^[A-Za-z0-9_-]+$/), publicKeyCose: z.string().regex(/^[A-Za-z0-9_-]+$/),
-  alg: z.union([z.literal(-7), z.literal(-8), z.literal(-257)]), signCount: z.number().int().min(0).max(0xffffffff),
-  backupEligible: z.boolean(), rpId: z.string().min(1), origins: z.array(z.string().url()).min(1),
-  label: z.string().max(80), createdAt: z.string().datetime(),
-}).strict()).max(100) }).strict();
 
 export interface LocalOnlyOptions { relay?: boolean; remote?: boolean }
 export interface PasskeyRegistrationReady { url: string; port: number }
@@ -35,14 +30,26 @@ export interface PasskeyBrowserOptions {
   execFile?: (file: string, args: string[], options: ExecFileOptions, callback: (error: Error | null) => void) => unknown;
 }
 
-/** Only the locally generated registration URL may reach an OS browser opener. */
-export async function openPasskeyBrowser(value: string, options: PasskeyBrowserOptions = {}): Promise<boolean> {
+/** Put the enrollment bearer in a private local file, rather than process arguments. */
+export async function createPasskeyLauncher(value: string, userDir: string): Promise<{ path: string; remove(): Promise<void> }> {
   let url: URL;
-  try { url = new URL(value); } catch { return false; }
+  try { url = new URL(value); } catch { throw new CliError('The passkey registration link could not be created.'); }
   const port = Number(url.port);
   if (url.protocol !== 'http:' || url.hostname !== 'localhost' || !Number.isInteger(port) || port < 1024 || port > 65535 ||
       url.username || url.password || url.pathname !== '/register' || url.hash || url.searchParams.size !== 1 ||
-      !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('token') ?? '') || url.href !== value) return false;
+      !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('token') ?? '') || url.href !== value) throw new CliError('The passkey registration link could not be created.');
+  const path = join(userDir, `passkey-${randomBytes(16).toString('hex')}.html`);
+  const target = value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
+  try {
+    await writeFile(path, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${target}"><title>Register a keysentry passkey</title></head><body><p><a href="${target}" rel="noreferrer">Register a keysentry passkey</a></p></body></html>\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch { throw new CliError(`The passkey launcher could not be created in ${userDir}. Set KEYSENTRY_USER_DIR to a writable directory.`); }
+  return { path, async remove() { await unlink(path).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new CliError('The passkey launcher could not be removed.'); }); } };
+}
+
+/** Only a local launcher file may reach the OS browser opener. */
+export async function openPasskeyBrowser(value: string, options: PasskeyBrowserOptions = {}): Promise<boolean> {
+  if (!isAbsolute(value) || !value.endsWith('.html') || /[\x00-\x1f\x7f]/.test(value)) return false;
+  try { const info = await lstat(value); if (!info.isFile() || info.isSymbolicLink()) return false; } catch { return false; }
   const platform = options.platform ?? process.platform;
   const source = options.env ?? process.env;
   const env: NodeJS.ProcessEnv = {};
@@ -209,6 +216,8 @@ export function createPasskeyRegistrationServer(options: PasskeyRegistrationServ
         if (existing.some(c => c.id === credential.id)) return reply(res, 409, { message: 'This passkey is already registered.' });
         credential.label = credentialLabel;
         credential.createdAt = (options.now?.() ?? new Date()).toISOString();
+        // Local dashboards select a fresh port for every launch under this RP.
+        credential.origins.push('http://localhost');
         await options.save(credential);
         reply(res, 200, { registered: true });
         setImmediate(() => { void shutdown({ status: 'registered', credential }); });
@@ -237,25 +246,18 @@ export function createPasskeyRegistrationServer(options: PasskeyRegistrationServ
   };
 }
 
-export async function listPasskeys(store: StateStore): Promise<PasskeyCredential[]> {
-  const raw = await store.readJson('pending', join(store.paths.dir, 'passkeys.json'));
-  if (raw === null) return [];
-  const parsed = credentialsSchema.safeParse(raw);
-  if (!parsed.success || new Set(parsed.data.credentials.map(c => c.id)).size !== parsed.data.credentials.length) throw new CliError('Saved passkeys could not be read.');
-  return parsed.data.credentials;
+export async function listPasskeys(store: StateStore, vault?: Vault): Promise<PasskeyCredential[]> {
+  return createPasskeyStore(store, vault).list();
 }
 
-export function createPasskeyManager(options: { store: StateStore; audit: Pick<AuditLog, 'append'>; assertHuman: (action: string) => void; now?: () => Date }) {
-  const path = join(options.store.paths.dir, 'passkeys.json');
+export function createPasskeyManager(options: { store: StateStore; vault?: Vault; audit: Pick<AuditLog, 'append'>; assertHuman: (action: string) => void; now?: () => Date }) {
+  const saved = createPasskeyStore(options.store, options.vault);
   return {
-    async list() { return (await listPasskeys(options.store)).map(({ id, label, rpId, createdAt }) => ({ id, label, rpId, createdAt })); },
+    async list() { return (await saved.list()).map(({ id, label, rpId, createdAt }) => ({ id, label, rpId, createdAt })); },
     async remove(id: string, forms: LocalOnlyOptions = {}) {
       options.assertHuman('remove a passkey'); localOnly(forms);
-      const credentials = await listPasskeys(options.store);
-      const remaining = credentials.filter(c => c.id !== id);
-      const removed = remaining.length !== credentials.length;
+      const removed = await saved.remove(id);
       if (removed) {
-        await options.store.writeJson('pending', path, { v: 1, credentials: remaining });
         await options.audit.append({ kind: 'passkey-remove', summary: 'Passkey removed.' });
       }
       return { id, removed };
@@ -266,14 +268,12 @@ export function createPasskeyManager(options: { store: StateStore; audit: Pick<A
         let url: URL;
         try { url = new URL(input.origin); } catch { throw new CliError('Use the watcher’s HTTPS origin for public registration.'); }
         if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new CliError('Use the watcher’s HTTPS origin without a path, credentials, query or fragment.');
-        return { status: 'public-origin', message: `A passkey for ${url.origin} must be registered on that origin. Public registration is a phase 3 dashboard feature; this watcher does not serve a registration page.` };
+        return { status: 'public-origin', message: `A passkey for ${url.origin} must be registered on that origin. Public-origin passkey registration is not available. Register a localhost passkey with keysentry passkey register in a human terminal.` };
       }
       const server = createPasskeyRegistrationServer({ label: input.label, timeoutMs: input.timeoutMs, now: options.now,
-        existing: () => listPasskeys(options.store), save: async credential => {
+        existing: () => saved.list(), save: async credential => {
           options.assertHuman('register a passkey');
-          const credentials = await listPasskeys(options.store);
-          if (credentials.length >= 100 || credentials.some(c => c.id === credential.id)) throw new CliError('This passkey cannot be added.');
-          await options.store.writeJson('pending', path, { v: 1, credentials: [...credentials, credential] });
+          await saved.add(credential);
           await options.audit.append({ kind: 'passkey-register', summary: 'Passkey registered.' });
         } });
       try {

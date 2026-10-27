@@ -13,6 +13,8 @@ import { providerName } from './provider-names.js';
 export interface FirstRunOptions {
   cwd: string;
   noSave?: boolean;
+  /** Guard defaults to the working tree; the ordinary first run includes history. */
+  includeHistory?: boolean;
   /** Existing projects supply their already-open runtime; a first run never opens a vault. */
   runtime?: Pick<KeysentryRuntime, 'fingerprintKey' | 'store'>;
   confirmSave?: (result: FirstRunResult) => Promise<boolean>;
@@ -137,7 +139,7 @@ export async function runFirstRun(opts: FirstRunOptions): Promise<{ result: Firs
   let result: FirstRunResult;
   try {
     const [files, history, deployTargets] = await Promise.all([
-      scanWorkingTree(cwd), scanHistory(cwd, { git: opts.git }), detectDeployTargets(cwd),
+      scanWorkingTree(cwd), opts.includeHistory === false ? Promise.resolve({ commits: 0, complete: true, hits: [] }) : scanHistory(cwd, { git: opts.git }), detectDeployTargets(cwd),
     ]);
     result = buildFirstRun({ root: cwd, files, history, deployTargets, fingerprintKey: key, elapsedMs: Math.round(performance.now() - start) });
   } finally { key.fill(0); }
@@ -175,17 +177,17 @@ export async function runFirstRun(opts: FirstRunOptions): Promise<{ result: Firs
 const HOST_NAMES: Record<HostId, string> = { railway: 'Railway', vercel: 'Vercel', render: 'Render', fly: 'Fly.io', 'github-actions': 'GitHub Actions', dotenv: 'Local files' };
 const count = (value: number, noun: string) => `${value} ${noun}${value === 1 ? '' : 's'}`;
 
-export function formatFirstRun(result: FirstRunResult): string {
+export function formatFirstRun(result: FirstRunResult, includeHistory = true): string {
   const committed = result.findings.filter(finding => finding.inGitHistory).length;
   const hosts = [...new Set(result.deployTargets.map(target => HOST_NAMES[target.host]))];
   const lines = [
-    `Found ${count(result.findings.length, 'key')} in local files and git history.`,
-    `Scanned ${count(result.scannedFiles, 'file')} and ${count(result.scannedCommits, 'commit')}${result.historyComplete ? '.' : '; history scan is incomplete.'}`,
-    committed ? `${count(committed, 'key')} appeared in git history. Removing a file does not remove its history; rotate these keys.` : 'No keys found in the scanned git history.',
+    includeHistory ? `Found ${count(result.findings.length, 'key')} in local files and git history.` : `Found ${count(result.findings.length, 'key')} in the working tree.`,
+    includeHistory ? `Scanned ${count(result.scannedFiles, 'file')} and ${count(result.scannedCommits, 'commit')}${result.historyComplete ? '.' : '; history scan is incomplete.'}` : `Scanned ${count(result.scannedFiles, 'file')}.`,
+    ...(includeHistory ? [committed ? `${count(committed, 'key')} appeared in git history. Removing a file does not remove its history; rotate these keys.` : 'No keys found in the scanned git history.'] : []),
     ...(hosts.length ? [`Possible deployment platforms: ${hosts.join(', ')} (from project configuration).`] : []),
     ...result.findings.map(finding => `${providerName(finding.provider)}: ${finding.hint ?? '(hidden)'} — ${finding.locations.map(location => `${location.path}${location.line === undefined ? '' : `:${location.line}`}${location.kind === 'history' ? ' (git history)' : ''}`).join(', ')}`),
     ...(result.nextSteps.length ? ['', 'Next steps:', ...result.nextSteps.map(step => `- ${step}`)] : []),
-    '', 'First run reads local files and git history. No network calls, token or account are needed.',
+    '', includeHistory ? 'First run reads local files and git history. No network calls, token or account are needed.' : 'This check reads local files only. Use --history to include git history.',
   ];
   return lines.join('\n');
 }

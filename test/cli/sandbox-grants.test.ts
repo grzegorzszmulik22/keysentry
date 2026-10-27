@@ -152,3 +152,66 @@ test('an existing encrypted inventory is read with its existing vault key and bi
   expect(result.writePaths).not.toContain(directory(f.cwd));
   expect(await readFile(store.paths.inventory, 'utf8')).toBe(saved);
 });
+
+test.each(['install-hook', 'uninstall-hook'])('guard %s grants its resolved hooks directory only', async action => {
+  const f = await fixture();
+  const hooks = resolve(f.cwd, '..', 'shared-private-hooks');
+  const resolveHooksDirectory = vi.fn(async () => hooks);
+  const result = await permissionOptionsForBin(f.argv('guard', action), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle,
+    { userDir: f.userDir, resolveHooksDirectory });
+  expect(resolveHooksDirectory).toHaveBeenCalledWith(f.cwd, { KEYSENTRY_VAULT: 'encrypted-file' });
+  expect(result.writePaths).toContain(directory(hooks));
+  expect(result.readPaths).toContain(directory(hooks));
+  expect(result.writePaths).not.toContain(directory(resolve(hooks, '..')));
+  expect(result.allowChildProcess).toBe(true);
+});
+
+test.each([[], ['--no-save'], ['guard'], ['guard', '--staged'], ['guard', '--history'], ['ui'], ['watch', '--once']].map(args => ({ args })))(
+  'git-reading command $args may create child processes with a file vault', async ({ args }) => {
+    const f = await fixture();
+    const result = await permissionOptionsForBin(f.argv(...args), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle,
+      { userDir: f.userDir });
+    expect(result.allowChildProcess).toBe(true);
+  },
+);
+
+test.each([['card'], ['timeline', 'plan-1']])('%s output grants only its selected --out file', async (...command) => {
+  const f = await fixture();
+  const output = resolve(f.cwd, '..', 'shared-output.svg');
+  for (const args of [[...command, '--out', output], [...command, `--out=${output}`]]) {
+    const result = await permissionOptionsForBin(f.argv(...args), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle,
+      { userDir: f.userDir });
+    expect(result.writePaths).toContain(output);
+    expect(result.writePaths).not.toContain(directory(resolve(output, '..')));
+    expect(result.allowChildProcess).toBe(false);
+  }
+});
+
+test('ordinary guard scans neither resolve hooks nor grant writes to them', async () => {
+  const f = await fixture(); const resolveHooksDirectory = vi.fn(async () => join(f.cwd, '.git', 'hooks'));
+  const result = await permissionOptionsForBin(f.argv('guard'), { KEYSENTRY_VAULT: 'env' }, f.bundle,
+    { userDir: f.userDir, resolveHooksDirectory });
+  expect(resolveHooksDirectory).not.toHaveBeenCalled();
+  expect(result.writePaths).not.toContain(directory(join(f.cwd, '.git', 'hooks')));
+});
+
+test('repeated output options grant only the final path Commander will use', async () => {
+  const f = await fixture();
+  for (const args of [['--out', 'first.svg', '--out', 'final.svg'],
+    ['--out=first.svg', '--out', 'final.svg'], ['--out', 'first.svg', '--out=final.svg']]) {
+    const result = await permissionOptionsForBin(f.argv('card', ...args), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle,
+      { userDir: f.userDir });
+    expect(result.writePaths).toContain(join(f.cwd, 'final.svg'));
+    expect(result.writePaths).not.toContain(join(f.cwd, 'first.svg'));
+  }
+});
+
+test('watcher grants place the user directory under its configured state directory', async () => {
+  const f = await fixture(); const stateDir = resolve(f.cwd, '..', 'watch-state');
+  const env = { KEYSENTRY_STATE_DIR: stateDir, KEYSENTRY_VAULT: 'encrypted-file' };
+  const result = await permissionOptionsForBin(f.argv('watch', '--once'), env, f.bundle);
+  expect(result.writePaths).toContain(directory(join(stateDir, 'user')));
+  const explicit = await permissionOptionsForBin(f.argv('watch', '--once'),
+    { ...env, KEYSENTRY_USER_DIR: f.userDir }, f.bundle);
+  expect(explicit.writePaths).toContain(directory(f.userDir));
+});

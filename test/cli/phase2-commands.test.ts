@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRuntime, runCli } from '../../src/cli/index.js';
@@ -9,6 +10,7 @@ import { configureApprovalRelay } from '../../src/cli/phase2.js';
 import { loadConfigMetadata } from '../../src/cli/config.js';
 import { verifyWatcherResume } from '../../src/watcher/index.js';
 import { createApprovalService } from '../../src/approvals/index.js';
+import { createFakeAuthenticator } from '../dashboard/helpers/fake-authenticator.js';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
@@ -19,6 +21,62 @@ async function context(interactive = true) {
   const output: string[] = []; const errors: string[] = [];
   return { runtime, http, output, errors, options: { runtime, env: {}, stdinIsTTY: true, stdoutIsTTY: true, output: (line: string) => output.push(line), error: (line: string) => errors.push(line) } };
 }
+
+function registrationRequest(url: URL, headers: Record<string, string> = {}, body?: unknown) {
+  return new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; body: string }>((resolve, reject) => {
+    const req = request({ hostname: '127.0.0.1', port: url.port, path: url.pathname + url.search,
+      method: body === undefined ? 'GET' : 'POST', headers: { Host: url.host, ...headers } }, response => {
+      let text = ''; response.setEncoding('utf8'); response.on('data', chunk => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode!, headers: response.headers, body: text }));
+    });
+    req.on('error', reject); req.end(body === undefined ? undefined : JSON.stringify(body));
+  });
+}
+
+test('passkey registration opens a private launcher file and never prints its bearer URL', async () => {
+  const c = await context(); const human = createFakeAuthenticator(); let path = '', bearer = '';
+  const code = await runCli(['passkey', 'register', '--json'], { ...c.options, openBrowser: async value => {
+    path = value;
+    const html = await readFile(path, 'utf8');
+    expect(html).toContain('http-equiv="refresh"');
+    bearer = /href="([^"]+)"/.exec(html)![1]!.replaceAll('&amp;', '&');
+    if (process.platform !== 'win32') expect((await stat(path)).mode & 0o777).toBe(0o600);
+    const ready = new URL(bearer);
+    const page = await registrationRequest(ready);
+    const cookie = page.headers['set-cookie']![0]!.split(';')[0]!;
+    const csrf = /name="csrf" content="([A-Za-z0-9_-]+)"/.exec(page.body)![1]!;
+    const headers = { Cookie: cookie, Origin: ready.origin, 'Content-Type': 'application/json', 'X-Keysentry-CSRF': csrf };
+    const options = await registrationRequest(new URL('/options', ready), headers, {});
+    const response = human.registration(JSON.parse(options.body).challenge, ready.origin).response;
+    expect((await registrationRequest(new URL('/register', ready), headers, response)).status).toBe(200);
+  } });
+  expect(code).toBe(0);
+  expect(path).toMatch(/\.html$/);
+  expect(path).toContain(c.runtime.userDir);
+  expect(c.errors.join('\n')).toContain(path);
+  const output = [...c.output, ...c.errors].join('\n');
+  expect(output).not.toContain(bearer); expect(output).not.toContain('?token=');
+  await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('passkey registration removes its launcher on cancellation', async () => {
+  const c = await context(); let path = '';
+  expect(await runCli(['passkey', 'register', '--json'], { ...c.options, openBrowser: async value => {
+    path = value; expect(await readFile(path, 'utf8')).toContain('http-equiv="refresh"'); process.emit('SIGINT');
+  } })).toBe(0);
+  expect(JSON.parse(c.output.join('\n')).status).toBe('cancelled');
+  await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('passkey registration removes its launcher when an injected opener fails', async () => {
+  const c = await context(); let path = '';
+  expect(await runCli(['passkey', 'register', '--json'], { ...c.options, openBrowser: async value => {
+    path = value; await readFile(path); throw new Error('Opener unavailable');
+  } })).toBe(1);
+  expect(path).toMatch(/\.html$/);
+  await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect([...c.output, ...c.errors].join('\n')).not.toContain('?token=');
+});
 
 test('new command groups are exposed in top-level help', async () => {
   const c = await context();
@@ -152,7 +210,8 @@ test('watcher setup JSON refusal cannot export deploy secrets or change relay se
 test('public-origin passkey registration explains the dashboard limit and notify list has metadata only', async () => {
   const c = await context();
   expect(await runCli(['passkey', 'register', '--origin', 'https://watcher.example.test', '--json'], c.options)).toBe(0);
-  expect(c.output.join('\n')).toContain('phase 3');
+  // Dashboard enrollment is removed; registration requires a human terminal.
+  expect(c.output.join('\n')).toContain('human terminal');
   c.output.length = 0;
   expect(await runCli(['notify', 'list', '--json'], c.options)).toBe(0);
   expect(JSON.parse(c.output.join('\n'))).toEqual([]);

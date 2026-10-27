@@ -159,7 +159,7 @@ test('bootstrap binds sealed identity and keeps runtime paths inside the private
   const opened = await bootstrapWatcher(f.env, { platform: process.platform, openVault: fastVault });
   try {
     expect(opened.options.cwd).toBe(f.env.KEYSENTRY_STATE_DIR);
-    expect(opened.options.userDir).toBe(join(f.env.KEYSENTRY_STATE_DIR, 'vault'));
+    expect(opened.options.userDir).toBe(join(f.env.KEYSENTRY_STATE_DIR, 'user'));
     expect(opened.options.settings?.hosts.railway.projectIds).toEqual(['project-one']);
     expect(JSON.parse(await readFile(join(f.env.KEYSENTRY_STATE_DIR, '.keysentry', 'project.json'), 'utf8'))).toEqual({ id: f.config.projectId });
     await opened.options.vault!.set('project/1234567890abcdef/inflight/plan-one', Buffer.alloc(32, 7));
@@ -198,7 +198,7 @@ test('bootstrapped runtime saves durable encrypted state without persisting its 
     const runtime = await createRuntime({ ...opened.options, hosts: [], http: new FakeHttp(), log: silentLogger });
     await runtime.scan();
     expect(await readFile(runtime.paths.inventory, 'utf8')).toMatch(/^keysentry-encrypted:v1\n/);
-    const rawVault = JSON.parse(await readFile(join(opened.options.userDir!, 'vault.enc'), 'utf8'));
+    const rawVault = JSON.parse(await readFile(join(f.env.KEYSENTRY_STATE_DIR, 'vault', 'vault.enc'), 'utf8'));
     expect(rawVault.entries).not.toHaveProperty(`project/${f.config.projectId}/key/state`);
     await expect(runtime.vault.set(`project/${f.config.projectId}/key/state`, Buffer.alloc(32))).rejects.toThrow(/KEYSENTRY_STATE_KEY/);
     expect((await runtime.audit.verify()).ok).toBe(true);

@@ -15,6 +15,8 @@ export interface DashboardOptions {
   passkeys?: PasskeyStore;
   idleMs?: number;
   open?: (url: string) => void;
+  /** Called once after the one-time sign-in token was exchanged, so the launcher can delete its local file. */
+  onTokenUsed?: () => void;
   now?: () => number;
   /** Receives only fixed, value-free operational error classes. */
   onError?: (errorClass: string) => void;
@@ -85,7 +87,9 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
         if (!granted) throw new DashboardError(401, 'Open keysentry again from your terminal.');
         touch();
         res.setHeader('Set-Cookie', `${sessions.cookieName}=${granted.id}; HttpOnly; SameSite=Strict; Path=/`);
-        res.writeHead(303, { Location: '/' }); res.end(); return;
+        res.writeHead(303, { Location: '/' }); res.end();
+        try { opts.onTokenUsed?.(); } catch { /* cleanup must never affect the response */ }
+        return;
       }
       if (req.method === 'GET' && target === '/' && !session) {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(START_PAGE); return;

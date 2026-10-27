@@ -7,7 +7,7 @@ import type { WatcherConfig } from '../watcher/index.js';
 import { createWatcherResumeRelay, detectPlatform, selfCheck } from '../watcher/index.js';
 import { createNotificationChannels, registerNotificationCommands } from './notifications.js';
 import { saveNotificationSettings, saveNotificationRelay } from './config.js';
-import { createPasskeyManager, listPasskeys, openPasskeyBrowser } from './passkeys.js';
+import { createPasskeyLauncher, createPasskeyManager, listPasskeys, openPasskeyBrowser } from './passkeys.js';
 import { buildWatcherSetupConfig, createWatchRuntime, runWatch, setupWatcher, watcherStatus, type WatcherPlatform } from './watcher.js';
 import { createWatcherStateStore } from './watcher-state.js';
 import { prepareWatcherDeployment } from './watcher-bootstrap.js';
@@ -104,8 +104,9 @@ export function createCliAutopilotManager(rt: KeysentryRuntime,
 /** The terminal's local approval uses the same executor, inventory checks and deferred-grace rails as watch. */
 export async function executeLocalApprovedAction(rt: KeysentryRuntime, actionId: string): Promise<{ executed: boolean; reason?: string }> {
   const watcher = await createWatchRuntime({ store: rt.store, audit: rt.audit, http: rt.http, log: rt.log,
+    saveRotationReport: rt.saveRotationReport,
     rotation: rt.config.rotation, fingerprintKey: rt.fingerprintKey, projectId: rt.projectId,
-    signingKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
+    signingKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
     channels: () => createNotificationChannels(rt.config.settings.notify.channels,
       { vault: rt.vault, http: rt.http, redactor: rt.redactor, receipt: rt.receipt }),
     engine: async () => { const engine = await rt.recoveryDeps(); return { ...engine, prompt: async () => null, reveal: undefined, grace: undefined }; },
@@ -157,13 +158,24 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       };
     } });
   const passkey = program.command('passkey').description('Manage local passkey credentials');
-  const passkeys = (rt: KeysentryRuntime) => createPasskeyManager({ store: rt.store, audit: rt.audit, assertHuman: opts.human, now: opts.now });
+  const passkeys = (rt: KeysentryRuntime) => createPasskeyManager({ store: rt.store, vault: rt.vault, audit: rt.audit, assertHuman: opts.human, now: opts.now });
   passkey.command('register').option('--origin <url>', 'Watcher public approval origin').option('--label <text>', 'Credential label')
     .option('--relay', 'Remote enrollment is unavailable').option('--remote', 'Remote enrollment is unavailable').action(async options => {
       opts.human('register a passkey'); const rt = await opts.getRuntime();
-      const result = await passkeys(rt).register({ ...options, open: opts.openBrowser ?? (async url => { await openPasskeyBrowser(url, { env: opts.env }); }),
-        onReady: ({ url }) => opts.diagnostic(`Open ${url} to register your passkey. This page closes after five minutes.`) });
-      opts.emit(result);
+      let launcher: Awaited<ReturnType<typeof createPasskeyLauncher>> | undefined;
+      try {
+        const result = await passkeys(rt).register({ ...options,
+          onReady: async ({ url }) => {
+            launcher = await createPasskeyLauncher(url, rt.userDir);
+            opts.diagnostic(`Open ${launcher.path} to register your passkey. This page closes after five minutes.`);
+          },
+          open: async () => {
+            if (!launcher) throw new CliError('The passkey launcher could not be created.');
+            if (opts.openBrowser) await opts.openBrowser(launcher.path);
+            else if (!await openPasskeyBrowser(launcher.path, { env: opts.env })) opts.diagnostic('The browser could not be opened. Open the passkey file shown above in your browser.');
+          } });
+        opts.emit(result);
+      } finally { await launcher?.remove(); }
     });
   passkey.command('list').action(async () => { const rt = await opts.getRuntime(); opts.emit(await passkeys(rt).list()); });
   passkey.command('remove <id>').option('--relay', 'Remote removal is unavailable').option('--remote', 'Remote removal is unavailable')
@@ -178,7 +190,7 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       if (options.relay || options.remote || opts.json() || !opts.interactive()) throw new CliError('Watcher setup needs a local interactive terminal and cannot print secrets in JSON.');
       if (options.relayServer) await configureApprovalRelay(rt, options.relayServer);
       const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault,
-        notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
+        notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
         intervalSeconds: rt.config.monitor.intervalMs / 1000, publicOrigin: options.origin,
         relayServer: options.relayServer ?? rt.config.settings.notify.relay?.server });
       const outputDir = resolve(rt.config.cwd, options.output ?? `.keysentry/watcher-setup-${Date.now()}`);
@@ -221,8 +233,9 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       const publicKeys = sealed ? async () => sealed.devicePublicKeys.map(key => ({ keyId: key.keyId, publicKeyDer: Buffer.from(key.publicKeyDer, 'base64') })) : () => localDeviceKeys(rt);
       const sources: FeedSource[] = [...DEFAULT_SOURCES.filter(source => !sealed?.sources.disabled.includes(source.id)), ...sealed?.sources.extra ?? []];
       opts.setExit(await runWatch({ store: watchStore, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
+        saveRotationReport: rt.saveRotationReport,
         signingKey: rt.signingKey, fingerprintKey: rt.fingerprintKey, deviceKeys: publicKeys,
-        passkeys: () => sealed ? Promise.resolve(sealed.passkeys) : listPasskeys(rt.store), channels: () => channels(rt),
+        passkeys: () => sealed ? Promise.resolve(sealed.passkeys) : listPasskeys(rt.store, rt.vault), channels: () => channels(rt),
         engine: async () => { const engine = await rt.recoveryDeps(); return { ...engine, prompt: async () => null, reveal: undefined, grace: undefined }; },
         freshInventory: rt.freshInventory, monitor: (context, notify, assertActive) => rt.watcherMonitor(context, { notify: async (_title, _body, signal) => {
           await notify({ id: randomUUID(), at: (opts.now ?? (() => new Date()))().toISOString(), kind: 'monitor', severity: 'warning',

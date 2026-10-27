@@ -14,10 +14,11 @@ import { canonicalJson, signDetached, type DeviceKey } from '../security/index.j
 import { CREDENTIAL_NAMES } from '../vault/index.js';
 import { createActionsRecovery, createWatcherResumeRelay, createWatcherTick, detectPlatform, runOnce, runWatcherLoop, selfCheck, trackHttpClock } from '../watcher/index.js';
 import type { ActionsRecoveryState, SignedWatcherResume, WatcherActionContext, WatcherConfig, WatcherTickState } from '../watcher/index.js';
-import type { ArmedPlan, AuditLog, FeedSource, HttpClient, Incident, IncidentEvidence, Inventory, Logger, NotifyChannel, NotifyMessage, PasskeyCredential, SignedNotifyMessage, Vault } from '../types.js';
+import type { ArmedPlan, AuditLog, FeedSource, HttpClient, Incident, IncidentEvidence, Inventory, Logger, NotifyChannel, NotifyMessage, PasskeyCredential, RotationReport, SignedNotifyMessage, Vault } from '../types.js';
 import { CliError } from './errors.js';
 import { cacheNotificationMessage, type NotifyChannelSettings } from './notifications.js';
 import { createWatcherStateStore } from './watcher-state.js';
+import { planIdSchema } from './schemas.js';
 
 export { setupWatcher, watcherStatus } from './watcher-setup.js';
 export type { WatcherSetupDependencies, WatcherDeploymentSecrets, WatcherPlatform } from './watcher-setup.js';
@@ -45,6 +46,8 @@ export interface WatchRuntimeDependencies {
   /** Local runtime can refresh adopted references with the device key. A deployed watcher omits this. */
   applyAdoptionUpdates?: (updates: NonNullable<AutopilotState['adoptionUpdates']>) => Promise<void>;
   onSignedMessage?: (message: SignedNotifyMessage, delivered: boolean) => Promise<void>;
+  /** The CLI supplies its shared sanitized report writer; embedders use encrypted state directly. */
+  saveRotationReport?: (report: RotationReport) => Promise<void>;
   /** Re-evaluated at each automatic-action boundary, including sealed/container execution. */
   integrityCheck?: () => Promise<{ ok: boolean; reasons: string[] }>;
 }
@@ -90,6 +93,13 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
   const platform = detectPlatform(env);
   const actions = platform.platform === 'github-actions';
   deps = { ...deps, store: createWatcherStateStore(deps.store, actions) };
+  async function saveReport(report: RotationReport) {
+    if (deps.saveRotationReport) return deps.saveRotationReport(report);
+    if (!planIdSchema.safeParse(report.planId).success) throw new CliError('Invalid plan identifier.');
+    // The runner has already projected the engine report to value-free metadata.
+    await deps.store.writeJson('report', path(deps.store, `reports/${report.planId}.json`), report);
+    if (!report.dryRun) await deps.store.writeJson('report', path(deps.store, 'rotation-report.json'), report);
+  }
   const stateFile = path(deps.store, 'autopilot.json');
   const savedInitialState = await deps.store.readJson<AutopilotState>('plan', stateFile);
   // Missing local scope differs from an explicit disarm; only a verified grant can pass checks without an arm.
@@ -271,6 +281,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
     const current = await check(); if (!current.ok) return;
     const result = await settleWaves({ state, now: now(), disarmed: state.disarmed, inventory },
       { ...await runner(context), trustedKeyIds, env, selfCheck: current });
+    for (const report of result.reports) await saveReport(report);
     await updated(result.adoptionUpdates);
   }
   async function executeApprovals(context?: WatcherActionContext, actionId?: string): Promise<{ executed: boolean; reason?: string }> {
@@ -292,6 +303,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       const armed = await deps.store.readJson<ArmedPlan>('plan', path(deps.store, 'armed-plan.json'));
       const result = await executeApprovedAction({ action: { ...action, kind: 'autopilot', planHash: action.planHash }, grant,
         inventory, armed: armed ?? undefined, state, now: now() }, { ...await runner(context), trustedKeyIds, env, selfCheck: checked });
+      if (result.report) await saveReport(result.report);
       await updated(result.adoptionUpdates);
       if (!result.reason && !result.asked.length && !result.guided.length
         && (result.report?.status === 'complete' || result.report?.status === 'grace-pending')) {
@@ -315,6 +327,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       activeContext = context;
       const current = await check(); if (!current.ok) return;
       const result = await resumeWaves({ state, now: now(), disarmed: state.disarmed }, { ...await runner(context), trustedKeyIds, env, selfCheck: current });
+      for (const report of result.reports) await saveReport(report);
       await updated(result.adoptionUpdates);
     },
     executeApprovals: context => executeApprovals(context),
@@ -415,6 +428,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       const armed = await deps.store.readJson('plan', path(deps.store, 'armed-plan.json'));
       const result = await runAutopilot({ incident, armed, trustedKeyIds, inventory, state, selfCheck: current, env, now: now(),
         watcherHost: context.ownHost, ownTokenNames: [...context.excludedTokenNames] }, await runner(context));
+      if (result.report) await saveReport(result.report);
       await updated(result.adoptionUpdates);
     },
     settleWaves: settle, requestApproval: requestIncident,

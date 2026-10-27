@@ -62,22 +62,24 @@ themselves are not isolated by port. Exact Host checks constrain DNS rebinding. 
 exact localhost Origin and session CSRF token. The server sends no CORS permissions, bounds JSON input and
 serves only bundled assets under a strict CSP with no inline scripts/styles or external resources. Authenticated
 idle sessions and the server expire after 15 minutes by default. The initial URL is a bearer credential until
-used or expired; a process able to steal it first can establish the browser session.
+used or expired; a process able to steal it first can establish the browser session. The CLI opens a 0600 HTML launcher in the private user directory instead of passing the token to the browser in process arguments. It deletes the file after two minutes. Normal output contains only the file path; an explicitly requested `ui --print-url` at a human terminal exposes the bearer URL to that terminal and its capture history. Same-user processes can still read the launcher.
 
 Every dashboard change and explicit reveal requires a fresh passkey assertion with user verification, bound
 to that session, exact route and canonical request-body digest. A proof expires after two minutes and is
-consumed once; altered input, replay and clone-warning counters fail closed. First enrollment needs a
-user-verified registration through the authenticated session; additional enrollment also needs an existing
-passkey. Credential records are JSON vault entries under `passkey/<id>`. The relying party is `localhost` and
-the assertion origin must match the current full origin, including port. These controls rely on the browser,
-authenticator and the human reviewing the action, and do not identify which human enrolled the first credential.
+consumed once; altered input, replay and clone-warning counters fail closed. Passkeys are registered only
+with `keysentry passkey register` at a human terminal. The dashboard has no registration routes: an agent
+driving a browser could otherwise add its own virtual authenticator, claim user verification and authorize
+changes. CLI and dashboard share the encrypted project `passkeys.json` array, including assertion counters.
+Earlier plaintext CLI records and vault `passkey/*` records migrate to that file once; plaintext state is
+refused afterwards. The relying party is `localhost`; assertion verification checks the current full origin,
+including port. Approval dialogs show the proposed changes and bind approval to the displayed review hash.
 
-An agent driving ordinary browser controls can read metadata but cannot supply the required user verification
-to make a change. Agent-marked launches additionally run read-only, refusing mutations and enrollment on the
-server. Disarm deliberately works without a passkey even there and cancels arming still in progress. Someone
-with an authenticated dashboard session can therefore stop future automatic work, but cannot re-arm without
-authorization or restore already revoked keys. An unrestricted same-user agent or compromised browser is
-outside this page-level boundary; it may access storage/processes or manipulate the trusted code directly.
+Agent-marked launches run read-only, with no key changes. Previews and drills can still save encrypted metadata.
+Disarm deliberately works without a passkey even there and cancels arming still in progress. Someone with an
+authenticated session can therefore stop future automatic work, but cannot re-arm without authorization or
+restore already revoked keys. Browser/authenticator implementations, terminal enrollment and human review
+remain trust boundaries. An unrestricted same-user agent or compromised browser may access storage/processes
+or manipulate the trusted code directly.
 
 Normal reads return only metadata/hints. Explicit reveal rereads a readable consumer, needs confirmation and
 passkey authorization, and audits only the variable name and cluster ID. Write-only values cannot be revealed.
@@ -202,7 +204,7 @@ must correctly terminate TLS and configure proxy trust.
 
 Local registration binds to loopback, uses a one-time token, opens as localhost, checks Host/Origin, serves only a
 static script and closes after success or timeout. A localhost passkey is not a public-origin passkey. The server
-does not provide public `/register`; the phase 3 dashboard enrolls only at localhost, so public-origin enrollment
+does not provide public `/register`; the dashboard never enrolls passkeys, so public-origin enrollment
 remains unavailable here. Notifications carry an approval-page URL only when a passkey for the watcher's public
 origin is registered; otherwise they direct the user to the local approval command. Browser/authenticator
 implementation, the selected origin and the local supervised enrollment remain trust boundaries.
@@ -258,7 +260,7 @@ operations still need maintainer validation before a release.
 | Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |
 | Watcher host | Read runtime memory or injected keys, modify code, roll back state or interrupt work. | Sealed configuration, separately supplied state/vault keys, scoped credential export, private volume permissions and a non-root read-only image reduce filesystem exposure. The host remains trusted with running plaintext and can defeat these controls. Own-platform incidents continue other covered rotations and request local changes for operating credentials. |
 | Same-user malware | Ask the OS vault for entries, read process memory or environment values, or replace files. | OS storage and encryption reduce exposure from files alone. They do not isolate keysentry from another process with your user's privileges in an unlocked session. |
-| AI coding agent or agent-driven browser | Invoke mutation commands, click dashboard controls or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive CLI mutation checks, marker-triggered read-only dashboard, exact-action user-verified passkeys, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
+| AI coding agent or agent-driven browser | Invoke mutation commands, click dashboard controls or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive CLI mutation checks, marker-triggered read-only dashboard, terminal-only passkey enrollment, exact-action user-verified passkeys, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
 | Foreign web page or local process | Rebind a hostname, make cross-origin requests, steal a sign-in link or replay a dashboard action. | Loopback binding, exact Host/Origin, single-use expiring link, strict session cookie/CSRF checks, CSP and fresh route/body-bound passkey proofs constrain access. A stolen unused link can establish a session; same-user process/browser compromise is outside those controls. |
 | Recipient of a share card or timeline | Infer infrastructure, counts or incident timing from an export. | Card platform/counts are opt-in and names/hints/values never enter it; timelines escape and redact recorded events. Chosen metadata can still identify a deployment or event, and publication is irreversible from keysentry. |
 | keysentry maintainers | Ship an unsafe implementation or change the release trust list. | Open source, readable release code, explicit trust roots, release signatures, checksums, provenance workflows, and independent rebuilding enable review. Maintainers still control releases; a valid signature identifies the signer, not the safety of the code. There is no external audit yet. |

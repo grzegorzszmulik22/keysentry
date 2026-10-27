@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -10,6 +10,7 @@ import { createFakeVault } from '../helpers/fake-vault.js';
 import { createFakeInFlight } from '../helpers/fake-inflight.js';
 import { getProvider } from '../../src/providers/index.js';
 import { createMonitorState } from '../../src/monitor/index.js';
+import { createApprovalService } from '../../src/approvals/index.js';
 import { createFakeAuthenticator } from '../dashboard/helpers/fake-authenticator.js';
 
 const dirs: string[] = [];
@@ -72,7 +73,25 @@ describe('dashboard runtime routes', () => {
     const { call, vault } = await setup();
     expect(await call('vault/store', { name: 'RAILWAY_TOKEN', role: 'read', value: 'private-platform-token' })).toEqual({ stored: true });
     expect((await vault.get('cred/RAILWAY_TOKEN@read'))?.toString()).toBe('private-platform-token');
+    const platforms = await call('platforms') as { platforms: { host: string; availableRoles: string[]; storedRoles: string[] }[] };
+    expect(platforms.platforms.find(platform => platform.host === 'railway')).toMatchObject({ availableRoles: ['read', 'write'], storedRoles: ['read'] });
     expect(await call('vault/remove', { name: 'RAILWAY_TOKEN', role: 'read' })).toEqual({ removed: true });
+  });
+
+  it('offers supported roles before any token has been stored', async () => {
+    const { call } = await setup();
+    const result = await call('platforms') as { platforms: { host: string; availableRoles: string[]; storedRoles: string[] }[] };
+    expect(result.platforms.find(platform => platform.host === 'railway')).toMatchObject({ availableRoles: ['read', 'write'], storedRoles: [] });
+  });
+
+  it('refreshes the local summary within 60 seconds when files change', async () => {
+    const { call, runtime } = await setup();
+    let at = new Date('2026-10-27T12:00:00Z');
+    runtime.now = () => at;
+    expect(await call('overview')).toMatchObject({ firstRun: { findings: [] } });
+    await writeFile(join(runtime.config.cwd, '.env'), `OPENROUTER_API_KEY=sk-or-v1-${'d'.repeat(64)}\n`);
+    at = new Date(at.getTime() + 60_000);
+    expect(await call('overview')).toMatchObject({ firstRun: { findings: [expect.any(Object)] } });
   });
 
   it('accepts a partial provider spending cap and returns the persisted settings', async () => {
@@ -157,8 +176,43 @@ describe('dashboard runtime routes', () => {
     state.keyRefs[cluster.id] = old.ref;
     state.pendingActions.push({ id: 'action-cap', action: 'cap', signalId: 'signal-cap', clusterIds: [cluster.id], status: 'pending', createdAt: runtime.now().toISOString() });
     await runtime.store.writeJson('monitor', runtime.paths.monitor, state);
-    expect(await call('approvals/approve', { id: 'action-cap' })).toEqual({ result: 'executed' });
+    const review = await call('approvals') as { pending: { id: string; changes: string[]; reviewHash: string }[] };
+    expect(review.pending[0]!.changes.join(' ')).toMatch(/caps|disables|disable/i);
+    expect(review.pending[0]!.reviewHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(await call('approvals/approve', { id: 'action-cap', reviewHash: review.pending[0]!.reviewHash })).toEqual({ result: 'executed' });
     expect(provider.keys.get(old.ref)?.active).toBe(false);
+  });
+
+  it('refuses an approval when the reviewed action changed', async () => {
+    const { runtime, call, provider, old } = await setup(); const inv = await runtime.scan();
+    const cluster = inv.clusters[0]!; const state = createMonitorState();
+    state.keyRefs[cluster.id] = old.ref;
+    state.pendingActions.push({ id: 'action-change', action: 'cap', signalId: 'signal', clusterIds: [cluster.id], status: 'pending', createdAt: runtime.now().toISOString() });
+    await runtime.store.writeJson('monitor', runtime.paths.monitor, state);
+    const review = await call('approvals') as { pending: { reviewHash: string }[] };
+    state.pendingActions[0]!.action = 'rotate';
+    await runtime.store.writeJson('monitor', runtime.paths.monitor, state);
+    await expect(call('approvals/approve', { id: 'action-change', reviewHash: review.pending[0]!.reviewHash })).rejects.toThrow(/changed/i);
+    expect(provider.keys.get(old.ref)?.active).toBe(true);
+    expect(provider.keys.size).toBe(1);
+  });
+
+  it('describes autopilot approvals and rejects a replaced request after review', async () => {
+    const { runtime, call, provider } = await setup(); const inv = await runtime.scan();
+    const service = createApprovalService({ store: runtime.store, audit: runtime.audit, deviceKeys: async () => [], credentials: async () => [],
+      now: runtime.now, rpId: 'localhost', origins: ['http://localhost'] });
+    const action = { id: 'autopilot-review', kind: 'autopilot', clusterIds: [inv.clusters[0]!.id], planHash: 'a'.repeat(64) };
+    const request = await service.request(action, false);
+    await runtime.store.writeJson('pending', join(runtime.paths.dir, 'watcher-approvals.json'), { actions: [{ action, request }] });
+    const review = await call('approvals') as { pending: { changes: string[]; reviewHash: string }[] };
+    expect(review.pending[0]!.changes.join(' ')).toContain('OPENROUTER_API_KEY');
+    expect(review.pending[0]!.changes.join(' ')).toContain('redeploy');
+    const changed = { ...action, planHash: 'b'.repeat(64) };
+    const updatedRequest = await service.request(changed, false);
+    await runtime.store.writeJson('pending', join(runtime.paths.dir, 'watcher-approvals.json'), { actions: [{ action: changed, request: updatedRequest }] });
+    await expect(call('approvals/approve', { id: action.id, reviewHash: review.pending[0]!.reviewHash })).rejects.toThrow(/changed/i);
+    expect(provider.keys.size).toBe(1);
+    expect(await service.status(action.id)).toBe('pending');
   });
 
   it('disarms while arming is waiting for a scan, and the older request cannot re-arm', async () => {
@@ -209,13 +263,13 @@ describe('dashboard runtime routes', () => {
   });
 });
 
-describe('dashboard vault passkeys', () => {
-  it('persists JSON in passkey/<id> and updates counters without adding duplicates', async () => {
-    const vault = createFakeVault(); const store = createDashboardPasskeyStore(vault);
+describe('dashboard encrypted-state passkeys', () => {
+  it('persists encrypted state and updates counters without adding duplicates', async () => {
+    const { runtime, vault } = await setup(); const store = createDashboardPasskeyStore(runtime.store, vault);
     const credential = createFakeAuthenticator().credential();
     await store.add(credential);
-    expect(await vault.list('passkey/')).toEqual([`passkey/${credential.id}`]);
-    expect(JSON.parse((await vault.get(`passkey/${credential.id}`))!.toString())).toEqual(credential);
+    expect(await vault.list('passkey/')).toEqual([]);
+    expect(await runtime.store.readJson('passkeys', join(runtime.paths.dir, 'passkeys.json'))).toEqual([credential]);
     await expect(store.add(credential)).rejects.toThrow();
     await store.update({ ...credential, signCount: 4 });
     expect(await store.list()).toEqual([{ ...credential, signCount: 4 }]);

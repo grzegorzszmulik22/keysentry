@@ -31,9 +31,9 @@ keysentry ui --read-only
 
 The dashboard brings together the key map, platform connection guidance, rotation preview, drill, autopilot, approvals, activity, notifications and settings. Connect shows the narrowest supported token and explains both its permissions and what keysentry will use it for. Values entered there go to the vault, not the project configuration.
 
-Changes need a passkey with user verification so that an AI agent driving a browser cannot make them through the dashboard without your participation. The first visit offers passkey enrollment on `localhost`; later changes require a fresh assertion bound to that exact action and input. Explicitly revealing a readable value also needs a passkey. Disarm remains available without one, including in read-only mode. Launches with a detected coding-agent marker are automatically read-only.
+Changes need a passkey with user verification and a fresh assertion bound to that exact action and input. Register passkeys only with `keysentry passkey register` at a human terminal; the dashboard cannot enroll them. An agent driving a browser could otherwise add its own virtual authenticator and authorize changes. The CLI and dashboard share the encrypted project `passkeys.json` store. Explicitly revealing a readable value also needs a passkey. Disarm remains available without one, including in read-only mode. Launches with a detected coding-agent marker are automatically read-only: no key changes. Previews and drills can still save encrypted plans, reports and readiness metadata.
 
-The server binds only to `127.0.0.1` and opens as `http://localhost:<random port>` with a single-use sign-in link. All assets are bundled locally; Host/Origin checks, CSRF tokens and a strict content policy protect requests. It shuts down after 15 idle minutes. Normal responses contain metadata and hints, not values; reveal is explicit and clipboard copy attempts to clear after 30 seconds. Browser permissions or closing the tab can prevent clipboard clearing. These controls do not isolate credentials from other software running as your OS user.
+The server binds only to `127.0.0.1` and opens as `http://localhost:<random port>` with a single-use sign-in link. `ui` writes that link into a private HTML launcher in the user directory and opens the file, keeping the token out of browser process arguments and normal terminal/JSON output. The file is deleted after two minutes. Open the printed file path if browser opening fails. `ui --print-url` prints the token-bearing URL only when explicitly requested at an interactive human terminal. All assets are bundled locally; Host/Origin checks, CSRF tokens and a strict content policy protect requests. It shuts down after 15 idle minutes. Normal responses contain metadata and hints, not values; reveal is explicit and clipboard copy attempts to clear after 30 seconds. Browser permissions or closing the tab can prevent clipboard clearing. These controls do not isolate credentials from other software running as your OS user.
 
 ## The trust promise
 
@@ -61,7 +61,7 @@ The current receipt keeps a bounded local history, rather than an unlimited reco
 
 Requires Node.js **22.13 or newer** and the installed project dependencies. The optional Node permission sandbox requires a patched supported release: **22.23.4, 24.22.1 or 26.12.1 or newer within those major lines**. Older or unsupported Node releases run without that additional sandbox; the HTTP allow-list still applies.
 
-The sandbox grants writes to the project's `.keysentry/` directory and the user data directory. `init` also receives the config file path, and `plan -o` receives its output file path. Executing commands receive the configured dotenv consumer files from the inventory, plus their temporary-file prefixes for atomic replacement. If the inventory cannot be read yet, those commands receive the configured dotenv roots instead. Sandbox status comes from Node's permission API.
+The sandbox grants writes to the project's `.keysentry/` directory and the user data directory. `init` also receives the config file path; `plan -o`, `card --out` and `timeline --out` receive their exact output paths. Hook install/removal receives the resolved Git hooks directory, including `core.hooksPath`. First run, guard, dashboard and watcher commands can start Git child processes. Executing commands receive the configured dotenv consumer files from the inventory, plus their temporary-file prefixes for atomic replacement. If the inventory cannot be read yet, those commands receive the configured dotenv roots instead. Sandbox status comes from Node's permission API.
 
 ```sh
 npm run build
@@ -116,7 +116,7 @@ keysentry digest
 keysentry digest --send
 ```
 
-Hygiene shows first-seen age, known copies and rotate-by dates, with a default 90-day rotation interval. First-seen means when keysentry observed a readable fingerprint, not when the provider created the key. Write-only keys cannot establish stable age. An unused-key hint appears only when the recorded usage has enough continuous coverage; absent evidence does not mean unused.
+Hygiene shows first-seen age, known copies and rotate-by dates, with a default 90-day rotation interval. First-seen means when keysentry observed a readable fingerprint, not when the provider created the key. Write-only keys cannot establish stable age. An unused-key hint appears when the provider's usage history covers 30 days. That coverage is not yet wired into the CLI/dashboard hygiene adapter, so these views currently omit the hint; absent evidence does not mean unused.
 
 Set rotation intervals, provider spending caps and digest preferences in the dashboard Settings screen. `spend-limits` previews eligible changes; `--apply` requires human approval and write-role credentials. This phase supports OpenRouter per-key caps only, preserves a known tighter limit, and reports other providers as unavailable. A provider cap is not an aggregate account budget; missing usage/reference/cap data can leave a key without a proposal.
 
@@ -131,7 +131,7 @@ keysentry timeline <planId-or-waveId>
 keysentry timeline <planId-or-waveId> --out incident.md
 ```
 
-The card is a self-contained SVG with the same readiness score as `keysentry drill`. By default it shares only the score and keysentry branding. `--share-platform` and `--share-counts` independently opt in to supported platform and completed-rotation statistics when available. It contains no key values, hints, names or project names. The dashboard offers an image preview, SVG download and PNG clipboard copy where the browser supports it.
+The card is a self-contained SVG with the same readiness score as `keysentry drill`. By default it shares only the score and keysentry branding. `--share-platform` and `--share-counts` independently opt in to supported platform and completed-rotation statistics when available. It names an incident only when the completed rotation belongs to an autopilot wave with a recorded incident on that platform; routine rotations use ?rotated on <Platform>?. It contains no key values, hints, names or project names. The dashboard offers an image preview, SVG download and PNG clipboard copy where the browser supports it.
 
 Timeline exports the selected plan or wave's recorded detection, decisions, writes, deployments, verification, grace and revocation events as Markdown. It cannot reconstruct events that were never recorded. Card and timeline exports are local files; review the metadata you choose to share before publishing them.
 
@@ -375,7 +375,7 @@ Local registration serves a one-page app on a random port, binds to `127.0.0.1` 
 
 A pending approval binds to the exact planned keys, consumers and steps. Requests normally expire after ten minutes; Actions-mode requests allow 60 minutes for scheduled checks. Approval is single-use. `approve <action-id>` executes a local autopilot action through the same scan, eligibility, deployment and revocation checks used by armed waves. `approve <action-id> --relay` verifies the watcher-signed request, shows the keys and available hints, asks for confirmation and publishes a device-signed approval. The watcher executes accepted grants on its next check; publication alone does not confirm execution. Guided changes still need the user. Existing monitor approvals remain available. The relay cannot authorize a different action or expand an armed plan. Public ntfy topics are readable and writable by others: a random topic reduces discovery, while trusted signatures provide authorization.
 
-Passkeys are scoped to their relying party and origin. A localhost registration does not register a passkey for a public watcher. `passkey register --origin https://watcher.example.com` explains that registration must happen there. The current approval server has no `/register` page; the local dashboard enrolls only for `localhost`, not a public watcher origin. Notifications include an approval-page link only when a passkey is registered for the watcher's public origin; otherwise they direct you to `keysentry approve <action-id>` on your computer. Arming, channel changes and passkey enrollment require the local human CLI or the passkey-gated local dashboard where offered; watcher setup uses the human CLI. Relay approvals cannot widen policy.
+Passkeys are scoped to their relying party and origin. A localhost registration does not register a passkey for a public watcher. `passkey register --origin https://watcher.example.com` explains that registration must happen there. The current approval server has no `/register` page; the dashboard never enrolls passkeys. Notifications include an approval-page link only when a passkey is registered for the watcher's public origin; otherwise they direct you to `keysentry approve <action-id>` on your computer. Passkey enrollment requires the local human CLI. Arming and channel changes require the local human CLI or a passkey-gated local dashboard action; watcher setup uses the human CLI. Relay approvals cannot widen policy.
 
 ## Kill switch
 
@@ -408,3 +408,5 @@ node tools/vitest-sandbox.mjs test
 ```
 
 Tests use injected fake vaults, hosts/providers and HTTP responses. The sandbox runner executes the suite without esbuild child-process startup. No real keychain, provider account or network request is needed for these tests. Release builds and real OS-store checks are separate integration work; see [SECURITY.md](SECURITY.md) and [docs/ACCESS.md](docs/ACCESS.md).
+
+When `KEYSENTRY_STATE_DIR` is set for a watcher/container, user metadata defaults to `<state dir>/user`. Set `KEYSENTRY_USER_DIR` to use another writable directory. Directory preparation errors name the affected path and the variable to set.

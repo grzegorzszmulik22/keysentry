@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { createHygieneStateStore, hygieneReport, planSpendLimits, applySpendLimits, buildDigest } from '../hygiene/index.js';
 import { createFileMonitorStateStore } from '../monitor/index.js';
+import { serviceKey } from '../core/index.js';
 import { buildTimeline, readinessScore, renderCard, renderTimelineMarkdown, type TimelineAuditEntry } from '../report/index.js';
 import { createDispatcher, signMessage } from '../notify/index.js';
 import { createNotificationChannels, notificationEgress, cacheNotificationMessage } from './notifications.js';
@@ -10,7 +11,7 @@ import { providerIdSchema } from './schemas.js';
 import { runFirstRun } from './first-run.js';
 import { CliError } from './errors.js';
 import type { KeysentryRuntime } from './runtime.js';
-import type { FirstRunResult, Incident, Inventory, NotifyMessage, RotationReport, Signal, ProviderKeyInfo, KeyHygiene } from '../types.js';
+import type { FirstRunResult, Incident, Inventory, NotifyMessage, Signal, ProviderKeyInfo, KeyHygiene } from '../types.js';
 
 const DAY = 86_400_000;
 const settingsSchema = z.object({
@@ -30,6 +31,7 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
   const hygieneStore = createHygieneStateStore(rt.store);
   const monitorStore = createFileMonitorStateStore(rt.config.cwd, rt.store);
   let firstRunResult: Promise<FirstRunResult> | undefined;
+  let firstRunAt = 0;
 
   async function settings(): Promise<DashboardSettings> {
     const stored = await rt.store.readJson<unknown>('monitor', settingsPath);
@@ -71,8 +73,14 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
 
   function firstRun(): Promise<FirstRunResult> {
     // Initial unsaved scans have per-run identifiers. Rebuild against this project's
-    // vault fingerprint key, then reuse the in-memory result for this dashboard.
-    firstRunResult ??= runFirstRun({ cwd: rt.config.cwd, noSave: true, runtime: rt, git: rt.firstRunGit }).then(scan => scan.result);
+    // vault fingerprint key. Refresh within a minute so rotations and local
+    // edits do not leave the dashboard's initial summary stale indefinitely.
+    const now = clock().getTime();
+    if (!firstRunResult || now - firstRunAt >= 60_000 || now < firstRunAt) {
+      firstRunAt = now;
+      firstRunResult = runFirstRun({ cwd: rt.config.cwd, noSave: true, runtime: rt, git: rt.firstRunGit }).then(scan => scan.result);
+      void firstRunResult.catch(() => { firstRunResult = undefined; });
+    }
     return firstRunResult;
   }
 
@@ -103,19 +111,34 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
     const monitor = await monitorStore.load();
     const redeploy = Object.fromEntries(rt.config.hosts.map(host => [host.id, host.capabilities.redeploy]));
     const score = readinessScore({ inventory, configuredCredentials: Object.keys(rt.config.providerCtx.credentials).filter(name => !!rt.config.providerCtx.credentials[name]), redeploy, canaries: monitor.canaries.length }).score;
-    const report = await rt.store.readJson<RotationReport>('report', join(rt.paths.dir, 'rotation-report.json'));
+    const report = await rt.rotationReport();
     let rotated: { keys: number; seconds: number; platform?: string } | undefined;
+    let incidentResponse = false;
     if (report && !report.dryRun) {
       const entries = (await rt.store.journal().read()).filter(entry => entry.planId === report.planId);
       const completed = new Set(entries.filter(entry => entry.event === 'revoked' && !entry.data?.cleanup && !entry.data?.undo && entry.clusterId).map(entry => entry.clusterId));
       if (completed.size) {
         const times = entries.map(entry => Date.parse(entry.at)).filter(Number.isFinite);
-        const hosts = [...new Set(inventory.services.map(service => service.host).filter(host => host !== 'dotenv'))];
+        const locations = new Set(report.deployments.map(deployment => deployment.serviceKey));
+        const hosts = [...new Set(inventory.services.filter(service => locations.has(serviceKey(service)))
+          .map(service => service.host).filter(host => host !== 'dotenv'))];
         rotated = { keys: completed.size, seconds: times.length ? Math.max(0, (Math.max(...times) - Math.min(...times)) / 1000) : 0,
           ...(hosts.length === 1 ? { platform: hosts[0] } : {}) };
+        if (rotated.platform) {
+          const waves = (await rt.autopilotManager().loadState()).waves;
+          const wave = waves.find(item => item.planId === report.planId);
+          if (wave) {
+            const incidents = await rt.store.readJson<{ incidents: Incident[] }>('plan', join(rt.paths.dir, 'watcher-incidents.json'));
+            incidentResponse = incidents?.incidents.some(incident => incident.id === wave.incidentId && incident.host === rotated?.platform) === true;
+          }
+        }
       }
     }
-    return { svg: renderCard({ score, optIn, ...(rotated ? { rotated } : {}) }), score };
+    let svg = renderCard({ score, optIn, ...(rotated ? { rotated } : {}) });
+    // The report renderer's contract predates incident provenance. Replace only
+    // its fixed, allow-listed platform sentence; no untrusted markup is added.
+    if (!incidentResponse) svg = svg.replace(/after the (Railway|Vercel|Render|Fly\.io|GitHub Actions) incident/g, 'rotated on $1');
+    return { svg, score };
   }
 
   async function spendLimits(apply: boolean, clusterIds?: string[]) {

@@ -123,7 +123,7 @@ async function remoteRequest(id: string, deps: AutopilotApprovalDependencies, no
 }
 
 /** Returns null only for an unknown local id, allowing the existing monitor approval path to run. */
-export async function approveAutopilot(id: string, options: {relay?: boolean}, deps: AutopilotApprovalDependencies): Promise<AutopilotApprovalResult | null> {
+export async function approveAutopilot(id: string, options: {relay?: boolean; reviewDigest?: string}, deps: AutopilotApprovalDependencies): Promise<AutopilotApprovalResult | null> {
   deps.assertHuman('approve an autopilot action');
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new CliError('The autopilot approval id is invalid.');
   let approvalAccepted = false;
@@ -137,6 +137,7 @@ export async function approveAutopilot(id: string, options: {relay?: boolean}, d
       rpId: 'localhost', origins: ['http://localhost'], now: deps.now }) : null;
     const priorGrant = service ? (await service.approved()).find(entry => entry.action.id === id) : undefined;
     const request = local ? checkLocal(local, id, now, priorGrant?.grant.digest) : await remoteRequest(id, deps, now);
+    if (options.reviewDigest !== undefined && request.digest !== options.reviewDigest) throw new CliError('The action changed. Review it again before approving.');
     deps.review?.({ actionId: id, clusters: request.clusters });
     if (!deps.confirm) throw new CliError('Review and confirm this autopilot action before approving it.');
     if (!await deps.confirm(id)) return { actionId: id, digest: request.digest, status: 'cancelled' };
