@@ -27,7 +27,6 @@
   "license": "Apache-2.0",
   "private": true,
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.2",
     "commander": "^12.1.0",
     "fast-xml-parser": "5.11.2",
     "libsodium-wrappers": "^0.8.4",

@@ -1,9 +1,8 @@
 import { CliError } from './errors.js';
-import { createInterface } from 'node:readline';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
-import { RotationAbortedError, type GuidedPrompt, type ProviderId } from '../types.js';
+import { RotationAbortedError, type GraceDecision, type GraceInfo, type GuidedPrompt, type ProviderId } from '../types.js';
 import { getProvider } from '../providers/index.js';
 
 /** Separate the terminal from diagnostics so an explicit reveal never reaches a log sink. */
@@ -26,7 +25,9 @@ export function hasInteractiveTerminal(io: PromptIO = {}): boolean {
 }
 
 /** Read raw data rather than keypresses: newlines inside bracketed paste are part of the value. */
-async function readHidden(io: NonNullable<ReturnType<typeof terminal>>): Promise<{ value: string | null; pasted: boolean }> {
+async function readHidden(io: NonNullable<ReturnType<typeof terminal>>, countdown?: {
+  deadline: number; now: () => Date; tick: (remainingMs: number) => void;
+}): Promise<{ value: string | null; pasted: boolean }> {
   const { input, output } = io;
   const previousRaw = input.isRaw === true;
   const wasFlowing = input.readableFlowing === true;
@@ -40,11 +41,15 @@ async function readHidden(io: NonNullable<ReturnType<typeof terminal>>): Promise
       let pasted = false;
       let done = false;
       let escapeTimer: ReturnType<typeof setTimeout> | undefined;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      let countdownTimer: ReturnType<typeof setInterval> | undefined;
       const decoder = new StringDecoder('utf8');
       const finish = (error?: Error) => {
         if (done) return;
         done = true;
         clearTimeout(escapeTimer);
+        clearTimeout(deadlineTimer);
+        clearInterval(countdownTimer);
         input.removeListener('data', onData);
         input.removeListener('end', onEnd);
         input.removeListener('error', onError);
@@ -115,6 +120,20 @@ async function readHidden(io: NonNullable<ReturnType<typeof terminal>>): Promise
       input.on('data', onData);
       input.once('end', onEnd);
       input.once('error', onError);
+      if (countdown) {
+        const remaining = () => Math.max(0, countdown.deadline - countdown.now().getTime());
+        countdown.tick(remaining());
+        countdownTimer = setInterval(() => countdown.tick(remaining()), 1000);
+        // Node clamps longer timers to 1 ms, so re-arm instead of shortening a long grace period.
+        const scheduleDeadline = () => {
+          deadlineTimer = setTimeout(() => {
+            if (remaining() > 0) { scheduleDeadline(); return; }
+            // Settle the pending read as Enter would; finish removes every listener/timer.
+            value = ''; pending = ''; finish();
+          }, Math.min(remaining(), 2_147_483_647));
+        };
+        scheduleDeadline();
+      }
       input.resume();
     });
   } finally {
@@ -123,13 +142,72 @@ async function readHidden(io: NonNullable<ReturnType<typeof terminal>>): Promise
   }
 }
 
-export async function confirmRotation(count: number, write: (text: string) => void): Promise<boolean> {
-  if (!process.stdin.isTTY) { write('Interactive confirmation requires a terminal. Pass --yes after reviewing the dry run.'); return false; }
-  const input = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const answer = await new Promise<string>(resolve => input.question(`Type ${count} to rotate ${count} secret cluster(s): `, resolve));
-    return answer.trim() === String(count);
-  } finally { input.close(); }
+export async function confirmRotation(count: number, write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {
+  const tty = terminal(io);
+  if (!tty) { write('Interactive confirmation requires a terminal.'); return false; }
+  write(`Type ${count} to rotate ${count} secret cluster(s): `);
+  const answer = await readHidden(tty);
+  return answer.value === String(count) && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+/** Credential input has no argv or @file form; the value is accepted only in memory. */
+export async function promptVaultValue(name: string, write: (text: string) => void, io: PromptIO = {}): Promise<string | null> {
+  const tty = terminal(io);
+  if (!tty) throw new CliError('Hidden credential input requires an interactive terminal. Use --stdin with piped input.');
+  write(`Enter ${name} (hidden); press Enter with an empty value to cancel.`);
+  const answer = await readHidden(tty);
+  return validateValue(answer.value);
+}
+
+export async function promptPassphrase(write: (text: string) => void, io: PromptIO = {}): Promise<Buffer> {
+  const tty = terminal(io);
+  if (!tty) throw new CliError('Hidden passphrase input requires an interactive terminal. Set KEYSENTRY_VAULT_PASSPHRASE for non-interactive use.');
+  write('Enter the encrypted-file passphrase (hidden):');
+  const answer = await readHidden(tty);
+  if (answer.value === null) throw new CliError('The passphrase cannot be empty.');
+  if (/[\x00-\x1f\x7f-\x9f]/.test(answer.value)) throw new CliError('The passphrase contains unsupported control characters.');
+  return Buffer.from(answer.value, 'utf8');
+}
+
+export async function confirmVaultFallback(store: string, reason: string, write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {
+  const tty = terminal(io);
+  if (!tty) return false;
+  write(`keysentry can't use ${store} here (${reason}). Keep keys in an encrypted file protected by a passphrase instead? [y/N]`);
+  const answer = await readHidden(tty);
+  return /^(?:y|yes)$/i.test(answer.value ?? '') && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+export async function confirmStateReset(write: (text: string) => void, io: PromptIO = {}): Promise<boolean> {
+  const tty = terminal(io);
+  if (!tty) return false;
+  write('Type RESET and press Enter to delete saved state. The audit log will be kept.');
+  const answer = await readHidden(tty);
+  return answer.value === 'RESET' && !answer.pasted && hasInteractiveTerminal(io);
+}
+
+/** The engine re-verifies before revocation, including when this countdown expires. */
+export async function promptGrace(info: GraceInfo, write: (text: string) => void, io: PromptIO = {}, now: () => Date = () => new Date()): Promise<GraceDecision> {
+  const deadline = Date.parse(info.deadline);
+  if (!Number.isFinite(deadline)) throw new CliError('The rotation grace deadline is invalid.');
+  if (deadline <= now().getTime()) return 'revoke';
+  const tty = terminal(io);
+  if (!tty) throw new CliError('Grace decisions require an interactive terminal.');
+  const minutes = Math.ceil((deadline - now().getTime()) / 60_000);
+  write(`New keys are live. Old keys stay valid for ${minutes} minutes so you can undo.\nEnter: revoke now · u: undo · l: later (run "keysentry finish")`);
+  const tick = (remainingMs: number) => {
+    const seconds = Math.ceil(remainingMs / 1000);
+    write(`Old keys stay valid for ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}.`);
+  };
+  while (true) {
+    const answer = await readHidden(tty, { deadline, now, tick });
+    if (deadline <= now().getTime()) return 'revoke';
+    if (!answer.pasted) {
+      if (answer.value === null) return 'revoke';
+      if (answer.value?.toLowerCase() === 'u') return 'undo';
+      if (answer.value?.toLowerCase() === 'l') return 'defer';
+    }
+    write('Press Enter to revoke now, u to undo, or l to leave old keys valid until keysentry finish.');
+  }
 }
 
 /** Pending actions need their exact id typed locally before they can change credentials. */

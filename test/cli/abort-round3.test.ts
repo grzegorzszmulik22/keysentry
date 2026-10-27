@@ -3,12 +3,29 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createRuntime } from '../../src/cli/runtime.js';
+import { createRuntime as productionCreateRuntime } from '../../src/cli/runtime.js';
 import { runCli } from '../../src/cli/index.js';
 import { RotationAbortedError, type RotationReport } from '../../src/types.js';
 import { getProvider } from '../../src/providers/index.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
+import { createFakeVault } from '../helpers/fake-vault.js';
+import { createFakeInFlight } from '../helpers/fake-inflight.js';
+
+// Phase 1 uses an injected vault and encrypted state; tests never open the OS store.
+const vaults = new Map<string, ReturnType<typeof createFakeVault>>();
+async function createRuntime(options: NonNullable<Parameters<typeof productionCreateRuntime>[0]> = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  const vault = vaults.get(cwd) ?? createFakeVault();
+  vaults.set(cwd, vault);
+  const runtime = await productionCreateRuntime({
+    vault, inflight: createFakeInFlight(), userDir: join(cwd, '.user'),
+    stdinIsTTY: true, stdoutIsTTY: true, grace: async () => 'revoke', ...options,
+  });
+  // Existing behavioral tests settle immediately; grace/recovery have focused coverage.
+  runtime.config.rotation.graceMs = 0;
+  return runtime;
+}
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -30,7 +47,7 @@ async function fixture(method: 'auto' | 'atomic-roll' | 'guided' = 'atomic-roll'
   const inv = await runtime.scan();
   const plan = await runtime.plan({ clusterIds: inv.clusters.map(cluster => cluster.id) });
   plan.steps.sort((left, right) => left.consumers[0]!.service.serviceId.localeCompare(right.consumers[0]!.service.serviceId));
-  const report = async () => JSON.parse(await readFile(join(runtime.paths.dir, 'rotation-report.json'), 'utf8')) as RotationReport;
+  const report = async () => (await runtime.store.readJson<RotationReport>('report', join(runtime.paths.dir, 'rotation-report.json')))!;
   const assertSecretFree = async (extra: unknown) => {
     const metadata = JSON.stringify(extra) + await readFile(join(runtime.paths.dir, 'rotation-report.json'), 'utf8') + await readFile(runtime.paths.journal, 'utf8');
     for (const key of provider.keys.values()) expect(metadata.includes(key.value)).toBe(false);

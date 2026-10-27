@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -17,7 +17,151 @@ const prompt: GuidedPrompt = {
 const info = { clusterId: 'cluster-one', provider: 'google' as const, hint: null, reason: 'The rolled key could not be written.' };
 const dirs: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
+});
+
+describe('vault prompts', () => {
+  it('reads a credential hidden and never interprets @ as a file', async () => {
+    const t = terminal();
+    const result = prompts.promptVaultValue('RAILWAY_TOKEN', t.write, t.io);
+    t.stream.write('@opaque-vault-value\r');
+    expect(await result).toBe('@opaque-vault-value');
+    expect(t.output.join('')).not.toContain('@opaque-vault-value');
+    expect(t.diagnostics.join('')).not.toContain('@opaque-vault-value');
+    expect(t.diagnostics.join('')).toContain('RAILWAY_TOKEN');
+    expect(t.raw).toEqual([true, false]);
+  });
+
+  it('allows an empty credential prompt to cancel', async () => {
+    const t = terminal();
+    const result = prompts.promptVaultValue('RAILWAY_TOKEN', t.write, t.io);
+    t.stream.write('\r');
+    expect(await result).toBeNull();
+  });
+
+  it('reads a passphrase into a Buffer without echoing it', async () => {
+    const t = terminal();
+    const result = prompts.promptPassphrase(t.write, t.io);
+    t.stream.write('a long opaque passphrase\r');
+    const passphrase = await result;
+    expect(Buffer.isBuffer(passphrase)).toBe(true);
+    expect(passphrase.toString()).toBe('a long opaque passphrase');
+    expect(t.output.join('') + t.diagnostics.join('')).not.toContain('a long opaque passphrase');
+    passphrase.fill(0);
+  });
+
+  it('refuses an empty passphrase', async () => {
+    const t = terminal();
+    const result = prompts.promptPassphrase(t.write, t.io);
+    t.stream.write('\r');
+    await expect(result).rejects.toThrow(/passphrase.*empty/i);
+  });
+
+  it('asks the exact fallback question and accepts an explicit y', async () => {
+    const t = terminal();
+    const result = prompts.confirmVaultFallback('linux-secret-service', 'store unavailable', t.write, t.io);
+    t.stream.write('y\r');
+    expect(await result).toBe(true);
+    expect(t.diagnostics).toContain("keysentry can't use linux-secret-service here (store unavailable). Keep keys in an encrypted file protected by a passphrase instead? [y/N]");
+  });
+
+  it.each(['', 'n', 'yes please'])('declines fallback without an explicit yes (%j)', async answer => {
+    const t = terminal();
+    const result = prompts.confirmVaultFallback('windows-dpapi', 'store unavailable', t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(false);
+  });
+
+  it('requires typed RESET before deleting state', async () => {
+    const t = terminal();
+    const result = prompts.confirmStateReset(t.write, t.io);
+    t.stream.write('RESET\r');
+    expect(await result).toBe(true);
+    expect(t.diagnostics.join('')).toContain('RESET');
+  });
+
+  it.each(['reset', ' RESET', 'RESET ', '\x1b[200~RESET\x1b[201~'])('refuses another or pasted reset confirmation (%j)', async answer => {
+    const t = terminal();
+    const result = prompts.confirmStateReset(t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(false);
+  });
+
+  it('does not read hidden values or accept confirmations from a nonterminal', async () => {
+    for (const flags of [[false, true], [true, false]]) {
+      const t = terminal(...flags);
+      await expect(prompts.promptPassphrase(t.write, t.io)).rejects.toThrow(/terminal/i);
+      await expect(prompts.promptVaultValue('RAILWAY_TOKEN', t.write, t.io)).rejects.toThrow(/terminal/i);
+      expect(await prompts.confirmVaultFallback('windows-dpapi', 'unavailable', t.write, t.io)).toBe(false);
+      expect(await prompts.confirmStateReset(t.write, t.io)).toBe(false);
+      expect(t.raw).toEqual([]);
+    }
+  });
+});
+
+describe('rotation grace prompt', () => {
+  const grace = () => ({ planId: 'plan-one', deadline: new Date(Date.now() + 120_000).toISOString(), clusters: [] });
+
+  it.each([['', 'revoke'], ['u', 'undo'], ['l', 'defer']] as const)('accepts %j as %s', async (answer, decision) => {
+    const t = terminal();
+    const result = prompts.promptGrace(grace(), t.write, t.io);
+    t.stream.write(answer + '\r');
+    expect(await result).toBe(decision);
+    expect(t.diagnostics.join('\n')).toContain('New keys are live. Old keys stay valid for 2 minutes so you can undo.');
+    expect(t.diagnostics.join('\n')).toContain('Enter: revoke now · u: undo · l: later (run "keysentry finish")');
+    expect(t.input.listenerCount('data')).toBe(0);
+    expect(t.raw).toEqual([true, false]);
+  });
+
+  it('shows a countdown and revokes at the deadline without input', async () => {
+    vi.useFakeTimers();
+    const t = terminal();
+    const result = prompts.promptGrace({ ...grace(), deadline: new Date(Date.now() + 2500).toISOString() }, t.write, t.io);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(t.diagnostics.join('\n')).toMatch(/0:02/);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(await result).toBe('revoke');
+    expect(t.input.listenerCount('data')).toBe(0);
+    expect(t.raw).toEqual([true, false]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('revokes directly when the deadline has already passed', async () => {
+    const t = terminal();
+    expect(await prompts.promptGrace({ ...grace(), deadline: new Date(Date.now() - 1).toISOString() }, t.write, t.io)).toBe('revoke');
+    expect(t.raw).toEqual([]);
+  });
+
+  it('clears countdown timers and restores the terminal on cancellation', async () => {
+    vi.useFakeTimers();
+    const t = terminal();
+    const result = prompts.promptGrace(grace(), t.write, t.io);
+    t.stream.write('\x03');
+    await expect(result).rejects.toBeInstanceOf(RotationAbortedError);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(t.raw).toEqual([true, false]);
+  });
+
+  it('does not shorten a grace period that exceeds the Node timer limit', async () => {
+    vi.useFakeTimers();
+    const t = terminal();
+    let settled = false;
+    const result = prompts.promptGrace({ ...grace(), deadline: new Date(Date.now() + 40 * 86_400_000).toISOString() }, t.write, t.io);
+    void result.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(2);
+    expect(settled).toBe(false);
+    t.stream.write('l\r');
+    expect(await result).toBe('defer');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('uses an injected terminal for rotation confirmation', async () => {
+    const t = terminal();
+    const result = prompts.confirmRotation(2, t.write, t.io);
+    t.stream.write('2\r');
+    expect(await result).toBe(true);
+  });
 });
 
 function terminal(inputTty = true, outputTty = true, initiallyPaused = true) {

@@ -1,4 +1,6 @@
-# Credentials belong in environment variables, never in this file.
+# Credentials belong in the vault, never in this file.
+# Run keysentry vault import-env or keysentry vault set <NAME>.
+# Existing environment credentials remain a fallback.
 # Environment scope settings override matching YAML settings.
 hosts:
   railway:
@@ -21,9 +23,18 @@ hosts:
   dotenv:
     enabled: true
     roots: [.] # resolved from --cwd
+    # Sandbox grants these roots read access only. Dotenv updates need explicit
+    # KEYSENTRY_NO_SANDBOX=1 when outside .keysentry/ and the user data directory.
     includeTemplates: false
 
+network:
+  # Exact additional HTTPS hostnames you approve (no paths, wildcards or IPs).
+  # Custom Supabase domains belong here; ordinary *.supabase.co is built in.
+  allowHosts: []
+  # allowHosts: [database.example.com]
+
 rotation:
+  graceSeconds: 120 # 0 disables grace; undo needs a readable, still-valid old key
   revoke: after-deploy
   redeploy: true
   revokeUnconfirmed: false # --revoke-unconfirmed accepts unconfirmed activation
@@ -35,10 +46,10 @@ rotation:
 
 monitor:
   interval: 300 # seconds
-  autoExecute: false # rotations require approval unless explicitly enabled
+  autoExecute: false # automatic actions require human terminal startup when enabled
   autoContain: false # cap/disable requires approval; env: KEYSENTRY_AUTO_CONTAIN
   containCooldownMinutes: 60
-  # High-confidence canary/leak/upstream revocation may kill a compromised old key
+  # High-confidence canary/leak/upstream revocation may revoke an exposed old key
   # before manual restart / next deployment is confirmed. This can break consumers.
   # Env override: KEYSENTRY_REVOKE_UNCONFIRMED_ON_HIGH_CONFIDENCE=true|false
   revokeUnconfirmedOnHighConfidence: true

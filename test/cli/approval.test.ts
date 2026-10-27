@@ -4,12 +4,29 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from '../../src/cli/index.js';
-import { createRuntime } from '../../src/cli/runtime.js';
+import { createRuntime as productionCreateRuntime } from '../../src/cli/runtime.js';
 import { RotationAbortedError } from '../../src/types.js';
 import { createMonitorState } from '../../src/monitor/index.js';
 import { getProvider } from '../../src/providers/index.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
+import { createFakeVault } from '../helpers/fake-vault.js';
+import { createFakeInFlight } from '../helpers/fake-inflight.js';
+
+// Phase 1 uses an injected vault and encrypted state; tests never open the OS store.
+const vaults = new Map<string, ReturnType<typeof createFakeVault>>();
+async function createRuntime(options: NonNullable<Parameters<typeof productionCreateRuntime>[0]> = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  const vault = vaults.get(cwd) ?? createFakeVault();
+  vaults.set(cwd, vault);
+  const runtime = await productionCreateRuntime({
+    vault, inflight: createFakeInFlight(), userDir: join(cwd, '.user'),
+    stdinIsTTY: true, stdoutIsTTY: true, grace: async () => 'revoke', ...options,
+  });
+  // Existing behavioral tests settle immediately; grace/recovery have focused coverage.
+  runtime.config.rotation.graceMs = 0;
+  return runtime;
+}
 
 const directories: string[] = [];
 afterEach(async () => { for (const path of directories.splice(0)) await rm(path, { recursive: true, force: true }); });
@@ -32,7 +49,7 @@ async function fixture(method: 'auto' | 'guided' | 'atomic-roll' = 'auto', manua
   expect(inv.clusters).toHaveLength(1); expect(inv.clusters[0]?.provider).toBe(provider.id);
   state.pendingActions.push({ id: 'review-this-action', createdAt: new Date().toISOString(), signalId: 'signal-test', action: 'rotate',
     clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending', highConfidence: true, revokeUnconfirmed: true });
-  await writeFile(runtime.paths.monitor, JSON.stringify(state));
+  await runtime.store.writeJson('monitor', runtime.paths.monitor, state);
   const output: string[] = []; const errors: string[] = [];
   return { runtime, host, provider, original, state, output, errors,
     io: { runtime, output: (line: string) => output.push(line), error: (line: string) => errors.push(line) } };
@@ -53,9 +70,10 @@ describe('pending action approval safety', () => {
     expect(JSON.parse(f.output.at(-1)!).cancelled).toBe(true);
   });
 
-  it('requires confirmation on a non-TTY unless --yes and still prints the action with --yes', async () => {
+  it('requires a human TTY even with --yes and still prints the reviewed action on a TTY', async () => {
     const f = await fixture();
-    expect(await runCli(['approve', 'review-this-action'], f.io)).toBe(1);
+    // --yes only skips the question in phase 1; it never bypasses the human TTY gate.
+    expect(await runCli(['approve', 'review-this-action', '--yes'], { ...f.io, stdinIsTTY: false, stdoutIsTTY: false })).toBe(1);
     expect(f.host.writes).toHaveLength(0);
     expect(await runCli(['approve', 'review-this-action', '--yes'], { ...f.io, confirmAction: async () => { throw new Error('must bypass'); } })).toBe(0);
     expect(f.host.writes).toHaveLength(1);
@@ -64,7 +82,7 @@ describe('pending action approval safety', () => {
 
   it('refuses atomic-roll approvals on a non-TTY even with --yes before invalidating the old token', async () => {
     const f = await fixture('atomic-roll');
-    expect(await runCli(['approve', 'review-this-action', '--yes'], f.io)).toBe(1);
+    expect(await runCli(['approve', 'review-this-action', '--yes'], { ...f.io, stdinIsTTY: false, stdoutIsTTY: false })).toBe(1);
     expect(f.errors.join('\n')).toMatch(/interactive terminal/i);
     expect(f.provider.keys.size).toBe(1); expect(f.provider.keys.get(f.original.ref)?.active).toBe(true);
     expect(f.host.writes).toHaveLength(0);
@@ -73,17 +91,17 @@ describe('pending action approval safety', () => {
 
   it('honors the recorded interactive requirement even when the current plan has no atomic roll', async () => {
     const f = await fixture(); f.state.pendingActions[0]!.requiresInteractive = true;
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(f.state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, f.state);
     await expect(f.runtime.approve('review-this-action', { interactive: false })).rejects.toThrow(/interactive terminal/i);
     expect(f.provider.keys.size).toBe(1); expect(f.host.writes).toHaveLength(0);
   });
 
   it('shows the recorded revocation choice and never broadens legacy actions', async () => {
     const f = await fixture(); delete f.state.pendingActions[0]!.revokeUnconfirmed;
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(f.state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, f.state);
     expect((await f.runtime.reviewAction('review-this-action')).revokeUnconfirmed).toBe(false);
     f.state.pendingActions[0]!.revokeUnconfirmed = true;
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(f.state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, f.state);
     f.runtime.config.monitor.policy.revokeUnconfirmedOnHighConfidence = false;
     expect((await f.runtime.reviewAction('review-this-action')).revokeUnconfirmed).toBe(false);
   });
@@ -98,11 +116,11 @@ describe('pending action approval safety', () => {
 
   it('refuses an action whose revocation choice changed while the human confirmed it', async () => {
     const f = await fixture('auto', true); f.state.pendingActions[0]!.revokeUnconfirmed = false;
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(f.state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, f.state);
     expect(await runCli(['approve', 'review-this-action'], { ...f.io, confirmAction: async () => {
       expect(f.errors.join('\n')).toContain('revokeUnconfirmed: false');
       f.state.pendingActions[0]!.revokeUnconfirmed = true;
-      await writeFile(f.runtime.paths.monitor, JSON.stringify(f.state)); return true;
+      await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, f.state); return true;
     } })).toBe(1);
     expect(f.errors.join('\n')).toMatch(/changed after review/i);
     expect(f.host.writes).toHaveLength(0); expect(f.provider.revoked).toHaveLength(0);
@@ -139,7 +157,7 @@ describe('pending action approval safety', () => {
     const f = await fixture(); let scans = 0; const list = f.host.listServices.bind(f.host);
     f.host.listServices = async () => { scans++; return list(); };
     await f.runtime.monitorOnce(); expect(scans).toBe(1);
-    const saved = JSON.parse(await readFile(f.runtime.paths.inventory, 'utf8'));
+    const saved = (await f.runtime.store.loadInventory())!;
     expect(saved.clusters).toHaveLength(1);
   });
 

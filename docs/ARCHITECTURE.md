@@ -1,6 +1,6 @@
 # keysentry architecture and module specs
 
-keysentry is a local-first CLI (plus an MCP server for coding agents). It finds every copy of every secret across a
+keysentry is a local CLI. It finds every copy of every secret across a
 team's hosts, rotates them in a safe order with one redeploy per service, verifies the new keys, revokes the old ones,
 and monitors keys so it can contain or rotate them when it sees suspicious use.
 
@@ -9,9 +9,7 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 
 ## Non-negotiable safety rules (every module)
 
-1. **Never persist or print a plaintext secret.** On disk store only keyed fingerprints (`core/fingerprint`) and hints
-   (prefix ≤ 7 chars + `…` + last 4, only for values ≥ 16 chars). Logs go through the `Redactor`. Error messages must
-   not include request bodies or headers that contain secrets.
+1. **Never persist a secret in plaintext, and never keep one after it is needed.** Inventory, plans, journal and monitor state are encrypted with a vault-held key. New and readable old rotation values exist only in memory and the encrypted `InFlightStore`; destroy their per-plan key and remove records when the rotation or full undo finishes. Partial and grace-pending work retains recovery data. Fingerprints use keyed HMAC (`core/fingerprint`); hints expose at most seven prefix and four suffix characters for values of at least 16 characters. Logs pass through the `Redactor`. Never put secrets in argv, child-process environments, URLs, errors, the audit log or network receipt.
 2. **Never delete or alter a variable keysentry was not asked to change.** Hosts whose API replaces the full set must
    read-modify-write. Railway: never `replace: true`.
 3. **Dry-run is the default** for anything that writes to a host or a provider. Writes require `dryRun: false`.
@@ -20,18 +18,25 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 5. **No secrets in URLs or query strings.** Use headers/bodies.
 6. **Fail closed.** If verification of a new key fails, stop that step, do not revoke the old key, report clearly.
 7. Monitoring actions are rate-limited (cooldown per cluster, max automatic rotations per day) to prevent loops.
+8. **Human approval gates mutations.** Mutation entry points refuse known coding-agent environments and require stdin/stdout TTYs, including with `--yes`. Build write-role adapters only after this check and human confirmation. Read commands use read-role credentials.
+9. **All outbound HTTP is guarded.** Adapters, detectors, notifications and release verification share the injected egress-checked `HttpClient`; every attempted request records only host, purpose, method, timestamp and result metadata.
 
 ## Layout and ownership
 
 | Path | Module | Wave |
 |---|---|---|
-| `src/types.ts`, `src/http.ts`, `test/helpers/*` | contracts and test helpers (orchestrator) | 0 |
+| `src/types.ts`, `test/helpers/*` | contracts and test helpers (orchestrator) | 0 |
+| `src/security/` | encryption/signing primitives and tamper-evident audit | phase 1, waves 0-1 |
+| `src/vault/` | OS stores, encrypted-file/env/memory backends, credential roles and key helpers | phase 1, wave 1 |
+| `src/net/`, `src/http.ts` | egress rules, guarded HTTP and network receipt | phase 1, wave 1 |
+| `src/release/`, `scripts/` | local integrity, release checks and reproducible build tooling | phase 1, wave 1 |
+| `src/doctor/`, `src/safety/` | capability guidance, agent refusal and Node permission re-exec | phase 1, wave 2 |
 | `src/core/` | fingerprint, classify, inventory, plan/runbook, redaction/logging, state store, random | 1 |
 | `src/hosts/` | host adapters: railway, vercel, render, fly, github-actions, dotenv | 1 |
 | `src/providers/` | provider adapters + registry | 1 |
 | `src/rotate/` | rotation engine | 2 |
 | `src/monitor/` | detectors, policy, canaries, daemon, notifier | 2 |
-| `src/cli/`, `src/mcp/`, `skill/`, `README.md` | CLI, config, MCP server, agent skill, e2e tests | 3 |
+| `src/cli/`, `README.md` | CLI integration, configuration, prompts and e2e tests | phase 1, wave 3 |
 
 Tests live in `test/<module>/*.test.ts`. Each module exports its public API from `src/<module>/index.ts`.
 
@@ -40,7 +45,7 @@ Tests live in `test/<module>/*.test.ts`. Each module exports its public API from
 ### core (`src/core/`)
 Public API (`src/core/index.ts`):
 - `fingerprint.ts`
-  - `loadOrCreateFingerprintKey(dir?: string): Promise<Buffer>`: 32 random bytes at `<dir ?? ~/.keysentry>/fingerprint.key`, created with mode 0o600 if missing; same key on every later call.
+  - `loadOrCreateFingerprintKey(dir?: string): Promise<Buffer>` remains a 0.1 compatibility helper. Production uses `vault/fingerprintKey(vault, projectId, <userDir>/fingerprint.key)`: a project-scoped vault key, importing and deleting a legacy file only after read-back verification.
   - `fingerprint(value: string, key: Buffer): string`: HMAC-SHA256(key, value), hex, first 32 chars.
   - `makeHint(value: string): string | null`: `prefix + '…' + last4` where prefix is the known key prefix if one matches (e.g. `sk-or-v1-`, `sk_live_`, `sk-ant-`, `ghp_`, `AKIA`), else the first 4 chars; capped at 7 chars of prefix; null when `value.length < 16`.
 - `classify.ts`
@@ -56,7 +61,9 @@ Public API (`src/core/index.ts`):
   - `renderRunbook(plan: RotationPlan, inv: Inventory): string`: Markdown runbook: summary counts, then numbered steps (tier, provider, hint, method, every consumer as `host/service:VAR`), what to do per method (guided steps include the provider dashboard hint), and the "one redeploy per service" list. No values.
   - `renderBlastRadius(inv: Inventory): string`: Markdown report: totals, clusters with more than one consumer first ("this key lives in N places"), tier breakdown, sealed secrets that must be rotated blind, scan errors.
 - `redact.ts`: `createRedactor(): Redactor` (registered values ≥ 6 chars are replaced by `«redacted»`; also masks any substring matching the high-confidence key patterns from classify); `createLogger(opts: { redactor: Redactor; level?: 'debug'|'info'|'warn'|'error'; json?: boolean; sink?: (line: string) => void }): Logger` writing redacted lines to stderr by default.
-- `store.ts`: state lives in `<cwd>/.keysentry/`. `statePaths(cwd)`, `saveInventory`, `loadInventory`, `writeJsonAtomic(path, data)` (write temp + rename), `readJson`, `createFileJournal(path): Journal` (JSONL, append-only), `appendAudit(path, event)` (JSONL). Files are created with mode 0o600 where the OS supports it. A `.gitignore` containing `*` is written into `.keysentry/` on first use.
+- `store.ts`: production uses `createStateStore({ cwd, cipher: createStateCipher(key) })` in `<cwd>/.keysentry/`. JSON records start with `keysentry-encrypted:v1` followed by base64 sealed bytes; journal lines are individually sealed with kind-specific authenticated data. The store exposes typed `writeJson`/`readJson`, inventory helpers, `journal()` and `migratePlaintext()`. A missing/wrong key raises `StateLockedError` without silently overwriting saved state. Legacy 0.1 plaintext helpers remain for compatibility tests, not CLI persistence. Files use private modes where supported and `.keysentry/.gitignore` ignores all contents.
+- `inflight.ts`: `createInFlightStore({ dir, vault, projectId })` stores per-plan values under a one-time vault key. `put` fsyncs before returning; `shred` deletes the key before removing the records. A shredded plan cannot accept later values.
+- CLI wraps the store journal so every event is mirrored as metadata to `security/createAuditLog`; no plaintext state/audit helper is used for production persistence.
 - `random.ts`: `generateSecret(likeValue?: string): string`: 32 random bytes; preserves the format of `likeValue` when it is clearly hex or base64/base64url of similar length; default base64url.
 
 ### hosts (`src/hosts/`)
@@ -122,6 +129,9 @@ interface EngineDeps {
   providers: (id: ProviderId) => ProviderAdapter;
   providerCtx: ProviderContext;            // engine clones it per step with siblingVars
   journal: Journal;
+  inflight?: InFlightStore;
+  grace?: (info: GraceInfo) => Promise<GraceDecision>;
+  crashHook?: (point: CrashPoint, detail: { clusterId?: string; serviceKey?: string }) => void;
   prompt: (p: GuidedPrompt) => Promise<string | null>;   // null = skip this step
   fingerprintKey: Buffer;
   redactor: Redactor;
@@ -135,24 +145,25 @@ interface RotateOptions {
   redeploy: boolean;            // default true
   deployTimeoutMs: number;      // default 600_000
   pollIntervalMs: number;       // default 5_000
+  graceMs?: number;            // engine default 0; CLI defaults to 120_000
 }
 ```
 
 Phases:
 1. **Read current values.** For each step, read the current plaintext from the first readable consumer (re-read from the host at execution time; the inventory has no plaintext). Re-fingerprint; if it no longer matches the cluster fingerprint, warn and skip (stale inventory). Sealed clusters have no readable value: auto providers that need the old value fall back to guided.
-2. **Create new credentials** in plan order: auto/atomic-roll/generate via `provider.rotate`; guided via `deps.prompt` (null → skipped). Register every new value with the redactor immediately. Verify each new value with `provider.verify`; on failure mark the step failed and do not write it (if the provider already created a key, try to revoke the new key and report).
+2. **Create new credentials** in plan order: auto/atomic-roll/generate via `provider.rotate`; guided via `deps.prompt` (null means skip). Immediately store the new value through `inflight.put` before another awaited operation, then journal `value-stored`. Register the new value with the redactor and verify it before writing. Store readable old values before host writes. If verification fails, do not write it; cleanup/reporting preserves recovery data whenever delivery may have happened.
 3. **Batch writes per service**: merge every new value (and companions) for each service into one `writeVariables(service, vars, { skipDeploy: true })` call. Variable names come from each consumer's `varName`.
 4. **One redeploy per service** (when the host has the redeploy capability and `opts.redeploy`), then poll `deploymentStatus` until success/failed/timeout.
-5. **Revoke old keys**: per step, only if every consumer service was written, and (for `after-deploy`) every redeploy for those services succeeded. `atomic-roll` steps are already revoked. `oldKeyRef` comes from `RotationResult.oldKeyRef`, or `provider.resolveKeyRef(oldValue)` for guided steps. For revoke, pass `siblingVars` containing the service's new values.
+5. **Grace and revoke old keys**: default CLI grace is 120 seconds, configurable by `rotation.graceSeconds` (0 disables). After successful writes/deployments, journal deadlines and offer revoke, undo or defer on an interactive terminal. Without a callback the engine waits. Revocation re-verifies the new value; `finishRotation` also checks saved deployment success and the deadline (`early: true` bypasses only the deadline). Atomic-roll steps already invalidated the old value. `oldKeyRef` comes from `RotationResult.oldKeyRef` or guided resolution; revocation uses matching new sibling values.
 6. **Journal** every transition (`deps.journal.append`), and return a `RotationReport`.
 
 Dry run: phases 1 and the diff only: for each service list `VAR: <old hint> → <new>` and the redeploys that would happen. No provider or host writes.
 
-Failure handling: one failed step never blocks other steps, but a failed host write for a service blocks revocation of every step that writes to that service. Writes that partly succeeded are reported per service. Resume: not required in v1, but the journal must contain enough (step, service, event, fingerprints) to see what happened.
+Failure handling: a failed host write blocks revocation of every step delivered to that service. Partial and grace-pending reports retain encrypted in-flight records. `resumeRotation({ plan, inventory, entries }, deps, opts)` reconstructs progress, skips writes whose fingerprints already match, and polls recorded deployments. A create with no durable replacement becomes an orphan suspect; recovery never guesses which key to revoke. `undoRotation` restores saved readable old values, redeploys once per service, verifies the old key and revokes the new key last. Undo is unavailable for unreadable or invalid old values. Completion/full undo crypto-shreds in-flight data. `crashHook` is an injected test seam, not production behavior.
 
 ### monitor (`src/monitor/`)
 Public API (`src/monitor/index.ts`):
-- `state.ts`: monitor state in `.keysentry/monitor.json`: per keyRef usage history (hourly buckets, 30 days), last cumulative totals, canaries, seen feed items, seen GitHub alerts, last verify results, cooldowns, pending actions, auto-rotation counts per day.
+- `state.ts`: encrypted monitor state in `.keysentry/monitor.json` through the supplied state store: per keyRef usage history (hourly buckets, 30 days), last cumulative totals, canaries, seen feed items, seen GitHub alerts, last verify results, cooldowns, pending actions, auto-rotation counts per day.
 - `detectors/usage.ts`: for every inventory cluster whose provider has `usage`/`listKeys` and resolvable keyRef (via `resolveKeyRef` using a value read from a host, or a stored mapping), compute the current window's cost/requests. Baseline: median and MAD of the last 7 days of hourly buckets. Signal `usage_anomaly` when the current hour exceeds max(floorUsd (default 2), median + 8·MAD, 5× the 95th percentile), or when a model never seen for that key costs more than $1 in the window. Cold start (< 24 buckets): only the floor and an optional per-key hourly budget. Confidence: high when > 20× baseline or budget exceeded, else medium.
 - `detectors/canary.ts` + `canary.ts`: `createCanary({ provider: 'openrouter', host, service, varName? })` creates a decoy key (OpenRouter `createCanaryKey`, limit $0.01), plants it in the given host service with `skipDeploy: true` under a plausible name (default `OPENROUTER_API_KEY_FALLBACK`), and records it. The detector raises `canary_triggered` (high) when the decoy's usage > 0 or it has been disabled for reaching its limit; scope = the host/service where it was planted. Also `listCanaries`, `removeCanary`.
 - `detectors/breach-feed.ts`: polls configurable RSS/Atom feeds (defaults for Railway, Vercel, Render, Fly, plus GitHub's changelog security label; leave URLs in one constants table and document that they must be checked). Items whose title/summary match security keywords (`security incident`, `unauthorized access`, `breach`, `compromised`, `rotate`, `environment variables`) and that mention a host present in the inventory raise `host_breach_advisory` (medium). Dedupe by link.
@@ -165,9 +176,18 @@ Public API (`src/monitor/index.ts`):
 
 ## Wave 3
 
-### cli (`src/cli/`), mcp (`src/mcp/`), skill, README
-- `config.ts`: `keysentry.yaml` (optional) + environment. Hosts are enabled when their token env var is set (`RAILWAY_TOKEN` or `RAILWAY_PROJECT_TOKEN`, `VERCEL_TOKEN` (+ `VERCEL_TEAM_ID`), `RENDER_API_KEY`, `FLY_API_TOKEN` (+ `FLY_ORG`), `GITHUB_TOKEN` + configured repos) and dotenv roots default to `.`. Provider admin credentials come from env vars named in `PROVIDER_CREDENTIALS`.
-- Commands (commander): `init` (fingerprint key, `.keysentry/`, sample `keysentry.yaml`), `scan` (writes inventory, prints blast radius), `report [--json]`, `plan [--tier …] [--cluster …] [--host …] [-o runbook.md]`, `rotate [--plan <id>|--tier …|--cluster …] [--execute] [--revoke after-deploy|immediately|never] [--no-redeploy]` (dry run unless `--execute`; interactive confirmation unless `--yes`; guided steps prompt for the new value with hidden input), `canary create|list|remove`, `monitor [--once] [--interval 300]`, `actions` (list pending), `approve <id>`, `dismiss <id>`, `drill` (timed dry run of rotating everything + a readiness score: % auto-rotatable, % sealed, duplicates, missing admin credentials), `mcp` (stdio MCP server).
-- MCP tools (`@modelcontextprotocol/sdk`, stdio): `scan`, `blast_radius`, `plan_rotation`, `rotate` (dry run unless `execute: true` and `confirm: "ROTATE"`), `monitor_status`, `list_pending_actions`. Tool results never contain plaintext values.
-- `skill/SKILL.md`: an agent skill telling coding agents how to use keysentry on breach night (scan → blast radius → plan → dry-run → execute with the human's confirmation).
-- E2E test with fake hosts/providers covering scan → plan → rotate (dry run and execute) → monitor once with a canary hit.
+### CLI (`src/cli/`) and README
+
+- `config.ts`: optional `keysentry.yaml` supplies scope, policy and timing; secrets have no YAML fields. Environment scope overrides remain supported. Credentials come from `createCredentialSource(vault, env)`: reads prefer dedicated `@read` entries, then base entries, then environment; writes use base entries or environment only. Register every token with the output redactor. `network.allowHosts` accepts exact DNS hostnames only, no wildcard or IP; `rotation.graceSeconds` defaults to 120.
+- Bin startup alone calls `maybeReexecWithPermissions` before runtime creation: directory read access to project/user data/dotenv roots and the bundle, write access to project `.keysentry/` and user data, child processes only for vault backends needing helpers. Supported patched Node lines start at 22.23.4, 24.22.1 and 26.12.1. The HTTP guard remains the network control.
+- These fixed write grants deny creation of project `keysentry.yaml` by init, dotenv updates and `plan -o` outputs outside `.keysentry/` and the user directory. `KEYSENTRY_NO_SANDBOX=1` explicitly opts out for commands needing those writes; it disables the Node filesystem/process permission layer, not guarded HTTP. Configured dotenv roots grant reads only.
+- Runtime startup opens the vault (asks before encrypted-file fallback), gets the project ID, builds the encrypted store with `stateKey`, migrates plaintext 0.1 files with one notice, imports the legacy fingerprint key, creates the audit log and wrapped journal, opens the in-flight store, then configures guarded HTTP. Runtime options inject vault/inflight/audit, crash hooks, TTY flags and user directory for tests. Help, version, network and offline verification do not open the vault; audit verification can check a local chain without a vault head, with the corresponding truncation limit.
+- Guard rules combine reviewed defaults, user feed hosts, user webhook hosts and `network.allowHosts`. User rules are identified as added by the user. Only configured webhook URLs are trusted URL exceptions for credential-bearing notification paths; they do not bypass host/HTTPS/redirect checks. Receipts contain no paths and retain active plus one rotated backup.
+- Read commands: `init`, `scan`, `report`, `plan`, `rotate` dry run, `drill`, monitor detection, `actions`, `canary list`, `vault status|list`, `doctor [--probe]`, `network [--since <iso>]`, `audit verify`, `verify [--offline]`. Init writes local setup; scan/plan and doctor write encrypted local metadata, but do not mutate host/provider keys. Doctor probes only when requested, persisting probe fingerprints encrypted.
+- Human mutation gates: `rotate --execute`, `approve`, `resume [planId]`, `finish [planId] [--now]`, `undo <planId> [--cluster <id>]`, canary create/remove with `--execute`, vault set/remove/import-env, `state reset`, and monitor startup with autoExecute or autoContain. Call `assertHumanForMutation` before opening adapters; `--yes` skips confirmation only. Rebuild write-role adapters after the human step. A local bundle mismatch blocks rotation execution; development mode gives one warning.
+- `vault set <NAME> [--role read|write] [--stdin]` accepts only `CREDENTIAL_NAMES` and reads values only through hidden prompt or stdin, never argv. The strict human gate still requires stdin/stdout TTYs with `--stdin`, so ordinary command-line pipes are refused. Embedding/tests can inject explicit TTY capability flags; this is not a normal CLI bypass. Status/list disclose names/backend/weakness only. Import copies present environment credentials and explains they can be removed from the environment.
+- `state reset` requires typing `RESET`, refuses partial/grace-pending in-flight work unless forced, removes encrypted state/in-flight records, keeps the audit log and appends a reset event.
+- Audit mirrors journal event names and plan/cluster/service IDs, scan counts, saved plan ID/step count, approvals, vault names/roles, doctor runs and state reset. Network blocks stay in the receipt. Checkpoint after each command that appended an event. Checkpoints are device-signed and vault-anchored; local-chain verification alone cannot detect all tail truncation.
+- Runtime writes a public presence marker at `<userDir>/audit-heads/<hash>.json`. Its presence triggers vault-anchor lookup even if the project log has been removed. When both marker and log are absent and no vault is injected, verification reports local-chain verification only with the independent head unchecked. The env backend cannot persist a head: signed checkpoints remain verifiable, but heads are process-local, a warning is emitted, and no durable tail-truncation check is available across processes.
+- `verify` first checks local manifest consistency, then published signed checksums online through guarded HTTP. Empty release public keys produce `unconfigured`, not a verified publisher. Current output states: `Release signing keys are not published yet; only the local check ran.` Source checkouts report development integrity. Provenance verification is not implemented in this phase.
+- E2E tests inject fake vaults, HTTP, hosts/providers and temporary directories; no real credential-store helper or network request is used. Cases cover encrypted persistence/audit, receipt hosts, agent refusal, hidden vault input, grace/finish, crash/resume and 0.1 migration.

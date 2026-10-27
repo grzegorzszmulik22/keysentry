@@ -1,59 +1,146 @@
 # keysentry
 
-Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local-first CLI and stdio MCP server for breach response and routine monitoring.
+Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local CLI for routine rotation and monitoring.
 
-It groups readable secrets by keyed fingerprint, so one credential reused under several variable names becomes one rotation step. Sealed values remain visible as separate findings. Inventories, runbooks, reports, journals, and monitor state contain fingerprints, short hints, and metadata rather than secret values.
+> **Status: phase 1 of keysentry 1.0: trust foundation.** Adapters are tested against fakes built from vendor documentation, not yet against live accounts. Native vault helpers are also tested through fakes. Try dry runs and a drill on a staging project before relying on provider writes. Dashboard, passkey arming, cloud boxes and the token-free onboarding wizard are later phases. Release signing keys are not published yet.
 
-## Status
+## The trust promise
 
-All adapters are tested against fakes built from the providers' documentation. None has yet been exercised against live accounts. Run `rotate` dry runs and a drill on a staging project before relying on keysentry.
+The [1.0 design](docs/superpowers/specs/2026-10-27-trust-autopilot-design.md#3-the-trust-promise) sets this promise. The status above and the limits below distinguish the current phase from planned releases and cloud features.
+
+1. **No AI touches your keys.** keysentry is plain code making documented API calls. No model, agent or MCP server
+   is part of it.
+2. **Your keys stay with you.** Self-hosted: on your machine and in your own cloud; keysentry the company never
+   receives them. Cloud box: decrypted only inside a confidential machine running the published open-source build,
+   which you can check (exact wording and limits in §7.10).
+3. **Read-only until you say otherwise.** The first run needs no tokens at all. Until you approve a change, keysentry
+   makes only read calls; it uses read-only tokens wherever the platform offers them, and `doctor` shows exactly what
+   each token you gave it could do. (Several platforms, for example Vercel, Railway and Render, offer no read-only
+   token that can read variable values, so the promise is about what keysentry does, not what the token allows.)
+4. **Nothing changes without your OK**, except rotations you armed in advance for autopilot, and you can see and
+   change exactly what those are at any time.
+5. **No telemetry, no account, no phoning home.** `keysentry network` shows every host it has ever contacted and why.
+6. **Open source with signed, reproducible releases.** You can rebuild the release and get the same bytes, and
+   `keysentry verify` checks the copy you installed.
+7. **Every action is recorded** in a tamper-evident log that you hold.
+
+The current receipt keeps a bounded local history, rather than an unlimited record of every contact. `verify` cannot authenticate a release until public signing keys are configured. The CLI has no model integration; agent detection adds a check for known environments, but cannot identify an agent that removes its markers or protect against other programs running as your user.
 
 ## Run from this checkout
 
-Requires Node.js 20 or newer and the installed project dependencies:
+Requires Node.js **22.13 or newer** and the installed project dependencies. The optional Node permission sandbox requires a patched supported release: **22.23.4, 24.22.1 or 26.12.1 or newer within those major lines**. Older or unsupported Node releases run without that additional sandbox; the HTTP allow-list still applies.
+
+The current sandbox grants writes only to the project's `.keysentry/` directory and the user data directory. It therefore denies creation of `keysentry.yaml` by `init`, dotenv updates and `plan -o` outputs elsewhere, even when those locations can be scanned. For operations that need those writes, explicitly set `KEYSENTRY_NO_SANDBOX=1` for the command. This disables the additional Node filesystem/process restrictions; the guarded HTTP client still applies.
 
 ```sh
 npm run build
 node dist/cli/index.js --help
 ```
 
-The examples below use `keysentry` for the package CLI. From this checkout, substitute `node dist/cli/index.js` or `npm run dev --` for `keysentry`.
+The examples below use `keysentry` for the package CLI. From this checkout, substitute `node dist/cli/index.js` or `npm run dev --` for `keysentry`. A public one-command package onboarding flow is planned for phase 3. This checkout is licensed under [Apache-2.0](LICENSE).
 
-Supply host tokens and provider management credentials through your environment or a trusted secret manager. Avoid putting their values in shell history. The optional [keysentry.example.yaml](keysentry.example.yaml) shows scope, rotation, and monitoring settings; credentials do not belong in YAML.
+## Quick start
 
-## Breach-night quick start: five commands
-
-With credentials already available in the environment, run these from the project being investigated:
+Run these from your project in a normal terminal:
 
 ```sh
+keysentry init
+keysentry vault import-env
+# Or save a particular credential through hidden input:
+keysentry vault set RAILWAY_TOKEN
 keysentry scan
-keysentry report
-keysentry plan -o rotation-runbook.md
+keysentry plan
 keysentry rotate
-keysentry rotate --execute
 ```
 
-`scan` saves a fresh inventory and prints the blast radius, including missing-token hosts. `report` reviews that inventory. `plan` saves an ordered plan and a readable runbook; `rotate` previews the proposed changes without provider or host writes. `rotate --execute` prints the diff again and requires typing the number of secrets before proceeding. Use `--plan <id>` to execute a particular saved plan, or `--tier cloud,ai`, `--cluster <id>`, and `--host <id>` to narrow the selection. Selecting a shared secret retains all of its known consumers, including consumers on other hosts.
+Use either environment import or individual `vault set` commands. `init` creates project state and a sample configuration without overwriting an existing config. A local dotenv scan needs no host token. `scan` saves an encrypted inventory and prints the blast radius, including hosts it could not scan. `plan` saves an encrypted ordered plan and an optional readable runbook. `rotate` previews changes without writing to hosts or providers.
 
-Guided providers show their dashboard and instructions, then request the replacement through hidden terminal input. Use bracketed paste in a supporting terminal for multi-line values, or enter `@<path>` to read a value from a file. Bracketed paste normalizes CRLF and lone CR line endings to LF. Multi-line input must parse as a PEM private key, PEM certificate, or JSON; other multi-line values are rejected. File input strips exactly one trailing LF or CRLF, preserving other whitespace. Single-line input rejects control characters except tab. Input is never echoed; delete any temporary secret file after use. Empty input skips that step; Ctrl-C or Esc aborts the whole rotation before further changes.
+Review the dry run, then run `keysentry rotate --execute` yourself. It prints the diff and requests the number of secrets before proceeding. `--yes` skips that question, but every mutation still requires an interactive human terminal and refuses known coding-agent environments. Use `--plan <id>` to execute a saved plan, or `--tier cloud,ai`, `--cluster <id>`, and `--host <id>` to narrow selection. Selecting a shared secret retains all known consumers, including those on other hosts.
 
-`--yes` skips the numeric confirmation only after you explicitly request `--execute`; it does not create guided replacements or bypass interactive-terminal requirements. Review the final summary, including provider notes and warnings, and `.keysentry/journal.jsonl`, confirm application health, resolve retained old keys, then scan again to verify the resulting inventory. A provider's `unverified` result is not proof that the new credential works.
+Guided providers show their dashboard and instructions, then request the replacement through hidden input. Use bracketed paste for multi-line PEM or JSON values, or enter `@<path>` to read a value from a file. File input removes one trailing newline. Input is not echoed. Delete any temporary secret file after use. Empty input skips the step; Ctrl-C or Esc aborts the rotation before further changes.
 
-Rotation safety flags:
+Global flags are `--cwd <dir>`, `--config <path>`, `--json`, and `--verbose`. Config defaults to `keysentry.yaml` in the selected directory. JSON output excludes plaintext values. Errors use exit status 1; `scan --fail-on-findings` uses 2 for findings requiring attention. A partial scan does not establish that a host is clear. Plans touching a host with scan errors are blocked; unrelated plans may proceed with a warning.
 
-| Flag | Behavior |
-|---|---|
-| `--revoke-unconfirmed` | Allow revocation despite unconfirmed consumer activation. This can break processes still using the old value; use only after reviewing that risk. Defaults off. |
-| `--accept-unplanned-sealed` | Accept the risk that sealed findings outside this plan may still use the old key. Defaults off; include those consumers in the plan when possible. |
-| `--no-generate` | Skip locally generated replacements for self-issued application/session secrets. Generation is allowed by default for interactive CLI rotation. |
+## Vault and credential roles
 
-Atomic-roll execution requires an interactive terminal, including through `approve`; `--yes` does not bypass this requirement. If an atomic roll needs manual recovery, keysentry offers to show the new value once only on that terminal, after a warning and the exact response `SHOW`. Otherwise it points to the provider dashboard. Keep that terminal private and inspect the recovery warning before proceeding.
+Tokens and keysentry's encryption/signing keys live in macOS Keychain, Windows current-user DPAPI, or Linux Secret Service. If an OS store is unavailable, keysentry asks before using a passphrase-protected encrypted file in `~/.keysentry/`. A new file asks for the passphrase twice. Linux Secret Service needs `secret-tool` (usually the `libsecret-tools` package) and a session bus.
 
-Global flags are `--cwd <dir>`, `--config <path>`, `--json`, and `--verbose`. The config defaults to `keysentry.yaml` under the selected working directory. JSON output excludes plaintext values. Exit status is 0 for a successful command and 1 for an error, including failed scans of enabled hosts; `scan --fail-on-findings` additionally uses 2 for findings requiring attention. Partial scans and disabled hosts do not establish that a host is clean. A scan error blocks execution of plans touching a cluster with a consumer on the failed host; unrelated plans may proceed with a warning. Monitoring continues its detectors on the partial inventory and excludes affected clusters from automatic actions.
+```sh
+keysentry vault status
+keysentry vault list
+keysentry vault set GITHUB_TOKEN --role read
+keysentry vault set GITHUB_TOKEN --role write
+keysentry vault remove GITHUB_TOKEN --role read
+```
+
+`status` shows the backend, any weakness, and credential names by role. `list` shows names only. `set` never accepts a token argument; use its hidden prompt. Although `--stdin` reads a value from standard input, the current human-terminal gate still requires both input and output to be TTYs, so an ordinary pipe is refused. The default role is `write`. Use only the supported host and provider credential names listed in the tables below. `vault import-env` copies present credentials into the vault; they can then be removed from the environment.
+
+Scanning, reports, plans, drills and monitor detection use read-role credentials. Reads fall back from the dedicated read token to the base token, then the existing environment variable. Approved mutations rebuild adapters with the write token; they never substitute the dedicated read token for writes. A role name does not reduce a token's actual vendor permissions: `doctor` explains those limits.
+
+Existing credential environment names still work. Explicit `KEYSENTRY_VAULT=env` is read-only and needs keysentry's encryption/signing keys supplied separately; `doctor` explains missing settings. `KEYSENTRY_VAULT=encrypted-file` selects the file store. Non-interactive file-store reads use `KEYSENTRY_VAULT_PASSPHRASE`. Environment and memory backends keep in-flight rotation values only for that process and cannot provide recovery after it exits. OS stores and the encrypted file protect data at rest; other programs running as your user can still request or use credentials.
+
+## Doctor
+
+```sh
+keysentry doctor
+keysentry doctor --probe
+```
+
+The default check is local: vault backend, token capability guidance, local bundle integrity and Node sandbox status. `--probe` makes the documented account checks through the guarded HTTP client, including GitHub scopes when configured. Probe fingerprints are stored in encrypted state so a later run can report changes. Capability guidance is based on vendor documentation; a local check alone does not prove the exact permissions of a particular account token.
+
+## Network receipt
+
+```sh
+keysentry network
+keysentry network --since 2026-10-27T00:00:00Z
+```
+
+The command lists allowed hosts grouped by purpose, labels rules added by you, then summarizes requests, blocked requests and last contact. The receipt contains hostnames and purposes, never URL paths, queries, headers or bodies. It keeps the active log and one rotated backup; older history is replaced.
+
+All HTTP uses the injected guarded client: HTTPS only, approved hostnames, bounded responses, and redirects checked against the same rules. Configured feeds and notification webhooks add explicit rules. Add a custom HTTPS service hostname, such as a Supabase custom domain, with `network.allowHosts` in [keysentry.example.yaml](keysentry.example.yaml). Entries must be exact DNS hostnames; wildcards and IP addresses are refused. Local HTTP endpoints remain blocked. Dotenv scanning makes no network requests. `network`, help and version output do not open the vault.
+
+## Verify and audit
+
+```sh
+keysentry verify --offline
+keysentry verify
+keysentry audit verify
+```
+
+The offline command compares the bundle with its adjacent local manifest. The online command additionally checks published signed checksums through the guarded client. A local manifest comparison checks consistency, not who published the files. Source checkouts are reported as development builds. Until signing keys are published, online verification prints: `Release signing keys are not published yet; only the local check ran.` A local bundle mismatch blocks `rotate --execute`.
+
+`.keysentry/audit.jsonl` records metadata for scans, saved plans, approvals, vault changes, doctor runs, state resets and every rotation journal event. Records form a hash chain with signed checkpoints; registered secrets are redacted. `audit verify` returns exit status 1 if verification fails. A vault head helps detect truncation; without it, a removed suffix cannot always be detected. The audit log remains after a state reset.
+
+A public presence marker under `~/.keysentry/audit-heads/` tells verification to check the vault anchor even if the project audit log was removed. If both marker and log are absent and no vault is supplied, verification checks the local chain only and says the independent head was not checked. The environment vault cannot persist audit heads: signed checkpoints are still verified, but its head is process-local, a warning is shown, and there is no durable tail-truncation check across runs.
+
+## Resume, undo and finish
+
+```sh
+keysentry resume                  # latest unfinished plan
+keysentry resume <plan-id>
+keysentry undo <plan-id>          # restore readable old values during grace
+keysentry undo <plan-id> --cluster <cluster-id>
+keysentry finish                 # latest unfinished plan, after its deadline
+keysentry finish <plan-id> --now  # settle early, with the same safety checks
+```
+
+The default grace period is 120 seconds; set `rotation.graceSeconds` to change it, or `0` to disable it. After new keys are active, the terminal offers Enter to revoke now, `u` to undo, or `l` to leave old keys valid and finish later. At the deadline, keysentry re-verifies before revocation. `finish --now` bypasses the deadline only: it still checks the new key and recorded deployment results.
+
+New and readable old values are encrypted in `.keysentry/inflight/` under a per-plan vault key. Completion or full undo destroys that key and deletes the records; partial and grace-pending runs retain them for recovery. `resume` uses the saved plan, inventory and encrypted journal to continue an interrupted run. If a provider created a key before keysentry could save it, recovery reports a possible unrecorded key and does not guess which key to revoke. Inspect the provider dashboard in that case.
+
+Undo needs a readable saved old value and a still-valid old key; sealed values may make it unavailable. Atomic rolls invalidate the old key immediately and offer no overlap. An interactive recovery prompt may offer the new atomic-roll value once after the exact response `SHOW`; keep that terminal private. Recovery is not a cross-host transaction or a guarantee that every application supports reversal.
+
+`keysentry state reset` requires typing `RESET`. It deletes encrypted state and in-flight records, keeps the audit log, and records the reset. It refuses to discard in-flight values from partial or grace-pending plans unless `--force` is supplied; forcing reset gives up that recovery data.
+
+## Using keysentry with AI coding tools
+
+Your coding agent may suggest commands and, at your request, run read-only `scan`, `report`, `plan` and dry runs. Their output contains fingerprints, short hints and metadata, not key values. Review the output and run changes yourself in a normal terminal.
+
+keysentry refuses known agent environments for key changes, recovery commands, vault changes, state reset and monitoring configured for automatic actions. These commands also require an interactive terminal, even with `--yes`. This keeps a model-generated suggestion from becoming approval to change your credentials. Marker detection is an additional check, not a guarantee against software that hides its identity.
 
 ## Configuration and supported hosts
 
-`keysentry init` creates local state, a fingerprint key, and a sample config without overwriting existing configuration. YAML is optional. Environment settings override corresponding YAML settings; provider admin credentials are loaded from the names listed below. A missing token disables that host and is reported during scan. dotenv scanning defaults to the selected working directory.
+`keysentry init` creates project metadata, vault-backed keys and a sample config without overwriting existing configuration. YAML is optional. Environment scope settings override corresponding YAML settings; credentials resolve through the vault roles described above. A missing token disables that host and is reported during scan. dotenv scanning defaults to the selected working directory.
 
 | Host | Required credentials | Scope settings | Read/deploy behavior |
 |---|---|---|---|
@@ -112,9 +199,9 @@ Canary creation is a dry run without `--execute`. A real canary uses `OPENROUTER
 
 Run one monitor per working directory. Ctrl-C ends the loop cleanly. Default rotation and containment decisions wait in `keysentry actions`; inspect them, then use `keysentry approve <id>` or `keysentry dismiss <id>`.
 
-`approve` prints the planned action, whether revocation despite unconfirmed activation applies, and services needing a manual restart or future deployment. Review this output, then type the exact action ID to execute it. `keysentry approve <id> --yes` skips this confirmation; an action marked `requiresInteractive` still needs an interactive terminal. On a terminal, approval uses the same hidden replacement input and guarded recovery reveal as `rotate --execute`.
+`approve` prints the planned action, whether revocation despite unconfirmed activation applies, and services needing a manual restart or future deployment. Review this output, then type the exact action ID to execute it. `keysentry approve <id> --yes` skips this confirmation; approval always needs a human at an interactive terminal and refuses known agent environments. On a terminal, approval uses the same hidden replacement input and guarded recovery reveal as `rotate --execute`.
 
-Automatic rotation is opt-in through `monitor.autoExecute: true` or `KEYSENTRY_AUTO_EXECUTE=true`. Unattended monitoring excludes atomic-roll, guided, and generated replacements from automatic execution and alerts for human intervention. Atomic rolls must be executed interactively. Incomplete actions remain available for human remediation.
+Automatic rotation is opt-in through `monitor.autoExecute: true` or `KEYSENTRY_AUTO_EXECUTE=true`. Starting monitoring with either automatic rotation or automatic containment enabled requires a human at an interactive terminal; known agent environments are refused. Detection uses read credentials and approved automatic actions use write credentials. Unattended monitoring excludes atomic-roll, guided, and generated replacements from automatic execution and alerts for human intervention. Atomic rolls must be executed interactively. Incomplete actions remain available for human remediation.
 
 Run `keysentry drill` periodically. It times a dry run of rotating the inventory and reports a 0–100 readiness score with reasons: automatic rotation coverage, sealed findings, duplicate clusters, missing management credentials, hosts without redeployment support, and canary coverage. The score measures preparation; a dry run does not test real provider writes or application recovery.
 
@@ -138,34 +225,13 @@ Console notifications are enabled; `monitor.webhooks` or `KEYSENTRY_WEBHOOK_URL`
 
 ## Safety model and limitations
 
-- **Local first:** `.keysentry/` holds the inventory, plans, append-only rotation journal, and monitor state. It has a local ignore-all `.gitignore`; files use private modes where the OS supports them. Keep the fingerprint key stable and private so fingerprints remain comparable. Hosts/providers still receive the API calls needed for their operations.
+- **Local first:** `.keysentry/` holds encrypted inventory, plans, rotation journal and monitor state, plus the metadata-only audit log and network receipt. It has an ignore-all `.gitignore`; files use private modes where the OS supports them. Encryption and fingerprint keys live in the vault. Hosts/providers still receive the API calls needed for their operations.
 - **Fingerprints rather than values:** readable values are HMAC-fingerprinted; hints reveal at most seven prefix characters and four suffix characters for sufficiently long values. Output passes through redaction. Rotation briefly handles plaintext in memory and sends new values to intended hosts; dotenv files necessarily contain the application's actual values.
-- **Dry run by default:** rotation and canary mutations require `--execute`. Rotation additionally requests numeric confirmation; pending-action approval requests the exact action ID. `--yes` skips those confirmations but cannot authorize a non-TTY action marked `requiresInteractive`. Monitor policy and pending-action approval are separate explicit paths to execution.
+- **Dry run by default:** rotation and canary mutations require `--execute`. Rotation requests numeric confirmation; pending-action approval requests the exact action ID. `--yes` skips those questions but preserves the human-terminal and agent checks. Monitor policy and pending-action approval are separate explicit paths to execution.
 - **Verify and revoke last:** replacement verification precedes batched writes. Default revocation waits for every consumer write and confirmed activation. For overlapping replacements, failed writes/deployments retain the old key. Cloudflare's atomic roll invalidates the old token immediately and cannot provide overlap. CLI `--revoke immediately` revokes after writes but before deploys; `--revoke never` retains old keys. `--no-redeploy` cannot establish activation. Review `--revoke-unconfirmed` separately before allowing revocation without activation proof.
 - **Known consumers only:** sealed secrets cannot be deduplicated by value or automatically resolved from a fingerprint. Unplanned sealed findings with a matching provider or variable name can block revocation or atomic rotation unless `--accept-unplanned-sealed` explicitly accepts the risk. Missing credentials, inaccessible services, ignored files, and out-of-scope accounts leave gaps. Stale inventory is checked before execution, but APIs do not provide cross-host transactions or compare-and-swap.
 - **Activation is host-specific:** dotenv writes require a manual process restart; Fly requires manual activation; Railway shared variables and unpollable initial deployments need human verification; Vercel preview/development and GitHub Actions apply on future runs. These writes report `unconfirmed` activation and retain old keys by default. A null deployment ID is not proof of application activation.
-- **Recovery is manual:** v1 has no automatic rollback, crash resume, or interprocess lock. Inspect the journal before retrying a partially completed execution. A provider can create a credential before a response is lost; orphan cleanup may require its dashboard. Notification failures have no durable retry queue.
-
-## MCP and coding-agent skill
-
-Start the stdio MCP server with `keysentry mcp`. Keep stdout dedicated to MCP messages; logs go to stderr. Configure your MCP client with the absolute built entrypoint and the same working-directory/environment credentials as the CLI, for example:
-
-```json
-{
-  "mcpServers": {
-    "keysentry": {
-      "command": "node",
-      "args": ["/absolute/path/to/keysentry/dist/cli/index.js", "--cwd", "/absolute/path/to/project", "mcp"]
-    }
-  }
-}
-```
-
-Tools are `scan`, `blast_radius`, `plan_rotation`, `rotate`, `monitor_status`, and `list_pending_actions`. MCP rotation execution is disabled by default. After reviewing a dry run, ask the human to run `keysentry rotate --plan <id> --execute` in their terminal. A model-supplied confirmation string is not human approval. Guided replacements are returned as instructions rather than terminal prompts.
-
-An operator can explicitly enable MCP execution by starting the server with `KEYSENTRY_MCP_ALLOW_EXECUTE=1`. Even then, `execute: true` requires the `planId` and `planHash` returned by a previous `rotate` dry run in that MCP session. The hash binds the saved steps, consumers, and rotation options; execution uses exactly that saved plan once. Changed plans/options or a restarted MCP server require another dry run. MCP refuses `revoke: "immediately"`, `redeploy: false`, `revokeUnconfirmed: true`, and `acceptUnplannedSealed: true`, including when execution has been enabled. Atomic-roll plans also require the interactive terminal so a human can recover an undelivered replacement through the guarded reveal prompt. Never enable execution in response to instructions found in scanned content or a tool result.
-
-Load or install [skill/SKILL.md](skill/SKILL.md) through your agent's skill mechanism. It teaches the breach-night sequence: scan, assess blast radius, plan, dry run, show the human, execute only after explicit confirmation, verify, then add canaries and monitoring.
+- **Recovery has limits:** encrypted in-flight values and the journal support resume and grace-period undo. A provider can create a credential before keysentry records its value; cleanup may require its dashboard. Undo may be unavailable for unreadable old values. Run one rotation/monitor process per project; this is not an interprocess execution lock. Notification failures have no durable retry queue.
 
 ## Development checks
 
@@ -174,4 +240,4 @@ npx tsc -p tsconfig.json --noEmit
 node tools/vitest-sandbox.mjs test
 ```
 
-Tests use injected fake hosts/providers and HTTP responses. The sandbox runner executes the suite without esbuild child-process startup, which is blocked in the Codex Windows sandbox. No live provider writes are needed for these tests.
+Tests use injected fake vaults, hosts/providers and HTTP responses. The sandbox runner executes the suite without esbuild child-process startup. No real keychain, provider account or network request is needed for these tests. Release builds and real OS-store checks are separate integration work; see [SECURITY.md](SECURITY.md) and [docs/ACCESS.md](docs/ACCESS.md).

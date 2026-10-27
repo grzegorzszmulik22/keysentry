@@ -4,12 +4,29 @@ import { basename, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from '../../src/cli/index.js';
-import { createRuntime } from '../../src/cli/runtime.js';
+import { createRuntime as productionCreateRuntime } from '../../src/cli/runtime.js';
 import { createMonitorState, defaultPolicy } from '../../src/monitor/index.js';
 import { getProvider } from '../../src/providers/index.js';
 import { createDotenvHost } from '../../src/hosts/index.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, silentLogger } from '../helpers/fake-http.js';
+import { createFakeVault } from '../helpers/fake-vault.js';
+import { createFakeInFlight } from '../helpers/fake-inflight.js';
+
+// Phase 1 uses an injected vault and encrypted state; tests never open the OS store.
+const vaults = new Map<string, ReturnType<typeof createFakeVault>>();
+async function createRuntime(options: NonNullable<Parameters<typeof productionCreateRuntime>[0]> = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  const vault = vaults.get(cwd) ?? createFakeVault();
+  vaults.set(cwd, vault);
+  const runtime = await productionCreateRuntime({
+    vault, inflight: createFakeInFlight(), userDir: join(cwd, '.user'),
+    stdinIsTTY: true, stdoutIsTTY: true, grace: async () => 'revoke', ...options,
+  });
+  // Existing behavioral tests settle immediately; grace/recovery have focused coverage.
+  runtime.config.rotation.graceMs = 0;
+  return runtime;
+}
 
 const directories: string[] = [];
 afterEach(async () => { for (const path of directories.splice(0)) await rm(path, { recursive: true, force: true }); });
@@ -36,7 +53,13 @@ describe('CLI commands', () => {
     expect(initial).toContain('autoExecute: false');
     expect(await runCli(['init', '--json'], f.io)).toBe(0);
     expect(await readFile(join(f.cwd, 'keysentry.yaml'), 'utf8')).toBe(initial);
-    expect((await readFile(join(f.runtime.paths.dir, 'fingerprint.key'))).length).toBe(32);
+    // The fingerprint key moved into the vault in phase 1.
+    const plaintextKeyPresent = await readFile(join(f.runtime.paths.dir, 'fingerprint.key')).then(() => true, error => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
+    expect(plaintextKeyPresent).toBe(false);
+    expect((await f.runtime.vault.list()).some(name => name.endsWith('/key/fingerprint'))).toBe(true);
   });
 
   it('gates findings exit status and produces parseable secret-free JSON', async () => {
@@ -131,28 +154,28 @@ describe('CLI commands', () => {
   it('lists, dismisses, and explicitly approves persisted pending actions', async () => {
     const f = await fixture(); const inv = await f.runtime.scan(); const state = createMonitorState();
     state.pendingActions.push(...['dismiss-me', 'approve-me'].map(id => ({ id, createdAt: new Date().toISOString(), signalId: 'signal-test', action: 'rotate' as const, clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' as const })));
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, state);
     expect(await runCli(['actions', '--json'], f.io)).toBe(0); expect(JSON.parse(f.output.at(-1)!)).toHaveLength(2);
     expect(await runCli(['dismiss', 'dismiss-me'], f.io)).toBe(0); expect(f.host.writes).toHaveLength(0);
     expect(await runCli(['approve', 'approve-me', '--yes', '--json'], f.io)).toBe(0); expect(f.host.writes).toHaveLength(2);
     expect(await runCli(['actions', '--json'], f.io)).toBe(0); expect(JSON.parse(f.output.at(-1)!)).toEqual([]);
   });
 
-  it('skips guided steps in the monitor executor and leaves remediation pending', async () => {
+  it('refuses non-TTY guided approval and leaves remediation pending', async () => {
     const f = await fixture(true); const inv = await f.runtime.scan();
     const state = createMonitorState();
     state.canaries.push({ id: 'decoy-test', provider: 'openrouter', keyRef: 'decoy-ref', service: inv.services[0]!, varName: 'DECOY_KEY', createdAt: new Date().toISOString() });
-    // Non-TTY approval skips guided input; TTY approval is covered separately.
+    // Phase 1 refuses all non-TTY approval, including --yes; guided input remains untouched.
     state.pendingActions.push({ id: 'guided-action', createdAt: new Date().toISOString(), signalId: 'canary-signal', action: 'rotate', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
-    expect(await runCli(['approve', 'guided-action', '--yes', '--json'], { ...f.io, prompt: async () => { throw new Error('must never prompt'); } })).toBe(0);
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, state);
+    expect(await runCli(['approve', 'guided-action', '--yes', '--json'], { ...f.io, stdinIsTTY: false, stdoutIsTTY: false, prompt: async () => { throw new Error('must never prompt'); } })).toBe(1);
     expect(f.host.writes).toHaveLength(0); expect((await f.runtime.pendingActions())[0]?.status).toBe('pending');
   });
 
   it('reports successful approval of pending containment as executed', async () => {
     const f = await fixture(); const inv = await f.runtime.scan(); const state = createMonitorState();
     state.pendingActions.push({ id: 'approve-cap', createdAt: new Date().toISOString(), signalId: 'usage-signal', action: 'cap', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, state);
     expect(await runCli(['approve', 'approve-cap', '--yes', '--json'], f.io)).toBe(0);
     expect(f.provider.capped).toEqual([f.key.ref]);
     expect(JSON.parse(f.output.at(-1)!).action.status).toBe('executed');
@@ -238,7 +261,7 @@ describe('CLI commands', () => {
     expect(report.steps[0]?.status).toBe('written');
     expect(report.deployments[0]?.state).toBe('unconfirmed');
     expect(provider.revoked).toHaveLength(0);
-    const state = JSON.parse(await readFile(runtime.paths.monitor, 'utf8'));
+    const state = (await runtime.store.readJson<ReturnType<typeof createMonitorState>>('monitor', runtime.paths.monitor))!;
     expect(state.keyRefs[inv.clusters[0]!.id]).toBe(replacement.ref);
     expect(state.keyRefs[report.steps[0]!.newFingerprint!]).toBe(replacement.ref);
   });
@@ -248,13 +271,13 @@ describe('CLI commands', () => {
     f.provider.rotate = async (value, ctx) => ({ ...await originalRotate(value, ctx), oldKeyRef: null });
     const inv = await f.runtime.scan(); const state = createMonitorState();
     state.pendingActions.push({ id: 'no-old-ref', createdAt: new Date().toISOString(), signalId: 'signal-test', action: 'rotate', clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending' });
-    await writeFile(f.runtime.paths.monitor, JSON.stringify(state));
+    await f.runtime.store.writeJson('monitor', f.runtime.paths.monitor, state);
     const report = await f.runtime.approve('no-old-ref');
     expect(report?.steps[0]?.status).toBe('verified');
     expect(report?.steps[0]?.warnings.length).toBeGreaterThan(0);
-    const persisted = JSON.parse(await readFile(f.runtime.paths.monitor, 'utf8'));
+    const persisted = (await f.runtime.store.readJson<ReturnType<typeof createMonitorState>>('monitor', f.runtime.paths.monitor))!;
     expect(persisted.pendingActions[0].status).toBe('executed');
-    const engineReport = JSON.parse(await readFile(join(f.runtime.paths.dir, 'rotation-report.json'), 'utf8'));
+    const engineReport = (await f.runtime.store.readJson<import('../../src/types.js').RotationReport>('report', join(f.runtime.paths.dir, 'rotation-report.json')))!;
     expect(engineReport.steps[0].status).toBe('deployed');
     expect(f.provider.revoked).toHaveLength(0);
   });
@@ -270,7 +293,7 @@ describe('CLI commands', () => {
     expect((await runtime.scan()).clusters[0]?.consumers).toHaveLength(2);
     const state = createMonitorState();
     state.canaries.push({ id: 'canary-partial', provider: 'openrouter', keyRef: decoy.ref, service, varName: 'DECOY_KEY', createdAt: new Date().toISOString() });
-    await writeFile(runtime.paths.monitor, JSON.stringify(state)); provider.spend(decoy.ref, 0.001);
+    await runtime.store.writeJson('monitor', runtime.paths.monitor, state); provider.spend(decoy.ref, 0.001);
     vercel.listServices = async () => { throw new Error('upstream inaccessible'); };
     const poll = await runtime.monitorOnce();
     expect(poll.signals.some(signal => signal.kind === 'canary_triggered')).toBe(true);
@@ -279,7 +302,7 @@ describe('CLI commands', () => {
     await expect(runtime.rotate(plan, { execute: true })).rejects.toThrow(/scan.*failed/i);
     expect(provider.keys.size).toBe(2); expect(provider.revoked).toHaveLength(0); expect(provider.capped).toHaveLength(0);
     expect(railway.writes).toHaveLength(0); expect(vercel.writes).toHaveLength(0);
-    expect(JSON.parse(await readFile(runtime.paths.monitor, 'utf8')).canaries[0].triggeredAt).toBeDefined();
+    expect((await runtime.store.readJson<ReturnType<typeof createMonitorState>>('monitor', runtime.paths.monitor))!.canaries[0].triggeredAt).toBeDefined();
   });
 
   it('executes an unaffected plan with a partial-scan warning', async () => {
@@ -408,7 +431,7 @@ describe('CLI commands', () => {
     const plan = await f.runtime.plan();
     const step = plan.steps[0]!;
     step.consumers[0]!.reference = true;
-    await writeFile(join(f.runtime.paths.plans, `${plan.id}.json`), JSON.stringify(plan));
+    await f.runtime.store.writeJson('plan', join(f.runtime.paths.plans, `${plan.id}.json`), plan);
     expect((await f.runtime.loadPlan(plan.id)).steps[0]?.consumers[0]?.reference).toBe(true);
   });
 
@@ -416,10 +439,10 @@ describe('CLI commands', () => {
     const f = await fixture(); const errors: string[] = [];
     await writeFile(join(f.cwd, 'custom.yaml'), 'hosts:\n  dotenv:\n    enabled: false\nmonitor:\n  feeds: []\n');
     const output: string[] = [];
-    expect(await runCli(['--cwd', f.cwd, '--config', 'custom.yaml', 'scan', '--json'], { env: {}, http: new FakeHttp(), log: silentLogger, output: line => output.push(line), error: line => errors.push(line) })).toBe(0);
+    expect(await runCli(['--cwd', f.cwd, '--config', 'custom.yaml', 'scan', '--json'], { env: {}, vault: f.runtime.vault, userDir: join(f.cwd, '.user'), http: new FakeHttp(), log: silentLogger, output: line => output.push(line), error: line => errors.push(line) })).toBe(0);
     expect(JSON.parse(output.at(-1)!).errors).toHaveLength(6);
     await writeFile(join(f.cwd, 'bad.yaml'), 'hosts: [opaque-secret-in-invalid-yaml\n');
-    expect(await runCli(['--cwd', f.cwd, '--config', 'bad.yaml', 'scan'], { env: {}, output: line => output.push(line), error: line => errors.push(line) })).toBe(1);
+    expect(await runCli(['--cwd', f.cwd, '--config', 'bad.yaml', 'scan'], { env: {}, vault: f.runtime.vault, userDir: join(f.cwd, '.user'), output: line => output.push(line), error: line => errors.push(line) })).toBe(1);
     expect(errors.at(-1)).toMatch(/Invalid YAML.*line/); expect(errors.join('\n')).not.toContain('opaque-secret-in-invalid-yaml');
   });
 });

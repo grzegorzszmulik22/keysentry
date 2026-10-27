@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createRuntime } from '../../src/cli/runtime.js';
+import { createRuntime as productionCreateRuntime } from '../../src/cli/runtime.js';
 import { runCli } from '../../src/cli/index.js';
 import { serviceKey } from '../../src/core/index.js';
 import { createMonitorState, defaultPolicy } from '../../src/monitor/index.js';
@@ -12,6 +12,23 @@ import { createDotenvHost } from '../../src/hosts/index.js';
 import type { RotationReport } from '../../src/types.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 import { FakeHttp, json, silentLogger } from '../helpers/fake-http.js';
+import { createFakeVault } from '../helpers/fake-vault.js';
+import { createFakeInFlight } from '../helpers/fake-inflight.js';
+
+// Phase 1 uses an injected vault and encrypted state; tests never open the OS store.
+const vaults = new Map<string, ReturnType<typeof createFakeVault>>();
+async function createRuntime(options: NonNullable<Parameters<typeof productionCreateRuntime>[0]> = {}) {
+  const cwd = options.cwd ?? process.cwd();
+  const vault = vaults.get(cwd) ?? createFakeVault();
+  vaults.set(cwd, vault);
+  const runtime = await productionCreateRuntime({
+    vault, inflight: createFakeInFlight(), userDir: join(cwd, '.user'),
+    stdinIsTTY: true, stdoutIsTTY: true, grace: async () => 'revoke', ...options,
+  });
+  // Existing behavioral tests settle immediately; grace/recovery have focused coverage.
+  runtime.config.rotation.graceMs = 0;
+  return runtime;
+}
 
 const directories: string[] = [];
 
@@ -40,7 +57,7 @@ describe('breach-night CLI and monitoring flow', () => {
     const inv = await runtime.scan(); const state = createMonitorState(); const actionId = 'action-e2e-recovery';
     state.pendingActions.push({ id: actionId, createdAt: new Date().toISOString(), signalId: 'leak-test', action: 'rotate',
       clusterIds: inv.clusters.map(cluster => cluster.id), status: 'pending', requiresInteractive: true, revokeUnconfirmed: false });
-    await writeFile(runtime.paths.monitor, JSON.stringify(state));
+    await runtime.store.writeJson('monitor', runtime.paths.monitor, state);
     const input = Object.assign(new PassThrough(), { isTTY: true, isRaw: false, setRawMode(value: boolean) { this.isRaw = value; return this; } });
     const terminal: string[] = []; const diagnostics: string[] = []; const output: string[] = [];
     expect(await runCli(['approve', actionId], { runtime, promptIO: { input: input as unknown as NodeJS.ReadStream,
@@ -208,7 +225,7 @@ describe('breach-night CLI and monitoring flow', () => {
     expect(railway.peek('api', 'OPENROUTER_API_KEY') === vercel.peek('web', 'OPENROUTER_API_KEY'), 'shared consumers agree').toBe(true);
     expect(railway.peek('api', 'SESSION_SECRET') === sessionSecret, 'monitor never generates session secret').toBe(true);
     expect(Object.keys(railway.writes[2]!.vars)).toEqual(['OPENROUTER_API_KEY']);
-    const state = JSON.parse(await readFile(join(cwd, '.keysentry', 'monitor.json'), 'utf8')) as {
+    const state = (await runtime.store.readJson<ReturnType<typeof createMonitorState>>('monitor', runtime.paths.monitor))! as {
       canaries: { id: string; triggeredAt?: string }[];
       pendingActions: { action: string; status: string; clusterIds: string[] }[];
     };
@@ -308,7 +325,7 @@ describe('breach-night CLI and monitoring flow', () => {
     provider.spend(canary!.keyRef, 0.001, 1);
 
     expect(await runCli(['monitor', '--once', '--json'], io)).toBe(0);
-    const report = JSON.parse(await readFile(join(cwd, '.keysentry', 'rotation-report.json'), 'utf8')) as RotationReport;
+    const report = (await runtime.store.readJson<RotationReport>('report', join(cwd, '.keysentry', 'rotation-report.json')))!;
     expect(report.dryRun).toBe(false);
     expect(report.deployments[0]!.state).toBe('unconfirmed');
     expect(provider.revoked).toEqual([original.ref]);
