@@ -16,7 +16,7 @@ read-only mode.
 |---|---|
 | `overview` | `{ firstRun: FirstRunResult \| null; connectedPlatforms: HostId[]; keys: number; inGitHistory: number; needsRotation: number; autopilot: 'off' \| 'armed' \| 'alert-only' \| 'disarmed'; nextSteps: string[] }` |
 | `keys` | `{ keys: KeyView[] }` with `KeyView = { id; provider: ProviderId; tier: RiskTier; hint: string \| null; method: RotationMethod; places: { label: string; host: HostId; variable: string; writeOnly: boolean }[]; inGitHistory: boolean; ageDays?: number; rotateBy?: string; armed: boolean; state: 'ok' \| 'attention' \| 'stop'; stateText: string }` |
-| `platforms` | `{ platforms: { host: HostId; name: string; connected: boolean; source?: 'vault' \| 'env'; roles: ('read' \| 'write')[]; tokens: { name: string; canReadValues: boolean; canWrite: boolean; scope: string; recommended: boolean; howToCreate: string; source: string }[]; keysentryUses: { scan: string; rotate: string } }[] }` |
+| `platforms` | `{ platforms: { host: HostId; name: string; connected: boolean; source?: 'vault' \| 'env'; availableRoles: ('read' \| 'write')[]; storedRoles: ('read' \| 'write')[]; tokens: { name: string; canReadValues: boolean; canWrite: boolean; scope: string; recommended: boolean; howToCreate: string; source: string }[]; keysentryUses: { scan: string; rotate: string } }[] }` |
 | `access` | `{ items: { area: string; status: 'ok' \| 'warn' \| 'fail' \| 'info'; title: string; detail: string; fix?: string }[] }` (doctor items) |
 | `network` | `{ allowed: { host: string; purpose: string; source: 'built in' \| 'added by you in keysentry.yaml' \| 'added by an environment variable' }[]; receipt: { host: string; purpose: string; count: number; blocked: number; lastAt: string }[] }` |
 | `rotations` | `{ active: { planId: string; status: RotationReport['status']; startedAt: string; deadline?: string; steps: { clusterId: string; hint: string \| null; status: string; warnings: string[] }[] }[] }` |
@@ -24,7 +24,7 @@ read-only mode.
 | `autopilot/eligibility` | `{ eligible: { id: string; hint: string \| null; provider: ProviderId; needsAdoption: boolean }[]; ineligible: { id: string; hint: string \| null; reason: string }[]; lastDrillAt: string \| null }` |
 | `activity` | `{ verify: { ok: boolean; problem?: string }; entries: { at: string; kind: string; summary: string }[] }` (newest first, at most 200) |
 | `notifications` | `{ channels: { id: string; kind: NotifyChannelKind; label: string; lastSuccessAt: string \| null }[]; deviceKeyId: string }` |
-| `approvals` | `{ pending: { id: string; kind: string; summary: string; createdAt: string; expiresAt?: string; source: 'monitor' \| 'autopilot' }[] }` |
+| `approvals` | `{ pending: { id: string; kind: string; summary: string; changes: string[]; reviewHash: string; createdAt: string; expiresAt?: string; source: 'monitor' \| 'autopilot' }[] }` (`changes`: the exact sentences the confirm dialog repeats; `reviewHash` binds the approval to them) |
 | `settings` | `{ graceMinutes: number; rotateEveryDays: number; spendCapsUsd: Record<string, number>; digestDay: 'mon' \| 'tue' \| 'wed' \| 'thu' \| 'fri' \| 'sat' \| 'sun' \| 'off'; showHints: boolean }` |
 | `hygiene` | `{ keys: KeyHygiene[] }` |
 
@@ -52,7 +52,7 @@ read-only mode.
 | `notifications/add` | `{ kind: NotifyChannelKind; label: string; settings: Record<string, string> }` | `{ id: string }` |
 | `notifications/remove` | `{ id: string }` | `{ removed: boolean }` |
 | `notifications/test` | `{}` | `{ delivered: string[]; failed: { id: string; reason: string }[] }` |
-| `approvals/approve` | `{ id: string }` | `{ result: string }` |
+| `approvals/approve` | `{ id: string; reviewHash: string }` | `{ result: string }` (refused when the action changed since it was shown) |
 | `approvals/dismiss` | `{ id: string }` | `{ dismissed: true }` |
 | `settings/update` | `Partial<settings>` | the new settings |
 | `spend-limits/apply` | `{ clusterIds: string[] }` | `{ applied: { clusterId: string; limitUsd: number }[]; skipped: { clusterId: string; reason: string }[] }` |
@@ -67,3 +67,11 @@ Secret fields (`botToken`, `webhookUrl`, `token`, `url`, `apiKey`, `password`) g
 handler validates every field again (the screen's checks are a convenience) and so do `autopilot/arm` (positive
 `maxServices`, `validDays` 1–365, `graceMinutes` ≥ 0, a drill in the last 24 hours) and `settings/update`.
 `autopilot/disarm` must also cancel any arming that is still in progress, so a disarm always wins.
+
+## Passkeys (changed after the phase 3 review)
+
+The dashboard never registers passkeys: the `passkey/register/*` routes are removed. Registration happens only with
+`keysentry passkey register` at a human terminal, and the CLI and the dashboard share one passkey store (an encrypted
+state file, `passkeys.json`). With no passkey, the dashboard says: "Register a passkey with keysentry passkey register
+in your terminal, then reload this page." `platforms[].availableRoles` lists the roles a token can be stored for and
+`storedRoles` the roles that already have one.
