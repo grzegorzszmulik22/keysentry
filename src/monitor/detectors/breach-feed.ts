@@ -1,5 +1,6 @@
-import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { fingerprint } from '../../core/fingerprint.js';
+import { fetchFeed, feedItemTexts } from '../../feeds/index.js';
+import { HIGH_CONFIDENCE_TITLE, isSecurityAdvisory, mentionsHost } from '../../autopilot/sources.js';
 import type { HostId, Signal } from '../../types.js';
 import { now, type DetectorContext } from '../context.js';
 
@@ -27,59 +28,6 @@ export const DEFAULT_BREACH_FEEDS: readonly BreachFeed[] = [
 ];
 
 const MAX_FEED_BYTES = 16 * 1024 * 1024;
-// General security words in tutorial bodies are common; only titles get these broader patterns.
-const SECURITY_TITLE = /\b(?:security[\s-]+(?:incident|disclosure|advisory|notice|update)|(?:data[\s-]+)?breach|compromis(?:e|ed)|unauthori[sz]ed[\s-]+access|credentials?[\s-]+(?:leak|exposure))\b/i;
-const SECURITY_PHRASE = /\b(?:rotate[\s-]+(?:all|your)[\s-]+(?:environment[\s-]+variables|secrets|keys|credentials)|unauthori[sz]ed[\s-]+(?:third[\s-]+party|access)|(?:may[\s-]+have|have[\s-]+been)[\s-]+(?:accessed|exposed|compromised))\b/i;
-const HIGH_CONFIDENCE_TITLE = /\b(?:security[\s-]+(?:incident|disclosure)|breach)\b/i;
-// Domain mentions may include subdomains or a sentence-ending period, but never another domain's label.
-// Product names are case-sensitive and cannot match inside domain names or identifiers.
-const HOST_MENTIONS: Record<HostId, RegExp[]> = {
-  railway: [/(?<![\w-])railway\.(?:com|app)(?![\w-]|\.[\w-])/i, /(?<![\w.-])Railway(?![\w-]|\.[\w-])/],
-  vercel: [/(?<![\w-])vercel\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Vercel(?![\w-]|\.[\w-])/],
-  render: [/(?<![\w-])render\.com(?![\w-]|\.[\w-])/i],
-  fly: [/(?<![\w-])fly\.io(?![\w-]|\.[\w-])/i],
-  'github-actions': [/(?<![\w-])github\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])GitHub(?![\w-]|\.[\w-])/],
-  dotenv: [],
-};
-
-type Row = Record<string, unknown>;
-
-function row(value: unknown): Row | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Row : undefined;
-}
-
-function array(value: unknown): unknown[] {
-  return value === undefined ? [] : Array.isArray(value) ? value : [value];
-}
-
-function content(value: unknown): string {
-  if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
-  if (Array.isArray(value)) return value.map(content).filter(Boolean).join(' ');
-  const object = row(value);
-  return object ? content([object['#text'], object['__cdata']]) : '';
-}
-
-function itemLink(item: Row): string {
-  const links = array(item.link);
-  const alternate = links.find(link => {
-    const object = row(link);
-    return object && (object['@_rel'] === undefined || object['@_rel'] === 'alternate');
-  });
-  const selected = alternate ?? links[0];
-  return content(row(selected)?.['@_href']) || content(selected) || content(item.guid) || content(item.id);
-}
-
-function itemDate(item: Row): number | undefined {
-  let latest: number | undefined;
-  // removeNSPrefix maps dc:date to date. Prefer a recent update to an older publication date.
-  for (const field of ['pubDate', 'published', 'updated', 'date']) {
-    for (const value of array(item[field])) {
-      const timestamp = Date.parse(content(value));
-      if (Number.isFinite(timestamp) && (latest === undefined || timestamp > latest)) latest = timestamp;
-    }
-  }
-  return latest;
-}
 
 function safeFeedUrl(value: string, ctx: DetectorContext): boolean {
   try {
@@ -111,40 +59,27 @@ export async function detectBreachFeeds(
   for (const feed of feeds) {
     try {
       if (!safeFeedUrl(feed.url, ctx)) throw new Error();
-      const response = await ctx.providerCtx.http.request({ method: 'GET', url: feed.url,
-        headers: { Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml' } });
-      if (response.status < 200 || response.status >= 300 || Buffer.byteLength(response.text, 'utf8') > MAX_FEED_BYTES) throw new Error();
-      if (XMLValidator.validate(response.text) !== true) throw new Error();
-      // Concatenate CDATA in document order before trimming, preserving spaces within split phrases.
-      const parsed = row(new XMLParser({ ignoreAttributes: false, removeNSPrefix: true,
-        processEntities: false, parseTagValue: false, trimValues: false }).parse(response.text));
-      const rss = row(parsed?.rss);
-      const channel = row(rss?.channel);
-      const atom = row(parsed?.feed);
-      if (rss?.channel === undefined && parsed?.feed === undefined) throw new Error();
-      const items = [...array(channel?.item), ...array(atom?.entry)];
       const feedId = fingerprint(feed.url, ctx.fingerprintKey);
+      const { items } = await fetchFeed(ctx.providerCtx.http, {
+        id: feedId, kind: 'official', url: feed.url, hosts: feed.host ? [feed.host] : [],
+        outlet: 'Configured advisory feed', owner: 'feed', maxBytes: MAX_FEED_BYTES,
+      }, {});
       const baseline = !ctx.state.feedBaselines[feedId];
-      for (const raw of items) {
-        const item = row(raw);
-        if (!item) continue;
-        const link = itemLink(item);
-        if (!link) continue;
-        const itemId = fingerprint(link, ctx.fingerprintKey);
+      for (const item of items) {
+        const itemId = fingerprint(item.id, ctx.fingerprintKey);
         if (baseline) {
           ctx.state.seenFeedItems[itemId] = at;
           continue;
         }
         if (seenBefore.has(itemId)) continue;
-        const datedAt = itemDate(item);
+        const datedAt = item.publishedAt === null ? undefined : Date.parse(item.publishedAt);
         if (datedAt !== undefined && (datedAt < cutoff || datedAt >= nextDay)) continue;
-        const [title = '', ...descriptions] = [item.title, item.description, item.summary, item.content, item['encoded']]
-          .map(value => content(value).replace(/<[^>]*>/g, ' '));
-        const texts = [title, ...descriptions];
-        if (!SECURITY_TITLE.test(title) && !texts.some(text => SECURITY_PHRASE.test(text))) continue;
+        const title = item.title;
+        const texts = feedItemTexts(item);
+        if (!isSecurityAdvisory(title, texts)) continue;
         const searchable = texts.join(' ');
         const hosts = ctx.inventory.hosts.filter(host => host === feed.host
-          || HOST_MENTIONS[host].some(pattern => pattern.test(searchable)));
+          || mentionsHost(host, searchable));
         if (hosts.length === 0) continue;
         for (const host of hosts) {
           const advisory = advisories.get(host) ?? { itemIds: new Set<string>(), confidence: 'medium' };
