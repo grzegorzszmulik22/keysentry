@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { WatcherConfigError } from '../watcher/index.js';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { basename } from 'node:path';
@@ -452,6 +453,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
         ? 'Saved state cannot be read on this computer. Run "keysentry scan" interactively to rebuild inventory and monitor state, or "keysentry state reset" to start over. Scan keeps journals, plans and in-flight values.'
         : error instanceof CliError || error instanceof AgentRefusalError
         || error instanceof VaultLockedError || error instanceof VaultReadOnlyError || error instanceof VaultUnavailableError
+        || error instanceof WatcherConfigError
         ? error.message : 'Command failed. Check configuration, enabled hosts, and the redacted rotation journal.');
     }
     return 1;

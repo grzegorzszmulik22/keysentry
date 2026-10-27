@@ -1,3 +1,4 @@
+export { WatcherConfigError } from './config.js';
 export {
   MAX_WATCHER_CONFIG_BYTES, ensureWatcherStateDir, loadWatcherConfigFromEnv, parseWatcherConfig,
 } from './config.js';

@@ -89,15 +89,15 @@ export function parseWatcherConfig(input: unknown): WatcherConfig {
     let armed: ArmedPlan | null = null;
     if (parsed.armed !== null) {
       const value = parsed.armed as Partial<ArmedPlan> | undefined;
-      if (!value || typeof value.createdAt !== 'string') throw new Error();
+      if (!value || typeof value.createdAt !== 'string') throw new WatcherConfigError();
       // Validate the signed format at creation time. An expired plan must still be
       // loadable so a running watcher can keep reporting in alert-only mode.
       const verified = verifyArmedPlan(value, { now: new Date(value.createdAt), trustedKeyIds: parsed.trustedKeyIds });
-      if (!verified.ok || verified.plan.projectId !== parsed.projectId) throw new Error();
+      if (!verified.ok || verified.plan.projectId !== parsed.projectId) throw new WatcherConfigError();
       armed = verified.plan;
     }
     return { ...parsed, armed };
-  } catch { throw new Error(INVALID_CONFIG); }
+  } catch { throw new WatcherConfigError(INVALID_CONFIG); }
 }
 
 export interface WatcherConfigLoadOptions {
@@ -114,11 +114,17 @@ export async function ensureWatcherStateDir(stateDir: string, options: WatcherCo
   try {
     await (options.mkdir ?? mkdir)(stateDir, { recursive: true, mode: 0o700 });
     info = await (options.stat ?? stat)(stateDir);
-    if (!info.isDirectory()) throw new Error();
-  } catch { throw new Error('KEYSENTRY_STATE_DIR must name a writable state directory.'); }
+    if (!info.isDirectory()) throw new WatcherConfigError();
+  } catch { throw new WatcherConfigError('KEYSENTRY_STATE_DIR must name a writable state directory.'); }
   if ((options.platform ?? process.platform) !== 'win32' && (info.mode & 0o077) !== 0) {
-    throw new Error('KEYSENTRY_STATE_DIR must be private. Run chmod 700 on the state directory, then try again.');
+    throw new WatcherConfigError('KEYSENTRY_STATE_DIR must be private. Run chmod 700 on the state directory, then try again.');
   }
+}
+
+/** Fixed, secret-free setup guidance (variable names only), safe to show to the operator as written. */
+export class WatcherConfigError extends Error {
+  readonly code = 'WATCHER_CONFIG';
+  constructor(message = 'The watcher configuration could not be read. Run keysentry watcher setup again.') { super(message); this.name = 'WatcherConfigError'; }
 }
 
 /** Read deploy-time secrets in memory only; errors contain variable names, never their contents. */
@@ -126,25 +132,25 @@ export async function loadWatcherConfigFromEnv(
   env: Readonly<Record<string, string | undefined>>, options: WatcherConfigLoadOptions = {},
 ): Promise<{ config: WatcherConfig; deployKey: Buffer; stateDir: string }> {
   const encodedKey = env.KEYSENTRY_WATCHER_KEY;
-  if (!encodedKey) throw new Error('Set KEYSENTRY_WATCHER_KEY to the base64 deploy key from keysentry watcher setup.');
+  if (!encodedKey) throw new WatcherConfigError('Set KEYSENTRY_WATCHER_KEY to the base64 deploy key from keysentry watcher setup.');
   const deployKey = Buffer.from(encodedKey, 'base64');
   if (deployKey.length !== 32 || deployKey.toString('base64') !== encodedKey) {
     deployKey.fill(0);
-    throw new Error('KEYSENTRY_WATCHER_KEY must be base64 encoding of exactly 32 bytes.');
+    throw new WatcherConfigError('KEYSENTRY_WATCHER_KEY must be base64 encoding of exactly 32 bytes.');
   }
   try {
     let sealed = env.KEYSENTRY_WATCHER_CONFIG;
     if (!sealed) {
       const file = env.KEYSENTRY_WATCHER_CONFIG_FILE;
-      if (!file) throw new Error('Set KEYSENTRY_WATCHER_CONFIG or KEYSENTRY_WATCHER_CONFIG_FILE to the sealed config from keysentry watcher setup.');
+      if (!file) throw new WatcherConfigError('Set KEYSENTRY_WATCHER_CONFIG or KEYSENTRY_WATCHER_CONFIG_FILE to the sealed config from keysentry watcher setup.');
       let bytes: Buffer | undefined;
       try {
         const info = await (options.stat ?? stat)(file);
-        if (info.isDirectory() || (info.size !== undefined && info.size > MAX_WATCHER_CONFIG_BYTES * 2)) throw new Error();
+        if (info.isDirectory() || (info.size !== undefined && info.size > MAX_WATCHER_CONFIG_BYTES * 2)) throw new WatcherConfigError();
         bytes = await (options.readFile ?? readFile)(file);
-        if (bytes.length > MAX_WATCHER_CONFIG_BYTES * 2) throw new Error();
+        if (bytes.length > MAX_WATCHER_CONFIG_BYTES * 2) throw new WatcherConfigError();
         sealed = bytes.toString('utf8').trim();
-      } catch { throw new Error('Could not read KEYSENTRY_WATCHER_CONFIG_FILE.'); }
+      } catch { throw new WatcherConfigError('Could not read KEYSENTRY_WATCHER_CONFIG_FILE.'); }
       finally { bytes?.fill(0); }
     }
     const config = openWatcherConfig(sealed, deployKey);
