@@ -122,6 +122,7 @@ interface FakeKey {
   byModel: Record<string, number>;
   limitUsd: number | null;
   name: string;
+  createdAt: string;
 }
 
 /**
@@ -134,6 +135,8 @@ export class FakeProvider implements ProviderAdapter {
   readonly capped: string[] = [];
   /** Make the next verify of a NEW key fail. */
   failVerifyOfNew = false;
+  /** Clock for key creation times (listKeys createdAt). */
+  now: () => Date = () => new Date();
   private seq = 0;
 
   constructor(
@@ -146,7 +149,7 @@ export class FakeProvider implements ProviderAdapter {
   issue(name = 'existing', limitUsd: number | null = null): { value: string; ref: string } {
     const ref = `key_${++this.seq}`;
     const value = `${this.prefix}${ref}_${'x'.repeat(24)}${this.seq}`;
-    this.keys.set(ref, { ref, value, active: true, costUsd: 0, requests: 0, byModel: {}, limitUsd, name });
+    this.keys.set(ref, { ref, value, active: true, costUsd: 0, requests: 0, byModel: {}, limitUsd, name, createdAt: this.now().toISOString() });
     return { value, ref };
   }
 
@@ -215,6 +218,7 @@ export class FakeProvider implements ProviderAdapter {
       hint: `${k.value.slice(0, 8)}...${k.value.slice(-4)}`,
       disabled: !k.active,
       limitUsd: k.limitUsd,
+      createdAt: k.createdAt,
     }));
   }
 

@@ -1,0 +1,12 @@
+export { validateVaultName } from './names.js';
+export { VaultUnavailableError, VaultLockedError, VaultReadOnlyError } from './errors.js';
+export { runHelper, type SpawnLike } from './exec.js';
+export { openVault } from './open.js';
+export { createMemoryVault } from './backends/memory.js';
+export { createEnvVault } from './backends/env.js';
+export { createEncryptedFileVault } from './backends/encrypted-file.js';
+export { createMacosKeychainVault } from './backends/macos-keychain.js';
+export { createWindowsDpapiVault } from './backends/windows-dpapi.js';
+export { createLinuxSecretServiceVault } from './backends/linux-secret-service.js';
+export { getProjectId, getOrCreateKey, stateKey, fingerprintKey, deviceKey, inflightKey, deleteInflightKey } from './keys.js';
+export { CREDENTIAL_NAMES, credentialVaultName, createCredentialSource, importFromEnv } from './credentials.js';

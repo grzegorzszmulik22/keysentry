@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: [v*]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build, compare and sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      KEYSENTRY_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.23.4
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Check tag matches package version
+        run: node --input-type=module -e "import fs from 'node:fs'; const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); if (process.env.GITHUB_REF_NAME !== 'v' + pkg.version) throw new Error('The release tag must match package.json version.');"
+      - run: npm run typecheck
+      - run: node tools/vitest-sandbox.mjs
+      - run: npm audit --audit-level=moderate
+      - run: npm run release:check
+      - run: npm run release:build
+      - name: Sign release checksums
+        env:
+          KEYSENTRY_RELEASE_SIGNING_KEY: ${{ secrets.KEYSENTRY_RELEASE_SIGNING_KEY }}
+        run: node scripts/sign-release.mjs dist-release/out/SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-artifacts
+          if-no-files-found: error
+          path: |
+            dist-release/out/keysentry.mjs
+            dist-release/out/release-manifest.json
+            dist-release/out/SHA256SUMS
+            dist-release/out/SHA256SUMS.sig
+            dist-release/out/*.tgz
+
+  publish:
+    name: Attest, release and publish
+    needs: build
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-artifacts
+          path: dist-release/out
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+      - name: Check npm supports trusted publishing
+        shell: bash
+        run: |
+          npm_version="$(npm --version)"
+          NPM_VERSION="$npm_version" node --input-type=module <<'NODE'
+          const [major, minor, patch] = process.env.NPM_VERSION.split('.').map(Number);
+          if (!(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))))) {
+            throw new Error('Trusted publishing requires npm 11.5.1 or newer. Update the publishing Node pin to a reviewed version that includes it.');
+          }
+          NODE
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Write SLSA build provenance
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          const { GITHUB_SERVER_URL: server, GITHUB_REPOSITORY: repo, GITHUB_REF: ref,
+            GITHUB_SHA: commit, GITHUB_RUN_ID: runId, GITHUB_RUN_ATTEMPT: attempt } = process.env;
+          const workflow = `${server}/${repo}/.github/workflows/release.yml`;
+          const predicate = {
+            buildDefinition: {
+              buildType: workflow,
+              externalParameters: { workflow: { repository: `${server}/${repo}`, ref, path: '.github/workflows/release.yml' } },
+              internalParameters: {},
+              resolvedDependencies: [{ uri: `git+${server}/${repo}.git`, digest: { gitCommit: commit } }],
+            },
+            runDetails: {
+              builder: { id: `${workflow}@${ref}` },
+              metadata: { invocationId: `${server}/${repo}/actions/runs/${runId}/attempts/${attempt}` },
+            },
+          };
+          writeFileSync('dist-release/out/provenance.json', JSON.stringify(predicate, null, 2) + '\n');
+          NODE
+      - name: Attest release artifacts with GitHub OIDC
+        shell: bash
+        run: |
+          for artifact in dist-release/out/keysentry.mjs dist-release/out/*.tgz; do
+            cosign attest-blob --yes --type https://slsa.dev/provenance/v1 \
+              --predicate dist-release/out/provenance.json \
+              --bundle "${artifact}.sigstore.json" "$artifact"
+          done
+      - name: Upload GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: gh release create "$GITHUB_REF_NAME" dist-release/out/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+      - name: Publish packed package with npm provenance
+        env:
+          NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+        shell: bash
+        run: |
+          packages=(dist-release/out/*.tgz)
+          if [ "${#packages[@]}" -ne 1 ] || [ ! -f "${packages[0]}" ]; then
+            echo 'Expected exactly one packed release tarball.' >&2
+            exit 1
+          fi
+          npm publish --provenance --access public "${packages[0]}"

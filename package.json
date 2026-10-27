@@ -4,7 +4,7 @@
   "description": "Breach-day key rotation and key monitoring: find every copy of every secret across your hosts, rotate in a safe order with one redeploy per service, verify, revoke, and rotate automatically on suspicious use.",
   "type": "module",
   "bin": {
-    "keysentry": "dist/cli/index.js"
+    "keysentry": "dist/keysentry.mjs"
   },
   "files": [
     "dist",
@@ -12,15 +12,19 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "dev": "tsx src/cli/index.ts"
+    "dev": "tsx src/cli/index.ts",
+    "bundle": "node scripts/build-bundle.mjs",
+    "release:build": "node scripts/release-build.mjs",
+    "release:check": "node scripts/check-reproducible.mjs",
+    "release:sign": "node scripts/sign-release.mjs"
   },
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "private": true,
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

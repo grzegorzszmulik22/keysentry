@@ -4,3 +4,4 @@ export { DEFAULT_SCRYPT, deriveKeyFromPassphrase } from './kdf.js';
 export type { ScryptParams } from './kdf.js';
 export { deviceKeyFromPrivate, generateDeviceKey, signDetached, verifyDetached } from './signing.js';
 export type { DeviceKey } from './signing.js';
+export { AUDIT_CHECKPOINT_PREFIX, createAuditLog } from './audit.js';
