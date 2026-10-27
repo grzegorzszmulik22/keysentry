@@ -24,7 +24,11 @@ import type {
   GuidedPrompt, HostAdapter, HostId, HttpClient, Inventory, Logger, Policy, ProviderAdapter,
   ProviderId, Redactor, RotationPlan, RotationReport, ServiceRef, AuditLog, InFlightStore, Vault, TokenRole, GraceInfo, GraceDecision,
 } from '../types.js';
-import { loadConfig, loadConfigMetadata } from './config.js';
+import { loadConfig, loadConfigMetadata, type ConfigSettings } from './config.js';
+import { createAutopilotManager, recordDrill, type AutopilotManagerOptions } from './autopilot.js';
+import { notificationEgress } from './notifications.js';
+import { persistManualAdoption, reconcileAutopilotRecovery } from './adoption-recovery.js';
+import { verifyArmedPlan } from '../autopilot/index.js';
 import { inventorySchema, planIdSchema, planSchema } from './schemas.js';
 import { humanizeServices, serviceLabel } from './display.js';
 import { hasInteractiveTerminal, promptSecret, revealSecret, promptPassphrase, promptGrace, confirmVaultFallback, confirmInventoryReplacement, confirmMissingManifest, promptVaultBackend, type RevealInfo, type PromptIO } from './prompts.js';
@@ -34,6 +38,10 @@ export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
 type Reveal = (info: RevealInfo, value: string) => Promise<boolean>;
 export interface RuntimeOptions {
   cwd?: string; config?: string; env?: NodeJS.ProcessEnv; http?: HttpClient;
+  settings?: ConfigSettings;
+  trustedPlanKeyIds?: string[];
+  /** Set only after authenticated sealed-watcher bootstrap in the CLI entry point. */
+  watcherAuthorized?: boolean;
   hosts?: HostAdapter[]; providers?: (id: ProviderId) => ProviderAdapter;
   policy?: Policy; feeds?: BreachFeed[]; fingerprintKey?: Buffer;
   prompt?: (p: GuidedPrompt) => Promise<string | null>; log?: Logger;
@@ -198,9 +206,49 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const inflight = options.inflight ?? createInFlightStore({ dir: join(paths.dir, 'inflight'), vault, projectId });
   const credentials = createCredentialSource(vault, env);
   const receipt = createFileReceipt(join(paths.dir, 'network.jsonl'));
+  let automaticGuard: (() => Promise<void>) | undefined;
+  const rawTransport = options.http ?? createFetchHttp();
+  const transport: HttpClient = { async request(request) {
+    const notificationUrl = [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls]
+      .some(value => new URL(value).href === new URL(request.url).href);
+    if (request.method !== 'GET' && !notificationUrl) await automaticGuard?.();
+    return rawTransport.request(request);
+  } };
   const feedUrls = options.feeds?.map(feed => feed.url) ?? metadata.feedUrls;
-  const rules = [...EGRESS_RULES, ...rulesForUserFeeds(feedUrls), ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules];
-  const http = createGuardedHttp(options.http ?? createFetchHttp(), { rules, receipt, trustedUrls: metadata.webhooks, log });
+  const notification = { rules: [] as import('../types.js').EgressRule[], trustedUrls: [] as string[] };
+  for (const setting of metadata.settings.notify.channels) {
+    try {
+      const entries = await notificationEgress([setting], vault);
+      notification.rules.push(...entries.rules); notification.trustedUrls.push(...entries.trustedUrls);
+    } catch { log.warn('A notification channel needs its settings repaired. Run notify test or remove and add it again.'); }
+  }
+  notification.trustedUrls.forEach(url => redactor.register(url));
+  const healthUrls: string[] = [];
+  const savedArmed = await store.readJson<import('../types.js').ArmedPlan>('plan', join(paths.dir, 'armed-plan.json'));
+  if (savedArmed) {
+    const signer = await deviceKey(vault);
+    try {
+      const checked = verifyArmedPlan(savedArmed, { now: new Date(savedArmed.createdAt), trustedKeyIds: options.trustedPlanKeyIds ?? [signer.keyId] });
+      if (checked.ok && checked.plan.projectId === projectId) healthUrls.push(...checked.plan.healthChecks.map(check => check.url));
+    } finally { signer.privateKeyDer.fill(0); }
+  }
+  const relayUrls: string[] = [];
+  if (metadata.settings.notify.relay) {
+    const topic = await vault.get('notify/relay/topic');
+    if (topic) {
+      try {
+        const value = topic.toString();
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(value)) throw new CliError('The approval relay topic is invalid. Run watcher setup again.');
+        redactor.register(value);
+        relayUrls.push(`${metadata.settings.notify.relay.server.replace(/\/$/, '')}/${value}`);
+      } finally { topic.fill(0); }
+    }
+  }
+  const rules = [...EGRESS_RULES, ...rulesForUserFeeds(feedUrls), ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'),
+    ...metadata.userHostRules, ...notification.rules, ...rulesForUserUrls(healthUrls, 'health check you configured'),
+    ...rulesForUserUrls(relayUrls, 'approval relay you configured')];
+  const http = createGuardedHttp(transport, { rules, receipt,
+    trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls], log });
   const config = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
   if (options.policy) config.monitor.policy = options.policy;
   if (options.feeds) config.monitor.feeds = options.feeds;
@@ -228,10 +276,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       return vars;
     },
     async writeVariables(service, vars, opts) {
+      await automaticGuard?.();
       for (const value of Object.values(vars)) redactor.register(value);
       await host.writeVariables(service, vars, opts);
     },
-    redeploy: service => host.redeploy(service),
+    async redeploy(service) { await automaticGuard?.(); return host.redeploy(service); },
     deploymentStatus: (service, id) => host.deploymentStatus(service, id),
   }));
   const hosts = wrapHosts(options.hosts ?? config.hosts);
@@ -357,7 +406,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   async function loadPlan(id: string): Promise<RotationPlan> {
     if (!planIdSchema.safeParse(id).success) throw new CliError('Invalid plan identifier.');
-    const stored = await store.readJson('plan', join(paths.plans, `${id}.json`));
+    let stored = await store.readJson('plan', join(paths.plans, `${id}.json`));
+    if (stored === null) stored = (await autopilotManager().loadState()).waves.find(wave => wave.planId === id)?.plan ?? null;
     const result = planSchema.safeParse(stored);
     if (!result.success) throw new CliError('Saved plan is missing or invalid; create a new plan.');
     remember(result.data.services);
@@ -388,7 +438,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         const member: unknown = Reflect.get(target, property, target);
         if (typeof member !== 'function') return member;
         return (...args: unknown[]) => {
-          if (typeof property === 'string' && mutations.includes(property)) ensureActive();
+          if (typeof property === 'string' && mutations.includes(property)) return (async () => {
+            await automaticGuard?.(); ensureActive(); return Reflect.apply(member, target, args);
+          })();
           return Reflect.apply(member, target, args);
         };
       },
@@ -425,6 +477,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     if (!report.dryRun) {
       await rememberKeyRefs(report, rotationPlan);
       await scan();
+      await refreshManualAdoption(report);
     }
     if (interrupted) throw interrupted;
     return safe(report);
@@ -442,6 +495,33 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     await stateStore.save(state);
   }
 
+  function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'selfCheck' | 'lastNotificationSuccess'>> = {}) {
+    return createAutopilotManager({ store, audit, projectId, deviceKey: () => deviceKey(vault), assertHuman,
+      scan: async () => rotationInventory(await scan()), rotateCluster: async clusterId => rotate(await plan({ clusterIds: [clusterId] }), {
+        execute: true, prompt: options.prompt ?? (p => promptSecret(p, diagnostic, options.promptIO)),
+      }),
+      settings: config.settings.autopilot, env, now: options.now, ...overrides });
+  }
+
+  function rotationInventory(inv: Inventory): Inventory {
+    return { ...inv, errors: inv.errors.filter(error => !config.disabledHosts.some(item => item.host === error.host && item.reason === error.message)
+      || inv.services.some(service => service.host === error.host)
+      || inv.clusters.some(cluster => cluster.consumers.some(consumer => consumer.service.host === error.host))) };
+  }
+
+  async function refreshManualAdoption(report: RotationReport) {
+    const manager = autopilotManager(); const armed = await manager.loadPlan();
+    if (!armed) return;
+    const state = await manager.loadState();
+    if (reconcileAutopilotRecovery(state, { planId: report.planId, report })) await manager.saveState(state);
+    const key = await deviceKey(vault);
+    try {
+      await persistManualAdoption({ report, armed, state, inventory: rotationInventory(await inventory()), trustedKeyIds: [key.keyId],
+        now: (options.now ?? (() => new Date()))(), entries: await journal.read(), saveState: manager.saveState,
+        applyUpdates: manager.applyAdoptionUpdates });
+    } finally { key.privateKeyDer.fill(0); }
+  }
+
   function detector(inv: Inventory, state: MonitorState, selected = { hosts, providerCtx: config.providerCtx }): DetectorContext {
     // Detection uses read credentials. A provider-side automatic containment fetches
     // write credentials only when that action is actually called.
@@ -451,7 +531,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         if (typeof member !== 'function') return member;
         if (!['cap', 'revoke', 'rotate'].includes(String(property))) return member.bind(target);
         return async (value: string, ctx: typeof config.providerCtx) => {
+          await automaticGuard?.();
           const write = await adapters('write');
+          await automaticGuard?.();
           return Reflect.apply(member, target, [value, { ...ctx, ...write.providerCtx, siblingVars: ctx.siblingVars }]);
         };
       },
@@ -566,6 +648,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     await audit.append({ kind: 'approval', summary: 'Monitor action approved.', data: { id } });
     if (aborted) throw aborted;
     await scan();
+    if (result) await refreshManualAdoption(result);
     return safe(result);
   }
 
@@ -592,6 +675,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const inv = await scan();
     const rotationPlan = await plan();
     const report = await execute(rotationPlan, inv, { execute: false });
+    await recordDrill(store, { at: (options.now ?? (() => new Date()))(),
+      passed: rotationInventory(inv).errors.length === 0 && report.steps.every(step => step.status !== 'failed') && report.deployments.every(deploy => deploy.state !== 'failed') });
     const total = inv.clusters.length;
     const automatic = inv.clusters.filter(cluster => cluster.method === 'generate' ||
       cluster.method !== 'guided' && cluster.fingerprint !== null && PROVIDER_CREDENTIALS[cluster.provider].every(name => !!config.providerCtx.credentials[name])).length;
@@ -642,6 +727,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   async function recover(mode: 'resume' | 'finish', id?: string, now = false) {
     assertHuman(mode === 'resume' ? 'resume a rotation' : 'finish a rotation');
     await prepareExecution();
+    await scan();
     const input = await recoveryInput(id);
     const deps = await recoveryDeps();
     const opts = { ...config.rotation, dryRun: false, early: now };
@@ -649,6 +735,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     await store.writeJson('report', join(paths.dir, 'rotation-report.json'), safe(report));
     await rememberKeyRefs(report, input.plan);
     await scan();
+    await refreshManualAdoption(report);
     return safe(report);
   }
 
@@ -720,6 +807,40 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   return {
     config, paths, redactor, providers, safe, humanize, vault, store, inflight, audit, credentials, http, receipt, rules, userDir, interactive, assertHuman, mutationContext, assertStateResetSafe, prepareExecution,
+    projectId, log, fingerprintKey, autopilotManager, signingKey: () => deviceKey(vault), recoveryDeps,
+    httpForUrls: (urls: string[], purpose: string) => createGuardedHttp(transport, {
+      rules: [...rules, ...rulesForUserUrls(urls, purpose)], receipt, log,
+      trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls],
+    }),
+    freshInventory: async () => rotationInventory(await scan()),
+    async watcherMonitor(context: import('../watcher/index.js').WatcherActionContext, notifier: import('../types.js').Notifier,
+      assertActive?: () => Promise<void>) {
+      let policy = context.alertOnly ? { ...config.monitor.policy, autoExecute: false, autoContain: false } : config.monitor.policy;
+      if (policy.autoExecute || policy.autoContain) {
+        if (!options.watcherAuthorized) assertHuman('run automatic monitor actions');
+        await prepareExecution();
+      }
+      const scanned = await scan();
+      try { await assertActive?.(); } catch { policy = { ...policy, autoExecute: false, autoContain: false }; }
+      const excluded = new Set([...CREDENTIAL_NAMES, ...context.excludedTokenNames]);
+      const own = (name: string) => excluded.has(name) || name.startsWith('KEYSENTRY_');
+      const inv = { ...scanned, findings: scanned.findings.filter(item => !own(item.varName)),
+        clusters: scanned.clusters.filter(cluster => !cluster.consumers.some(consumer => own(consumer.varName))) };
+      const state = await stateStore.load();
+      // The incident pipeline owns breach corroboration. Legacy feeds have no source kind.
+      const previous = automaticGuard; automaticGuard = assertActive;
+      try {
+        return await runMonitorOnce({ ...detector(inv, state), ...config.monitor, feeds: [], policy, state: stateStore, notifier,
+          rotate: (rotationPlan, rotationOptions) => monitored(rotationPlan, inv, rotationOptions) });
+      } finally { automaticGuard = previous; }
+    },
+    async monitorReadOnly(notifier?: import('../types.js').Notifier) {
+      const inv = await scan(); const state = await stateStore.load();
+      const readPolicy = { ...config.monitor.policy, autoExecute: false, autoContain: false };
+      return runMonitorOnce({ ...detector(inv, state), policy: readPolicy, state: stateStore,
+        notifier: notifier ?? config.monitor.notifier, rotate: async () => { throw new CliError('Monitor actions require approval.'); },
+        feeds: config.monitor.feeds, github: config.monitor.github, usageOptions: config.monitor.usageOptions });
+    },
     scan: command(() => scan(true)), inventory: command(inventory), plan: command(plan), loadPlan, rotate: command(rotate),
     monitorOnce: command(monitorOnce), monitor, reviewAction, checkpoint: () => audit.checkpoint(),
     createCanary: command(plant), drill: command(readiness),
@@ -738,6 +859,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         if (oldRef) state.keyRefs[restored.clusterId] = oldRef;
       }
       await stateStore.save(state);
+      const manager = autopilotManager(); const autopilot = await manager.loadState();
+      if (reconcileAutopilotRecovery(autopilot, { planId: id, undo: report, entries: await journal.read() })) await manager.saveState(autopilot);
       await scan(); return safe(report);
     }),
     resetState: command(resetState), vaultList,

@@ -2,7 +2,7 @@
 
 Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local CLI for routine rotation and monitoring.
 
-> **Status: phase 1 of keysentry 1.0: trust foundation.** Adapters are tested against fakes built from vendor documentation, not yet against live accounts. Native vault helpers are also tested through fakes. Try dry runs and a drill on a staging project before relying on provider writes. Dashboard, passkey arming, cloud boxes and the token-free onboarding wizard are later phases. Release signing keys are not published yet.
+> **Status: keysentry 1.0 phase 2: breach autopilot and a self-hosted watcher.** Adapters are tested against fakes built from vendor documentation, not yet against live accounts. Native vault helpers are also tested through fakes. Try dry runs and a drill on a staging project before relying on provider writes. Real-browser passkey ceremonies and deployed watcher operation still need integration checks. The dashboard, cloud boxes and token-free onboarding wizard are later phases. Release signing keys are not published yet.
 
 ## The trust promise
 
@@ -149,7 +149,7 @@ keysentry refuses known agent environments for key changes, dismissing pending a
 | Railway | `RAILWAY_TOKEN` or `RAILWAY_PROJECT_TOKEN` | `hosts.railway.projectIds`; `RAILWAY_PROJECT_IDS` | Readable and sealed variables; shared environment variables included; one deployment per service when supported |
 | Vercel | `VERCEL_TOKEN` | `VERCEL_TEAM_ID`, `hosts.vercel.targets` / `VERCEL_TARGETS` | Readable and sensitive variables; production redeploys; preview/development apply on their next deployment |
 | Render | `RENDER_API_KEY` | Accessible services | Readable variables; explicit service redeploy |
-| Fly | `FLY_API_TOKEN` | `FLY_ORG` or `hosts.fly.apps` / `FLY_APPS` | Sealed values; stages updates; manually run `fly secrets deploy -a <app>` |
+| Fly | `FLY_API_TOKEN` | `FLY_ORG` or `hosts.fly.apps` / `FLY_APPS` | Sealed values; stages updates and rolls Machines one at a time through the Machines API; stopped Machines stay stopped; an app with no Machines remains unconfirmed |
 | GitHub Actions | `GITHUB_TOKEN` and configured repositories | `hosts.github.repos` / `GITHUB_REPOS` | Repository secrets are sealed; encrypted writes apply to the next workflow run |
 | dotenv | None | `hosts.dotenv.roots` / `KEYSENTRY_DOTENV_ROOTS` | Local `.env` and `.env.*` files; no application restart |
 
@@ -225,6 +225,95 @@ Usage baselines use seven days of hourly history, retaining 30 days. Once a base
 
 Console notifications are enabled; `monitor.webhooks` or `KEYSENTRY_WEBHOOK_URL` add Slack/Discord-compatible webhook notifications. Treat webhook URLs as credentials. Configure `monitor.feeds: []` to disable external advisory feeds. The bundled feed URLs and security keyword matching are advisory, can produce false positives, and need operator verification. GitHub alerts require `monitor.github.repos`, `GITHUB_TOKEN`, and suitable token permissions/account support; the Actions-host repository list does not enable alert polling by itself.
 
+## Breach autopilot
+
+Autopilot is an explicit authorization for selected keys, hosts and limits. Start in your normal terminal:
+
+```sh
+keysentry scan
+keysentry drill
+keysentry arm --hosts railway --grace 15 --max-services 10
+keysentry autopilot status
+```
+
+`arm` lists eligible keys and explains exclusions. It requires a completed, passing drill from the last 24 hours. Use `--cluster <ids>` to narrow selection, `--valid-days <n>` to set the authorization lifetime, and `--health '<serviceKey>=https://app.example.com/health'` to add an application check. Defaults are 90 days, 15 minutes of grace and at most 10 services per wave. Non-secret defaults belong in the `autopilot` section of [keysentry.example.yaml](keysentry.example.yaml). The device key signs the plan, which is saved in encrypted state; re-arming replaces it and is audited.
+
+For a write-only key, `arm` offers a supervised adoption rotation. The prompt says plainly that this rotates the key now. You can decline it; that key then remains outside automatic coverage. Adoption records the replacement's fingerprint and provider key reference, rather than retaining its plaintext. After watcher rotations, status can show **re-arm to refresh adopted keys**. `keysentry arm --refresh` reviews and signs updates in the same local CLI/`watch` state store. A separate deployed watcher's adoption updates are not automatically imported into that store. Reconcile its original encrypted state and matching keys before re-arming or renewing that deployment; remote update import and dashboard reconciliation remain a phase 3 gap.
+
+**News alone never rotates.** One uncorroborated report alerts and requests approval. A trigger needs a high-confidence official advisory, or credential-exposure reports corroborated by an official source or a second independent news owner naming the same platform. Each watcher reads the sources itself. An outage, a phishing story that merely mentions the platform, or a breach at another company is not authorization to rotate your keys.
+
+Autopilot will never automatically rotate payment keys, database credentials, data-encryption keys, wallet or private keys, atomic rolls such as Cloudflare, guided providers, or generated secrets outside the exact-name allow-list. Scope growth, changed values, an expired plan or an untrusted signature prevents automatic execution and requests approval. A new consumer is not silently added to the plan.
+
+Each incident gets one rotation wave. Services deploy one at a time; configured health checks run after activation and again before deferred revocation. A fresh read-role scan checks current consumers before settling grace. The first verification, deployment or health-check failure stops the wave and keeps old keys valid when revocation has not begun. An interrupted settlement can leave some old keys already revoked; inspect its report. For next-deploy hosts, old keys stay valid unless the signed plan contains the required acceptance and maximum-deadline revocation consent. Phase 2 does not automatically detect an early next deployment.
+
+## Run the watcher
+
+```sh
+keysentry watch                    # local vault and encrypted project state
+keysentry watch --port 8787        # optional approval/health server
+keysentry watch --once             # one scheduled cycle, including safe settlement
+keysentry watcher setup
+keysentry watcher status https://watcher.example.com
+```
+
+Run one watcher per state directory. Locally it uses the same vault and state as the CLI. `watcher setup` guides token selection using the actual platform capabilities, creates deployment and state keys, seals the configuration, and points to the chosen template under [deploy/](deploy/README.md). Setup does not deploy anything. It warns when you would host the watcher on a platform it protects, because that platform also holds the watcher's own credentials.
+
+Setup prints `KEYSENTRY_WATCHER_KEY`, `KEYSENTRY_STATE_KEY`, `KEYSENTRY_VAULT_PASSPHRASE`, the sealed `KEYSENTRY_WATCHER_CONFIG` and encrypted portable `KEYSENTRY_WATCHER_VAULT` once, only in an interactive terminal. Store all five values in your platform's secret settings only; add the portable-vault variable explicitly if your template lists only the first four. The portable vault supplies the chosen host/provider credentials, scope and signing material absent from the fixed sealed-config format. Do not put these values in command arguments, a committed configuration, logs or a JSON export. `KEYSENTRY_WATCHER_CONFIG_FILE` can point to a file containing the sealed configuration. The image keeps its encrypted vault and state under `KEYSENTRY_STATE_DIR=/data`; keep their keys and passphrase outside that directory. Existing POSIX state directories must have mode 0700, and the volume must persist across runs.
+
+Each `watcher setup` creates a new deployment key, state key, vault passphrase and portable-vault identity. It does not migrate an existing live volume. To renew a deployed watcher:
+
+1. Use its original matching vault, keys and encrypted state to inspect and finish or undo every grace-pending or stopped rotation. Reconcile any adopted-key updates before creating the replacement authorization; remote updates are not imported automatically by the local CLI.
+2. Disarm and stop the old watcher. Retain a secure backup of its unchanged encrypted volume and separately protected original keys for recovery and audit inspection.
+3. Prepare the new setup and use a fresh private state directory or volume with all five newly generated secret settings. Keep the old volume unchanged; do not point the new state key or passphrase at it, and never store an unlock key alongside encrypted state.
+
+Phase 2 has no dashboard or automatic export/import flow to reconcile remote adopted-key updates or migrate a live watcher. Keep the original deployment material available until that reconciliation and all pending recovery work are complete.
+
+The templates cover Docker Compose, Railway, Fly, Render and scheduled GitHub Actions. They still require the release image/digest and platform checks described in [deploy/README.md](deploy/README.md). Scheduled Actions can run late or be skipped; caches can be evicted, and public-repository caches must be treated as public encrypted data. This mode cannot promise an exact response time.
+
+The watcher resumes interrupted work, polls the relay and feeds, handles incident waves and approvals, settles due grace, runs monitoring and sends a daily signed heartbeat. If notification delivery has not succeeded within 24 hours, state is unwritable, the armed plan is invalid or clock skew exceeds five minutes, it enters alert-only mode. Status shows the plan, waves and deadlines, delivery time and next settlement. An optional public approval server needs an HTTPS origin and correctly configured proxy/binding; `--port` alone does not provide TLS.
+
+## Notifications
+
+```sh
+keysentry notify add telegram      # also discord, slack, ntfy, webhook, resend, smtp, console
+keysentry notify list
+keysentry notify test
+keysentry notify verify ABCD-EFGH
+keysentry notify verify --file signed-message.json
+keysentry notify remove <channel-id>
+```
+
+Prompts hide tokens, passwords, webhook URLs and topics. Secret channel fields are stored in the vault as `notify/<channelId>/<field>`; YAML contains only channel IDs/kinds and non-secret settings such as an ntfy server or email addresses. `notify list` shows IDs and kinds only. Notification destinations are explicitly added to the guarded client's user rules; health URLs use the purpose **health check you configured**. Review actual contacts with `keysentry network`.
+
+Watcher messages are signed by the device or configured watcher key and carry a short verification code. Verification checks the stored/full signed message with a locally trusted public key; the short code alone is not a signature or an approval. Generic webhooks carry the full signed JSON and signature headers. Messages contain no secret values; short key hints are opt-in with `autopilot.showHints`. Channel operators can still read notification metadata, suppress delivery or replay a message. Use an independent channel where possible, and run `notify test` after changing its settings.
+
+## Approvals with a passkey
+
+```sh
+keysentry passkey register
+keysentry passkey list
+keysentry passkey remove <credential-id>
+keysentry approve <action-id>
+keysentry approve <action-id> --relay
+```
+
+Local registration serves a one-page app on a random port, binds to `127.0.0.1` and opens as `http://localhost:<port>` with a one-time token. Host and Origin checks, a strict content policy and bundled static script protect that local page. It closes after successful registration, five minutes or Ctrl-C. Local passkeys use RP ID `localhost`; the recorded origin must also match when approving.
+
+A passkey approval binds to one pending action and its digest, expires after ten minutes and is single-use. Device-key approval through `approve` works locally or publishes a signed approval through the configured relay; existing monitor approvals remain available. The relay cannot authorize a different action or expand an armed plan. Public ntfy topics are readable and writable by others: a random topic reduces discovery, while trusted signatures provide authorization.
+
+Passkeys are scoped to their relying party and origin. A localhost registration does not register a passkey for a public watcher. `passkey register --origin https://watcher.example.com` explains that registration must happen there. The current approval server has no `/register` page; public-origin enrollment is a phase 3 dashboard feature. Arming, adding/removing channels, registering/removing passkeys and watcher setup require the local human CLI and cannot be done through a relay.
+
+## Kill switch
+
+```sh
+keysentry disarm
+keysentry disarm --relay
+```
+
+Local disarm sets the saved off-state. With `--relay`, it also publishes a device-signed disarm to the watcher. Disarming needs no passkey. The approval server also has a Disarm page; remote delivery can be delayed, so check the watcher's status. Disarm stops new automatic effects and grace settlement; old keys that have not yet been revoked stay valid. It does not restore a key already revoked.
+
+Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-arming requires the local CLI and a new signed plan. When the watcher's own host has an incident, rotate its platform/provider credentials through the guided path; the watcher does not automatically replace its own operating credentials.
+
 ## Safety model and limitations
 
 - **Local first:** `.keysentry/` holds encrypted inventory, plans, rotation journal and monitor state, plus the metadata-only audit log and network receipt. It has an ignore-all `.gitignore`; files use private modes where the OS supports them. Encryption and fingerprint keys live in the vault. Hosts/providers still receive the API calls needed for their operations.
@@ -232,8 +321,8 @@ Console notifications are enabled; `monitor.webhooks` or `KEYSENTRY_WEBHOOK_URL`
 - **Dry run by default:** rotation and canary mutations require `--execute`. Rotation requests numeric confirmation; pending-action approval requests the exact action ID. `--yes` skips those questions but preserves the human-terminal and agent checks. Monitor policy and pending-action approval are separate explicit paths to execution.
 - **Verify and revoke last:** replacement verification precedes batched writes. Default revocation waits for every consumer write and confirmed activation. For overlapping replacements, failed writes/deployments retain the old key. Cloudflare's atomic roll invalidates the old token immediately and cannot provide overlap. CLI `--revoke immediately` revokes after writes but before deploys; `--revoke never` retains old keys. `--no-redeploy` cannot establish activation. Review `--revoke-unconfirmed` separately before allowing revocation without activation proof.
 - **Known consumers only:** sealed secrets cannot be deduplicated by value or automatically resolved from a fingerprint. Unplanned sealed findings with a matching provider or variable name can block revocation or atomic rotation unless `--accept-unplanned-sealed` explicitly accepts the risk. Missing credentials, inaccessible services, ignored files, and out-of-scope accounts leave gaps. Stale inventory is checked before execution, but APIs do not provide cross-host transactions or compare-and-swap.
-- **Activation is host-specific:** dotenv writes require a manual process restart; Fly requires manual activation; Railway shared variables and unpollable initial deployments need human verification; Vercel preview/development and GitHub Actions apply on future runs. These writes report `unconfirmed` activation and retain old keys by default. A null deployment ID is not proof of application activation.
-- **Recovery has limits:** encrypted in-flight values and the journal support resume and grace-period undo. A provider can create a credential before keysentry records its value; cleanup may require its dashboard. Undo may be unavailable for unreadable old values. Run one rotation/monitor process per project; this is not an interprocess execution lock. Notification failures have no durable retry queue.
+- **Activation is host-specific:** dotenv writes require a manual process restart; unsupported Fly layouts need manual activation; Railway shared variables and unpollable initial deployments need human verification; Vercel preview/development and GitHub Actions apply on future runs. These writes report `unconfirmed` activation and retain old keys by default. A null deployment ID is not proof of application activation.
+- **Recovery has limits:** encrypted in-flight values and the journal support resume and grace-period undo. A provider can create a credential before keysentry records its value; cleanup may require its dashboard. Undo may be unavailable for unreadable old values. Run one rotation/monitor/watcher process per project; this is not an interprocess execution lock. Watcher acknowledgments survive restarts, but channel delivery itself is not guaranteed.
 
 ## Development checks
 

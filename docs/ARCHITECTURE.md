@@ -1,6 +1,6 @@
 # keysentry architecture and module specs
 
-keysentry is a local CLI. It finds every copy of every secret across a
+keysentry is a local CLI with an optional self-hosted watcher. It finds known copies of secrets across a
 team's hosts, rotates them in a safe order with one redeploy per service, verifies the new keys, revokes the old ones,
 and monitors keys so it can contain or rotate them when it sees suspicious use.
 
@@ -36,6 +36,10 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 | `src/providers/` | provider adapters + registry | 1 |
 | `src/rotate/` | rotation engine | 2 |
 | `src/monitor/` | detectors, policy, canaries, daemon, notifier | 2 |
+| `src/autopilot/`, `src/feeds/` | signed armed plans, incident corroboration, scope checks, rotation waves and kill switch | phase 2 |
+| `src/notify/` | signed messages, channels and delivery retries | phase 2 |
+| `src/approvals/` | WebAuthn verification, action-bound approval service, relay and minimal HTTP server | phase 2 |
+| `src/watcher/`, `deploy/` | sealed deployment configuration, serialized runtime, container and platform templates | phase 2 |
 | `src/cli/`, `README.md` | CLI integration, configuration, prompts and e2e tests | phase 1, wave 3 |
 
 Tests live in `test/<module>/*.test.ts`. Each module exports its public API from `src/<module>/index.ts`.
@@ -89,8 +93,8 @@ One factory per host, all returning `HostAdapter`; `src/hosts/index.ts` re-expor
 - **Fly** `createFlyHost({ token, org?: string, apps?: string[], http, log })`. Values are write-only.
   - listServices: Machines API `GET https://api.machines.dev/v1/apps?org_slug=<org>` (or the configured app names).
   - readVariables: GraphQL `POST https://api.fly.io/graphql` `query($name:String!){ app(name:$name){ secrets { name digest createdAt } } }` → names only, `sealed: true`.
-  - writeVariables: GraphQL `setSecrets(input: { appId, secrets: [{ key, value }], replaceAll: false })`. If the API cannot stage without deploying, document it in a code comment and still never deploy more than once per plan.
-  - redeploy: return null and log a warning ("run `fly secrets deploy -a <app>`") unless a reliable API exists; deploymentStatus → success for null ids is never called.
+  - writeVariables: Machines API `POST /v1/apps/{app}/secrets` with `{ values }` stages only selected secrets and remembers the returned secret version when available.
+  - redeploy: list all Machines with full configs, then lease and update them sequentially with unchanged config, `current_version` and available `min_secrets_version`. Running Machines must confirm the new started version before continuing; stopped/suspended Machines remain stopped. Release leases even on failure. The opaque deployment ID contains only app/machine/version metadata. No Machines returns null and does not prove activation; status requires each recorded new version.
 - **GitHub Actions** `createGithubActionsHost({ token, repos: string[] /* owner/repo */, http, log })`. REST `https://api.github.com`, headers `Authorization: Bearer`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`.
   - One ServiceRef per repo (projectId = owner, serviceId = owner/repo). readVariables: `GET /repos/{o}/{r}/actions/secrets?per_page=100` → names, sealed.
   - writeVariables: `GET /repos/{o}/{r}/actions/secrets/public-key` → `{ key_id, key }`; encrypt with libsodium `crypto_box_seal` (package `libsodium-wrappers`, await `sodium.ready`); `PUT /repos/{o}/{r}/actions/secrets/{name}` `{ encrypted_value, key_id }`.
@@ -191,3 +195,131 @@ Public API (`src/monitor/index.ts`):
 - Runtime writes a public presence marker at `<userDir>/audit-heads/<hash>.json`. Its presence triggers vault-anchor lookup even if the project log has been removed. When both marker and log are absent and no vault is injected, verification reports local-chain verification only with the independent head unchecked. The env backend cannot persist a head: signed checkpoints remain verifiable, but heads are process-local, a warning is emitted, and no durable tail-truncation check is available across processes.
 - `verify` first checks local manifest consistency, then published signed checksums online through guarded HTTP. Empty release public keys produce `unconfigured`, not a verified publisher. Current output states: `Release signing keys are not published yet; only the local check ran.` Source checkouts report development integrity. Provenance verification is not implemented in this phase.
 - E2E tests inject fake vaults, HTTP, hosts/providers and temporary directories; no real credential-store helper or network request is used. Cases cover encrypted persistence/audit, receipt hosts, agent refusal, hidden vault input, grace/finish, crash/resume and 0.1 migration.
+
+## Phase 2: breach autopilot and watcher
+
+### Authorization and scope (`src/autopilot/`)
+
+`autopilotEligibility` uses the actual provider capabilities and the existing exact-name generate rule. Payment,
+database, encryption, wallet/private-key, guided and atomic-roll credentials are excluded. Write-only consumers
+need supervised adoption before automatic coverage. Adoption stores the replacement fingerprint, provider key
+reference and time in `ArmedCluster.adopted`; its plaintext is not retained as authorization material.
+
+`buildArmedPlan` captures all consumers of selected eligible clusters, including consumers on other hosts. The
+plan binds the project, incident hosts, permitted methods, fingerprints, maximum service count, health checks,
+grace period, expiry and explicit next-deploy acceptance. Defaults are 10 services, 900 seconds and 90 days;
+validity is capped at 365 days. `signArmedPlan` signs the canonical document, including its signer, with the
+`keysentry-armed-plan:v1\n` domain prefix. `verifyArmedPlan` validates the strict schema, Ed25519 signature,
+trusted key ID and current time. Verification precedes every automatic boundary.
+
+`checkScope` compares the signed document with fresh inventory. Added/removed consumers, changed fingerprints,
+an uncovered host, ineligible methods and a wave exceeding its signed service limit become approval requests.
+`arm` requires a successful drill from the last 24 hours and signs the selected authorization locally. Both the
+drill record and `armed-plan.json` are encrypted state; the latter uses StateStore kind `plan`. Re-arming replaces
+the authorization and appends an audit event. Non-secret defaults are YAML `autopilot` settings, not doctor state.
+
+After adopted-key rotations, the runner returns `adoptionUpdates`. The local CLI can apply updates in its own
+state store and re-sign with the device key. A watcher cannot forge a device authorization: it retains the updates
+and reports `re-arm to refresh adopted keys`. Local `arm --refresh` reviews and signs updates for the same CLI/local
+`watch` store; it does not import updates from a separate deployed watcher. Remote renewal must reconcile the
+original watcher's encrypted state and matching keys before re-arming. Remote update export/import and dashboard
+reconciliation remain phase 3 gaps. Manual rotations must also apply adoption updates before treating the old
+authorization as current.
+
+### Sources and incident decisions (`src/feeds/`, `src/autopilot/{sources,incidents}.ts`)
+
+`fetchFeed` uses the guarded client, conditional cache headers and bounded RSS/Atom parsing. Recorded evidence
+contains sanitized metadata and keyed item identities, never application key values. The source table records
+official/news classification, platform coverage and publisher ownership. One high-confidence official advisory
+can trigger; an official source plus credential-exposure news, or two independent news owners describing the
+same platform's credential exposure within the allowed window, can corroborate. One report alone alerts and
+requests approval. News naming a platform without credential exposure does not trigger rotation.
+
+Incident state is encrypted and persisted before its effects. One platform incident per seven-day window avoids
+repeated waves; a triggered incident does not trigger again. Each watcher fetches evidence itself rather than
+accepting a central rotation instruction. Feed text remains untrusted even when its host is allow-listed.
+
+### Wave execution (`src/autopilot/runner.ts`, `src/rotate/`)
+
+`runAutopilot` creates one `wave-<incidentId>` with the original inventory, rotation plan and signed authorization
+saved before execution. It forces serial deployments, verify-before-write, stop on first failure, a wave-wide
+revocation hold, and deferred grace. Signed health checks use the guarded HTTP client: three probes 20 seconds
+apart after deployment and again before deferred revocation. No provider diagnostics or response bodies become
+notification content. The runner's start/failure/grace/end messages contain counts; hints are separately opt-in.
+
+`resumeWaves` continues saved interrupted work. Before `settleWaves`, CLI wiring rescans using read-role tokens
+and supplies the fresh inventory, so a newly discovered consumer cannot be missed by a saved scan. Recovery
+revalidates authorization and scope. Disarmed/alert-only state prevents automatic recovery and settlement.
+Next-deploy consumers retain old keys unless signed maximum-deadline consent permits revocation; early
+next-deploy detection is not implemented. Failed waves need human remediation. Interrupted settlement can leave
+some old keys revoked, which is reported rather than claiming the whole wave remains reversible.
+
+### Signed notifications (`src/notify/`)
+
+The CLI constructs Telegram, Discord, Slack, ntfy, webhook, Resend, SMTP and console channels. YAML `notify`
+contains channel IDs, kinds and non-secret server/address settings. Secret fields use vault names
+`notify/<channelId>/<field>`; webhook URLs, bot/API tokens, SMTP passwords and topics never enter YAML. Each
+configured HTTP destination becomes an explicit user egress rule and trusted URL entry where required by
+credential-bearing service paths. Health hosts are user rules with purpose `health check you configured`.
+SMTP uses TLS/STARTTLS with certificate verification and records a metadata-only `smtp:<host>` receipt entry.
+
+`signMessage` signs canonical messages with `keysentry-notify:v1\n`; the short base32 verification code derives
+from the signature. `verifyMessage` requires the full signed object and trusted public key. The CLI verifies a
+cached message by code or a full JSON file against its device/configured watcher keys. Generic webhook delivery
+preserves the signed JSON and adds signature headers; text channels show the code. Secret checks reject a
+message rather than changing its signed content. The dispatcher retries individual channels and records actual
+successful delivery, which the watcher persists for its notification dead-man check.
+
+### Approvals and local registration (`src/approvals/`, `src/cli/`)
+
+The encrypted approval store binds each action ID to one digest and a random challenge. Requests expire after
+ten minutes, are single-use and limit failed attempts. WebAuthn accepts supported COSE keys, validates exact RP
+and origin, requires user verification, checks counters and rejects clone warnings. Device approvals sign
+`keysentry-approval:v1\n` plus `{ actionId, digest, at }`; signed disarms use their separate domain prefix.
+The relay verifies configured trusted keys and freshness. Its topic is not authorization; ntfy.sh topics can be
+public read/write. A relay may delay or suppress a valid message and cannot re-arm the watcher.
+
+`passkey register` binds a temporary server to `127.0.0.1` but opens `localhost` at a random port, with RP ID
+`localhost`, a one-time URL token, exact Host/Origin checks, strict CSP and a bundled static script. It shuts
+down after success, five minutes or Ctrl-C. Public-origin enrollment must happen on that origin; the current
+approval server has no `/register` route and dashboard enrollment remains phase 3. Arming and channel/passkey
+changes are local human mutations; remote approval cannot widen policy.
+
+The minimal approval server exposes health, approval challenges/assertions and disarm only. It checks exact
+Host and POST Origin, caps requests, rate-limits callers and serves no secret values. HTTPS termination and
+trusted-proxy configuration belong to deployment. A disarm needs no passkey, stops new automatic effects and
+settlement, and cannot restore a completed revocation. `KEYSENTRY_ALERT_ONLY=1` forces the same automatic hold.
+
+### Watcher runtime (`src/watcher/`, `src/cli/`, `deploy/`)
+
+Locally `watch` uses the CLI vault and encrypted state. Container setup seals an authenticated config containing
+the signed plan and required runtime settings. `KEYSENTRY_WATCHER_KEY` opens it; `KEYSENTRY_STATE_KEY` and
+`KEYSENTRY_VAULT_PASSPHRASE` protect persistent runtime data. The additional encrypted
+`KEYSENTRY_WATCHER_VAULT` bootstrap blob supplies the selected host/provider tokens, scope, fingerprint and signing
+material not present in the fixed `WatcherConfig` interface; its state/deployment unlock keys remain external.
+All five generated values belong in platform secret settings, including the extra portable-vault variable when
+using templates that list only the four core variables. Setup prints secrets only once to an interactive
+TTY, never JSON. The sealed config comes from `KEYSENTRY_WATCHER_CONFIG` or
+`KEYSENTRY_WATCHER_CONFIG_FILE`. Keys and passphrases stay outside `KEYSENTRY_STATE_DIR` (`/data` in the image).
+POSIX state directories require mode 0700. All vault/state/in-flight/audit paths must resolve under that volume.
+
+Setup creates a new deployment key, state key, vault passphrase and portable-vault identity on every invocation;
+it does not migrate an existing live volume. Deployment renewal first uses the original matching vault, keys and
+encrypted state to finish or undo pending grace/stopped rotations and reconcile remote adoption updates. Then
+disarm and stop the old watcher, retain a secure backup of its unchanged encrypted volume with original keys
+protected separately for recovery/audit, and prepare the new setup against a fresh private directory or volume.
+Supply all five new secret settings to the replacement. Leave the old volume unchanged; a new key/passphrase must
+not be substituted against it. Unlock keys remain outside state. There is no phase 2 live-state migration or
+remote adoption export/import flow; the later dashboard must address that reconciliation explicitly.
+
+The serialized tick resumes waves, polls the relay, reads sources, persists incident decisions, handles waves
+and approval requests, settles grace, runs detectors and sends a daily heartbeat. Persisted acknowledgments and
+the original start/delivery anchors survive scheduled restarts. No successful notification for 24 hours, invalid
+authorization, unwritable state or clock skew beyond 300 seconds forces alert-only. The watcher excludes its own
+operating credential names from automatic work; an incident on its own platform requests guided rotation.
+
+`watch --once` provides scheduled execution with a fresh safety check before its final settlement. Templates
+cover Railway, Fly, Render, Docker Compose and Actions; they do not deploy automatically. The container runs
+non-root with a read-only root and a private writable state volume. Image publication/digests, live platform
+permissions and browser ceremonies remain release integration checks. Actions scheduling delay, dropped runs
+and cache eviction are operational limits, not a real-time guarantee.

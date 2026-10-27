@@ -1,19 +1,20 @@
-# keysentry phase 1 threat model
+# keysentry 1.0 threat model
 
 keysentry needs access to secret values to compare their copies and replace them. This is a local
-CLI, not a service that takes custody of your keys. You choose the projects and credentials it can
+CLI and optional watcher that you host. You choose the projects and credentials they can
 use. Its [trust promise](superpowers/specs/2026-10-27-trust-autopilot-design.md#3-the-trust-promise)
 guides the design; the [access guide](ACCESS.md) describes the actual integration permissions.
 
-This model covers 1.0 phase 1: vault storage, encrypted state, network restrictions, an audit log,
-rotation recovery, human confirmation, and release tooling. There has been **no external security
+This model covers 1.0 phases 1 and 2: vault storage, encrypted state, network restrictions, an audit log,
+rotation recovery, human confirmation, release tooling, signed breach autopilot, notifications, approvals and
+the self-hosted watcher. There has been **no external security
 audit**. Adapter behaviour has **not yet been tested against live accounts**. Fake API tests and
 source review can check our decisions and formats, but cannot establish every provider's live
 permission or deployment behaviour.
 
 ## Assets
 
-| Asset | Why it matters | Where phase 1 permits it |
+| Asset | Why it matters | Where it is permitted |
 |---|---|---|
 | Hosting and provider credentials | Can reveal configuration, create or disable keys, or deploy code within their scopes. | OS vault, explicitly chosen encrypted-file vault, or a supported environment source; plaintext while needed in memory and in authorized API headers/bodies. |
 | Existing and replacement secret values | Applications need them; losing a replacement can interrupt a rotation. | Original host/provider, process memory, and encrypted per-rotation records while recovery or undo needs them. |
@@ -22,6 +23,9 @@ permission or deployment behaviour.
 | Audit chain, MAC key and device signing key | Help detect changes to the recorded history. | Secret-free audit metadata in a local log; MAC key, signing key and known head in the vault. |
 | Release signing key and trusted public keys | Determine which published checksum signatures users accept. | Private key in the maintainer's release secret store/signing process; public trust list in the source and bundle. |
 | Running applications | A mistimed change or revocation can stop them. | Hosting platforms controlled by the user; modified only through an approved rotation. |
+| Signed armed plan | Authorizes specific automatic rotations, consumer scope, limits and expiry. | Encrypted local/watcher state and sealed deployment configuration; verified against trusted device keys before effects. |
+| Approval credentials, challenges and grants | Authorize one narrowly bound action without sharing application secrets. | Public passkey credentials and single-use approval state in encrypted storage; challenges/assertions in the approval flow; signed device messages through the relay. |
+| Watcher deployment/state keys and vault passphrase | Unlock the sealed configuration, saved state and recovery values. | Platform secret settings and process memory; never beside encrypted state or in committed config. The watcher host can access them while running. |
 
 ## Boundaries and controls
 
@@ -57,6 +61,11 @@ and time limits constrain where requests go and how much data is accepted. The r
 host, purpose, method, time, and status, never authentication headers or bodies. A permitted host
 can still return false or malicious data. The allow-list does not constrain unrelated processes.
 
+Notification webhook URLs and topics can themselves be credentials. The local setup stores them in the vault,
+adds exact configured HTTP destinations as user rules/trusted URLs, and never records URL paths in the receipt.
+Health-check hosts require explicit user rules. SMTP is an explicit non-HTTP exception: it uses TLS or mandatory
+STARTTLS with certificate checks and writes one `smtp:<host>` metadata entry to the receipt.
+
 **The CLI to the operating system.** The optional Node permission model limits file access and
 child-process use on supported patched versions. On Node 22 it is enabled only at **22.23.4 or
 later**. Node 22 has no network permission flag; the client allow-list remains the network control.
@@ -76,6 +85,58 @@ encrypted value is stored can leave an orphan suspect; it is reported and nothin
 guesswork. A write-only old value cannot be restored. A platform that applies values on the next
 deployment needs an explicit activation decision. Cloudflare's atomic roll invalidates the old
 token immediately and cannot provide overlap or restore it.
+
+**Feeds to automatic authorization.** News and official feeds are untrusted input. Size caps, defensive XML parsing,
+sanitized text, per-source platform rules and publisher-owner corroboration reduce accidental triggers. A single
+news report raises an alert and approval request; news without credential-exposure evidence never rotates.
+A high-confidence official advisory or the defined corroborated evidence can trigger only inside a valid,
+unexpired device-signed plan. This is not proof that the reporting source is truthful. Compromise of an official
+feed, or collusion between sources counted as independent, can still supply misleading eligible evidence.
+
+Current inventory is checked against every armed consumer. New/removed consumers, changed fingerprints and scope
+growth request approval. Autopilot excludes payment, database, encryption, wallet/private keys, atomic rolls,
+guided methods and generated secrets outside the exact-name allow-list. Write-only adoption is a supervised real
+rotation that records a fingerprint and provider reference; watcher adoption updates need a locally re-signed
+plan. Deferred settlement uses a fresh read-role scan. Hosts can still omit a consumer or lie about deployment.
+
+**Watcher to applications.** One wave per incident, serial deployments, replacement verification, application
+health checks, grace and a wave-wide revocation hold limit cascading changes. Signature/time/scope checks repeat
+at automatic boundaries. Failure stops the wave; revocations already attempted during an interrupted settlement
+cannot be undone atomically. Next-deploy revocation needs signed maximum-deadline acceptance; early activation
+detection is not implemented. Disarm and `KEYSENTRY_ALERT_ONLY=1` stop automatic effects and settlement, without
+restoring keys already revoked. A remote disarm may be delayed by its transport.
+
+The watcher falls back to alert-only when its notification window, state writability, armed-plan validity or clock
+checks fail. Delivery means a channel accepted the message, not that a person read it. An attacker who controls
+the channel can suppress alerts after acceptance. Scheduled Actions can be delayed or skipped, and encrypted
+cached state can be evicted or rolled back. One writer per state directory is required; there is no distributed
+lock or rollback-resistant generation counter.
+
+**Messages and approvals.** Notification signatures bind the full message to a locally trusted device/watcher
+public key. The short code is a lookup/check aid, not an approval credential. Notifications contain no secret
+values and hints are opt-in; operators may still learn names, counts and timing. Text-channel truncation can
+hide context, so signature verification requires the complete signed object. A valid signature proves the
+signer, not that the proposed action is safe.
+
+Passkey approvals bind exact action ID and digest to a random, ten-minute, single-use challenge and require user
+verification. Device approvals also bind the digest and time. Trusted keys, replay tracking and freshness protect
+relay messages; relay topic secrecy is not authorization. Adding coverage, channels or credentials requires the
+local human CLI and cannot be done through the relay. Disarming requires no passkey. The approval server exposes
+only bounded health/approval/disarm routes with exact Host/Origin checks, strict CSP and rate limits. Deployment
+must correctly terminate TLS and configure proxy trust.
+
+Local registration binds to loopback, uses a one-time token, opens as localhost, checks Host/Origin, serves only a
+static script and closes after success or timeout. A localhost passkey is not a public-origin passkey. The server
+does not provide public `/register`; public enrollment remains a phase 3 dashboard feature. Browser/authenticator
+implementation, the selected origin and the local supervised enrollment remain trust boundaries.
+
+**Watcher to its host.** The sealed config and encrypted state protect data at rest without their separately
+supplied keys; the running host has both keys and process access. The image runs non-root with a read-only root
+and a private writable volume; POSIX state directories with group/other permissions are refused. A host operator
+or compromised host can still read memory, steal injected secrets, alter the running code or roll back files.
+The watcher excludes its operating credentials from automatic rotation and asks for guided changes when its own
+platform has an incident. Hosting the watcher on a different platform can reduce shared exposure, but does not
+remove either host's trust boundary.
 
 **The audit log to the vault.** Entries form a SHA-256 chain, and each entry carries an HMAC-SHA256
 over its hash using the 32-byte `audit/mac` key held in the vault. Missing or incorrect MACs are
@@ -108,12 +169,15 @@ operations still need maintainer validation before a release.
 
 ## Actors and remaining risks
 
-| Actor | What they could try | Phase-1 response and residual risk |
+| Actor | What they could try | Response and residual risk |
 |---|---|---|
 | Network attacker | Read or alter API traffic, redirect it, or supply oversized responses. | HTTPS certificate checks, validated destinations, guarded redirects, and body/time limits. DNS, TLS trust roots, and the destination service remain trusted. Availability failures can still stop a scan or rotation. |
 | Malicious package or build tool | Read credentials or change released code. | Locked source dependencies, ignored install scripts, bundled releases with no install hooks/dependencies, reviewable code, and reproducibility checks. A bundled malicious dependency still runs with the CLI's effective access; a compromised toolchain can produce consistently bad output. |
 | Breached hosting platform | Read values it already hosts, lie about state, or undo an update. | Scope credentials narrowly, track every known consumer, verify and revoke in order. A platform can expose keys it holds and fake a successful deployment; keysentry cannot repair that trust boundary. |
-| Breached notification channel | Read, suppress, or alter alerts; lure the user into taking action. | Notification content must contain no secret values. A message alone grants no CLI approval. Phase 1 does not implement the later signed-message and passkey-approval system; verify the proposed action in your own terminal. Delivery and authenticity of existing webhook notifications are not guaranteed. |
+| Breached notification channel | Read, suppress, alter or replay alerts; lure the user into taking action. | Signed watcher messages contain no values, hints are opt-in, and trusted-key verification detects edits. A message grants no approval. The operator can suppress delivery or retain metadata; legacy monitor webhook messages do not gain signature guarantees merely by using the same channel. |
+| News feed author | Publish a misleading story, replay an old item or abuse a platform mention to provoke changes. | Bounded parsing, evidence classification, publisher-owner corroboration and incident deduplication limit triggers. News alone alerts; only signed-plan scope can execute. Incorrect official evidence or colluding independent owners remain possible. |
+| Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |
+| Watcher host | Read runtime memory or injected keys, modify code, roll back state or interrupt work. | Sealed configuration, separately supplied state/vault keys, private volume permissions and a non-root read-only image reduce filesystem exposure. The host remains trusted with running plaintext and can defeat these controls. Own-platform incidents request guided credential rotation. |
 | Same-user malware | Ask the OS vault for entries, read process memory or environment values, or replace files. | OS storage and encryption reduce exposure from files alone. They do not isolate keysentry from another process with your user's privileges in an unlocked session. |
 | AI coding agent | Invoke mutation commands or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive mutation checks, detected agent refusal, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
 | keysentry maintainers | Ship an unsafe implementation or change the release trust list. | Open source, readable release code, explicit trust roots, release signatures, checksums, provenance workflows, and independent rebuilding enable review. Maintainers still control releases; a valid signature identifies the signer, not the safety of the code. There is no external audit yet. |
@@ -137,12 +201,11 @@ operations still need maintainer validation before a release.
 
 ## Later phases
 
-The trust design also describes armed breach autopilot, a managed watcher, signed notifications,
-passkey approvals, a local dashboard, confidential cloud boxes, and team/enterprise roles. Those
-are later phases, not protections established by this work. No cloud box or control plane is
+The trust design also describes a local dashboard, public-origin passkey enrollment, confidential cloud boxes,
+and team/enterprise roles. Those are later phases, not protections established by this work. No cloud box or control plane is
 deployed here, and there is no current claim that confidential hardware prevents operators or a
-cloud provider from accessing a running keysentry instance. An existing monitor policy is not the
-later signed armed-plan and passkey approval system.
+cloud provider from accessing a running keysentry instance. Legacy monitor policy remains distinct from the
+signed armed-plan scope; enabling one does not authorize the other.
 
 Before public release, the maintainer must finish integration review, exercise real OS vaults,
 run the release and reproducibility builds outside the sandbox, validate install/verify behaviour,

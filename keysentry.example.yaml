@@ -44,6 +44,33 @@ rotation:
   deployTimeoutMs: 600000
   pollIntervalMs: 5000
 
+# Non-secret defaults for locally signed armed plans.
+# A recent drill and keysentry arm are still required to authorize autopilot.
+autopilot:
+  graceMinutes: 15
+  maxServices: 10
+  showHints: false
+  healthChecks: []
+  # healthChecks:
+  #   - serviceKey: railway:project-id/environment-id/service-id
+  #     url: https://app.example.com/health
+  #     expectStatus: 200
+
+# Add channels through keysentry notify add <kind>.
+# Only non-secret settings belong here. Tokens, webhook URLs, SMTP passwords
+# and ntfy/relay topics go in vault entries notify/<channelId>/<field>.
+notify:
+  channels:
+    - id: console
+      kind: console
+    # - id: phone
+    #   kind: ntfy
+    #   server: https://ntfy.sh
+    # - id: email
+    #   kind: resend
+    #   from: keysentry@example.com
+    #   to: [operator@example.com]
+
 monitor:
   interval: 300 # seconds
   autoExecute: false # automatic actions require human terminal startup when enabled

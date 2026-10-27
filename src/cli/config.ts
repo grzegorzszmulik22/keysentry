@@ -1,8 +1,8 @@
 import { CliError } from './errors.js';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { isIP } from 'node:net';
-import { parseDocument } from 'yaml';
+import { parseDocument, stringify } from 'yaml';
 import { z } from 'zod';
 import { createLogger, createRedactor } from '../core/index.js';
 import { createFetchHttp } from '../http.js';
@@ -40,6 +40,18 @@ const safeUrl = z.string().url().refine(value => {
   const url = new URL(value);
   return (url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password;
 });
+const guardedUrl = safeUrl.refine(value => {
+  const url = new URL(value);
+  return url.protocol === 'https:' && !url.port && !url.hash && !isIP(url.hostname.replace(/^\[|\]$/g, ''))
+    && !/^[a-z]+:\/\/[^/]*@/i.test(value);
+});
+const channelId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+const channelSettings = z.object({
+  id: channelId,
+  kind: z.enum(['telegram', 'discord', 'slack', 'ntfy', 'webhook', 'resend', 'smtp', 'console']),
+  server: guardedUrl.optional(), from: nonempty.optional(), to: z.array(nonempty).optional(),
+  host: exactHostname.optional(), port: z.union([z.literal(465), z.literal(587)]).optional(),
+}).strict();
 const repository = nonempty.refine(value => {
   const parts = value.split('/');
   return parts.length === 2 && /^[A-Za-z0-9-]+$/.test(parts[0]!)
@@ -68,6 +80,17 @@ export const configSchema = z.object({
     pollIntervalMs: positive.int().default(5_000),
   }).strict().prefault({}),
   network: z.object({ allowHosts: z.array(exactHostname).default([]) }).strict().prefault({}),
+  autopilot: z.object({
+    graceMinutes: z.number().finite().nonnegative().default(15),
+    maxServices: z.number().int().positive().default(10), showHints: z.boolean().default(false),
+    healthChecks: z.array(z.object({ serviceKey: nonempty, url: guardedUrl,
+      expectStatus: z.number().int().min(100).max(599).optional(),
+    }).strict()).max(50).default([]),
+  }).strict().prefault({}),
+  notify: z.object({
+    channels: z.array(channelSettings).max(50).refine(items => new Set(items.map(item => item.id)).size === items.length).default([]),
+    relay: z.object({ server: guardedUrl }).strict().optional(),
+  }).strict().prefault({}),
   monitor: z.object({
     interval: positive.default(300),
     autoExecute: z.boolean().default(false),
@@ -122,6 +145,8 @@ export interface LoadConfigOptions {
   redactor?: Redactor;
   vault?: Vault;
   role?: TokenRole;
+  /** Sealed watcher bootstrap supplies validated non-secret settings in memory. */
+  settings?: ConfigSettings;
 }
 
 function validate(input: unknown): ConfigSettings {
@@ -171,11 +196,11 @@ async function readSettings(path: string, explicit: boolean): Promise<unknown> {
 }
 
 /** Read scope and network configuration without opening a vault or building adapters. */
-export async function loadConfigMetadata(options: Pick<LoadConfigOptions, 'cwd' | 'config' | 'env'> = {}): Promise<ConfigMetadata> {
+export async function loadConfigMetadata(options: Pick<LoadConfigOptions, 'cwd' | 'config' | 'env' | 'settings'> = {}): Promise<ConfigMetadata> {
   const cwd = resolve(options.cwd ?? process.cwd());
   const configPath = resolve(cwd, options.config ?? 'keysentry.yaml');
   const env = options.env ?? process.env;
-  const settings = validate(await readSettings(configPath, options.config !== undefined));
+  const settings = validate(options.settings ?? await readSettings(configPath, options.config !== undefined));
   const railway = settings.hosts.railway;
   const vercel = settings.hosts.vercel;
   const fly = settings.hosts.fly;
@@ -206,8 +231,28 @@ export async function loadConfigMetadata(options: Pick<LoadConfigOptions, 'cwd' 
     cwd, configPath, settings,
     feedUrls: settings.monitor.feeds?.map(feed => feed.url) ?? [],
     webhooks: [...settings.monitor.webhooks], dotenvRoots: [...dotenv.roots],
-    userHostRules: [...new Set(settings.network.allowHosts)].map(host => ({ host, owner: 'user', purpose: 'host you added in keysentry.yaml' })),
+    userHostRules: [
+      ...[...new Set(settings.network.allowHosts)].map(host => ({ host, owner: 'user', purpose: 'host you added in keysentry.yaml' })),
+      ...settings.autopilot.healthChecks.map(check => ({ host: new URL(check.url).hostname, owner: 'user', purpose: 'health check you configured' })),
+    ],
   };
+}
+
+/** Persist only the non-secret notification metadata; secrets live in the vault. */
+export async function saveNotificationSettings(path: string, channels: ConfigSettings['notify']['channels']): Promise<void> {
+  const previous = await readSettings(path, false) as Record<string, unknown>;
+  const notify = previous.notify && typeof previous.notify === 'object' ? previous.notify as Record<string, unknown> : {};
+  const next = { ...previous, notify: { ...notify, channels } };
+  validate(next);
+  await writeFile(path, stringify(next), { mode: 0o600 });
+}
+
+export async function saveNotificationRelay(path: string, server: string): Promise<void> {
+  const previous = await readSettings(path, false) as Record<string, unknown>;
+  const notify = previous.notify && typeof previous.notify === 'object' ? previous.notify as Record<string, unknown> : {};
+  const next = { ...previous, notify: { ...notify, relay: { server } } };
+  validate(next);
+  await writeFile(path, stringify(next), { mode: 0o600 });
 }
 
 /** Vault credentials take precedence; environment remains the last fallback. */

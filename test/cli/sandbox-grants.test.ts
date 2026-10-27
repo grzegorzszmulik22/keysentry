@@ -41,6 +41,22 @@ test('init grants only its chosen config file in addition to private state', asy
   expect(result.allowChildProcess).toBe(false);
 });
 
+test('notification mutations can write the exact selected config and watcher setup its selected directory', async () => {
+  const f = await fixture();
+  const notify = await permissionOptionsForBin(f.argv('notify', 'add', 'console'), { KEYSENTRY_VAULT: 'memory' }, f.bundle, { userDir: f.userDir });
+  expect(notify.writePaths).toContain(join(f.cwd, 'keysentry.yaml'));
+  const destination = join(f.cwd, 'deployment');
+  const watcher = await permissionOptionsForBin(f.argv('watcher', 'setup', '--output', destination), { KEYSENTRY_VAULT: 'memory' }, f.bundle, { userDir: f.userDir });
+  expect(watcher.writePaths).toContain(directory(destination));
+});
+
+test('sealed watch grants its explicitly configured private state directory', async () => {
+  const f = await fixture(); const state = join(f.cwd, 'watcher-state');
+  const result = await permissionOptionsForBin(f.argv('watch', '--once'), { KEYSENTRY_VAULT: 'encrypted-file', KEYSENTRY_STATE_DIR: state, KEYSENTRY_WATCHER_KEY: 'present' }, f.bundle, { userDir: f.userDir });
+  expect(result.writePaths).toContain(directory(state));
+  expect(result.readPaths).toContain(directory(state));
+});
+
 test('plan output grants the exact -o or --output file, including an external path', async () => {
   const f = await fixture(); const output = resolve(f.cwd, '..', 'keysentry-runbook.md');
   for (const args of [['plan', '-o', output], ['plan', `--output=${output}`]]) {

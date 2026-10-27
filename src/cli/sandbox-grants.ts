@@ -92,11 +92,21 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
   const bundle = resolve(bundlePath);
   const command = commandName(args);
   const writePaths = [directory(join(metadata.cwd, '.keysentry')), directory(userDir)];
+  const extraReads: string[] = [];
   if (command === 'init') writePaths.push(metadata.configPath);
+  if (command === 'notify' && (args.includes('add') || args.includes('remove'))) writePaths.push(metadata.configPath);
+  if (command === 'watcher' && args.includes('setup') && args.some(value => value === '--relay-server' || value.startsWith('--relay-server='))) writePaths.push(metadata.configPath);
+  if (command === 'watch' && env.KEYSENTRY_WATCHER_KEY) {
+    const stateDir = resolve(metadata.cwd, env.KEYSENTRY_STATE_DIR ?? '.keysentry');
+    writePaths.push(directory(stateDir)); extraReads.push(directory(stateDir));
+    if (env.KEYSENTRY_WATCHER_CONFIG_FILE) extraReads.push(resolve(metadata.cwd, env.KEYSENTRY_WATCHER_CONFIG_FILE));
+  }
   const output = argument('--output') ?? argument('-o');
   if (command === 'plan' && output) writePaths.push(resolve(metadata.cwd, output));
+  if (command === 'watcher' && args.includes('setup') && output) writePaths.push(directory(resolve(metadata.cwd, output)));
   const writesDotenv = ['approve', 'resume', 'finish', 'undo'].includes(command ?? '')
     || command === 'rotate' && args.includes('--execute')
+    || command === 'arm' || command === 'watch'
     || command === 'monitor' && (metadata.settings.monitor.autoExecute || metadata.settings.monitor.autoContain);
   if (writesDotenv && metadata.settings.hosts.dotenv.enabled !== false) {
     let inventory: Inventory | null = null;
@@ -112,8 +122,8 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
     } else writePaths.push(...metadata.dotenvRoots.map(directory));
   }
   return {
-    readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), metadata.configPath, ...metadata.dotenvRoots.map(directory)],
+    readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), metadata.configPath, ...metadata.dotenvRoots.map(directory), ...extraReads],
     writePaths: [...new Set(writePaths)],
-    allowChildProcess: await needsVaultHelper(env, userDir),
+    allowChildProcess: command === 'passkey' && args.includes('register') || await needsVaultHelper(env, userDir),
   };
 }

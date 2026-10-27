@@ -18,6 +18,10 @@ import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
 import { permissionOptionsForBin } from './sandbox-grants.js';
 export { permissionOptionsForBin } from './sandbox-grants.js';
 import { StateLockedError } from '../core/index.js';
+import { registerPhase2Commands, relaySettings, localDeviceKeys } from './phase2.js';
+import { approveAutopilot } from './autopilot-approvals.js';
+import { listPasskeys } from './passkeys.js';
+import { bootstrapWatcher } from './watcher-bootstrap.js';
 import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
 
 export { createRuntime } from './runtime.js';
@@ -31,6 +35,8 @@ export interface CliOptions extends RuntimeOptions {
   confirm?: (count: number) => Promise<boolean>;
   confirmAction?: (id: string) => Promise<boolean>;
   promptIO?: PromptIO;
+  confirmAdoption?: (question: string) => Promise<boolean>;
+  openBrowser?: (url: string) => Promise<void>;
 }
 
 function role(value: string): TokenRole {
@@ -84,6 +90,7 @@ function summary(report: RotationReport, journal: string) {
 /** No process.exit or real network is required by this entry point: inject a runtime for embedding/tests. */
 export async function runCli(args: string[] = process.argv.slice(2), options: CliOptions = {}): Promise<number> {
   let runtime = options.runtime;
+  let deployment: Awaited<ReturnType<typeof bootstrapWatcher>> | undefined;
   let exitCode = 0;
   const initialRedactor = createRedactor();
   const output = options.output ?? ((line: string) => process.stdout.write(`${line}\n`));
@@ -116,9 +123,13 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       ...(interactive() ? { grace: options.grace ?? (info => promptGrace(info, diagnostic, options.promptIO, options.now)) } : {}),
     };
   };
-  const getRuntime = async () => {
+  const getRuntime = async (watcher = false) => {
     if (!runtime) {
-      runtime = await createRuntime(effectiveOptions());
+      const effective = effectiveOptions();
+      if (watcher && (effective.env ?? process.env).KEYSENTRY_WATCHER_KEY) {
+        deployment = await bootstrapWatcher(effective.env ?? process.env, { cwd: effective.cwd });
+      }
+      runtime = await createRuntime({ ...effective, ...deployment?.options, watcherAuthorized: !!deployment });
     }
     return runtime;
   };
@@ -134,6 +145,11 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     if (report.steps.some(step => step.status === 'failed') || report.deployments.some(deployment => deployment.state === 'failed')) exitCode = 1;
     else if (program.opts().failOnFindings && !report.dryRun && report.steps.some(step => ['skipped', 'written'].includes(step.status))) exitCode = 2;
   };
+
+  registerPhase2Commands(program, { getRuntime, watcherConfig: () => deployment?.config,
+    human, emit, diagnostic, interactive, json: () => !!program.opts().json, setExit: code => { exitCode = code; },
+    env: options.env ?? process.env, now: options.now, promptIO: options.promptIO,
+    confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser });
 
   program.command('init').description('Create private local state and sample config without overwriting files').action(async () => {
     const rt = await getRuntime(); const result = await rt.init();
@@ -240,9 +256,18 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   program.command('actions').description('List pending monitor actions').action(async () => { const rt = await getRuntime(); emit(await rt.pendingActions()); });
   program.command('approve <id>').description('Review, confirm, and execute a pending rotation or containment action')
     .option('--yes', 'Skip typing the action id after reviewing the action')
-    .action(async (id: string, opts: { yes?: boolean }) => {
+    .option('--relay', 'Publish a signed approval to the configured watcher relay')
+    .action(async (id: string, opts: { yes?: boolean; relay?: boolean }) => {
     human('approve a key change');
-    const rt = await getRuntime(); const review = await rt.reviewAction(id);
+    const rt = await getRuntime();
+    const relay = await relaySettings(rt);
+    const approved = await approveAutopilot(id, opts, { store: rt.store, audit: rt.audit,
+      http: relay ? rt.httpForUrls([relay.server], 'approval relay you configured') : rt.http,
+      deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store),
+      watcherPublicKeys: async () => { const key = await rt.vault.get('watcher/signing/public'); return key ? [key] : []; },
+      now: options.now, relay, assertHuman: human });
+    if (approved) { emit(approved, opts.relay ? 'Signed approval published to the watcher relay.' : 'Autopilot action approved locally.'); return; }
+    const review = await rt.reviewAction(id);
     await rt.prepareExecution(diagnostic);
     const rotation = review.action.action === 'rotate' || review.action.action === 'breach-mode';
     diagnostic([`Action ${review.action.id}: ${review.action.action} ${review.action.clusterIds.length} secret cluster(s).`,
@@ -395,6 +420,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   } finally {
     try { await runtime?.checkpoint(); }
     catch { diagnostic('The audit checkpoint could not be saved. Run keysentry audit verify to inspect the log.'); exitCode = 1; }
+    deployment?.dispose();
   }
   return exitCode;
 }

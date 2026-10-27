@@ -4,7 +4,7 @@ You can start with local files and add platforms when you need them. You do not 
 
 There are two different permission questions: **what your token allows**, and **what keysentry does with it**. Railway, Vercel and Render do not document a read-only token that can read all the variable values needed for a scan. Their tokens can allow writes even while keysentry is only scanning. Use the narrowest token below, and review `keysentry doctor` before rotating.
 
-This page describes phase 1 and vendor documentation checked on 27 October 2026. The [research notes](../notes/phase1-facts.md) record the evidence and its limits. Adapters have been tested against fakes, **not live accounts**. There has been **no external audit yet**. An item marked unverified is not a promise that the platform will accept that operation with that token.
+This page describes phases 1 and 2 and vendor documentation checked on 27 October 2026. The [phase 1 research notes](../notes/phase1-facts.md) and [phase 2 facts](../notes/phase2-facts.md) record the evidence and its limits. Adapters have been tested against fakes, **not live accounts**. There has been **no external audit yet**. An item marked unverified is not a promise that the platform will accept that operation with that token.
 
 ## Local files and saved data
 
@@ -87,7 +87,9 @@ The token is broader than this adapter: it currently does not scan secret files 
 
 Choose an explicit short expiry: the recorded default is 20 years. Tokens can be narrowed with caveats using `fly tokens attenuate`. Creation and attenuation are implemented in [flyctl token commands](https://github.com/superfly/flyctl/tree/master/internal/command/tokens).
 
-keysentry reads app names through `GET https://api.machines.dev/v1/apps?org_slug=...` unless names are configured. It reads secret names, digests and creation times with GraphQL at `https://api.fly.io/graphql`, and treats every value as sealed. Approved changes use `setSecrets` with `replaceAll: false` and `stage: true`. Support for that staging field has not been checked against a live account; a rejected request is not retried without staging. Activation is manual: `fly secrets deploy -a <app>`; keysentry does not confirm the deployment itself.
+keysentry reads app names through `GET https://api.machines.dev/v1/apps?org_slug=...` unless names are configured. It reads secret names, digests and creation times with GraphQL at `https://api.fly.io/graphql`, and treats every value as sealed. Approved changes use Machines API `POST /v1/apps/{app}/secrets` with selected `{ values }`, which stages the secrets without activating Machines.
+
+Activation lists all Machines, leases each in order, and updates its unchanged config with its current version and the available minimum secrets version. It releases the lease and confirms the new started version before moving to the next running Machine. Previously stopped/suspended Machines stay stopped and must report the new version. Empty apps remain unconfirmed. A partial or failed update stops the sequence; API readiness is not an application health check. Token acceptance, real lease/update timing and stopped/suspended behavior still need live-account validation. See the [Fly module notes](../notes/hosts.md#fly-phase-2-machines-api).
 
 Fly's [secret documentation](https://docs.fly.io/apps/secrets) says plaintext cannot be read back. The [Machines API specification](https://docs.fly.io/api/machines/openapi.json) nevertheless describes `show_secrets=true` and a secret `value` field. Whether this returns values, and with which token, is **unverified**; this adapter does not use it. The [Machines API reference](https://docs.fly.io/llms.txt) also describes secret-write endpoints and secret versions for machine updates. Deploy access can run application code that reads secrets, even when the secret-listing API does not reveal them.
 
@@ -153,7 +155,65 @@ These adapters do not receive a separate organization management token. Give the
 
 ## Other network access
 
-When monitoring is configured, keysentry can read provider usage/key metadata, GitHub secret-scanning alerts and configured advisory/status feeds, and can send configured notifications. Approval is required for provider or host mutations unless you explicitly enabled the relevant automatic policy. Notifications must not carry secret values; a channel can still see whatever project metadata you choose to send. Signed notifications, passkey approvals and the new armed autopilot workflow are later phases, not phase 1 guarantees.
+When monitoring or the watcher is configured, keysentry can read provider usage/key metadata, GitHub secret-scanning alerts and configured advisory/news/status feeds, and send configured notifications. Approval is required for provider or host mutations unless you explicitly enabled the relevant automatic policy or signed armed plan. Watcher notification messages are signed and contain no secret values; hints are opt-in. Channel operators can still see message metadata and suppress delivery. Legacy monitor webhooks remain a distinct path; they do not acquire signed-message guarantees merely by using the same provider.
+
+### Notification destinations
+
+`notify add` prompts for channel settings and stores secret fields under vault names
+`notify/<channelId>/<field>`. YAML contains only IDs/kinds and non-secret settings such as the ntfy server and
+email addresses. Bot tokens, API keys, webhook URLs, SMTP passwords and topics stay out of YAML. Every configured
+HTTP notification URL is explicitly installed as a user egress rule and trusted URL where its credential-bearing
+path requires one. This exception never removes HTTPS, host or redirect checks. `notify list` shows IDs/kinds only;
+`notify test` sends signed test messages to all channels and reports delivery outcomes.
+
+| Destination | What it receives | What it can learn or do |
+|---|---|---|
+| `api.telegram.org` | Bot token in its required API path; chat ID and escaped signed-message rendering | Bot/chat identity, notification text, code and timing; can retain or suppress messages |
+| `discord.com` | Configured credential-bearing webhook path and message rendering; mentions disabled | Channel identity, notification text, code and timing |
+| `hooks.slack.com` | Configured credential-bearing webhook path and message rendering | Workspace/channel identity, notification text, code and timing |
+| Configured ntfy server, including `ntfy.sh` | Topic in the publish JSON body, optional bearer token, rendered message and priority | Topic, notification metadata and timing; public topics may be readable/writable by anyone |
+| Configured generic HTTPS webhook | Full signed JSON plus `X-Keysentry-Signature` and verification-code headers | Full notification metadata and a verifiable signer identity; receives no application secret values |
+| `api.resend.com` | Sending API key in a header; sender, recipients, subject and rendered plain-text message | Addresses, notification metadata and timing; sending-only credentials can be used where sufficient |
+| Configured SMTP server on 465 or 587 | Credentials only after verified TLS/STARTTLS; envelope addresses and plain-text message | Mail identities, notification metadata and timing; onward mail providers can also see the content |
+| Console | Rendered signed-message text and verification code | Anyone with terminal/log access can read notification metadata |
+
+The short code identifies a signed message; checking it requires the full cached message or signed JSON and a
+trusted local device/watcher public key. A notification is not approval. Channel delivery acceptance does not
+prove that a person read it. Setup should use independent channels where possible; no successful delivery within
+the watcher's 24-hour window forces alert-only.
+
+### Feeds, health checks, approvals and the watcher
+
+The watcher reads official platform feeds and curated news sources through the guarded client. Feed servers
+receive normal GET request metadata and conditional cache headers, not credentials from application inventory.
+The bundled sources and publisher ownership are in `src/autopilot/sources.ts` and [phase 2 facts](../notes/phase2-facts.md).
+News alone never authorizes rotation. Only defined corroborated evidence plus a valid signed plan can execute.
+
+An armed plan can include HTTPS application health checks. Their hosts are explicit user rules with purpose
+`health check you configured`. The endpoint receives GET probes after deployment and before deferred revocation;
+the check sends no application secret values. Use a health endpoint that does not require credentials in its URL.
+`keysentry network` records only its hostname and request metadata.
+
+The optional approval relay sends/polls signed device approvals and disarms through the configured ntfy server.
+It receives action ID/digest, timestamp, key ID and signature plus transport/topic metadata, not application
+values or the device private key. The relay can delay, suppress or replay messages; trusted signatures,
+freshness and action-bound single-use approval state decide authorization. A random topic reduces discovery;
+it is not authorization and is not a confidentiality guarantee on public ntfy.
+
+The approval server serves health/version, bounded action summaries and WebAuthn challenges, accepts assertions,
+and exposes disarm. It serves no inventory values or private keys. Passkey public credentials and counters are
+stored encrypted. Local registration uses RP ID `localhost` and a one-time localhost page; it does not enroll a
+passkey for a public watcher origin. Public-origin registration requires the later dashboard; the current server
+has no `/register` route. Policy-widening operations require the local human CLI, not a relay approval.
+
+Your watcher host necessarily receives its selected host/provider credentials, encrypted portable vault,
+deployment key, state key and vault passphrase through platform secret settings. Setup emits
+`KEYSENTRY_WATCHER_KEY`, `KEYSENTRY_STATE_KEY`, `KEYSENTRY_VAULT_PASSPHRASE`, `KEYSENTRY_WATCHER_CONFIG` and
+`KEYSENTRY_WATCHER_VAULT` only to an interactive terminal. Configure all five; templates listing only the core four
+need the extra portable-vault variable. Keep the encrypted persistent volume private and its unlock keys outside
+it. The running host can access plaintext in memory despite at-rest encryption. Prefer a separate platform from
+the applications it protects; an incident on the watcher's own platform requests guided credential rotation.
+See [deployment instructions](../deploy/README.md) for platform settings, scheduled-run delays and cache limits.
 
 An explicit `keysentry verify` can fetch `SHA256SUMS` and `SHA256SUMS.sig` from `https://github.com/grzenio22/keysentry/releases/download/v<version>/` through the same guarded client. The release key list is empty in this phase, so online signature verification reports **unconfigured** until a trusted public key is embedded. Offline integrity compares the bundle with the adjacent manifest; it is not independent evidence of who published both files.
 
