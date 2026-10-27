@@ -87,7 +87,12 @@ export function createCanaryKey(ctx: ProviderContext, name: string): Promise<{ v
   return createKey(ctx, name, 0.01);
 }
 
-export const openrouterProvider: ProviderAdapter = {
+export interface OpenRouterAdapter extends ProviderAdapter {
+  /** Set a hard spending limit after the caller has approved the mutation. */
+  setLimit(keyRef: string, limitUsd: number, ctx: ProviderContext): Promise<void>;
+}
+
+export const openrouterProvider: OpenRouterAdapter = {
   id: 'openrouter',
   method: 'auto',
 
@@ -167,6 +172,17 @@ export const openrouterProvider: ProviderAdapter = {
 
   async cap(ref, ctx) {
     const response = await request(ctx, { method: 'PATCH', url: `${BASE}/keys/${encodeURIComponent(keyRef(ref, ctx))}`, headers: headers(ctx), body: JSON.stringify({ disabled: true }) }, PROVIDER);
+    ensureOk(response, PROVIDER);
+  },
+
+  async setLimit(ref, limitUsd, ctx) {
+    if (!Number.isFinite(limitUsd) || limitUsd < 0) {
+      throw new Error(`${PROVIDER} spending limit must be a finite, non-negative number`);
+    }
+    const response = await request(ctx, {
+      method: 'PATCH', url: `${BASE}/keys/${encodeURIComponent(keyRef(ref, ctx))}`,
+      headers: headers(ctx), body: JSON.stringify({ limit: limitUsd }),
+    }, PROVIDER);
     ensureOk(response, PROVIDER);
   },
 
