@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildInventory, buildPlan, createLogger, createRedactor, fingerprint } from '../../src/core/index.js';
-import { executePlan, finishRotation, resumeRotation } from '../../src/rotate/index.js';
+import { executePlan, finishRotation, resumeRotation, undoRotation } from '../../src/rotate/index.js';
 import type { EngineDeps, RotateOptions } from '../../src/rotate/engine.js';
 import type { JournalEntry, ProviderContext } from '../../src/types.js';
 import { FakeHttp } from '../helpers/fake-http.js';
@@ -105,6 +105,50 @@ function withoutPublicReferences(value: unknown): unknown {
 }
 
 describe('AWS rotation recovery', () => {
+  it('finish retains old keys when a consumer companion changed after staging', async () => {
+    const f = await awsFixture();
+    f.deps.grace = async () => 'defer';
+    const options = { ...f.opts, graceMs: 1_000, holdRevocationOnAnyFailure: true };
+    await executePlan(f.plan, f.inventory, f.deps, options);
+    const manualId = 'AKIAMANUALPAIRABCDEFG';
+    await f.host.writeVariables(f.services[1]!, { [f.idName]: manualId }, { skipDeploy: true });
+    const report = await finishRotation({ plan: f.plan, inventory: f.inventory, entries: [...f.entries] }, f.deps, { ...options, early: true });
+    expect(report.status).toBe('partial');
+    expect(report.steps[0]!.status).toBe('failed');
+    expect(f.revokedIds).toEqual([]);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+    expect(JSON.stringify(report)).not.toContain(manualId);
+  });
+
+  it('undo never overwrites a consumer companion that moved to a third value', async () => {
+    const f = await awsFixture();
+    f.deps.grace = async () => 'defer';
+    await executePlan(f.plan, f.inventory, f.deps, { ...f.opts, graceMs: 1_000 });
+    const manualId = 'AKIAMANUALPAIRABCDEFG';
+    await f.host.writeVariables(f.services[1]!, { [f.idName]: manualId }, { skipDeploy: true });
+    f.host.writes.length = 0;
+    const report = await undoRotation({ plan: f.plan, inventory: f.inventory, entries: [...f.entries] }, f.deps, f.opts);
+    expect(report.restored).toEqual([]);
+    expect(report.unavailable[0]!.reason).toMatch(/consumer.*changed/i);
+    expect(f.host.peek(f.services[1]!.serviceId, f.idName)).toBe(manualId);
+    expect(f.host.writes).toEqual([]);
+    expect(f.revokedIds).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain(manualId);
+  });
+
+  it('keeps public key references usable when replacement storage and cleanup both fail', async () => {
+    const f = await awsFixture();
+    f.inflight.put = async () => { throw new Error('temporary storage unavailable'); };
+    f.provider.revoke = async () => { throw new Error('cleanup unavailable'); };
+    const report = await executePlan(f.plan, f.inventory, f.deps, f.opts);
+    expect(report.steps[0]!.newKeyRef).toBe(f.newId);
+    expect(report.steps[0]!.oldKeyRef).toBe(f.oldId);
+    expect(f.entries.some(entry => entry.event === 'created' && entry.data?.newKeyRef === f.newId)).toBe(true);
+    expect(JSON.stringify({ report, entries: f.entries })).not.toContain(f.newValue());
+    expect(f.host.writes).toEqual([]);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+  });
+
   it('resumes a mixed pair after the first consumer write, verifies the stored old pair and revokes using the new pair', async () => {
     const f = await awsFixture();
     expect(f.plan.steps).toHaveLength(1);

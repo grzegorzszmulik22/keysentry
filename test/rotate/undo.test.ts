@@ -206,6 +206,7 @@ describe('undoRotation', () => {
     const newId = 'AKIAQRSTUVWXYZABCDEF';
     await h.inflight.put(h.plan.id, `old-companion:${pair.step.clusterId}:AWS_ACCESS_KEY_ID`, oldId);
     await h.inflight.put(h.plan.id, `companion:${pair.step.clusterId}:AWS_ACCESS_KEY_ID`, newId);
+    for (const service of h.services) await h.host.writeVariables(service, { AWS_ACCESS_KEY_ID: newId }, { skipDeploy: true });
     const verify = h.provider.verify.bind(h.provider);
     vi.spyOn(h.provider, 'verify').mockImplementation(async (value, ctx) => {
       expect(ctx.siblingVars?.AWS_ACCESS_KEY_ID).toBe(value === pair.before.value ? oldId : newId);
@@ -228,6 +229,10 @@ describe('undoRotation', () => {
     const newId = 'AKIAQRSTUVWXYZABCDEF';
     await h.inflight.put(h.plan.id, `old-companion:${pair.step.clusterId}:APP_AWS_ACCESS_KEY_ID`, oldId);
     await h.inflight.put(h.plan.id, `companion:${pair.step.clusterId}:APP_AWS_ACCESS_KEY_ID`, newId);
+    // The renamed pair must also be the replacement currently staged at consumers.
+    for (const service of h.services) await h.host.writeVariables(service, {
+      APP_AWS_SECRET_ACCESS_KEY: pair.next.newValue, APP_AWS_ACCESS_KEY_ID: newId,
+    }, { skipDeploy: true });
     h.deps.providerCtx.siblingVars = { AWS_ACCESS_KEY_ID: 'AKIAUNRELATEDABCDEFG', AWS_SECRET_ACCESS_KEY: 'unrelated-secret' };
     const verify = h.provider.verify.bind(h.provider);
     vi.spyOn(h.provider, 'verify').mockImplementation(async (value, ctx) => {
@@ -251,6 +256,7 @@ describe('undoRotation', () => {
     h.provider.keys.set(newId, next);
     h.entries.find(entry => entry.event === 'created')!.data!.newKeyRef = newId;
     await h.inflight.put(h.plan.id, `companion:${pair.step.clusterId}:AWS_ACCESS_KEY_ID`, newId);
+    for (const service of h.services) await h.host.writeVariables(service, { AWS_ACCESS_KEY_ID: newId }, { skipDeploy: true });
     const log = vi.fn();
     h.deps.providerCtx.log = { ...silentLogger, info: log };
     const verify = h.provider.verify.bind(h.provider);
@@ -279,6 +285,8 @@ describe('undoRotation', () => {
     h.entries.find(entry => entry.event === 'created')!.data!.newKeyRef = secret;
     await h.inflight.put(h.plan.id, `new:${pair.step.clusterId}`, secret);
     await h.inflight.put(h.plan.id, `companion:${pair.step.clusterId}:AWS_ACCESS_KEY_ID`, secret);
+    // Keep host state consistent with the substituted recorded replacement.
+    for (const service of h.services) await h.host.writeVariables(service, { OPENAI_API_KEY: secret, AWS_ACCESS_KEY_ID: secret }, { skipDeploy: true });
     const before = h.entries.length;
     const result = await undoRotation(h, h.deps, options);
     expect(result.unavailable).toEqual([]);

@@ -3,7 +3,7 @@ import { RotationAbortedError } from '../types.js';
 import { crash, isCrash } from './recovery.js';
 import { undoRotation } from './undo.js';
 import type {
-  Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
+  ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
   RotationReport, RotationResult, ServiceRef, StepReport, StepStatus,
 } from '../types.js';
@@ -22,6 +22,7 @@ export interface EngineDeps {
   inflight?: InFlightStore;
   grace?: (info: GraceInfo) => Promise<GraceDecision>;
   crashHook?: (point: CrashPoint, detail: { clusterId?: string; serviceKey?: string }) => void;
+  healthCheck?: (serviceKey: string) => Promise<{ ok: boolean; detail: string }>;
   /** True only when the replacement was actually presented to a human. */
   reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<boolean>;
 }
@@ -38,6 +39,10 @@ export interface RotateOptions {
   verifyRetries: number;
   /** Omitted by legacy callers; defaults to zero. */
   graceMs?: number;
+  deployConcurrency?: number;
+  stopOnFirstFailure?: boolean;
+  holdRevocationOnAnyFailure?: boolean;
+  nextDeployAcceptance?: ArmedPlan['nextDeployAcceptance'];
 }
 
 interface ServiceWork {
@@ -75,6 +80,7 @@ interface StepWork {
   recovered?: boolean;
   undone?: boolean;
   oldCompanions?: Record<string, string>;
+  unusedCleanupAttempted?: boolean;
 }
 
 class JournalFailure extends Error {
@@ -95,7 +101,12 @@ export async function runRotation(
   // Only an explicit false authorizes mutations, including for callers supplying incomplete JS options.
   const dryRun = opts?.dryRun !== false;
   const redeploy = opts?.redeploy ?? true;
-  const revoke = opts?.revoke ?? 'after-deploy';
+  const holdRevocation = opts?.holdRevocationOnAnyFailure === true;
+  // A wave-wide hold needs every deployment result before any old-key revocation.
+  const revoke = holdRevocation && opts?.revoke === 'immediately' ? 'after-deploy' : opts?.revoke ?? 'after-deploy';
+  const stopOnFirstFailure = opts?.stopOnFirstFailure === true;
+  const deployConcurrency = Number.isFinite(opts?.deployConcurrency)
+    ? Math.max(1, Math.floor(opts.deployConcurrency!)) : 8;
   const graceMs = Number.isFinite(opts?.graceMs) && opts.graceMs! > 0 ? opts.graceMs! : 0;
   const revokeUnconfirmed = opts?.revokeUnconfirmed === true;
   const acceptUnplannedSealed = opts?.acceptUnplannedSealed === true;
@@ -151,6 +162,9 @@ export async function runRotation(
   };
   const history = (resumeEntries ?? []).filter(entry => entry.planId === plan.id);
   const recorded = [...history];
+  let waveStopped = stopOnFirstFailure && history.some(entry => entry.data?.undo !== true
+    && (entry.event === 'failed' || entry.event === 'deploy-result' && entry.data?.state === 'failed'));
+  let writesBegan = history.some(entry => entry.event === 'written' || entry.data?.partialWritePossible === true);
   const clusterHistory = (id: string) => history.filter(entry => entry.clusterId === id && entry.data?.undo !== true);
   const works: StepWork[] = plan.steps.map(step => {
     const stepReport: StepReport = { clusterId: step.clusterId, status: 'pending', warnings: [] };
@@ -189,6 +203,7 @@ export async function runRotation(
     log.warn(message, { clusterId: work.step.clusterId });
   }
   async function fail(work: StepWork, message: string): Promise<void> {
+    if (stopOnFirstFailure) waveStopped = true;
     if (work.recoveryMessage) message += ` ${work.recoveryMessage}`;
     work.report.status = 'failed';
     work.report.error = clean(message);
@@ -219,6 +234,7 @@ export async function runRotation(
       || work.report.status === 'skipped' && !work.result
       || revoke === 'never' && work.ready && work.report.status !== 'failed' && [...work.services].every(key => services.get(key)?.written));
     if (dryRun) report.status = 'dry-run';
+    else if (stopOnFirstFailure && waveStopped && !delivered && !report.orphanSuspects?.length) report.status = 'failed';
     else if (report.status !== 'grace-pending' && report.status !== 'partial') {
       report.status = !aborted && settled && !works.some(work => work.report.status === 'failed') ? 'complete' : progressed ? 'partial' : 'failed';
     }
@@ -261,6 +277,8 @@ export async function runRotation(
     return work.step.method === 'generate' && work.result?.oldKeyRef === null && work.result.newKeyRef === null && !work.provider?.revoke;
   }
   async function cleanupUnused(work: StepWork): Promise<void> {
+    if (work.unusedCleanupAttempted) return;
+    work.unusedCleanupAttempted = true;
     if (aborted) {
       warn(work, 'Cancellation blocks provider cleanup; revoke the unused replacement manually.');
       return;
@@ -377,6 +395,24 @@ export async function runRotation(
     if (!service.written) return 'skipped';
     const references = referenceServiceKeys(work, key);
     return references.length > 0 && references.every(ref => services.get(ref)!.activation === 'success') ? 'success' : 'unconfirmed';
+  }
+  function acceptanceFor(key: string): ArmedPlan['nextDeployAcceptance'][number] | undefined {
+    const service = services.get(key)!;
+    return opts?.nextDeployAcceptance?.find(rule => rule.host === service.service.host
+      && Number.isFinite(rule.maxHours) && rule.maxHours > 0);
+  }
+  function acceptedActivation(work: StepWork, key: string): boolean {
+    const activation = activationFor(work, key);
+    return activation === 'success' || activation === 'unconfirmed' && acceptanceFor(key) !== undefined;
+  }
+  function anyFailure(): boolean {
+    return works.some(work => work.report.status === 'failed') || report.deployments.some(deployment => deployment.state === 'failed'
+      || deployment.state === 'unconfirmed' && acceptanceFor(deployment.serviceKey) === undefined);
+  }
+  function stopped(work: StepWork): void {
+    work.ready = false;
+    if (work.report.status !== 'failed') work.report.status = 'skipped';
+    if (!work.report.warnings.includes('Stopped after an earlier failure in this wave.')) warn(work, 'Stopped after an earlier failure in this wave.');
   }
   async function reportUnwritten(work: StepWork, missing: string[], context = '', bestEffort = false): Promise<void> {
     const locations = missing.map(key => {
@@ -542,6 +578,7 @@ export async function runRotation(
         }
         const value = variable.sealed ? undefined : variable.value;
         const alreadyNew = work.recovered && value !== undefined && fingerprint(value, deps.fingerprintKey) === work.report.newFingerprint;
+        if (alreadyNew) writesBegan = true;
         if (!alreadyNew && consumer.fingerprint !== null && (value === undefined || fingerprint(value, deps.fingerprintKey) !== consumer.fingerprint)) {
           stale = true;
         }
@@ -628,6 +665,10 @@ export async function runRotation(
       }
     }
 
+    if (!dryRun && stopOnFirstFailure && !waveStopped) {
+      const unprepared = works.find(work => !work.undone && work.report.status === 'skipped');
+      if (unprepared) await fail(unprepared, 'A cluster could not be prepared safely; no consumer was changed.');
+    }
     if (dryRun) {
       for (const [key, service] of services) {
         if (!works.some(work => work.ready && work.services.has(key))) continue;
@@ -639,6 +680,7 @@ export async function runRotation(
       // fallbacks can require a person even when the plan labels them automatic.
       for (const work of works) {
         if (!work.ready) continue;
+        if (waveStopped) { stopped(work); continue; }
         try {
           const provider = deps.providers(work.step.provider);
           work.provider = provider;
@@ -715,6 +757,7 @@ export async function runRotation(
       }
       for (const work of preparation) {
         work.ready = false;
+        if (waveStopped) { stopped(work); continue; }
         if (aborted) {
           work.report.status = 'skipped';
           warn(work, 'Rotation interrupted by the operator; no new provider mutation or replacement prompt was started.');
@@ -731,7 +774,10 @@ export async function runRotation(
             if (!result.oldKeyRef && work.oldValue !== undefined && provider.resolveKeyRef) result.oldKeyRef = await provider.resolveKeyRef(work.oldValue, ctx);
           } else if (work.guided) {
             const replacement = await guidedReplacement(work);
-            if (!replacement) continue;
+            if (!replacement) {
+              if (stopOnFirstFailure) await fail(work, 'A replacement needs human input; no consumer was changed.');
+              continue;
+            }
             result = replacement;
           } else {
             try {
@@ -760,7 +806,10 @@ export async function runRotation(
                 phase: 'guided-fallback', code: 'GUIDED_ROTATION_REQUIRED', atomicRollsAlreadyRan,
               } });
               const replacement = await guidedReplacement(work, true);
-              if (!replacement) continue;
+              if (!replacement) {
+                if (stopOnFirstFailure) await fail(work, 'A replacement needs human input; no consumer was changed.');
+                continue;
+              }
               result = replacement;
             }
             // Save before invoking any injected registration/logging/journal code.
@@ -853,6 +902,23 @@ export async function runRotation(
             warn(work, 'URGENT: Rolled credential preparation could not finish; attempting delivery because the old key is already revoked.');
             continue;
           }
+          if (work.result) {
+            // Ordinary storage errors can occur after the provider created a
+            // key. Record its references and clean it up instead of losing it.
+            register(work.result.newValue);
+            for (const [name, value] of Object.entries(work.result.companions ?? {})) register(value, classify(name, value).isSecret);
+            if (work.step.provider === 'aws') for (const keyRef of [work.result.oldKeyRef, work.result.newKeyRef]) {
+              if (keyRef && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(keyRef) && !sensitiveValues.has(keyRef)) publicKeyRefs.add(keyRef);
+            }
+            work.report.newFingerprint = fingerprint(work.result.newValue, deps.fingerprintKey);
+            work.report.oldKeyRef = work.result.oldKeyRef;
+            work.report.newKeyRef = work.result.newKeyRef;
+            await journal('created', { clusterId: work.step.clusterId, data: {
+              phase: 'preparation-failed', newFingerprint: work.report.newFingerprint,
+              oldKeyRef: work.result.oldKeyRef, newKeyRef: work.result.newKeyRef, oldRevoked: false,
+            } });
+            await cleanupUnused(work);
+          }
           await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.');
         }
       }
@@ -885,6 +951,7 @@ export async function runRotation(
       }
       const conflicts = populateBatches();
       for (const work of conflicts) {
+        if (waveStopped) { stopped(work); continue; }
         if (work.atomicRoll) {
           warn(work, 'URGENT: A write conflict affects a rolled credential; preserving its replacement and retrying delivery.');
           continue;
@@ -894,6 +961,15 @@ export async function runRotation(
         await cleanupUnused(work);
       }
       if (conflicts.size > 0) populateBatches();
+      if (waveStopped && !writesBegan) {
+        // Every preparation must succeed before an unattended wave can stage any values.
+        for (const work of works) {
+          if (work.result && !work.oldRevoked) await cleanupUnused(work);
+          if (work.report.status !== 'failed') stopped(work);
+          else work.ready = false;
+        }
+        populateBatches();
+      }
       // Primary rolled values take precedence over companions of other rolls.
       for (const work of works) if (work.ready && work.atomicRoll) for (const c of work.step.consumers) {
         const key = serviceKey(c.service);
@@ -913,6 +989,7 @@ export async function runRotation(
       }
       for (const [key, service] of services) {
         if (service.steps.size === 0) continue;
+        if (waveStopped && ![...service.steps].some(work => work.atomicRoll)) continue;
         const atomics = [...service.steps].filter(work => work.atomicRoll && Object.keys(additionsFor(work, key)).length > 0);
         // A companion must never replace its own atomic primary value. Other
         // incompatible atomic additions remain visible as unwritten recovery work.
@@ -938,6 +1015,7 @@ export async function runRotation(
         const attempts = atomics.length > 0 ? 4 : 1;
         for (let attempt = 0; !written && attempt < attempts; attempt++) {
           try {
+            writesBegan = true;
             await service.host!.writeVariables(service.service, service.vars, { skipDeploy: true });
             crash(deps, 'after-write', { serviceKey: key });
             service.rewritten = resumeEntries !== undefined;
@@ -1000,6 +1078,10 @@ export async function runRotation(
         const result = work.result!;
         if (work.oldRevoked) { await transition(work, 'revoked', 'revoked'); return; }
         if (revoke === 'never') return;
+        if (holdRevocation && anyFailure()) {
+          warn(work, 'A failure in this wave holds further old-key revocations; finish the successful clusters manually.');
+          return;
+        }
         if (aborted) {
           warn(work, 'Cancellation blocks old-key revocation; the old key is retained.');
           return;
@@ -1071,6 +1153,18 @@ export async function runRotation(
             }
           }
         } catch (error) { if (isCrash(error)) throw error; if (error instanceof JournalFailure) throw error; }
+        if (state === 'success' && deps.healthCheck) {
+          let health: { ok: boolean; detail: string };
+          try { health = await deps.healthCheck(key); }
+          catch (error) { if (isCrash(error)) throw error; health = { ok: false, detail: 'Health check could not be completed.' }; }
+          if (!health.ok) {
+            state = 'failed';
+            for (const work of service.steps) warn(work, health.detail);
+          }
+        }
+        // Latch before awaiting persistence: another worker may otherwise start
+        // a deployment while this known failure is still being journalled.
+        if (state === 'failed' && stopOnFirstFailure) waveStopped = true;
         service.activation = state;
         report.deployments.push({ serviceKey: key, deploymentId, state });
         await journal('deploy-result', { serviceKey: key, data: { deploymentId, state, timedOut } });
@@ -1085,12 +1179,12 @@ export async function runRotation(
           warn(work, `Consumer activation unconfirmed: ${service.service.host}/${service.service.serviceName} (${key}) requires a manual restart/next deploy.`);
         }
       }
-      // Fixed worker count bounds both starting deployments and polling them.
+      // Bound both deployment starts and their polling; a failed wave starts no further deployments.
       const deploymentServices = [...services].filter(([, service]) => !isRailwayShared(service.service));
       let nextService = 0;
       let deploymentStopped = false;
-      const deploymentTasks = Array.from({ length: Math.min(deps.crashHook ? 1 : 8, deploymentServices.length) }, async () => {
-        while (!deploymentStopped && nextService < deploymentServices.length) {
+      const deploymentTasks = Array.from({ length: Math.min(deps.crashHook ? 1 : deployConcurrency, deploymentServices.length) }, async () => {
+        while (!deploymentStopped && !waveStopped && nextService < deploymentServices.length) {
           const [key, service] = deploymentServices[nextService++]!;
           try { await deployService(key, service); }
           catch (error) { if (isCrash(error)) throw error; deploymentStopped = true; throw error; }
@@ -1098,6 +1192,13 @@ export async function runRotation(
       });
       const deploymentResults = await Promise.allSettled(deploymentTasks);
       for (const result of deploymentResults) if (result.status === 'rejected') throw result.reason;
+      if (waveStopped) for (const [key, service] of deploymentServices.slice(nextService)) {
+        if (service.steps.size === 0) continue;
+        service.activation = 'skipped';
+        report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
+        await journal('deploy-result', { serviceKey: key, data: { deploymentId: null, state: 'skipped', stopped: true } });
+        for (const work of service.steps) warn(work, 'Stopped after an earlier failure in this wave.');
+      }
       // Shared variables activate through their referring services. Derive each
       // step independently so an unrelated shared key cannot block revocation.
       for (const [key, service] of services) {
@@ -1112,23 +1213,93 @@ export async function runRotation(
       }
       const graceHeld = new Set<StepWork>();
       const graceEndings = new Map<StepWork, string>();
-      if (!aborted && revoke === 'after-deploy' && (graceMs > 0 || history.some(entry => entry.event === 'grace-start'))) {
+      const waveFailure = holdRevocation && anyFailure();
+      async function holdSuccessfulClusters(): Promise<void> {
+        report.status = 'partial';
+        report.pendingRevocations = (report.pendingRevocations ?? []).filter(item =>
+          works.find(work => work.step.clusterId === item.clusterId)?.report.status !== 'failed');
+        for (const work of works) {
+          if (!work.ready || work.oldRevoked || work.report.status === 'failed'
+            || ![...work.services].every(key => acceptedActivation(work, key))) continue;
+          const nextDeployAcceptance = [...new Map([...work.services].filter(key => activationFor(work, key) === 'unconfirmed')
+            .map(key => { const rule = acceptanceFor(key)!; return [rule.host, rule] as const; })).values()];
+          const duration = nextDeployAcceptance.length > 0 ? Math.max(...nextDeployAcceptance.map(rule => rule.maxHours)) * 3_600_000 : graceMs;
+          const saved = clusterHistory(work.step.clusterId).filter(entry => entry.event === 'grace-start').at(-1)?.data?.deadline;
+          const deadline = report.pendingRevocations.find(item => item.clusterId === work.step.clusterId)?.deadline
+            ?? graceEndings.get(work) ?? (typeof saved === 'string' ? saved : new Date(now().getTime() + duration).toISOString());
+          graceHeld.add(work);
+          if (!report.pendingRevocations.some(item => item.clusterId === work.step.clusterId)) {
+            report.pendingRevocations.push({ clusterId: work.step.clusterId, deadline,
+              undoAvailable: work.oldValue !== undefined && !work.oldRevoked });
+            await journal('grace-start', { clusterId: work.step.clusterId, data: { deadline,
+              reason: nextDeployAcceptance.length > 0 ? 'next-deploy' : 'wave-failure', waveFailure: true,
+              ...(nextDeployAcceptance.length > 0 ? { nextDeployAcceptance } : {}),
+            } });
+          }
+          warn(work, 'A failure in this wave holds further old-key revocations; finish the successful clusters manually.');
+        }
+      }
+      if (waveFailure) await holdSuccessfulClusters();
+      if (!aborted && !waveFailure && revoke === 'after-deploy' && (deps.grace || graceMs > 0 || opts.nextDeployAcceptance?.length
+        || history.some(entry => entry.event === 'grace-start'))) {
         const eligible = works.filter(work => work.ready && !work.oldRevoked && work.report.status !== 'failed'
-          && [...work.services].every(key => activationFor(work, key) === 'success') && !blockedBySealed(work));
-        if (eligible.length > 0) {
+          && [...work.services].every(key => acceptedActivation(work, key)) && !blockedBySealed(work));
+        // Each cluster may have a different signed next-deploy maximum.
+        const groups = new Map<string, { works: StepWork[]; deadline: string; nextDeploy: ArmedPlan['nextDeployAcceptance'] }>();
+        for (const work of eligible) {
+          const nextDeploy = [...new Map([...work.services].filter(key => activationFor(work, key) === 'unconfirmed')
+            .map(key => { const rule = acceptanceFor(key)!; return [rule.host, rule] as const; })).values()];
+          const saved = clusterHistory(work.step.clusterId).filter(entry => entry.event === 'grace-start').at(-1)?.data?.deadline;
+          const duration = nextDeploy.length > 0 ? Math.max(...nextDeploy.map(rule => rule.maxHours)) * 3_600_000 : graceMs;
+          if (duration === 0 && typeof saved !== 'string' && !deps.grace) continue;
+          const deadline = typeof saved === 'string' && Number.isFinite(Date.parse(saved)) ? saved : new Date(now().getTime() + duration).toISOString();
+          const groupKey = `${deadline}:${nextDeploy.length > 0 ? 'next-deploy' : 'grace'}`;
+          const group = groups.get(groupKey) ?? { works: [], deadline, nextDeploy: [] };
+          group.works.push(work);
+          group.nextDeploy.push(...nextDeploy);
+          groups.set(groupKey, group);
+        }
+        for (const group of groups.values()) {
+          const eligible = group.works;
           const savedDeadlines = eligible.map(work => clusterHistory(work.step.clusterId).filter(entry => entry.event === 'grace-start').at(-1)?.data?.deadline)
             .filter((value): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)));
-          const deadline = savedDeadlines.length > 0 ? savedDeadlines.sort()[0]! : new Date(now().getTime() + graceMs).toISOString();
+          const deadline = savedDeadlines.length > 0 ? savedDeadlines.sort()[0]! : group.deadline;
           const info: GraceInfo = { planId: plan.id, deadline, clusters: eligible.map(work => ({
             clusterId: work.step.clusterId, hint: work.step.hint, undoAvailable: work.oldValue !== undefined && !work.oldRevoked,
           })) };
-          for (const work of eligible) await journal('grace-start', { clusterId: work.step.clusterId, data: { deadline } });
+          for (const work of eligible) {
+            const nextDeployAcceptance = [...new Map([...work.services].filter(key => activationFor(work, key) === 'unconfirmed')
+              .map(key => { const rule = acceptanceFor(key)!; return [rule.host, rule] as const; })).values()];
+            await journal('grace-start', { clusterId: work.step.clusterId, data: {
+              deadline, ...(nextDeployAcceptance.length > 0 ? { reason: 'next-deploy', nextDeployAcceptance } : {}),
+            } });
+          }
           let decision: GraceDecision;
           if (deps.grace) decision = await deps.grace(sanitize(info, true));
+          else if (group.nextDeploy.length > 0) decision = 'defer';
           else {
             await sleep(Math.max(0, Date.parse(deadline) - now().getTime()));
             decision = 'revoke';
+            if (deps.healthCheck) for (const key of new Set(eligible.flatMap(work => [...work.services]))) {
+              const service = services.get(key)!;
+              if (service.activation !== 'success') continue;
+              let health: { ok: boolean; detail: string };
+              try { health = await deps.healthCheck(key); }
+              catch (error) { if (isCrash(error)) throw error; health = { ok: false, detail: 'Health check could not be completed.' }; }
+              if (health.ok) continue;
+              service.activation = 'failed';
+              const deployment = report.deployments.find(item => item.serviceKey === key);
+              if (deployment) deployment.state = 'failed';
+              await journal('deploy-result', { serviceKey: key,
+                data: { deploymentId: deployment?.deploymentId ?? null, state: 'failed', phase: 'grace-health' } });
+              for (const work of service.steps) {
+                warn(work, health.detail);
+                graceHeld.add(work);
+                await fail(work, 'Consumer health check failed; the old key is retained.');
+              }
+            }
             for (const work of eligible) {
+              if (work.report.status === 'failed') { graceHeld.add(work); continue; }
               let verified = false;
               try { verified = (await work.provider!.verify(work.result!.newValue, work.newCtx!)).ok; }
               catch (error) { if (isCrash(error)) throw error; }
@@ -1138,7 +1309,7 @@ export async function runRotation(
           }
           if (decision === 'defer') {
             report.status = 'grace-pending';
-            report.pendingRevocations = info.clusters.map(cluster => ({ clusterId: cluster.clusterId, deadline, undoAvailable: cluster.undoAvailable }));
+            (report.pendingRevocations ??= []).push(...info.clusters.map(cluster => ({ clusterId: cluster.clusterId, deadline, undoAvailable: cluster.undoAvailable })));
             for (const work of eligible) graceHeld.add(work);
           } else if (decision === 'undo') {
             const values = new Map<string, string>();
@@ -1167,9 +1338,18 @@ export async function runRotation(
             }
             graceUndid = works.every(work => work.undone || work.report.status === 'revoked');
           }
+          if (group.nextDeploy.length > 0 && decision === 'revoke') {
+            for (const work of eligible) {
+              graceHeld.add(work);
+              (report.pendingRevocations ??= []).push({ clusterId: work.step.clusterId, deadline, undoAvailable: work.oldValue !== undefined });
+              warn(work, 'Next-deploy activation has not been confirmed; finish this rotation after the accepted maximum.');
+            }
+            report.status = 'grace-pending';
+          }
           if (decision !== 'defer') for (const work of eligible) graceEndings.set(work, deadline);
         }
       }
+      if (!waveFailure && holdRevocation && anyFailure()) await holdSuccessfulClusters();
       for (const work of works) {
         if (graceHeld.has(work)) continue;
         if (!work.ready || work.report.status === 'failed') continue;
@@ -1189,6 +1369,8 @@ export async function runRotation(
           }
         }
       }
+      if (holdRevocation && anyFailure() && works.some(work => work.ready && !work.oldRevoked
+        && work.report.status !== 'failed' && !graceHeld.has(work))) await holdSuccessfulClusters();
       for (const [work, deadline] of graceEndings) await journal('grace-end', { clusterId: work.step.clusterId,
         data: { deadline, pending: work.report.status !== 'revoked' && !work.undone } });
     }

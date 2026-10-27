@@ -1,0 +1,15 @@
+node_modules
+.git
+.keysentry
+logs
+dist
+dist-release
+tools/probes
+.env
+.env.*
+*.key
+*.pem
+**/.keysentry
+**/logs
+**/.env
+**/.env.*

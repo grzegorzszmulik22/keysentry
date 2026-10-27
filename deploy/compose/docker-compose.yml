@@ -1,0 +1,19 @@
+services:
+  watcher:
+    # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
+    image: ghcr.io/grzenio22/keysentry:1.0.0
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    env_file: [.env]
+    environment:
+      KEYSENTRY_STATE_DIR: /data
+      KEYSENTRY_VAULT: encrypted-file
+      NODE_ENV: production
+    volumes: ["keysentry-data:/data"]
+    tmpfs: ["/tmp"]
+volumes:
+  keysentry-data: {}

@@ -1,0 +1,28 @@
+services:
+  - type: worker
+    name: keysentry-watcher
+    runtime: image
+    # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
+    image:
+      url: ghcr.io/grzenio22/keysentry:1.0.0
+    plan: 0.5c-512mb
+    numInstances: 1
+    envVars:
+      - key: KEYSENTRY_STATE_DIR
+        value: /data
+      - key: KEYSENTRY_VAULT
+        value: encrypted-file
+      - key: NODE_ENV
+        value: production
+      - key: KEYSENTRY_VAULT_PASSPHRASE
+        sync: false
+      - key: KEYSENTRY_STATE_KEY
+        sync: false
+      - key: KEYSENTRY_WATCHER_KEY
+        sync: false
+      - key: KEYSENTRY_WATCHER_CONFIG
+        sync: false
+    disk:
+      name: keysentry-data
+      mountPath: /data
+      sizeGB: 1

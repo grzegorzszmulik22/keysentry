@@ -7,3 +7,7 @@ export {
   isSecurityAdvisory, mentionsHost,
 } from './sources.js';
 export { updateIncidents } from './incidents.js';
+export { isAlertOnly } from './kill-switch.js';
+export type { SelfCheckResult } from './kill-switch.js';
+export { runAutopilot, resumeWaves, settleWaves } from './runner.js';
+export type { AutopilotState, AutopilotWave, AutopilotDeps, AutopilotInput, WaveRecoveryDeps, WaveRecoveryInput, WaveRecoveryResult } from './runner.js';

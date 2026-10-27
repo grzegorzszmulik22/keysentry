@@ -1,4 +1,4 @@
-import { serviceKey } from '../core/index.js';
+import { fingerprint, serviceKey } from '../core/index.js';
 import type {
   Consumer, Inventory, JournalEntry, PlanStep, ProviderAdapter, ProviderContext, RawVariable, RotationPlan, ServiceRef,
 } from '../types.js';
@@ -200,6 +200,34 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
       const consumer = work.step.consumers.find(item => !item.reference);
       if (!consumer || !deps.hosts[consumer.service.host]) throw new Error('Host unavailable.');
       const siblings = await read(consumer.service);
+      // Undo may retry an already restored consumer, but never overwrite a
+      // later manual rotation or a value installed by a different plan.
+      for (const direct of work.step.consumers.filter(item => !item.reference)) {
+        const variables = (await read(direct.service)).filter(variable => variable.name === direct.varName);
+        const variable = variables[0];
+        const expected = [work.newValue, work.oldValue].filter((value): value is string => value !== null)
+          .map(value => fingerprint(value, deps.fingerprintKey));
+        const recordedWrite = entries.some(entry => entry.event === 'written' && entry.data?.undo !== true
+          && entry.clusterId === work.step.clusterId && entry.serviceKey === serviceKey(direct.service));
+        if (variables.length !== 1 || !variable || (variable.sealed ? !direct.sealed || !recordedWrite
+          : variable.value === undefined || !expected.includes(fingerprint(variable.value, deps.fingerprintKey)))) {
+          work.unavailable = 'A consumer changed since this rotation; undo will not overwrite its current value.';
+          break;
+        }
+        for (const [name, newValue] of Object.entries(work.newCompanions)) {
+          const companions = (await read(direct.service)).filter(candidate => candidate.name === name);
+          const companion = companions[0];
+          const expectedCompanions = [newValue, work.oldCompanions[name]].filter((value): value is string => value !== undefined)
+            .map(value => fingerprint(value, deps.fingerprintKey));
+          if (companions.length !== 1 || !companion || (companion.sealed ? !direct.sealed || !recordedWrite
+            : companion.value === undefined || !expectedCompanions.includes(fingerprint(companion.value, deps.fingerprintKey)))) {
+            work.unavailable = 'A consumer changed since this rotation; undo will not overwrite its current value.';
+            break;
+          }
+        }
+        if (work.unavailable) break;
+      }
+      if (work.unavailable) continue;
       for (const reference of work.step.consumers.filter(item => item.reference)) if (!await referenceCurrent(work, reference)) {
         work.unavailable = 'A saved reference changed or no longer resolves to its source; the replacement key is retained.';
         break;

@@ -1,0 +1,23 @@
+app = "keysentry-watcher"
+primary_region = "ams"
+
+[build]
+  # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
+  image = "ghcr.io/grzenio22/keysentry:1.0.0"
+
+[env]
+  KEYSENTRY_STATE_DIR = "/data"
+  KEYSENTRY_VAULT = "encrypted-file"
+  NODE_ENV = "production"
+
+[mounts]
+  source = "keysentry_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Outbound-only worker. Configure an HTTP service and /healthz check only if
+# you explicitly enable the approval server; see deploy/README.md.

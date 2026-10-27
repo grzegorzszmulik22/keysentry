@@ -1,7 +1,7 @@
-import { serviceKey } from '../core/index.js';
+import { fingerprint, serviceKey } from '../core/index.js';
 import type { EngineDeps, RotateOptions } from './engine.js';
 import { crash, createRecoverySafety, isCrash } from './recovery.js';
-import type { Inventory, JournalEntry, PlanStep, ProviderContext, RotationPlan, RotationReport, StepReport } from '../types.js';
+import type { Inventory, JournalEntry, PlanStep, ProviderAdapter, ProviderContext, RawVariable, RotationPlan, RotationReport, StepReport } from '../types.js';
 
 interface FinishInput {
   plan: RotationPlan;
@@ -52,6 +52,15 @@ function graceDeadline(entries: JournalEntry[], clusterId: string): string | und
       || (cluster !== null && typeof cluster === 'object' && cluster.clusterId === clusterId))) return entry.data.deadline;
   }
   return undefined;
+}
+
+function nextDeployRules(entries: JournalEntry[], clusterId: string): { host: string; revokeAfterMax: boolean }[] | undefined {
+  const entry = [...entries].reverse().find(candidate => candidate.clusterId === clusterId && candidate.event === 'grace-start');
+  if (entry?.data?.reason !== 'next-deploy') return undefined;
+  const rules = entry.data.nextDeployAcceptance;
+  if (!Array.isArray(rules)) return [];
+  return rules.filter((rule): rule is { host: string; revokeAfterMax: boolean } => rule !== null && typeof rule === 'object'
+    && typeof rule.host === 'string' && typeof rule.revokeAfterMax === 'boolean');
 }
 
 function ref(value: unknown): string | null {
@@ -157,6 +166,126 @@ export async function finishRotation(
   const settled = new Set(input.plan.steps.filter(step => ended(entries, step.clusterId)).map(step => step.clusterId));
   const pending: NonNullable<RotationReport['pendingRevocations']> = [];
   let blocked = false;
+  // Check the entire due wave before the first revocation. Otherwise a later
+  // failed health check could arrive after an earlier old key was retired.
+  const dueServices = new Set(pendingSteps.filter(step => {
+    if (unfinishedUndo(entries, step)) return false;
+    const deadline = graceDeadline(entries, step.clusterId)!;
+    return Number.isFinite(Date.parse(deadline)) && (now().getTime() >= Date.parse(deadline)
+      || opts.early === true && nextDeployRules(entries, step.clusterId) === undefined);
+  }).flatMap(step => step.consumers.map(consumer => serviceKey(consumer.service))));
+  const currentVariables = new Map<string, RawVariable[] | null>();
+  const consumerFailures = new Map<string, string>();
+  for (const step of pendingSteps) {
+    if (unfinishedUndo(entries, step)) continue;
+    if (!step.consumers.some(consumer => dueServices.has(serviceKey(consumer.service)))) continue;
+    const clusterId = step.clusterId;
+    const data = metadata(entries, clusterId);
+    const replacement = deps.inflight ? await deps.inflight.get(input.plan.id, `new:${clusterId}`) : null;
+    const expected = typeof data.newFingerprint === 'string' ? data.newFingerprint
+      : replacement === null ? null : fingerprint(replacement, deps.fingerprintKey);
+    const companions = new Map<string, string>();
+    if (deps.inflight) for (const slot of await deps.inflight.slots(input.plan.id)) {
+      const prefix = `companion:${clusterId}:`;
+      if (!slot.startsWith(prefix)) continue;
+      const value = await deps.inflight.get(input.plan.id, slot);
+      if (value !== null) companions.set(slot.slice(prefix.length), fingerprint(value, deps.fingerprintKey));
+    }
+    let changed = expected === null;
+    for (const consumer of step.consumers.filter(candidate => !candidate.reference)) {
+      const key = serviceKey(consumer.service);
+      if (!currentVariables.has(key)) {
+        try {
+          const host = deps.hosts[consumer.service.host];
+          currentVariables.set(key, host ? await host.readVariables(consumer.service) : null);
+        } catch (error) { if (isCrash(error)) throw error; currentVariables.set(key, null); }
+      }
+      const recordedWrite = entries.some(entry => entry.event === 'written' && entry.data?.undo !== true
+        && entry.clusterId === clusterId && entry.serviceKey === key);
+      const expectedValues = new Map<string, string | null>(companions);
+      expectedValues.set(consumer.varName, expected);
+      for (const [name, expectedFingerprint] of expectedValues) {
+        const matches = currentVariables.get(key)?.filter(variable => variable.name === name) ?? [];
+        const current = matches[0];
+        if (matches.length !== 1 || !current || (current.sealed
+          ? !consumer.sealed || !recordedWrite
+          : current.value === undefined || fingerprint(current.value, deps.fingerprintKey) !== expectedFingerprint)) changed = true;
+      }
+    }
+    const old = deps.inflight ? await deps.inflight.get(input.plan.id, `old:${clusterId}`) : null;
+    const oldFingerprint = old === null ? step.consumers.find(consumer => consumer.fingerprint !== null)?.fingerprint
+      : fingerprint(old, deps.fingerprintKey);
+    const planned = new Set(step.consumers.map(consumer => `${serviceKey(consumer.service)}\0${consumer.varName}`));
+    if (oldFingerprint && [...input.inventory.findings, ...input.inventory.clusters.flatMap(cluster => cluster.consumers)]
+      .some(consumer => consumer.fingerprint === oldFingerprint && !planned.has(`${serviceKey(consumer.service)}\0${consumer.varName}`))) changed = true;
+    if (!changed) continue;
+    const warning = 'A consumer changed since this rotation or its replacement could not be confirmed; the old key is retained.';
+    consumerFailures.set(clusterId, warning);
+    const stepReport = report.steps.find(result => result.clusterId === clusterId)!;
+    stepReport.status = 'failed';
+    stepReport.error = warning;
+    stepReport.warnings.push(warning);
+    await journal('failed', { clusterId, data: { phase: 'finish-consumers', error: warning } });
+  }
+  const healthFailures = new Map<string, string>();
+  if (deps.healthCheck) for (const deployment of report.deployments) {
+    if (deployment.state !== 'success' || !dueServices.has(deployment.serviceKey)) continue;
+    let health: { ok: boolean; detail: string };
+    try { health = await deps.healthCheck(deployment.serviceKey); }
+    catch (error) { if (isCrash(error)) throw error; health = { ok: false, detail: 'Health check could not be completed.' }; }
+    if (health.ok) continue;
+    healthFailures.set(deployment.serviceKey, health.detail);
+    deployment.state = 'failed';
+    await journal('deploy-result', { serviceKey: deployment.serviceKey,
+      data: { deploymentId: deployment.deploymentId, state: 'failed', phase: 'finish-health' } });
+    for (const step of pendingSteps.filter(candidate => candidate.consumers.some(consumer => serviceKey(consumer.service) === deployment.serviceKey))) {
+      const stepReport = report.steps.find(result => result.clusterId === step.clusterId)!;
+      stepReport.status = 'failed';
+      stepReport.warnings.push(health.detail);
+      await journal('failed', { clusterId: step.clusterId, data: { phase: 'finish-health', error: 'Consumer health check failed.' } });
+    }
+  }
+  const checkedReplacements = new Map<string, { provider: ProviderAdapter; verified: boolean }>();
+  if (opts.holdRevocationOnAnyFailure === true) for (const step of pendingSteps) {
+    if (unfinishedUndo(entries, step)) continue;
+    if (!step.consumers.some(consumer => dueServices.has(serviceKey(consumer.service)))) continue;
+    const clusterId = step.clusterId;
+    let provider: ProviderAdapter | undefined;
+    let verified = false;
+    try {
+      provider = deps.providers(step.provider);
+      const value = deps.inflight ? await deps.inflight.get(input.plan.id, `new:${clusterId}`) : null;
+      if (value !== null) {
+        let siblingVars = { ...ctx.siblingVars };
+        if (deps.inflight) for (const slot of await deps.inflight.slots(input.plan.id)) {
+          const prefix = `companion:${clusterId}:`;
+          if (!slot.startsWith(prefix)) continue;
+          const companion = await deps.inflight.get(input.plan.id, slot);
+          if (companion !== null) siblingVars[slot.slice(prefix.length)] = companion;
+        }
+        for (const consumer of step.consumers) if (!consumer.reference) siblingVars[consumer.varName] = value;
+        if (step.provider === 'aws') {
+          const secretName = step.consumers.find(consumer => !consumer.reference)?.varName ?? '';
+          const prefix = secretName.replace(/_SECRET_ACCESS_KEY$/, '');
+          siblingVars = Object.fromEntries(Object.entries(siblingVars).filter(([name]) =>
+            !/_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)$/.test(name)
+            || name === secretName || name === `${prefix}_ACCESS_KEY_ID` || name === `${prefix}_SESSION_TOKEN`));
+        }
+        verified = (await provider.verify(value, { ...ctx, siblingVars })).ok;
+      }
+    } catch (error) { if (isCrash(error)) throw error; }
+    if (provider) checkedReplacements.set(clusterId, { provider, verified });
+    if (!verified) {
+      const stepReport = report.steps.find(result => result.clusterId === clusterId)!;
+      stepReport.status = 'failed';
+      stepReport.warnings.push('The replacement credential no longer verifies; the old key is retained.');
+      await journal('failed', { clusterId, data: { phase: 'finish-verification', error: 'Replacement verification failed.' } });
+    }
+  }
+  let waveFailure = opts.holdRevocationOnAnyFailure === true && (healthFailures.size > 0
+    || report.steps.some(step => step.status === 'failed') || report.deployments.some(deployment => deployment.state === 'failed'
+      || deployment.state === 'unconfirmed' && !pendingSteps.some(step => step.consumers.some(consumer => serviceKey(consumer.service) === deployment.serviceKey)
+        && nextDeployRules(entries, step.clusterId)?.some(rule => rule.host === step.consumers.find(consumer => serviceKey(consumer.service) === deployment.serviceKey)!.service.host))));
   for (const step of pendingSteps) {
     const clusterId = step.clusterId;
     const stepReport = report.steps.find(s => s.clusterId === clusterId)!;
@@ -166,17 +295,33 @@ export async function finishRotation(
     const newValue = deps.inflight ? await deps.inflight.get(input.plan.id, `new:${clusterId}`) : null;
     const undoAvailable = oldValue !== null && data.oldRevoked !== true && step.method !== 'atomic-roll';
     const item = { clusterId, deadline, undoAvailable };
+    const acceptedNextDeploy = nextDeployRules(entries, clusterId);
     let warning: string | undefined;
     let expired = false;
-    if (unfinishedUndo(entries, step)) {
+    if (consumerFailures.has(clusterId)) {
+      warning = consumerFailures.get(clusterId)!;
+      blocked = true;
+    }
+    else if (unfinishedUndo(entries, step)) {
       warning = 'Undo was started but did not finish. Resume undo before finishing this rotation; the old key is retained.';
       blocked = true;
     }
     else if (!Number.isFinite(Date.parse(deadline))) { warning = 'The saved grace deadline is unavailable; the old key is retained.'; blocked = true; }
-    else if (now().getTime() < Date.parse(deadline) && opts.early !== true) warning = 'The grace period deadline has not passed; the old key is retained.';
+    else if (now().getTime() < Date.parse(deadline) && (opts.early !== true || acceptedNextDeploy !== undefined)) warning = 'The grace period deadline has not passed; the old key is retained.';
     else expired = true;
-    const successful = step.consumers.length > 0 && step.consumers.every(consumer => report.deployments.some(d => d.serviceKey === serviceKey(consumer.service) && d.state === 'success'));
-    if (expired && !successful) { warning = 'A consumer deployment did not succeed; the old key is retained.'; blocked = true; }
+    if (expired && acceptedNextDeploy !== undefined && (acceptedNextDeploy.length === 0 || acceptedNextDeploy.some(rule => !rule.revokeAfterMax))) {
+      warning = 'The next deploy has not been confirmed and the armed plan did not authorize revocation after the maximum; the old key is retained.';
+      blocked = true;
+    }
+    const successful = step.consumers.length > 0 && step.consumers.every(consumer => report.deployments.some(d => d.serviceKey === serviceKey(consumer.service)
+      && (d.state === 'success' || d.state === 'unconfirmed' && acceptedNextDeploy?.some(rule => rule.host === consumer.service.host && rule.revokeAfterMax))));
+    if (expired && !successful && !warning) { warning = 'A consumer deployment did not succeed; the old key is retained.'; blocked = true; }
+    if (expired && waveFailure) {
+      warning = 'A failure in this wave holds further old-key revocations; finish the successful clusters manually.';
+      blocked = true;
+    }
+    const healthFailure = step.consumers.map(consumer => healthFailures.get(serviceKey(consumer.service))).find(detail => detail !== undefined);
+    if (expired && healthFailure !== undefined) { warning = healthFailure; blocked = true; }
     if (expired && successful && sealedConsumerBlocks(step, input, opts)) {
       warning = 'Unplanned sealed consumers may still use the old key; it is retained.';
       blocked = true;
@@ -187,7 +332,7 @@ export async function finishRotation(
     }
     if (!warning) {
       let provider;
-      try { provider = deps.providers(step.provider); }
+      try { provider = checkedReplacements.get(clusterId)?.provider ?? deps.providers(step.provider); }
       catch (error) {
         if (isCrash(error)) throw error;
         warning = 'The credential provider is unavailable; the old key is retained.';
@@ -223,7 +368,7 @@ export async function finishRotation(
         const newCtx: ProviderContext = { ...ctx, siblingVars: providerSiblings(siblingVars) };
         const oldCtx: ProviderContext = { ...ctx, siblingVars: providerSiblings(oldSiblings) };
         let verified = false;
-        try { verified = (await provider.verify(newValue!, newCtx)).ok; }
+        try { verified = checkedReplacements.get(clusterId)?.verified ?? (await provider.verify(newValue!, newCtx)).ok; }
         catch (error) { if (isCrash(error)) throw error; }
         if (!verified) {
           warning = 'The replacement credential no longer verifies; the old key is retained.';
@@ -253,6 +398,10 @@ export async function finishRotation(
                 if (isCrash(error)) throw error;
                 warning = 'The old credential could not be revoked; check the provider before retrying.';
                 blocked = true;
+                stepReport.status = 'failed';
+                stepReport.error = warning;
+                if (opts.holdRevocationOnAnyFailure === true) waveFailure = true;
+                await journal('failed', { clusterId, data: { phase: 'finish-revocation', error: warning } });
               }
               if (revoked) crash(deps, 'after-revoke', { clusterId });
             }

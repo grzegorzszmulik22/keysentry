@@ -1,0 +1,80 @@
+name: keysentry watcher
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+      timezone: UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keysentry-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0; notes/phase1-facts.md §3
+        with:
+          node-version: 24.22.1
+      # Cache v4.3.0 pin is outside the supplied facts: verify it before publishing this template.
+      - name: Restore encrypted state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0; notes/phase1-facts.md §3
+        with:
+          path: .keysentry
+          key: keysentry-state-${{ github.run_id }}
+          restore-keys: |
+            keysentry-state-
+      - name: Prepare private state directory
+        run: |
+          mkdir -p .keysentry
+          chmod 0700 .keysentry
+      - name: Download and check release bundle
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set this repository variable to the reviewed release tag, e.g. v1.0.0.
+          RELEASE_TAG: ${{ vars.KEYSENTRY_RELEASE_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo 'Set the KEYSENTRY_RELEASE_TAG repository variable to a release tag.' >&2
+            exit 1
+          fi
+          gh release download "$RELEASE_TAG" --repo grzenio22/keysentry --pattern keysentry.mjs --pattern release-manifest.json --pattern SHA256SUMS
+          # Select only the two known filenames; never trust paths from a checksum file.
+          grep -E '^[a-f0-9]{64}  (keysentry\.mjs|release-manifest\.json)$' SHA256SUMS > checked-sums
+          test "$(wc -l < checked-sums)" -eq 2
+          test "$(grep -Ec '  keysentry\.mjs$' checked-sums)" -eq 1
+          test "$(grep -Ec '  release-manifest\.json$' checked-sums)" -eq 1
+          sha256sum --check --strict checked-sums
+      - name: Run one watcher cycle
+        id: watch
+        env:
+          KEYSENTRY_STATE_DIR: .keysentry
+          KEYSENTRY_VAULT: encrypted-file
+          NODE_ENV: production
+          KEYSENTRY_VAULT_PASSPHRASE: ${{ secrets.KEYSENTRY_VAULT_PASSPHRASE }}
+          KEYSENTRY_STATE_KEY: ${{ secrets.KEYSENTRY_STATE_KEY }}
+          KEYSENTRY_WATCHER_KEY: ${{ secrets.KEYSENTRY_WATCHER_KEY }}
+          KEYSENTRY_WATCHER_CONFIG: ${{ secrets.KEYSENTRY_WATCHER_CONFIG }}
+        shell: bash
+        run: |
+          set +e
+          node keysentry.mjs watch --once
+          result=$?
+          if [ "$result" -eq 2 ]; then
+            echo 'The watcher completed in alert-only mode. Check its signed notifications and configuration.' >&2
+          fi
+          exit "$result"
+      - name: Save encrypted state after this run
+        if: ${{ always() && steps.release.outcome == 'success' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0; notes/phase1-facts.md §3
+        with:
+          path: .keysentry
+          key: keysentry-state-${{ github.run_id }}

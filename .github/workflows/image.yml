@@ -1,0 +1,52 @@
+name: Watcher image
+
+on:
+  push:
+    tags: [v*]
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; notes/phase1-facts.md §3
+        with:
+          persist-credentials: false
+      - name: Prepare buildx
+        run: docker buildx create --name keysentry-builder --driver docker-container --use
+      - name: Build private repository image locally
+        id: private-build
+        if: ${{ github.event.repository.private }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --provenance=true --sbom=true \
+            --build-arg "KEYSENTRY_BUILD_COMMIT=$GITHUB_SHA" \
+            --tag "ghcr.io/grzenio22/keysentry:$GITHUB_REF_NAME" \
+            --output type=oci,dest=keysentry-image.tar .
+      - name: Sign in to GHCR
+        id: login
+        if: ${{ !github.event.repository.private }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push public image with attestations
+        id: push
+        if: ${{ !github.event.repository.private }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --provenance=true --sbom=true \
+            --build-arg "KEYSENTRY_BUILD_COMMIT=$GITHUB_SHA" \
+            --tag "ghcr.io/grzenio22/keysentry:$GITHUB_REF_NAME" \
+            --tag "ghcr.io/grzenio22/keysentry:${GITHUB_REF_NAME#v}" \
+            --metadata-file image-metadata.json --push .
+      - name: Sign out of GHCR
+        if: ${{ always() && !github.event.repository.private }}
+        run: docker logout ghcr.io
