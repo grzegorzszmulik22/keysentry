@@ -4,7 +4,10 @@ const DAY_MS = 86_400_000;
 const PROCESS_STARTED_AT = new Date();
 
 export interface SelfCheckInput {
-  lastNotifySuccessAt: string | null;
+  /** Legacy field; callers must supply only external deliveries here. Prefer lastExternalSuccessAt. */
+  lastNotifySuccessAt?: string | null;
+  /** Console output never satisfies the notification check. Explicit null overrides legacy history. */
+  lastExternalSuccessAt?: string | null;
   now: Date;
   stateWritable: boolean;
   armedValid: boolean;
@@ -18,8 +21,9 @@ export interface SelfCheckResult { ok: boolean; reasons: string[] }
 export function selfCheck(input: SelfCheckInput): SelfCheckResult {
   const reasons: string[] = [];
   const now = input.now.getTime();
-  const last = input.lastNotifySuccessAt === null
-    ? (input.startedAt ?? PROCESS_STARTED_AT).getTime() : Date.parse(input.lastNotifySuccessAt);
+  const delivered = input.lastExternalSuccessAt !== undefined ? input.lastExternalSuccessAt : input.lastNotifySuccessAt ?? null;
+  const last = delivered === null
+    ? (input.startedAt ?? PROCESS_STARTED_AT).getTime() : Date.parse(delivered);
   if (!Number.isFinite(now) || !Number.isFinite(last) || last > now) {
     reasons.push('The watcher clock or notification timestamp needs checking.');
   } else if (now - last >= DAY_MS) {

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { createWatcherTick, runOnce, runWatcherLoop, type WatcherTickDependencies, type WatcherTickState } from '../../src/watcher/loop.js';
 import type { Incident, NotifyMessage } from '../../src/types.js';
 import { selfCheck } from '../../src/watcher/self-check.js';
+import { createActionsRecovery, signWatcherResume } from '../../src/watcher/recovery.js';
+import { generateDeviceKey } from '../../src/security/index.js';
 
 const now = new Date('2026-10-27T08:00:00Z');
 const incident = (id = 'inc-railway', host: Incident['host'] = 'railway', status: Incident['status'] = 'triggered'): Incident => ({
@@ -48,11 +50,11 @@ function fixture() {
 }
 
 describe('one watcher cycle', () => {
-  it('resumes, handles relay, fetches incidents, rotates, settles, monitors, then sends heartbeat', async () => {
+  it('handles relay before resuming, then fetches incidents, rotates, settles, monitors, and sends heartbeat', async () => {
     const f = fixture();
     f.time(new Date('2026-10-27T09:00:00Z'));
     const result = await createWatcherTick(f.deps)();
-    expect(f.events).toEqual(['resume', 'relay', 'approval', 'sources', 'incidents', 'autopilot', 'settle', 'monitor', 'notify:watcher-heartbeat']);
+    expect(f.events).toEqual(['relay', 'approval', 'resume', 'sources', 'incidents', 'autopilot', 'settle', 'monitor', 'notify:watcher-heartbeat']);
     expect(result.status).toBe('ok');
   });
 
@@ -67,7 +69,7 @@ describe('one watcher cycle', () => {
     const f = fixture();
     f.deps.relay!.poll = async () => ({ approvals: [], disarms: ['signed-disarm'] });
     const result = await createWatcherTick(f.deps)();
-    expect(f.events).toEqual(['resume', 'disarm', 'sources', 'incidents', 'notify:watcher-incident-paused', 'request:inc-railway', 'monitor:alert-only']);
+    expect(f.events).toEqual(['disarm', 'sources', 'incidents', 'notify:watcher-incident-paused', 'request:inc-railway', 'monitor:alert-only']);
     expect(result.status).toBe('alert-only');
   });
 
@@ -81,6 +83,170 @@ describe('one watcher cycle', () => {
     expect(JSON.stringify([result, f.logs])).not.toContain('plaintext-token');
   });
 
+  it('executes granted actions after applying relay approvals and before new incidents', async () => {
+    const f = fixture();
+    f.deps.executeApprovals = async context => {
+      expect(context.alertOnly).toBe(false);
+      expect(context.excludedTokenNames).toEqual(['RAILWAY_TOKEN']);
+      f.events.push('execute approvals');
+    };
+    await createWatcherTick(f.deps)();
+    expect(f.events.indexOf('execute approvals')).toBeGreaterThan(f.events.indexOf('approval'));
+    expect(f.events.indexOf('execute approvals')).toBeLessThan(f.events.indexOf('sources'));
+  });
+
+  it('contains approved-action execution failure and continues sources and monitoring', async () => {
+    const f = fixture();
+    f.deps.executeApprovals = async () => { throw new Error('private-approval-data'); };
+    const result = await createWatcherTick(f.deps)();
+    expect(result.errors).toContain('execute approved actions');
+    expect(f.events).toContain('sources');
+    expect(f.events).toContain('monitor');
+    expect(JSON.stringify([result, f.logs])).not.toContain('private-approval-data');
+  });
+
+  it('does not execute grants while disarmed', async () => {
+    const f = fixture(); f.unsafe();
+    f.deps.executeApprovals = async () => { f.events.push('execute approvals'); };
+    await createWatcherTick(f.deps)();
+    expect(f.events).not.toContain('execute approvals');
+  });
+
+  it('polls for a mid-wave disarm every thirty seconds and stops before the next effect', async () => {
+    const f = fixture(); let polls = 0; const effects: string[] = [];
+    f.deps.relay!.poll = async () => ({ approvals: [], disarms: ++polls > 1 ? ['signed-disarm'] : [] });
+    f.deps.runAutopilot = async (_incident, context) => {
+      for (const ms of [0, 29_999, 30_000, 60_000]) {
+        f.time(new Date(now.getTime() + ms));
+        if (await context.shouldStop()) break;
+        effects.push(String(ms));
+      }
+    };
+    await createWatcherTick(f.deps)();
+    expect(effects).toEqual(['0', '29999']);
+    expect(polls).toBe(2);
+    expect(f.events).toContain('disarm');
+    expect(f.events).not.toContain('settle');
+  });
+
+  it('checks local disarm between steps without waiting for another relay poll', async () => {
+    const f = fixture(); const stopped: boolean[] = [];
+    f.deps.runAutopilot = async (_incident, context) => {
+      stopped.push(await context.shouldStop()); f.unsafe();
+      stopped.push(await context.shouldStop());
+    };
+    await createWatcherTick(f.deps)();
+    expect(stopped).toEqual([false, true]);
+  });
+
+  it('concurrent engine checks await the same relay poll before permitting an effect', async () => {
+    const f = fixture(); let polls = 0; let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.deps.relay!.poll = async () => {
+      if (++polls === 1) return { approvals: [] };
+      await gate;
+      return { approvals: [], disarms: ['signed-disarm'] };
+    };
+    let stopped: boolean[] = [];
+    f.deps.runAutopilot = async (_incident, context) => {
+      f.time(new Date(now.getTime() + 30_000));
+      const first = context.shouldStop(); const second = context.shouldStop();
+      // Give the second check a chance to finish while the first is still polling.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      release(); stopped = await Promise.all([first, second]);
+    };
+    await createWatcherTick(f.deps)();
+    expect(stopped).toEqual([true, true]);
+    expect(polls).toBe(2);
+  });
+
+  it('stops a running action if a relay re-poll fails', async () => {
+    const f = fixture(); let polls = 0; let stopped = false;
+    f.deps.relay!.poll = async () => { if (++polls > 1) throw new Error('private-relay'); return { approvals: [] }; };
+    f.deps.runAutopilot = async (_incident, context) => {
+      f.time(new Date(now.getTime() + 30_000)); stopped = await context.shouldStop();
+    };
+    const result = await createWatcherTick(f.deps)();
+    expect(stopped).toBe(true);
+    expect(result.errors).toContain('relay poll');
+    expect(f.events).not.toContain('settle');
+  });
+
+  it('uses external delivery history when console deliveries are more recent', async () => {
+    const f = fixture();
+    f.deps.lastNotifySuccessAt = () => '2026-10-28T08:00:00Z';
+    f.deps.lastExternalSuccessAt = () => null;
+    f.deps.state = { pendingTriggered: [], pendingAlerted: [], ownPlatformNotified: [], approvalsRequested: [], lastHeartbeatAt: null,
+      startedAt: now.toISOString(), lastNotifySuccessAt: '2026-10-28T08:00:00Z' };
+    f.time(new Date('2026-10-28T08:00:00Z'));
+    const result = await createWatcherTick(f.deps)();
+    expect(result.status).toBe('alert-only');
+    expect(f.events).not.toContain('autopilot');
+    expect(f.events).not.toContain('resume');
+  });
+
+  it('starts an Actions cache miss alert-only and sends one urgent recovery message across restarts', async () => {
+    const f = fixture(); f.deps.platform = { platform: 'github-actions', host: 'github-actions' };
+    let saved: WatcherTickState | undefined;
+    f.deps.saveState = async snapshot => { saved = snapshot; };
+    const tick = createWatcherTick(f.deps);
+    expect((await tick()).status).toBe('alert-only');
+    await tick();
+    const second = fixture(); second.deps.platform = f.deps.platform; second.deps.state = saved;
+    expect((await createWatcherTick(second.deps)()).status).toBe('alert-only');
+    expect([...f.messages, ...second.messages].filter(message => message.kind === 'watcher-state-missing')).toEqual([
+      expect.objectContaining({ severity: 'urgent', lines: [
+        'This watcher started without its saved state, so autopilot is paused. Run `keysentry autopilot resume --relay` on your computer to resume it.',
+      ] }),
+    ]);
+    expect(f.events).not.toContain('autopilot');
+    expect(f.events).not.toContain('resume');
+    expect(second.events).not.toContain('autopilot');
+  });
+
+  it('lets the recovery verifier clear the Actions pause before any automatic actions', async () => {
+    const f = fixture(); f.deps.platform = { platform: 'github-actions', host: 'github-actions' };
+    let paused = true;
+    f.deps.recovery = { alertOnly: () => paused, resume: async message => {
+      if (message === 'verified-resume') { paused = false; f.events.push('recovery resume'); }
+    } };
+    f.deps.relay!.poll = async () => ({ approvals: [], resumes: ['verified-resume'] });
+    expect((await createWatcherTick(f.deps)()).status).toBe('ok');
+    expect(paused).toBe(false);
+    expect(f.events.indexOf('recovery resume')).toBeLessThan(f.events.indexOf('resume'));
+    expect(f.events).toContain('autopilot');
+  });
+
+  it('a disarm wins over a simultaneous recovery resume', async () => {
+    const f = fixture(); f.deps.platform = { platform: 'github-actions', host: 'github-actions' };
+    let paused = true;
+    f.deps.recovery = { alertOnly: () => paused, resume: async () => { paused = false; } };
+    f.deps.relay!.poll = async () => ({ approvals: [], disarms: ['disarm'], resumes: ['resume'] });
+    expect((await createWatcherTick(f.deps)()).status).toBe('alert-only');
+    expect(paused).toBe(true);
+    expect(f.events).not.toContain('resume');
+  });
+
+  it('keeps Actions paused for a forged resume and releases queued work only for a trusted signed resume', async () => {
+    const f = fixture(); f.deps.platform = { platform: 'github-actions', host: 'github-actions' };
+    const device = generateDeviceKey();
+    const message = signWatcherResume({ watcherId: 'test-watcher', at: now.toISOString() }, device);
+    const recovery = createActionsRecovery({ watcherId: 'test-watcher', trustedKeyIds: [device.keyId],
+      deviceKeys: async () => [{ keyId: device.keyId, publicKeyDer: device.publicKeyDer }], now: f.deps.now,
+      saveState: async state => { expect(state.usedResumeSignatures).toContain(message.sig); },
+    });
+    f.deps.recovery = recovery;
+    let resumes: unknown[] = [{ ...message, sig: Buffer.alloc(64).toString('base64') }];
+    f.deps.relay!.poll = async () => ({ approvals: [], resumes });
+    const tick = createWatcherTick(f.deps);
+    expect((await tick()).status).toBe('alert-only');
+    expect(f.events).not.toContain('autopilot');
+    resumes = [message];
+    expect((await tick()).status).toBe('ok');
+    expect(f.events.filter(event => event === 'autopilot')).toHaveLength(1);
+    expect((await recovery.resume(message)).ok).toBe(false);
+  });
+
   it('failure to check safety never allows an automatic action', async () => {
     const f = fixture(); f.deps.selfCheck = async () => { throw new Error('secret'); };
     const result = await createWatcherTick(f.deps)();
@@ -91,14 +257,14 @@ describe('one watcher cycle', () => {
     expect(f.events).toContain('monitor:alert-only');
   });
 
-  it('sends one urgent guided own-platform message and does not auto-rotate that incident', async () => {
+  it('sends one urgent guided own-platform message and still runs armed rotation with own tokens excluded', async () => {
     const f = fixture(); f.deps.platform = { platform: 'railway', host: 'railway' };
     const tick = createWatcherTick(f.deps);
     await tick(); await tick();
     expect(f.messages).toHaveLength(1);
     expect(f.messages[0]).toMatchObject({ severity: 'urgent', kind: 'watcher-own-platform' });
     expect(f.messages[0]!.lines.join(' ')).toBe('The platform this watcher runs on reported a security incident. Rotate the tokens you gave keysentry (RAILWAY_TOKEN) by hand, then run `keysentry watcher setup` again.');
-    expect(f.events).not.toContain('autopilot');
+    expect(f.events.filter(event => event === 'autopilot')).toHaveLength(1);
   });
 
   it('news-only alerted incidents request approval once and never rotate', async () => {
@@ -205,6 +371,20 @@ describe('one watcher cycle', () => {
     await tick(); await tick();
     expect(attempts).toBe(2);
     expect(f.messages).toHaveLength(1);
+  });
+
+  it('retries an own-token warning independently after the armed action completed, including after restart', async () => {
+    const f = fixture(); f.deps.platform = { platform: 'railway', host: 'railway' };
+    f.deps.notify = async () => { throw new Error('private-channel'); };
+    let snapshot: WatcherTickState | undefined;
+    f.deps.saveState = async state => { snapshot = state; };
+    expect((await createWatcherTick(f.deps)()).status).toBe('error');
+    expect(f.events.filter(event => event === 'autopilot')).toHaveLength(1);
+    const second = fixture(); second.deps.platform = f.deps.platform; second.deps.state = snapshot;
+    second.deps.updateIncidents = async () => ({ incidents: [{ ...incident(), waveId: 'wave-completed' }], changed: [], triggered: [] });
+    await createWatcherTick(second.deps)();
+    expect(second.messages.filter(message => message.kind === 'watcher-own-platform')).toHaveLength(1);
+    expect(second.events).not.toContain('autopilot');
   });
 
   it('serializes concurrent calls so a new incident only runs once', async () => {

@@ -16,6 +16,7 @@ export default function () {
       KEYSENTRY_STATE_KEY: preserve(),
       KEYSENTRY_WATCHER_KEY: preserve(),
       KEYSENTRY_WATCHER_CONFIG: preserve(),
+      KEYSENTRY_WATCHER_VAULT: preserve(),
     },
     volumeMounts: { '/data': data },
   });

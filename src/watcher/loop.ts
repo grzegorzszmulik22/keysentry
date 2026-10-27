@@ -18,6 +18,8 @@ export interface WatcherActionContext {
   /** Adapters must never include these credentials in a rotation, including resumed waves. */
   excludedTokenNames: readonly string[];
   ownHost: HostId | null;
+  /** Call between engine steps/effects. Re-polls the relay at most once per thirty seconds. */
+  shouldStop: () => Promise<boolean>;
 }
 
 /** Store this metadata through the encrypted StateStore before acting. Never store credentials here. */
@@ -25,8 +27,14 @@ export interface WatcherTickState {
   /** Original watcher activation, retained even when notification delivery has never succeeded. */
   startedAt?: string;
   lastNotifySuccessAt?: string | null;
+  lastExternalSuccessAt?: string | null;
+  /** Actions cache-loss pause; only authenticated recovery may clear it. */
+  requiresResume?: boolean;
+  recoveryNotified?: boolean;
   pendingTriggered: Incident[];
   pendingAlerted: Incident[];
+  /** Token notices retry independently of the incident's armed action and wave acknowledgments. */
+  pendingOwnPlatform?: Incident[];
   ownPlatformNotified: string[];
   completedTriggered?: string[];
   pausedTriggeredNotified?: string[];
@@ -40,26 +48,33 @@ export interface WatcherTickDependencies {
   platform: DetectedPlatform;
   ownTokenNames: readonly string[];
   log: Pick<Logger, 'warn'>;
-  selfCheck: (input: { startedAt: Date; now: Date; lastNotifySuccessAt: string | null }) => MaybePromise<SelfCheckResult>;
+  selfCheck: (input: { startedAt: Date; now: Date; lastNotifySuccessAt: string | null; lastExternalSuccessAt?: string | null }) => MaybePromise<SelfCheckResult>;
   resumeWaves: (context: WatcherActionContext) => Promise<unknown>;
+  /** Execute single-use grants through the approved-action executor and the same runner rails. */
+  executeApprovals?: (context: WatcherActionContext) => Promise<unknown>;
   relay?: {
     /** The relay/service adapter must authenticate messages before applying approvals or disarms. */
-    poll: () => Promise<{ approvals: unknown[]; disarms?: unknown[] }>;
+    poll: () => Promise<{ approvals: unknown[]; disarms?: unknown[]; resumes?: unknown[] }>;
     approve: (message: unknown) => Promise<unknown>;
     disarm: (message: unknown) => Promise<unknown>;
   };
+  /** Bind to createActionsRecovery; resume authenticates and durably deduplicates device messages. */
+  recovery?: { alertOnly: () => boolean; resume: (message: unknown) => Promise<unknown> };
   fetchSources: () => Promise<IncidentEvidence[]>;
   /** This adapter must persist returned incident state before resolving, so a crash cannot retrigger a wave. */
   updateIncidents: (evidence: IncidentEvidence[], now: Date) => MaybePromise<{
     incidents: Incident[]; changed: Incident[]; triggered: Incident[];
   }>;
+  /** Resolve only after accepting the incident for execution or approval; reject safety-declined attempts for retry. */
   runAutopilot: (incident: Incident, context: WatcherActionContext) => Promise<unknown>;
   settleWaves: (context: WatcherActionContext) => Promise<unknown>;
   requestApproval: (incident: Incident) => Promise<unknown>;
   /** Always runs; the adapter must suppress monitor mutations when alertOnly is true. */
   runMonitorOnce: (context: WatcherActionContext) => Promise<unknown>;
-  /** Use the dispatcher's actual successful-delivery timestamp, preserved across runtime restarts. */
-  lastNotifySuccessAt: () => string | null;
+  /** Legacy adapter: supply external delivery history only. */
+  lastNotifySuccessAt?: () => string | null;
+  /** Preferred: the dispatcher's lastExternalSuccessAt, preserved across runtime restarts. */
+  lastExternalSuccessAt?: () => string | null;
   /** Sign with the watcher/device key and reject when no channel delivered successfully. */
   notify: (message: NotifyMessage) => Promise<unknown>;
   state?: WatcherTickState;
@@ -74,17 +89,27 @@ function initialState(): WatcherTickState {
 /** One serialized, non-throwing cycle. Production I/O belongs in the supplied adapters. */
 export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<WatcherTickResult> {
   const state = deps.state ?? initialState();
+  if (deps.platform.platform === 'github-actions') state.requiresResume ??= state.startedAt === undefined;
+  const recoveryRequired = () => deps.recovery ? deps.recovery.alertOnly() : state.requiresResume === true;
   const startedAt = state.startedAt === undefined ? deps.startedAt ?? new Date() : new Date(state.startedAt);
   const completedTriggered = state.completedTriggered ??= [];
   const pausedTriggeredNotified = state.pausedTriggeredNotified ??= [];
+  const pendingOwnPlatform = state.pendingOwnPlatform ??= state.pendingTriggered.filter(incident =>
+    deps.platform.host !== null && incident.host === deps.platform.host && !state.ownPlatformNotified.includes(incident.id));
   let tail: Promise<unknown> = Promise.resolve();
+  let lastRelayPollAt = -Infinity;
 
   async function cycle(): Promise<WatcherTickResult> {
     const errors: string[] = [];
     const reasons = new Set<string>();
     let alertOnly = false;
     let persistenceFailed = false;
-    const lastNotifySuccessAt = () => deps.lastNotifySuccessAt() ?? state.lastNotifySuccessAt ?? null;
+    let relayUnsafe = false;
+    let relayDisarmed = false;
+    let relayPollInFlight: Promise<void> | undefined;
+    const lastNotifySuccessAt = () => deps.lastExternalSuccessAt
+      ? deps.lastExternalSuccessAt() ?? state.lastExternalSuccessAt ?? null
+      : deps.lastNotifySuccessAt?.() ?? state.lastNotifySuccessAt ?? null;
     const failed = (step: string) => {
       if (!errors.includes(step)) errors.push(step);
       try { deps.log.warn(`The watcher could not complete ${step}.`); } catch { /* Logging cannot stop the tick. */ }
@@ -95,7 +120,8 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
     };
     const context = async (): Promise<WatcherActionContext> => {
       const checked = await step('self-check', async () => {
-        const input = { startedAt: new Date(startedAt), now: (deps.now ?? (() => new Date()))(), lastNotifySuccessAt: lastNotifySuccessAt() };
+        const input = { startedAt: new Date(startedAt), now: (deps.now ?? (() => new Date()))(), lastNotifySuccessAt: lastNotifySuccessAt(),
+          ...(deps.lastExternalSuccessAt ? { lastExternalSuccessAt: lastNotifySuccessAt() } : {}) };
         const checked = await deps.selfCheck(input);
         // Enforce delivery independently of adapters, using the persisted activation
         // anchor so short-lived scheduled processes cannot reset the 24-hour window.
@@ -103,7 +129,12 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
           ...input,
           stateWritable: !persistenceFailed, armedValid: true,
         });
-        return { ok: checked.ok && delivery.ok, reasons: [...checked.reasons, ...delivery.reasons] };
+        const recovering = recoveryRequired();
+        return { ok: checked.ok && delivery.ok && !relayUnsafe && !relayDisarmed && !recovering,
+          reasons: [...checked.reasons, ...delivery.reasons,
+            ...(relayUnsafe ? ['The watcher relay check could not complete.'] : []),
+            ...(relayDisarmed ? ['Autopilot is disarmed.'] : []),
+            ...(recovering ? ['Autopilot is paused until a device resumes this watcher.'] : [])] };
       });
       const safe = checked.ok && checked.value.ok === true && Array.isArray(checked.value.reasons);
       if (!safe) {
@@ -111,33 +142,69 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
         if (checked.ok) checked.value.reasons.forEach(reason => reasons.add(reason));
         else reasons.add('The watcher self-check could not complete.');
       }
-      return { alertOnly: !safe, reasons: [...reasons], excludedTokenNames: [...deps.ownTokenNames], ownHost: deps.platform.host };
+      return { alertOnly: !safe, reasons: [...reasons], excludedTokenNames: [...deps.ownTokenNames], ownHost: deps.platform.host, shouldStop };
     };
     const persist = async () => {
       const result = await step('state save', () => {
         state.lastNotifySuccessAt = lastNotifySuccessAt();
+        if (deps.lastExternalSuccessAt) state.lastExternalSuccessAt = lastNotifySuccessAt();
+        state.requiresResume = recoveryRequired();
         return deps.saveState?.(structuredClone(state));
       });
       if (!result.ok) persistenceFailed = true;
       return result;
     };
 
+    const pollRelay = async (force = false): Promise<void> => {
+      if (!deps.relay) return;
+      if (relayPollInFlight) return relayPollInFlight;
+      const instant = (deps.now ?? (() => new Date()))().getTime();
+      if (!force && instant >= lastRelayPollAt && instant - lastRelayPollAt < 30_000) return;
+      // Set before awaiting so simultaneous engine checks cannot flood the relay.
+      lastRelayPollAt = instant;
+      const relay = deps.relay;
+      relayPollInFlight = (async () => {
+        const messages = await step('relay poll', () => relay.poll());
+        if (!messages.ok) { relayUnsafe = true; return; }
+        for (const message of messages.value.disarms ?? []) {
+          // A received disarm always stops this cycle, including if durable application needs retry.
+          relayDisarmed = true;
+          if (!(await step('relay disarm', () => relay.disarm(message))).ok) relayUnsafe = true;
+        }
+        for (const message of messages.value.approvals) await step('relay approval', () => relay.approve(message));
+        // A resume received in the same poll as a disarm must never undo that disarm.
+        if (!relayDisarmed && deps.recovery) {
+          for (const message of messages.value.resumes ?? []) await step('relay resume', () => deps.recovery!.resume(message));
+        }
+      })();
+      try { await relayPollInFlight; }
+      finally { relayPollInFlight = undefined; }
+    };
+    async function shouldStop(): Promise<boolean> {
+      try { await pollRelay(); return (await context()).alertOnly; }
+      catch { failed('self-check'); relayUnsafe = true; return true; }
+    }
+
     try {
       const now = (deps.now ?? (() => new Date()))();
       const at = now.toISOString();
       state.startedAt ??= startedAt.toISOString();
       await persist();
+      if (recoveryRequired() && !state.recoveryNotified) {
+        const sent = await step('state recovery notification', () => deps.notify({
+          id: `watcher-state-missing-${state.startedAt}`, at,
+          kind: 'watcher-state-missing', severity: 'urgent', title: 'Watcher needs to resume',
+          lines: ['This watcher started without its saved state, so autopilot is paused. Run `keysentry autopilot resume --relay` on your computer to resume it.'],
+        }));
+        if (sent.ok) { state.recoveryNotified = true; await persist(); }
+      }
+      // Remote disarm must be observed before recovering any interrupted effect.
+      await pollRelay(true);
       const resume = await context();
       if (!resume.alertOnly) await step('wave resume', () => deps.resumeWaves(resume));
-
-      if (deps.relay) {
-        const relay = deps.relay;
-        const messages = await step('relay poll', () => relay.poll());
-        if (messages.ok) {
-          // Process disarm first; a simultaneous approval cannot undo it.
-          for (const message of messages.value.disarms ?? []) await step('relay disarm', () => relay.disarm(message));
-          for (const message of messages.value.approvals) await step('relay approval', () => relay.approve(message));
-        }
+      if (deps.executeApprovals) {
+        const approved = await context();
+        if (!approved.alertOnly) await step('execute approved actions', () => deps.executeApprovals!(approved));
       }
 
       const evidence = await step('source fetch', () => deps.fetchSources());
@@ -150,6 +217,10 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
           // after its own effects but before our completion acknowledgment is saved.
           const candidates = [...updated.value.triggered, ...updated.value.incidents.filter(item => item.status === 'triggered')];
           for (const incident of candidates) {
+            if (deps.platform.host !== null && incident.host === deps.platform.host
+              && !state.ownPlatformNotified.includes(incident.id) && !pendingOwnPlatform.some(item => item.id === incident.id)) {
+              pendingOwnPlatform.push(structuredClone(incident));
+            }
             if (!completedTriggered.includes(incident.id) && !incident.waveId
               && !state.pendingTriggered.some(existing => existing.id === incident.id)) state.pendingTriggered.push(structuredClone(incident));
           }
@@ -168,20 +239,24 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
       }
 
       if (durable) {
+        for (const incident of [...pendingOwnPlatform]) {
+          const names = deps.ownTokenNames.filter(name => /^[A-Z][A-Z0-9_]{0,199}$/.test(name)).join(', ') || 'the configured tokens';
+          const sent = await step('own-platform notification', () => deps.notify({
+            id: `watcher-own-platform-${incident.id}`, at: incident.trigger?.at ?? at,
+            kind: 'watcher-own-platform', severity: 'urgent', title: 'Watcher platform incident',
+            lines: [`The platform this watcher runs on reported a security incident. Rotate the tokens you gave keysentry (${names}) by hand, then run \`keysentry watcher setup\` again.`],
+          }));
+          if (sent.ok) {
+            state.ownPlatformNotified.push(incident.id);
+            pendingOwnPlatform.splice(pendingOwnPlatform.findIndex(item => item.id === incident.id), 1);
+            if (!(await persist()).ok) { durable = false; break; }
+          }
+        }
+      }
+      if (durable) {
         for (const incident of [...state.pendingTriggered]) {
-          let done = false;
-          if (deps.platform.host !== null && incident.host === deps.platform.host) {
-            if (state.ownPlatformNotified.includes(incident.id)) done = true;
-            else {
-              const names = deps.ownTokenNames.filter(name => /^[A-Z][A-Z0-9_]{0,199}$/.test(name)).join(', ') || 'the configured tokens';
-              const sent = await step('own-platform notification', () => deps.notify({
-                id: `watcher-own-platform-${incident.id}`, at: incident.trigger?.at ?? at,
-                kind: 'watcher-own-platform', severity: 'urgent', title: 'Watcher platform incident',
-                lines: [`The platform this watcher runs on reported a security incident. Rotate the tokens you gave keysentry (${names}) by hand, then run \`keysentry watcher setup\` again.`],
-              }));
-              if (sent.ok) { state.ownPlatformNotified.push(incident.id); done = true; }
-            }
-          } else {
+          let done = completedTriggered.includes(incident.id);
+          if (!done) {
             const action = await context();
             if (!action.alertOnly) done = (await step('autopilot', () => deps.runAutopilot(incident, action))).ok;
             else {
@@ -201,7 +276,7 @@ export function createWatcherTick(deps: WatcherTickDependencies): () => Promise<
             }
           }
           if (done) {
-            completedTriggered.push(incident.id);
+            if (!completedTriggered.includes(incident.id)) completedTriggered.push(incident.id);
             state.pendingTriggered = state.pendingTriggered.filter(item => item.id !== incident.id);
             if (!(await persist()).ok) { durable = false; break; }
           }

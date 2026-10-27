@@ -15,8 +15,11 @@ export function createDispatcher(channels: NotifyChannel[], opts: DispatcherOpti
   const now = opts.now ?? (() => new Date());
   const sleep = opts.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
   let last: string | null = null;
+  let lastExternal: string | null = null;
   return {
     lastSuccessAt: (): string | null => last,
+    /** Last successful delivery outside local console output; suitable for notification self-checks. */
+    lastExternalSuccessAt: (): string | null => lastExternal,
     async send(m: SignedNotifyMessage): Promise<{ delivered: string[]; failed: { id: string; reason: string }[] }> {
       const results = await Promise.all(channels.map(async channel => {
         let reason = `${CHANNEL_LABELS[channel.kind]} delivery failed`;
@@ -24,6 +27,7 @@ export function createDispatcher(channels: NotifyChannel[], opts: DispatcherOpti
           try {
             await channel.send(m);
             last = now().toISOString();
+            if (channel.kind !== 'console') lastExternal = last;
             return { id: channel.id, ok: true as const };
           } catch (error) {
             // Never trust an exception's message, including custom channel implementations.

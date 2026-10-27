@@ -11,3 +11,10 @@ export { createWatcherTick, runWatcherLoop, runOnce } from './loop.js';
 export type {
   WatcherActionContext, WatcherTickDependencies, WatcherTickResult, WatcherTickState, RunOnceDependencies,
 } from './loop.js';
+export { RESUME_PREFIX, signWatcherResume, verifyWatcherResume, createActionsRecovery, createSequencedStateRecord } from './recovery.js';
+export type {
+  SignedWatcherResume, RecoveryDeviceKey, WatcherResumeVerification, ActionsRecoveryState, ActionsRecoveryOptions,
+  ActionsRecovery, SequencedStateRecord, SequencedStatePersistence,
+} from './recovery.js';
+export { createWatcherResumeRelay } from './resume-relay.js';
+export type { WatcherResumeRelayOptions, WatcherResumeRelayPollResult, WatcherResumeRelay } from './resume-relay.js';

@@ -8,7 +8,8 @@ for setup values, persistent state, and health checks.
    `ghcr.io/grzenio22/keysentry` digest. Add a 1 GiB volume mounted at `/data`,
    prepare it as owner 65532 with mode 0700, and keep one replica.
 2. Paste `KEYSENTRY_WATCHER_CONFIG`, `KEYSENTRY_WATCHER_KEY`,
-   `KEYSENTRY_STATE_KEY`, and `KEYSENTRY_VAULT_PASSPHRASE` from local
+   `KEYSENTRY_STATE_KEY`, `KEYSENTRY_VAULT_PASSPHRASE`, and
+   `KEYSENTRY_WATCHER_VAULT` from local
    `keysentry watcher setup` into the service's Variables. Set
    `KEYSENTRY_STATE_DIR=/data`, `KEYSENTRY_VAULT=encrypted-file`, and
    `NODE_ENV=production`. Never generate a replacement state key in Railway.
@@ -28,7 +29,7 @@ for setup values, persistent state, and health checks.
 1. First deploy and check a working project as above.
 2. In Railway choose Workspace > Templates > New Template, or Generate Template
    from Project. Select the image service and persistent volume in the composer.
-3. Mark all four setup values as user-supplied secrets. Keep their defaults empty.
+3. Mark all five setup values as user-supplied secrets. Keep their defaults empty.
    Do not use `${{secret(32)}}` for keys that must match local setup. Use
    `preserve()` in IaC to keep secrets already set in Railway.
 4. Review the image digest, volume mount, one-replica setting, and variables,

@@ -20,21 +20,24 @@ The templates have been checked locally as text and YAML, not deployed.
    an incident there requires you to rotate the watcher's own tokens by hand and
    run setup again.
 
-2. Store these four values in your platform's secret settings. Never put them in a
+2. Store these five values in your platform's secret settings. Never put them in a
    Docker build argument, Dockerfile, repository variable, image, workflow YAML,
    or a committed file. Keep a separate secure backup.
 
-   | Secret | Value from setup |
-   | --- | --- |
-   | `KEYSENTRY_WATCHER_CONFIG` | Entire sealed string beginning `ksw1.` |
-   | `KEYSENTRY_WATCHER_KEY` | Matching base64 32-byte deployment key |
-   | `KEYSENTRY_STATE_KEY` | Matching base64 32-byte state key; do not generate a replacement on the platform |
-   | `KEYSENTRY_VAULT_PASSPHRASE` | Passphrase for the encrypted-file vault |
+   | Secret | Value from setup | Purpose |
+   | --- | --- | --- |
+   | `KEYSENTRY_WATCHER_CONFIG` | Entire sealed string beginning `ksw1.` | Supplies the sealed plan, notification and watcher settings |
+   | `KEYSENTRY_WATCHER_KEY` | Matching base64 32-byte deployment key | Opens the sealed watcher configuration |
+   | `KEYSENTRY_STATE_KEY` | Matching base64 32-byte state key | Encrypts recovery state; do not generate a replacement on the platform |
+   | `KEYSENTRY_VAULT_PASSPHRASE` | Passphrase for the encrypted-file vault | Opens the watcher's encrypted vault |
+   | `KEYSENTRY_WATCHER_VAULT` | Base64 encrypted portable vault | Initializes credentials, signing keys and runtime settings when the persisted vault is absent |
 
    Provider/platform credentials belong inside the encrypted vault initialized by
-   setup. Preserve and restore the encrypted state/vault it produces, following
-   setup's instructions. Do not copy keys into the state directory. The deployment
-   key opens configuration; it does not replace the separate state key.
+   setup. The watcher imports `KEYSENTRY_WATCHER_VAULT` only when its persisted
+   vault is absent; an existing updated vault takes precedence. Preserve and
+   restore encrypted state/vault following setup's instructions. Keep deploy-time
+   keys outside the state directory. The deployment key opens configuration; it
+   does not replace the separate state key.
 
    An alternative is to mount a file containing only the sealed string and set
    `KEYSENTRY_WATCHER_CONFIG_FILE` to its path instead of
@@ -51,6 +54,9 @@ The templates have been checked locally as text and YAML, not deployed.
    Do not deploy the literal placeholder. Private GHCR images need your own
    registry credentials; public images do not. Build publication happens only for
    public repositories. The two Docker base images are already pinned by digest.
+   The image workflow attaches buildx provenance and SBOM attestations. Images
+   are currently unsigned; cosign keyless signing is planned for the publishing
+   release, with OIDC permission added alongside the signing step.
 
 4. Provision persistent state at `/data` with owner `65532:65532` and mode `0700`.
    The image prepares that mount point, but a provider volume may replace its
@@ -75,7 +81,7 @@ The templates have been checked locally as text and YAML, not deployed.
    "${EDITOR:-vi}" .env
    ```
 
-   Fill `.env` with the four exact `NAME=value` assignments from setup. This is a
+   Fill `.env` with the five exact `NAME=value` assignments from setup. This is a
    local deployment secret file: do not commit or share it. Compose reads it with
    `env_file`. Replace the image reference with the released digest.
 
@@ -124,7 +130,7 @@ The templates have been checked locally as text and YAML, not deployed.
    to your deployment workspace. Create a Railway project and an image-based
    service using the released image digest. Add a 1 GiB volume at `/data` and keep
    a single replica.
-2. Set the four secrets above in service Variables. Set these ordinary variables:
+2. Set the five secrets above in service Variables. Set these ordinary variables:
 
    ```text
    KEYSENTRY_STATE_DIR=/data
@@ -159,7 +165,7 @@ read on 2026-12-01. Dashboard template publishing steps are in
    replace its image reference with the released digest, then create a Blueprint
    from that repository in Render. It creates a paid background worker with one
    disk mounted at `/data`; it has no inbound HTTP endpoint.
-2. When prompted, paste all four setup secrets. Each uses `sync: false`;
+2. When prompted, paste all five setup secrets. Each uses `sync: false`;
    `KEYSENTRY_STATE_KEY` must be the setup value, not a Render-generated value.
    Later Blueprint syncs do not update these secrets: change them in the worker's
    Environment settings when setup is repeated.
@@ -184,7 +190,7 @@ read on 2026-12-01. Dashboard template publishing steps are in
    fly volumes create keysentry_data --app YOUR-UNIQUE-APP --region ams --size 1
    ```
 
-2. In a private mode-0600 local file such as `.watcher-secrets.env`, put the four
+2. In a private mode-0600 local file such as `.watcher-secrets.env`, put the five
    exact `NAME=value` assignments from setup. Import through stdin, so values are
    not command-line arguments:
 
@@ -212,7 +218,7 @@ read on 2026-12-01. Dashboard template publishing steps are in
    `.github/workflows/keysentry-watch.yml` in a repository you control, on its
    default branch. Review the pinned actions: each is pinned to a full commit SHA
    recorded in `notes/phase1-facts.md` (actions/cache v6.1.0 verified 2026-10-27).
-2. Add the four setup values under Settings > Secrets and variables > Actions >
+2. Add the five setup values under Settings > Secrets and variables > Actions >
    Repository secrets. Add the ordinary repository variable
    `KEYSENTRY_RELEASE_TAG`, for example `v1.0.0`, selecting a release you reviewed.
    This workflow downloads the bundle and manifest from that release, then checks
@@ -221,11 +227,14 @@ read on 2026-12-01. Dashboard template publishing steps are in
    the release publisher. Use the release verification process for publisher
    trust.
 3. If setup produced encrypted recovery state, initialize it through a controlled
-   first run before arming, following setup's instructions. The workflow restores
+   first run, following setup's instructions. The workflow restores
    the latest `keysentry-state-` cache prefix and saves a new immutable cache as
    `keysentry-state-${{ github.run_id }}`. It serializes runs and saves recovery
    state even if a watcher tick fails. Cache only encrypted state; never put the
    deployment key, state key, passphrase, or a plaintext secret file in `.keysentry`.
+   A cache miss, including the first run, starts alert-only and stays paused until
+   a registered device sends a fresh signed `keysentry autopilot resume --relay`
+   through the configured relay. Review the watcher's state before resuming.
 4. Enable Actions and choose Run workflow to test it. Inspect the run's watcher
    logs and signed notifications. Exit 0 means the run completed, 1 means an
    error, and 2 means alert-only. Actions mode has no inbound approval server;
@@ -237,6 +246,12 @@ off after 60 days without repository activity; forks start with schedules off.
 Caches may be evicted after seven days without access or because the repository
 cache limit is exceeded, and default-branch caches can be restored by pull-request
 workflows. Keep backups and verify recovery before relying on unattended rotation.
+The monotonic sequence is protected inside encrypted state. It detects an older
+restore only after the same process has seen a newer sequence. Across separate
+Actions runs, an older snapshot is detectable only when a newer snapshot is also
+present; restoring an old snapshot alone does not provide an independent latest
+sequence. Cache access also exposes encrypted vault files and plaintext audit and
+network-receipt metadata to workflows that can restore the cache.
 Reruns reuse the original run ID; an immutable cache with that ID cannot be
 overwritten, so use a new workflow dispatch for a new recovery snapshot.
 

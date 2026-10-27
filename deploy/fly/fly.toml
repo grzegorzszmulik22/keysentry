@@ -1,6 +1,10 @@
 app = "keysentry-watcher"
 primary_region = "ams"
 
+# Import all five setup values with `fly secrets import` through stdin:
+# KEYSENTRY_WATCHER_CONFIG, KEYSENTRY_WATCHER_KEY, KEYSENTRY_STATE_KEY,
+# KEYSENTRY_VAULT_PASSPHRASE, KEYSENTRY_WATCHER_VAULT.
+
 [build]
   # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
   image = "ghcr.io/grzenio22/keysentry:1.0.0"

@@ -8,6 +8,9 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     init: true
+    # Supply all five setup values in the private .env file:
+    # KEYSENTRY_WATCHER_CONFIG, KEYSENTRY_WATCHER_KEY, KEYSENTRY_STATE_KEY,
+    # KEYSENTRY_VAULT_PASSPHRASE, KEYSENTRY_WATCHER_VAULT.
     env_file: [.env]
     environment:
       KEYSENTRY_STATE_DIR: /data

@@ -20,6 +20,13 @@ describe('watcher self-check', () => {
     expect(selfCheck({ ...input, lastNotifySuccessAt: '2026-10-28T07:59:00Z', now: input.startedAt }).ok).toBe(true);
   });
 
+  it('ignores console success when explicit external delivery history is supplied', () => {
+    expect(selfCheck({ ...healthy, now: new Date('2026-10-28T08:00:00Z'),
+      lastNotifySuccessAt: '2026-10-28T08:00:00Z', lastExternalSuccessAt: null }).ok).toBe(false);
+    expect(selfCheck({ ...healthy, now: new Date('2026-10-28T08:00:00Z'),
+      lastExternalSuccessAt: '2026-10-28T07:00:00Z' }).ok).toBe(true);
+  });
+
   it('requires writable state, a valid armed plan, and at most five minutes of clock skew', () => {
     expect(selfCheck({ ...healthy, clockSkewSeconds: -300 }).ok).toBe(true);
     const result = selfCheck({ ...healthy, stateWritable: false, armedValid: false, clockSkewSeconds: 301 });

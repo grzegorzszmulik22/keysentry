@@ -6,7 +6,7 @@ const root = new URL('../../', import.meta.url);
 const read = (path: string) => readFile(new URL(path, root), 'utf8');
 const yaml = async (path: string) => parse(await read(path));
 const image = 'ghcr.io/grzenio22/keysentry';
-const secrets = ['KEYSENTRY_VAULT_PASSPHRASE', 'KEYSENTRY_STATE_KEY', 'KEYSENTRY_WATCHER_KEY', 'KEYSENTRY_WATCHER_CONFIG'];
+const secrets = ['KEYSENTRY_VAULT_PASSPHRASE', 'KEYSENTRY_STATE_KEY', 'KEYSENTRY_WATCHER_KEY', 'KEYSENTRY_WATCHER_CONFIG', 'KEYSENTRY_WATCHER_VAULT'];
 const cachePin = '55cc8345863c7cc4c66a329aec7e433d2d1c52a9';
 
 describe('watcher deployment contracts (static; no Docker or platform calls)', () => {
@@ -46,6 +46,17 @@ describe('watcher deployment contracts (static; no Docker or platform calls)', (
     for (const entry of ['node_modules', '.git', '.keysentry', 'logs', 'dist', 'dist-release', 'tools/probes', '.env', '.env.*']) {
       expect(ignored).toContain(entry);
     }
+  });
+
+  test.each([
+    'deploy/compose/docker-compose.yml',
+    'deploy/fly/fly.toml',
+    'deploy/render/render.yaml',
+    'deploy/railway/.railway/railway.ts',
+    'deploy/github-actions/keysentry-watch.yml',
+  ])('%s names every setup value needed for the first watcher start', async path => {
+    const template = await read(path);
+    for (const name of secrets) expect(template).toContain(name);
   });
 
   test('Compose runs a confined non-root worker with persistent state and env_file secrets', async () => {
@@ -141,7 +152,7 @@ describe('watcher deployment contracts (static; no Docker or platform calls)', (
     expect(workflow.on.push.tags).toEqual(['v*']);
     expect(workflow.permissions).toEqual({});
     const job = workflow.jobs.image;
-    expect(job.permissions).toEqual({ contents: 'read', packages: 'write', 'id-token': 'write' });
+    expect(job.permissions).toEqual({ contents: 'read', packages: 'write' });
     const push = job.steps.find((step: { id?: string }) => step.id === 'push');
     const login = job.steps.find((step: { id?: string }) => step.id === 'login');
     expect(push.if).toBe('${{ !github.event.repository.private }}');

@@ -21,16 +21,47 @@ test('dispatcher keeps going when one channel fails and reports lastSuccessAt', 
   ];
   const d = createDispatcher(channels, { log: { ...silentLogger, warn: (...args) => logLines.push(args) }, now: () => new Date(instant), sleep: async ms => { sleeps.push(ms); } });
   expect(d.lastSuccessAt()).toBeNull();
+  expect(d.lastExternalSuccessAt()).toBeNull();
   expect(await d.send(m())).toEqual({ delivered: ['working'], failed: [{ id: 'broken', reason: 'Webhook delivery failed' }] });
   expect(attempts).toBe(3);
   expect(sleeps).toEqual([1000, 2000]);
   expect(d.lastSuccessAt()).toBe('2026-10-27T12:01:00.000Z');
+  expect(d.lastExternalSuccessAt()).toBeNull();
   expect(JSON.stringify(logLines)).not.toContain('secret.example');
   expect(JSON.stringify(logLines)).not.toContain('recipient@');
   instant = '2026-10-27T12:02:00Z';
   await d.send(m());
   expect(d.lastSuccessAt()).toBe('2026-10-27T12:02:00.000Z');
+  expect(d.lastExternalSuccessAt()).toBeNull();
 });
+
+test.each(['telegram', 'discord', 'slack', 'ntfy', 'webhook', 'resend', 'smtp'] as const)(
+  '%s delivery advances external success time and later console delivery cannot refresh it', async kind => {
+    let externalFails = false;
+    let consoleFails = false;
+    let instant = '2026-10-27T12:01:00Z';
+    const d = createDispatcher([
+      { id: 'console', kind, async send() { if (externalFails) throw new Error('failure'); } },
+      { id: 'local-output', kind: 'console', async send() { if (consoleFails) throw new Error('failure'); } },
+    ], { log: silentLogger, retries: 1, now: () => new Date(instant) });
+
+    expect((await d.send(m())).delivered).toEqual(['console', 'local-output']);
+    expect(d.lastSuccessAt()).toBe('2026-10-27T12:01:00.000Z');
+    expect(d.lastExternalSuccessAt()).toBe('2026-10-27T12:01:00.000Z');
+
+    externalFails = true;
+    instant = '2026-10-27T13:01:00Z';
+    expect((await d.send(m())).delivered).toEqual(['local-output']);
+    expect(d.lastSuccessAt()).toBe('2026-10-27T13:01:00.000Z');
+    expect(d.lastExternalSuccessAt()).toBe('2026-10-27T12:01:00.000Z');
+
+    consoleFails = true;
+    instant = '2026-10-27T14:01:00Z';
+    expect((await d.send(m())).delivered).toEqual([]);
+    expect(d.lastSuccessAt()).toBe('2026-10-27T13:01:00.000Z');
+    expect(d.lastExternalSuccessAt()).toBe('2026-10-27T12:01:00.000Z');
+  },
+);
 
 test('one blocked channel does not delay delivery through the others', async () => {
   let release!: () => void;
