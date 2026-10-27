@@ -283,6 +283,8 @@ describe('undoRotation', () => {
     next.value = secret;
     h.provider.keys.set(secret, next);
     h.entries.find(entry => entry.event === 'created')!.data!.newKeyRef = secret;
+    // Undo previously trusted a substituted stored value; the journalled replacement must match it too.
+    h.entries.find(entry => entry.event === 'created')!.data!.newFingerprint = fingerprint(secret, key);
     await h.inflight.put(h.plan.id, `new:${pair.step.clusterId}`, secret);
     await h.inflight.put(h.plan.id, `companion:${pair.step.clusterId}:AWS_ACCESS_KEY_ID`, secret);
     // Keep host state consistent with the substituted recorded replacement.

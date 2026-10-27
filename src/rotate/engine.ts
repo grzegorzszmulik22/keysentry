@@ -1,6 +1,6 @@
 import { classify, fingerprint, serviceKey } from '../core/index.js';
 import { RotationAbortedError } from '../types.js';
-import { crash, isCrash } from './recovery.js';
+import { crash, isCrash, unresolvedOrphans } from './recovery.js';
 import { undoRotation } from './undo.js';
 import type {
   ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
@@ -81,6 +81,7 @@ interface StepWork {
   undone?: boolean;
   oldCompanions?: Record<string, string>;
   unusedCleanupAttempted?: boolean;
+  unusedCleanupSucceeded?: boolean;
 }
 
 class JournalFailure extends Error {
@@ -171,11 +172,20 @@ export async function runRotation(
     report.steps.push(stepReport);
     return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
   });
+  const pendingOrphans = unresolvedOrphans(plan, history);
+  const orphanClusters = new Set(pendingOrphans.map(suspect => suspect.clusterId));
+  const cleanedOrphanClusters = new Set(history.filter(entry => entry.event === 'orphan-suspected'
+    && entry.clusterId && !orphanClusters.has(entry.clusterId)).map(entry => entry.clusterId));
+  for (const suspect of pendingOrphans) if (suspect.provider === 'aws' && suspect.keyRef
+    && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(suspect.keyRef)) publicKeyRefs.add(suspect.keyRef);
+  if (pendingOrphans.length > 0) report.orphanSuspects = pendingOrphans
+    .filter((suspect): suspect is typeof suspect & { keyRef: string } => suspect.keyRef !== null);
   const services = new Map<string, ServiceWork>();
   let aborted = false;
   let graceUndid = false;
   let deliveryUncertain = false;
   let providerProducedResult = false;
+  let unusedReplacementMayBeLive = pendingOrphans.length > 0;
   let railwayNamespace: Promise<ServiceRef[]> | undefined;
   const plannedLocations = new Set(plan.steps.flatMap(step => step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`)));
   const referenceLocations = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
@@ -234,6 +244,7 @@ export async function runRotation(
       || work.report.status === 'skipped' && !work.result
       || revoke === 'never' && work.ready && work.report.status !== 'failed' && [...work.services].every(key => services.get(key)?.written));
     if (dryRun) report.status = 'dry-run';
+    else if (unusedReplacementMayBeLive) report.status = 'partial';
     else if (stopOnFirstFailure && waveStopped && !delivered && !report.orphanSuspects?.length) report.status = 'failed';
     else if (report.status !== 'grace-pending' && report.status !== 'partial') {
       report.status = !aborted && settled && !works.some(work => work.report.status === 'failed') ? 'complete' : progressed ? 'partial' : 'failed';
@@ -296,6 +307,7 @@ export async function runRotation(
       await work.provider!.revoke!(result.newKeyRef, work.ctx!);
       crash(deps, 'after-revoke', { clusterId: work.step.clusterId });
       await journal('revoked', { clusterId: work.step.clusterId, data: { keyRef: result.newKeyRef, cleanup: true } });
+      work.unusedCleanupSucceeded = true;
     } catch (error) {
       if (isCrash(error)) throw error;
       if (error instanceof JournalFailure) throw error;
@@ -550,6 +562,14 @@ export async function runRotation(
     // Preflight the entire plan before creating credentials, checking secondary copies too.
     for (const work of works) {
       if (work.undone) { work.report.status = 'skipped'; continue; }
+      if (orphanClusters.has(work.step.clusterId)) {
+        await fail(work, 'An unused replacement may still be live at the provider. Check it and complete cleanup before resuming this cluster.');
+        continue;
+      }
+      if (cleanedOrphanClusters.has(work.step.clusterId)) {
+        await fail(work, 'The recorded unused replacement was revoked. Scan again before starting another rotation.');
+        continue;
+      }
       const cluster = inv.clusters.find(candidate => candidate.id === work.step.clusterId);
       const locations = new Set(work.step.consumers.map(c => `${serviceKey(c.service)}\0${c.varName}`));
       if (!cluster || locations.size === 0 || cluster.consumers.some(c => !locations.has(`${serviceKey(c.service)}\0${c.varName}`))
@@ -795,6 +815,9 @@ export async function runRotation(
             }
             catch (error) {
               if (isCrash(error)) throw error;
+              // Only a rejected provider call promises no mutation. A store
+              // error carrying the same code cannot authorize guided fallback.
+              if (work.result) throw error;
               if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'GUIDED_ROTATION_REQUIRED') throw error;
               // This code guarantees rotate rejected before mutation, even for
               // an adapter or stale plan that advertised an atomic roll.
@@ -913,11 +936,29 @@ export async function runRotation(
             work.report.newFingerprint = fingerprint(work.result.newValue, deps.fingerprintKey);
             work.report.oldKeyRef = work.result.oldKeyRef;
             work.report.newKeyRef = work.result.newKeyRef;
-            await journal('created', { clusterId: work.step.clusterId, data: {
-              phase: 'preparation-failed', newFingerprint: work.report.newFingerprint,
-              oldKeyRef: work.result.oldKeyRef, newKeyRef: work.result.newKeyRef, oldRevoked: false,
-            } });
+            let preparationJournalFailure: JournalFailure | undefined;
+            try {
+              await journal('created', { clusterId: work.step.clusterId, data: {
+                phase: 'preparation-failed', newFingerprint: work.report.newFingerprint,
+                oldKeyRef: work.result.oldKeyRef, newKeyRef: work.result.newKeyRef, oldRevoked: false,
+              } });
+            } catch (error) {
+              if (isCrash(error)) throw error;
+              if (!(error instanceof JournalFailure)) throw error;
+              // Losing the metadata write cannot suppress cleanup of a known,
+              // unused provider key. Stop execution after the cleanup attempt.
+              preparationJournalFailure = error;
+            }
             await cleanupUnused(work);
+            if (!work.unusedCleanupSucceeded && !localGeneration(work)) {
+              // The value may never have reached durable storage. Preserve all
+              // remaining recovery data while the provider key may still live.
+              unusedReplacementMayBeLive = true;
+              const suspect = { clusterId: work.step.clusterId, provider: work.step.provider, keyRef: work.result.newKeyRef };
+              if (suspect.keyRef) (report.orphanSuspects ??= []).push({ ...suspect, keyRef: suspect.keyRef });
+              await journal('orphan-suspected', { clusterId: work.step.clusterId, data: { ...suspect, reason: 'unused-key-cleanup' } });
+            }
+            if (preparationJournalFailure) throw preparationJournalFailure;
           }
           await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.');
         }

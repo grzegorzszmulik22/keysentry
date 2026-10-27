@@ -12,7 +12,14 @@ export class EgressBlockedError extends Error {
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// API owners stay on one host, including within a provider's wildcard rule.
+const CROSS_HOST_REDIRECT_OWNERS = new Set(['feed', 'release', 'notify', 'user']);
 const hostOf = (url: URL): string => url.hostname.toLowerCase().replace(/\.$/, '');
+
+function isCredentialHeader(name: string): boolean {
+  return /token|secret|key|auth/i.test(name)
+    || ['cookie', 'openai-organization'].includes(name.toLowerCase());
+}
 
 export function createGuardedHttp(inner: HttpClient, opts: {
   rules: readonly EgressRule[];
@@ -75,9 +82,13 @@ export function createGuardedHttp(inner: HttpClient, opts: {
         const host = hostOf(url);
         const rule = matchRule(url, opts.rules);
         const exempt = redirects === 0 && trusted.has(url.href);
-        if (!rule || (!exempt && (containsSecret(current.url) || containsSecret(url.href))) || (owner !== undefined && rule.owner !== owner)) {
+        if (!rule || (!exempt && (containsSecret(current.url) || containsSecret(url.href)))
+          || (owner !== undefined && rule.owner !== owner)
+          || (firstHost !== undefined && host !== firstHost && !CROSS_HOST_REDIRECT_OWNERS.has(rule.owner))) {
           return blocked(host, current.method);
         }
+        // Classify forbidden targets before the hop limit so their blocked attempt is still recorded.
+        if (redirects > 0 && redirects > maxRedirects) throw new Error(`Too many redirects from ${firstHost}`);
         owner ??= rule.owner;
         firstHost ??= host;
 
@@ -92,8 +103,6 @@ export function createGuardedHttp(inner: HttpClient, opts: {
 
         const location = Object.entries(response.headers).find(([name]) => name.toLowerCase() === 'location')?.[1];
         if (!REDIRECT_STATUSES.has(response.status) || location === undefined) return response;
-        if (redirects >= maxRedirects) throw new Error(`Too many redirects from ${firstHost}`);
-
         const next: HttpRequest = { ...current, headers: current.headers ? { ...current.headers } : undefined };
         if (response.status === 303 || ((response.status === 301 || response.status === 302) && !['GET', 'HEAD'].includes(current.method))) {
           next.method = 'GET';
@@ -107,7 +116,7 @@ export function createGuardedHttp(inner: HttpClient, opts: {
         try { target = new URL(location, url); } catch { return blocked('(unparseable)', next.method); }
         if (hostOf(target) !== host) {
           for (const name of Object.keys(next.headers ?? {})) {
-            if (['authorization', 'cookie'].includes(name.toLowerCase())) delete next.headers![name];
+            if (isCredentialHeader(name)) delete next.headers![name];
           }
         }
         next.url = target.href;

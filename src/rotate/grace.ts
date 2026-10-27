@@ -1,7 +1,7 @@
-import { fingerprint, serviceKey } from '../core/index.js';
+import { buildInventory, fingerprint, serviceKey } from '../core/index.js';
 import type { EngineDeps, RotateOptions } from './engine.js';
-import { crash, createRecoverySafety, isCrash } from './recovery.js';
-import type { Inventory, JournalEntry, PlanStep, ProviderAdapter, ProviderContext, RawVariable, RotationPlan, RotationReport, StepReport } from '../types.js';
+import { crash, createRecoverySafety, isCrash, unresolvedOrphans } from './recovery.js';
+import type { Inventory, JournalEntry, PlanStep, ProviderAdapter, ProviderContext, RawVariable, RotationPlan, RotationReport, ServiceRef, StepReport } from '../types.js';
 
 interface FinishInput {
   plan: RotationPlan;
@@ -146,9 +146,18 @@ export async function finishRotation(
   const now = deps.now ?? (() => new Date());
   const dryRun = opts?.dryRun !== false;
   const report = baseReport(input, entries, now, dryRun);
-  const pendingSteps = input.plan.steps.filter(step => graceDeadline(entries, step.clusterId) !== undefined && !ended(entries, step.clusterId));
+  const orphans = unresolvedOrphans(input.plan, entries);
+  const orphanClusters = new Set(orphans.map(orphan => orphan.clusterId));
+  const knownOrphans = orphans.filter((orphan): orphan is typeof orphan & { keyRef: string } => orphan.keyRef !== null);
+  if (knownOrphans.length > 0) report.orphanSuspects = knownOrphans;
+  for (const step of report.steps) if (orphanClusters.has(step.clusterId)) {
+    step.status = 'failed';
+    step.warnings.push('An unused replacement may still be active at the provider; check it before finishing this rotation.');
+  }
+  const pendingSteps = input.plan.steps.filter(step => !orphanClusters.has(step.clusterId)
+    && graceDeadline(entries, step.clusterId) !== undefined && !ended(entries, step.clusterId));
   const finalEntry = [...entries].reverse().find(entry => entry.event === 'plan-end');
-  if (pendingSteps.length === 0 && finalEntry && finalEntry.data?.pending !== true) {
+  if (orphans.length === 0 && pendingSteps.length === 0 && finalEntry && finalEntry.data?.pending !== true) {
     const saved = finalEntry.data?.report;
     if (saved !== null && typeof saved === 'object' && 'planId' in saved && saved.planId === input.plan.id) return saved as RotationReport;
     const status = finalEntry.data?.status;
@@ -175,6 +184,7 @@ export async function finishRotation(
       || opts.early === true && nextDeployRules(entries, step.clusterId) === undefined);
   }).flatMap(step => step.consumers.map(consumer => serviceKey(consumer.service))));
   const currentVariables = new Map<string, RawVariable[] | null>();
+  let railwayNamespace: ServiceRef[] | null | undefined;
   const consumerFailures = new Map<string, string>();
   for (const step of pendingSteps) {
     if (unfinishedUndo(entries, step)) continue;
@@ -184,6 +194,9 @@ export async function finishRotation(
     const replacement = deps.inflight ? await deps.inflight.get(input.plan.id, `new:${clusterId}`) : null;
     const expected = typeof data.newFingerprint === 'string' ? data.newFingerprint
       : replacement === null ? null : fingerprint(replacement, deps.fingerprintKey);
+    const old = deps.inflight ? await deps.inflight.get(input.plan.id, `old:${clusterId}`) : null;
+    const oldFingerprint = old === null ? step.consumers.find(consumer => consumer.fingerprint !== null)?.fingerprint
+      : fingerprint(old, deps.fingerprintKey);
     const companions = new Map<string, string>();
     if (deps.inflight) for (const slot of await deps.inflight.slots(input.plan.id)) {
       const prefix = `companion:${clusterId}:`;
@@ -191,14 +204,40 @@ export async function finishRotation(
       const value = await deps.inflight.get(input.plan.id, slot);
       if (value !== null) companions.set(slot.slice(prefix.length), fingerprint(value, deps.fingerprintKey));
     }
-    let changed = expected === null;
-    for (const consumer of step.consumers.filter(candidate => !candidate.reference)) {
+    // Reference consumers can be changed into literal credentials or redirected
+    // during grace. Read their current variables along with the direct copies.
+    for (const consumer of step.consumers) {
       const key = serviceKey(consumer.service);
       if (!currentVariables.has(key)) {
         try {
           const host = deps.hosts[consumer.service.host];
           currentVariables.set(key, host ? await host.readVariables(consumer.service) : null);
         } catch (error) { if (isCrash(error)) throw error; currentVariables.set(key, null); }
+      }
+    }
+    if (step.consumers.some(consumer => consumer.reference) && railwayNamespace === undefined) {
+      try { railwayNamespace = await deps.hosts.railway?.listServices() ?? null; }
+      catch (error) { if (isCrash(error)) throw error; railwayNamespace = null; }
+    }
+    // Use the current namespace, including unplanned names, so a renamed or
+    // ambiguous reference source cannot resolve through saved service names.
+    const scans = railwayNamespace ? buildInventory([{ host: 'railway', services: railwayNamespace.map(service => ({
+      service, vars: currentVariables.get(serviceKey(service)) ?? [],
+    })) }], deps.fingerprintKey, now()) : undefined;
+    let changedAt: string | undefined;
+    let usingOldAt: string | undefined;
+    for (const consumer of step.consumers) {
+      const key = serviceKey(consumer.service);
+      if (consumer.reference) {
+        const matches = currentVariables.get(key)?.filter(variable => variable.name === consumer.varName) ?? [];
+        const current = matches[0];
+        if (current && !current.sealed && current.value !== undefined && oldFingerprint
+          && fingerprint(current.value, deps.fingerprintKey) === oldFingerprint) usingOldAt ??= key;
+        const resolved = scans?.findings.some(finding => finding.reference && finding.fingerprint === expected
+          && serviceKey(finding.service) === key && finding.varName === consumer.varName);
+        if (matches.length !== 1 || !current || current.sealed || current.value === undefined
+          || expected === null || fingerprint(current.value, deps.fingerprintKey) !== expected && !resolved) changedAt ??= key;
+        continue;
       }
       const recordedWrite = entries.some(entry => entry.event === 'written' && entry.data?.undo !== true
         && entry.clusterId === clusterId && entry.serviceKey === key);
@@ -207,19 +246,23 @@ export async function finishRotation(
       for (const [name, expectedFingerprint] of expectedValues) {
         const matches = currentVariables.get(key)?.filter(variable => variable.name === name) ?? [];
         const current = matches[0];
+        if (name === consumer.varName && current && !current.sealed && current.value !== undefined && oldFingerprint
+          && fingerprint(current.value, deps.fingerprintKey) === oldFingerprint) usingOldAt ??= key;
         if (matches.length !== 1 || !current || (current.sealed
           ? !consumer.sealed || !recordedWrite
-          : current.value === undefined || fingerprint(current.value, deps.fingerprintKey) !== expectedFingerprint)) changed = true;
+          : current.value === undefined || expectedFingerprint === null
+            || fingerprint(current.value, deps.fingerprintKey) !== expectedFingerprint)) changedAt ??= key;
       }
     }
-    const old = deps.inflight ? await deps.inflight.get(input.plan.id, `old:${clusterId}`) : null;
-    const oldFingerprint = old === null ? step.consumers.find(consumer => consumer.fingerprint !== null)?.fingerprint
-      : fingerprint(old, deps.fingerprintKey);
-    const planned = new Set(step.consumers.map(consumer => `${serviceKey(consumer.service)}\0${consumer.varName}`));
-    if (oldFingerprint && [...input.inventory.findings, ...input.inventory.clusters.flatMap(cluster => cluster.consumers)]
-      .some(consumer => consumer.fingerprint === oldFingerprint && !planned.has(`${serviceKey(consumer.service)}\0${consumer.varName}`))) changed = true;
-    if (!changed) continue;
-    const warning = 'A consumer changed since this rotation or its replacement could not be confirmed; the old key is retained.';
+    const planned = new Set(input.plan.steps.flatMap(plannedStep => plannedStep.consumers
+      .map(consumer => `${serviceKey(consumer.service)}\0${consumer.varName}`)));
+    const unplanned = oldFingerprint ? [...input.inventory.findings, ...input.inventory.clusters.flatMap(cluster => cluster.consumers)]
+      .find(consumer => consumer.fingerprint === oldFingerprint && !planned.has(`${serviceKey(consumer.service)}\0${consumer.varName}`)) : undefined;
+    if (!changedAt && !unplanned && expected !== null) continue;
+    const warning = usingOldAt ? `A consumer changed at ${usingOldAt} and still uses the old key; it is retained.`
+      : changedAt ? `A consumer changed at ${changedAt} or its replacement could not be confirmed; the old key is retained.`
+      : unplanned ? `A consumer outside this plan at ${serviceKey(unplanned.service)} still uses the old key; it is retained.`
+        : 'The saved replacement fingerprint is unavailable; the old key is retained.';
     consumerFailures.set(clusterId, warning);
     const stepReport = report.steps.find(result => result.clusterId === clusterId)!;
     stepReport.status = 'failed';
@@ -420,15 +463,17 @@ export async function finishRotation(
       stepReport.warnings.push(warning);
       pending.push(item);
     }
-    await journal('grace-end', { clusterId, data: { deadline, pending: !settled.has(clusterId) } });
+    await journal('grace-end', { clusterId, data: { deadline, pending: !settled.has(clusterId), kept: !settled.has(clusterId),
+      ...(warning ? { reason: warning } : {}) } });
   }
   if (pending.length > 0) report.pendingRevocations = pending;
-  const everySettled = input.plan.steps.every(step => settled.has(step.clusterId) || skipped.has(step.clusterId));
+  const everySettled = orphans.length === 0 && input.plan.steps.every(step => settled.has(step.clusterId) || skipped.has(step.clusterId));
   const delivered = entries.some(entry => entry.event === 'written' || entry.data?.partialWritePossible === true);
   const progressed = delivered || entries.some(entry => entry.event === 'verified' && entry.data?.undo !== true)
     || report.steps.some(step => ['written', 'deployed', 'verified', 'revoked'].includes(step.status))
     || input.plan.steps.some(step => unfinishedUndo(entries, step));
-  report.status = everySettled ? 'complete' : pending.length > 0 && !blocked ? 'grace-pending' : progressed ? 'partial' : 'failed';
+  report.status = orphans.length > 0 ? 'partial' : everySettled ? 'complete'
+    : pending.length > 0 && !blocked ? 'grace-pending' : progressed ? 'partial' : 'failed';
   report.finishedAt = now().toISOString();
   if (deps.inflight && (everySettled || report.status === 'failed' && !delivered)) {
     await deps.inflight.shred(input.plan.id);

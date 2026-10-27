@@ -22,12 +22,15 @@ interface UndoWork {
   step: PlanStep;
   oldValue: string;
   newValue: string | null;
+  newFingerprint: string | null;
   oldCompanions: Record<string, string>;
   newCompanions: Record<string, string>;
   provider: ProviderAdapter;
   ctx: ProviderContext;
   newKeyRef: string | null;
   services: Set<string>;
+  restore: Map<string, Record<string, string>>;
+  undoStarted: boolean;
   unavailable?: string;
 }
 
@@ -105,6 +108,7 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
   const selected = plan.steps.filter(step => !input.clusterIds || input.clusterIds.includes(step.clusterId));
   const works: UndoWork[] = [];
   const currentVariables = new Map<string, RawVariable[]>();
+  let fullHistory: JournalEntry[] | undefined;
   const referenceTargets = new Map<string, Consumer[]>();
   let namespace: ServiceRef[] | undefined;
   async function read(service: ServiceRef): Promise<RawVariable[]> {
@@ -117,6 +121,36 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
     for (const variable of variables) if (variable.value !== undefined) registerNamed(variable.name, variable.value);
     currentVariables.set(key, variables);
     return variables;
+  }
+  async function sealedWriteCurrent(work: UndoWork, consumer: Consumer, name: string): Promise<boolean> {
+    if (!consumer.sealed) return false;
+    // Sealed values cannot be compared. Their provenance must still belong to
+    // this rotation, including when the caller supplied only this plan's entries.
+    try { fullHistory ??= await deps.journal.read(); }
+    catch (error) { if (isCrash(error)) throw error; return false; }
+    const key = serviceKey(consumer.service);
+    let ownWrite = -1;
+    for (let index = 0; index < fullHistory.length; index++) {
+      const entry = fullHistory[index]!;
+      if (entry.planId === plan.id && entry.clusterId === work.step.clusterId && entry.serviceKey === key
+        && entry.event === 'written' && entry.data?.undo !== true
+        && (!Array.isArray(entry.data?.variableNames) || entry.data.variableNames.includes(name))
+        && (entry.data?.newFingerprint === undefined || entry.data.newFingerprint === work.newFingerprint)) ownWrite = index;
+    }
+    if (ownWrite < 0) return false;
+    const later = fullHistory.slice(ownWrite + 1);
+    const unfinished = new Set<string>();
+    for (const entry of later) {
+      if (entry.planId === plan.id) continue;
+      if ((entry.event === 'plan-start' || entry.event === 'resume') && entry.data?.dryRun !== true) unfinished.add(entry.planId);
+      if (entry.event === 'plan-end') unfinished.delete(entry.planId);
+    }
+    // These invocation records carry no consumer identities. An unfinished
+    // later plan might have stopped between a sealed write and its journal entry.
+    if (unfinished.size > 0) return false;
+    return !later.some(entry => entry.planId !== plan.id && entry.serviceKey === key
+      && (entry.event === 'written' || (entry.event === 'failed' && entry.data?.phase === 'write'))
+      && (!Array.isArray(entry.data?.variableNames) || entry.data.variableNames.includes(name)));
   }
   async function referenceCurrent(work: UndoWork, consumer: Consumer, visited = new Set<string>()): Promise<boolean> {
     const location = `${serviceKey(consumer.service)}\0${consumer.varName}`;
@@ -163,7 +197,9 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
       continue;
     }
     let newKeyRef: string | null = null;
+    let newFingerprint: string | null = null;
     for (const entry of history) if (typeof entry.data?.newKeyRef === 'string') newKeyRef = entry.data.newKeyRef;
+    for (const entry of history) if (typeof entry.data?.newFingerprint === 'string') newFingerprint = entry.data.newFingerprint;
     const prefix = `old-companion:${step.clusterId}:`;
     const oldCompanions = Object.fromEntries([...values].filter(([slot]) => slot.startsWith(prefix))
       .map(([slot, value]) => [slot.slice(prefix.length), value]));
@@ -188,8 +224,10 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
         debug: (message, data) => deps.providerCtx.log.debug(clean(message), sanitize(data)),
       },
     };
-    works.push({ step, oldValue, newValue: values.get(`new:${step.clusterId}`) ?? null, oldCompanions, newCompanions,
-      provider, ctx, newKeyRef, services: new Set(step.consumers.map(consumer => serviceKey(consumer.service))) });
+    works.push({ step, oldValue, newValue: values.get(`new:${step.clusterId}`) ?? null, newFingerprint, oldCompanions, newCompanions,
+      provider, ctx, newKeyRef, services: new Set(step.consumers.map(consumer => serviceKey(consumer.service))),
+      restore: new Map(), undoStarted: history.some(entry => entry.event === 'resume' && entry.data?.undo === true
+        && entry.data?.phase === 'start') });
   }
   const services = new Map<string, {
     service: ServiceRef; vars: Record<string, string>; works: Set<UndoWork>; ok: boolean;
@@ -203,27 +241,33 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
       // Undo may retry an already restored consumer, but never overwrite a
       // later manual rotation or a value installed by a different plan.
       for (const direct of work.step.consumers.filter(item => !item.reference)) {
+        const key = serviceKey(direct.service);
+        const changed = `A newer value is in place at ${key}; keysentry won't overwrite it.`;
         const variables = (await read(direct.service)).filter(variable => variable.name === direct.varName);
         const variable = variables[0];
-        const expected = [work.newValue, work.oldValue].filter((value): value is string => value !== null)
-          .map(value => fingerprint(value, deps.fingerprintKey));
-        const recordedWrite = entries.some(entry => entry.event === 'written' && entry.data?.undo !== true
-          && entry.clusterId === work.step.clusterId && entry.serviceKey === serviceKey(direct.service));
-        if (variables.length !== 1 || !variable || (variable.sealed ? !direct.sealed || !recordedWrite
-          : variable.value === undefined || !expected.includes(fingerprint(variable.value, deps.fingerprintKey)))) {
-          work.unavailable = 'A consumer changed since this rotation; undo will not overwrite its current value.';
+        const current = variable?.value === undefined ? null : fingerprint(variable.value, deps.fingerprintKey);
+        const alreadyRestored = !variable?.sealed && work.undoStarted && current === fingerprint(work.oldValue, deps.fingerprintKey);
+        if (variables.length !== 1 || !variable || (variable.sealed ? !await sealedWriteCurrent(work, direct, direct.varName)
+          : current === null || (current !== work.newFingerprint && !alreadyRestored))) {
+          work.unavailable = changed;
           break;
         }
+        let restore = work.restore.get(key);
+        if (!restore) work.restore.set(key, restore = Object.create(null) as Record<string, string>);
+        if (!alreadyRestored) restore[direct.varName] = work.oldValue;
         for (const [name, newValue] of Object.entries(work.newCompanions)) {
           const companions = (await read(direct.service)).filter(candidate => candidate.name === name);
           const companion = companions[0];
-          const expectedCompanions = [newValue, work.oldCompanions[name]].filter((value): value is string => value !== undefined)
-            .map(value => fingerprint(value, deps.fingerprintKey));
-          if (companions.length !== 1 || !companion || (companion.sealed ? !direct.sealed || !recordedWrite
-            : companion.value === undefined || !expectedCompanions.includes(fingerprint(companion.value, deps.fingerprintKey)))) {
-            work.unavailable = 'A consumer changed since this rotation; undo will not overwrite its current value.';
+          const previous = work.oldCompanions[name];
+          const currentCompanion = companion?.value === undefined ? null : fingerprint(companion.value, deps.fingerprintKey);
+          const companionRestored = !companion?.sealed && work.undoStarted && previous !== undefined
+            && currentCompanion === fingerprint(previous, deps.fingerprintKey);
+          if (companions.length !== 1 || !companion || (companion.sealed ? !await sealedWriteCurrent(work, direct, name)
+            : currentCompanion === null || (currentCompanion !== fingerprint(newValue, deps.fingerprintKey) && !companionRestored))) {
+            work.unavailable = changed;
             break;
           }
+          if (previous !== undefined && !companionRestored) restore[name] = previous;
         }
         if (work.unavailable) break;
       }
@@ -267,7 +311,7 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
       let service = services.get(key);
       if (!service) services.set(key, service = { service: consumer.service, vars: Object.create(null), works: new Set(), ok: false });
       service.works.add(work);
-      const additions = consumer.reference ? {} : { ...work.oldCompanions, [consumer.varName]: work.oldValue };
+      const additions = work.restore.get(key) ?? {};
       for (const [name, value] of Object.entries(additions)) {
         if (Object.hasOwn(service.vars, name) && service.vars[name] !== value) {
           for (const owner of service.works) owner.unavailable = 'Conflicting old values target a consumer; the replacement keys are retained.';
@@ -285,9 +329,7 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
     if (ready.length === 0) continue;
     const payload: Record<string, string> = Object.create(null);
     for (const work of ready) {
-      const direct = work.step.consumers.filter(item => !item.reference && serviceKey(item.service) === key);
-      if (direct.length > 0) Object.assign(payload, work.oldCompanions);
-      for (const consumer of direct) payload[consumer.varName] = work.oldValue;
+      Object.assign(payload, work.restore.get(key));
     }
     try {
       const host = deps.hosts[service.service.host];

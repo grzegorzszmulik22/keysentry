@@ -129,7 +129,8 @@ describe('AWS rotation recovery', () => {
     f.host.writes.length = 0;
     const report = await undoRotation({ plan: f.plan, inventory: f.inventory, entries: [...f.entries] }, f.deps, f.opts);
     expect(report.restored).toEqual([]);
-    expect(report.unavailable[0]!.reason).toMatch(/consumer.*changed/i);
+    // M4 now identifies the service whose newer value must be preserved.
+    expect(report.unavailable[0]!.reason).toMatch(/newer value.*keysentry won't overwrite/i);
     expect(f.host.peek(f.services[1]!.serviceId, f.idName)).toBe(manualId);
     expect(f.host.writes).toEqual([]);
     expect(f.revokedIds).toEqual([]);

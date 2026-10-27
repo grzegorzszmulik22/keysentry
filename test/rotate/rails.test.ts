@@ -431,7 +431,8 @@ describe('rotation wave safety rails', () => {
     expect(h.host.peek(h.services[1]!.serviceId, 'OPENAI_API_KEY')).toBe(newer.value);
     expect(h.host.writes).toEqual([]);
     expect(report.restored).toEqual([]);
-    expect(report.unavailable[0]!.reason).toMatch(/consumer.*changed/i);
+    // M4 identifies the service whose newer value keysentry must preserve.
+    expect(report.unavailable[0]!.reason).toMatch(/newer value.*keysentry won't overwrite/i);
     expect(h.provider.revoked).toEqual([]);
   });
 
@@ -439,11 +440,16 @@ describe('rotation wave safety rails', () => {
     const h = await fixture('railway', true);
     h.deps.grace = async () => 'defer';
     await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, graceMs: 1_000 });
+    // Previously any old value authorized another write; an interrupted undo has durable direction intent.
+    h.entries.push({ at: h.deps.now!().toISOString(), planId: h.plan.id, event: 'resume',
+      clusterId: h.plan.steps[0]!.clusterId, data: { undo: true, phase: 'start' } });
     await h.host.writeVariables(h.services[1]!, { OPENAI_API_KEY: h.old[0]!.value }, { skipDeploy: true });
+    h.host.writes.length = 0;
     const report = await undoRotation(h.input(), h.deps, h.opts);
     expect(report.unavailable).toEqual([]);
     expect(report.restored).toHaveLength(1);
     expect(h.host.peek(h.services[1]!.serviceId, 'OPENAI_API_KEY')).toBe(h.old[0]!.value);
+    expect(h.host.writes.some(write => write.serviceId === h.services[1]!.serviceId)).toBe(false);
   });
 
   it.each([false, true])('a storage failure cleans or records the created replacement (cleanup fails=%s)', async cleanupFails => {

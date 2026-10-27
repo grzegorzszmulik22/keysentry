@@ -4,6 +4,7 @@ import { describe, expect, test } from 'vitest';
 import {
   DISPLAY_ONLY_URL_HOSTS, EGRESS_RULES, matchRule, rulesForUserFeeds, rulesForUserUrls,
 } from '../../src/net/allowlist.js';
+import * as net from '../../src/net/index.js';
 import type { EgressRule } from '../../src/types.js';
 import { DEFAULT_BREACH_FEEDS } from '../../src/monitor/detectors/breach-feed.js';
 
@@ -107,6 +108,33 @@ test('rulesForUserFeeds uses the fixed configured-feed purpose', () => {
   expect(rulesForUserFeeds(['https://feed.example.com/rss.xml'])).toEqual([
     { host: 'feed.example.com', owner: 'user', purpose: 'breach feed you configured' },
   ]);
+});
+
+test('user URL rules retain their config or environment source without URL credentials', () => {
+  for (const source of ['config', 'env'] as const) {
+    const rules = rulesForUserUrls([
+      'https://HOOK.EXAMPLE.COM./private-path?value=private-value',
+      'https://hook.example.com/other-path',
+    ], 'notification webhook you configured', source);
+    expect(rules).toEqual([
+      { host: 'hook.example.com', owner: 'user', purpose: 'notification webhook you configured', source },
+    ]);
+    expect(matchRule(new URL('https://hook.example.com/next'), rules)).toBe(rules[0]);
+    expect(JSON.stringify(rules)).not.toMatch(/private-path|private-value|other-path/);
+  }
+});
+
+test('network rule descriptions distinguish built-in, config and environment hosts', () => {
+  expect(typeof net.describeRuleSource).toBe('function');
+  for (const rule of EGRESS_RULES) expect(net.describeRuleSource(rule)).toBe('built in');
+  expect(net.describeRuleSource(rulesForUserUrls(['https://hook.example.com/path'], 'webhook', 'env')[0]!))
+    .toBe('added by an environment variable');
+  expect(net.describeRuleSource(rulesForUserUrls(['https://hook.example.com/path'], 'webhook', 'config')[0]!))
+    .toBe('added by you in keysentry.yaml');
+  expect(net.describeRuleSource(rulesForUserUrls(['https://hook.example.com/path'], 'webhook')[0]!))
+    .toBe('added by you in keysentry.yaml');
+  expect(net.describeRuleSource(rulesForUserFeeds(['https://feed.example.com/rss'])[0]!))
+    .toBe('added by you in keysentry.yaml');
 });
 
 test.each([

@@ -93,17 +93,20 @@ test('blocked receipts and errors redact a secret-shaped hostname label', async 
   expect(new EgressBlockedError(`${secret}.example.com`).message).not.toContain(secret);
 });
 
-test('follows a same-owner redirect and drops authorization and cookie on host change', async () => {
+// Following a provider redirect to another host with the same owner was the L3 defect.
+test('blocks and records a provider redirect to another host even with the same owner', async () => {
   const receipt = memoryReceipt();
   const inner = new FakeHttp()
     .on('POST', /api\.openai\.com/, () => makeResponse(307, '', { Location: 'https://downloads.example.com/result' }))
     .on('POST', /downloads\.example\.com/, () => makeResponse(200, 'ok'));
   const request: HttpRequest = { method: 'POST', url: 'https://api.openai.com/start', body: 'payload', headers: { aUtHoRiZaTiOn: 'token', CoOkIe: 'session', Accept: 'application/json' } };
-  expect((await createGuardedHttp(inner, { rules, receipt }).request(request)).text).toBe('ok');
-  expect(inner.calls[1]).toMatchObject({ method: 'POST', body: 'payload', headers: { Accept: 'application/json' } });
-  expect(Object.keys(inner.calls[1]!.headers!)).toEqual(['Accept']);
+  await expect(createGuardedHttp(inner, { rules, receipt, now: () => date }).request(request)).rejects.toBeInstanceOf(EgressBlockedError);
+  expect(inner.calls).toHaveLength(1);
   expect(request.headers).toHaveProperty('aUtHoRiZaTiOn', 'token');
-  expect(receipt.entries.map(({ host, status }) => [host, status])).toEqual([['api.openai.com', 307], ['downloads.example.com', 200]]);
+  expect(receipt.entries).toEqual([
+    { at: date.toISOString(), host: 'api.openai.com', method: 'POST', purpose: 'OpenAI API', allowed: true, status: 307 },
+    { at: date.toISOString(), host: 'downloads.example.com', method: 'POST', purpose: 'not on the allowed list', allowed: false },
+  ]);
 });
 
 test.each([301, 302, 303])('redirect %i changes a POST to GET without body', async status => {

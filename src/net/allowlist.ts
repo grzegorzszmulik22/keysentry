@@ -2,6 +2,16 @@ import { isIP } from 'node:net';
 import { createRedactor } from '../core/redact.js';
 import type { EgressRule } from '../types.js';
 
+/** Provenance for user additions; kept local until it is part of the shared contract. */
+export type SourcedEgressRule = EgressRule & { source?: 'config' | 'env' };
+
+export function describeRuleSource(rule: SourcedEgressRule):
+  'built in' | 'added by you in keysentry.yaml' | 'added by an environment variable' {
+  if (rule.source === 'env') return 'added by an environment variable';
+  if (rule.source === 'config' || rule.owner === 'user') return 'added by you in keysentry.yaml';
+  return 'built in';
+}
+
 /** Reviewed network destinations. Guidance URLs alone never grant network access. */
 export const EGRESS_RULES: readonly EgressRule[] = [
   { host: 'backboard.railway.com', owner: 'railway', purpose: 'Railway GraphQL API' },
@@ -101,15 +111,15 @@ export function matchRule(url: URL, rules: readonly EgressRule[]): EgressRule | 
 }
 
 /** User configuration authorizes only the named host, never its siblings or parent. */
-export function rulesForUserUrls(urls: string[], purpose: string): EgressRule[] {
-  const rules = new Map<string, EgressRule>();
+export function rulesForUserUrls(urls: string[], purpose: string, source?: 'config' | 'env'): SourcedEgressRule[] {
+  const rules = new Map<string, SourcedEgressRule>();
   for (const value of urls) {
     let url: URL;
     try { url = new URL(value); }
     catch { throw new TypeError('Invalid user URL host: (unparseable)'); }
     const host = normalizedHost(url.hostname);
     if (!validAuthority(url)) throw new TypeError(`Invalid user URL host: ${createRedactor().redact(host) || '(unparseable)'}`);
-    rules.set(host, { host, purpose, owner: 'user' });
+    rules.set(host, { host, purpose, owner: 'user', ...(source === undefined ? {} : { source }) });
   }
   return [...rules.values()];
 }

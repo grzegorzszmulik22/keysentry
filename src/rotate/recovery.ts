@@ -1,11 +1,37 @@
 import { classify } from '../core/index.js';
-import type { CrashPoint, Inventory, JournalEntry, ProviderContext, RotationPlan } from '../types.js';
+import type { CrashPoint, Inventory, JournalEntry, ProviderContext, ProviderId, RotationPlan } from '../types.js';
 import type { EngineDeps } from './engine.js';
 
 export interface RecoveryInput {
   plan: RotationPlan;
   inventory: Inventory;
   entries: JournalEntry[];
+}
+
+export interface RecordedOrphan {
+  clusterId: string;
+  provider: ProviderId;
+  keyRef: string | null;
+  createdAt?: string;
+}
+
+/** A recorded unused key remains unresolved until a later revocation records it. */
+export function unresolvedOrphans(plan: RotationPlan, entries: JournalEntry[]): RecordedOrphan[] {
+  const unresolved = new Map<string, RecordedOrphan>();
+  for (const entry of entries) {
+    if (entry.planId !== plan.id) continue;
+    const step = plan.steps.find(step => step.clusterId === entry.clusterId);
+    if (!step) continue;
+    if (entry.event === 'orphan-suspected') {
+      const keyRef = typeof entry.data?.keyRef === 'string' ? entry.data.keyRef : null;
+      unresolved.set(`${step.clusterId}\0${keyRef ?? ''}`, { clusterId: step.clusterId, provider: step.provider, keyRef,
+        ...(typeof entry.data?.createdAt === 'string' ? { createdAt: entry.data.createdAt } : {}) });
+    } else if (entry.event === 'revoked' && typeof entry.data?.keyRef === 'string') {
+      unresolved.delete(`${step.clusterId}\0${entry.data.keyRef}`);
+      if (entry.data.cleanup === true) unresolved.delete(`${step.clusterId}\0`);
+    }
+  }
+  return [...unresolved.values()];
 }
 
 // Hooks simulate process death. Preserve even primitive throws by identity; no
