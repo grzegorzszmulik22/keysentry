@@ -3,7 +3,7 @@ import { buildInventory, buildPlan, createLogger, createRedactor, serviceKey } f
 import { executePlan, finishRotation, resumeRotation, undoRotation } from '../../src/rotate/index.js';
 import type { EngineDeps, RotateOptions } from '../../src/rotate/index.js';
 import type { HostId, JournalEntry } from '../../src/types.js';
-import { FakeHttp } from '../helpers/fake-http.js';
+import { FakeHttp, json } from '../helpers/fake-http.js';
 import { createFakeInFlight } from '../helpers/fake-inflight.js';
 import { FakeHost, FakeProvider } from '../helpers/fakes.js';
 
@@ -43,6 +43,168 @@ async function fixture(hostId: HostId = 'railway', sameKey = false) {
 }
 
 describe('rotation wave safety rails', () => {
+  it('a remote stop before creation leaves every provider key and consumer unchanged', async () => {
+    const h = await fixture();
+    h.deps.shouldStop = async () => true;
+    const report = await executePlan(h.plan, h.inventory, h.deps, h.opts);
+    expect(h.provider.keys.size).toBe(h.old.length);
+    expect(h.host.writes).toEqual([]);
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('failed');
+  });
+
+  it('a remote stop between creations preserves the prepared replacement without delivering it', async () => {
+    const h = await fixture();
+    let stop = false;
+    const rotate = h.provider.rotate.bind(h.provider);
+    h.provider.rotate = async (value, ctx) => { const result = await rotate(value, ctx); stop = true; return result; };
+    h.deps.shouldStop = async () => stop;
+    const report = await executePlan(h.plan, h.inventory, h.deps, h.opts);
+    expect(h.provider.keys.size).toBe(h.old.length + 1);
+    expect(h.host.writes).toEqual([]);
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('partial');
+    expect(h.inflight.shredded.has(h.plan.id)).toBe(false);
+    expect(await h.inflight.get(h.plan.id, `new:${h.plan.steps[0]!.clusterId}`)).not.toBeNull();
+  });
+
+  it('a remote stop after writes blocks deployment and every old-key revocation', async () => {
+    const h = await fixture();
+    h.deps.shouldStop = async () => h.host.writes.length === h.services.length;
+    const report = await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, deployConcurrency: 1 });
+    expect(h.host.writes).toHaveLength(h.services.length);
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('partial');
+  });
+
+  it('a remote stop after deployments blocks the first old-key revocation', async () => {
+    const h = await fixture();
+    h.deps.shouldStop = async () => h.host.redeploys.length === h.services.length;
+    const report = await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, deployConcurrency: 1 });
+    expect(h.host.redeploys).toHaveLength(h.services.length);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('partial');
+    for (const old of h.old) expect(h.provider.keys.get(old.ref)?.active).toBe(true);
+  });
+
+  it('a remote stop during deferred settlement retains every old key', async () => {
+    const h = await fixture();
+    h.deps.grace = async () => 'defer';
+    await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, graceMs: 1_000 });
+    h.clock.ms += 1_000;
+    let polls = 0;
+    // A later empty relay response must not undo a stop already received.
+    h.deps.shouldStop = async () => ++polls === 1;
+    const report = await finishRotation(h.input(), h.deps, h.opts);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.pendingRevocations).toHaveLength(h.plan.steps.length);
+    expect(report.status).toBe('partial');
+    expect(polls).toBe(1);
+  });
+
+  it('resume polls for a remote stop before delivering saved replacements', async () => {
+    const h = await fixture();
+    const interrupted = new Error('simulated interruption');
+    h.deps.crashHook = point => { if (point === 'after-store') throw interrupted; };
+    await expect(executePlan(h.plan, h.inventory, h.deps, h.opts)).rejects.toBe(interrupted);
+    delete h.deps.crashHook;
+    h.deps.shouldStop = async () => true;
+    const count = h.provider.keys.size;
+    const report = await resumeRotation(h.input(), h.deps, h.opts);
+    expect(h.provider.keys.size).toBe(count);
+    expect(h.host.writes).toEqual([]);
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('partial');
+    expect(h.inflight.shredded.has(h.plan.id)).toBe(false);
+  });
+
+  it('undo polls for a remote stop before restoring any consumer', async () => {
+    const h = await fixture();
+    h.deps.grace = async () => 'defer';
+    await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, graceMs: 1_000 });
+    h.host.writes.length = 0;
+    h.host.redeploys.length = 0;
+    h.deps.shouldStop = async () => true;
+    const report = await undoRotation(h.input(), h.deps, h.opts);
+    expect(h.host.writes).toEqual([]);
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.restored).toEqual([]);
+    expect(h.inflight.shredded.has(h.plan.id)).toBe(false);
+  });
+
+  it('a successful remote stop poll allows the normal rotation rails to complete', async () => {
+    const h = await fixture();
+    h.deps.shouldStop = async () => false;
+    const report = await executePlan(h.plan, h.inventory, h.deps, h.opts);
+    expect(report.status).toBe('complete');
+    expect(h.provider.revoked).toEqual(h.old.map(key => key.ref));
+  });
+
+  it('a concurrent empty poll cannot clear a remote stop already received', async () => {
+    const h = await fixture();
+    let deployPolls = 0;
+    h.deps.shouldStop = async () => {
+      if (h.host.writes.length < h.services.length) return false;
+      if (++deployPolls > 1) return true;
+      // The first poll returns after another deployment worker received disarm.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      return false;
+    };
+    const report = await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, deployConcurrency: 3 });
+    expect(h.host.redeploys).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+    expect(report.status).toBe('partial');
+  });
+
+  it('a remote stop blocking unused-key cleanup keeps its live replacement recoverable', async () => {
+    const h = await fixture();
+    h.provider.failVerifyOfNew = true;
+    h.deps.shouldStop = async () => h.provider.keys.size > h.old.length;
+    const report = await executePlan(h.plan, h.inventory, h.deps, { ...h.opts, stopOnFirstFailure: true });
+    expect(h.provider.revoked).toEqual([]);
+    expect(h.host.writes).toEqual([]);
+    expect(report.status).toBe('partial');
+    expect(h.inflight.shredded.has(h.plan.id)).toBe(false);
+    expect(await h.inflight.get(h.plan.id, `new:${h.plan.steps[0]!.clusterId}`)).not.toBeNull();
+  });
+
+  it('a remote stop during a provider metadata lookup blocks its later mutation HTTP', async () => {
+    const h = await fixture();
+    let stop = false;
+    const http = new FakeHttp().on('GET', /metadata/, () => { stop = true; return json(200, {}); })
+      .on('POST', /create/, () => json(200, {}));
+    h.deps.providerCtx.http = http;
+    const rotate = h.provider.rotate.bind(h.provider);
+    h.provider.rotate = async (value, ctx) => {
+      await ctx.http.request({ method: 'GET', url: 'https://provider.invalid/metadata' });
+      await ctx.http.request({ method: 'POST', url: 'https://provider.invalid/create' });
+      return rotate(value, ctx);
+    };
+    h.deps.shouldStop = async () => stop;
+    await executePlan(h.plan, h.inventory, h.deps, h.opts);
+    expect(http.calls.map(call => call.method)).toEqual(['GET']);
+    expect(h.provider.keys.size).toBe(h.old.length);
+    expect(h.host.writes).toEqual([]);
+    expect(h.provider.revoked).toEqual([]);
+  });
+
+  it('a failed remote stop poll stops effects without reflecting the callback error', async () => {
+    const h = await fixture();
+    h.deps.shouldStop = async () => { throw new Error('private relay response'); };
+    const report = await executePlan(h.plan, h.inventory, h.deps, h.opts);
+    expect(h.provider.keys.size).toBe(h.old.length);
+    expect(h.host.writes).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain('private relay response');
+    expect(report.status).toBe('failed');
+  });
+
   it.each([1, 0, -2])('deployConcurrency %s redeploys services one at a time', async concurrency => {
     const h = await fixture();
     let active = 0;

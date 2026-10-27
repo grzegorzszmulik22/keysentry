@@ -1,6 +1,7 @@
 import { buildInventory, fingerprint, serviceKey } from '../core/index.js';
 import type { EngineDeps, RotateOptions } from './engine.js';
 import { crash, createRecoverySafety, isCrash, unresolvedOrphans } from './recovery.js';
+import { withStopChecks } from './stop.js';
 import type { Inventory, JournalEntry, PlanStep, ProviderAdapter, ProviderContext, RawVariable, RotationPlan, RotationReport, ServiceRef, StepReport } from '../types.js';
 
 interface FinishInput {
@@ -142,6 +143,7 @@ function sealedConsumerBlocks(step: PlanStep, input: FinishInput, opts: RotateOp
 export async function finishRotation(
   input: FinishInput, deps: EngineDeps, opts: RotateOptions & { early?: boolean },
 ): Promise<RotationReport> {
+  deps = withStopChecks(deps);
   const entries = input.entries.filter(entry => entry.planId === input.plan.id);
   const now = deps.now ?? (() => new Date());
   const dryRun = opts?.dryRun !== false;

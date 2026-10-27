@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto';
 import { buildPlan } from '../core/index.js';
+import { actionDigest } from '../approvals/service.js';
+import type { ApprovalAction } from '../approvals/service.js';
+import { CREDENTIAL_NAMES } from '../vault/credentials.js';
 import { canonicalJson } from '../security/index.js';
 import { executePlan, finishRotation, resumeRotation, type EngineDeps, type RotateOptions } from '../rotate/index.js';
-import { RotationAbortedError } from '../types.js';
+import { StopRequestedError } from '../rotate/stop.js';
 import type {
-  ArmedPlan, AuditLog, HostAdapter, HostId, Incident, Inventory, JournalEntry, NotifyMessage,
+  ApprovalGrant, ArmedPlan, AuditLog, Cluster, HostAdapter, HostId, Incident, Inventory, JournalEntry, NotifyMessage,
   ProviderAdapter, RotationPlan, RotationReport,
 } from '../types.js';
-import { verifyArmedPlan } from './armed-plan.js';
+import { autopilotEligibility, verifyArmedPlan } from './armed-plan.js';
 import { checkScope } from './scope.js';
 import { isAlertOnly, type SelfCheckResult } from './kill-switch.js';
 
@@ -21,6 +24,15 @@ export interface AutopilotWave {
   plan?: RotationPlan;
   inventory?: Inventory;
   armed?: ArmedPlan;
+  /** False means only the start notification was attempted; no provider work could have begun. */
+  executionStarted?: boolean;
+  approval?: { grant: ApprovalGrant; action: PendingAutopilotAction };
+}
+
+export interface PendingAutopilotAction extends ApprovalAction { kind: 'autopilot'; planHash: string }
+export interface PendingAsk {
+  actionId: string; incidentId: string; clusterIds: string[]; reasons: string[];
+  action: PendingAutopilotAction; attempts: number; nextAttemptAt: string;
 }
 
 export interface AutopilotState {
@@ -29,6 +41,7 @@ export interface AutopilotState {
   adoptionUpdates?: Record<string, { fingerprint: string; keyRef: string; at: string }>;
   adoptionUpdatesPlanId?: string;
   adoptionNoticeSent?: boolean;
+  pendingAsks?: PendingAsk[];
 }
 
 export interface AutopilotDeps {
@@ -36,14 +49,17 @@ export interface AutopilotDeps {
   options: RotateOptions & { showHints?: boolean };
   notify: (message: NotifyMessage) => Promise<void>;
   /** Use the proposed id, or return the approval service's actual id. Two-argument callbacks remain valid. */
-  requestApproval: (clusterIds: string[], reasons: string[], actionId?: string) => Promise<void | string | { actionId: string }>;
+  requestApproval: (clusterIds: string[], reasons: string[], actionId?: string, action?: PendingAutopilotAction) => Promise<void | string | { actionId: string }>;
   audit: AuditLog;
   saveState: (state: AutopilotState) => Promise<void>;
+  shouldStop?: () => Promise<boolean>;
 }
 
 export interface AutopilotInput {
   incident: Incident; armed: unknown; trustedKeyIds: string[]; inventory: Inventory; state: AutopilotState;
   selfCheck: SelfCheckResult; env: NodeJS.ProcessEnv; now: Date;
+  ownTokenNames?: string[];
+  watcherHost?: HostId | null;
 }
 
 export interface WaveRecoveryDeps extends AutopilotDeps {
@@ -76,6 +92,21 @@ async function serialize<T>(state: AutopilotState, operation: () => Promise<T>):
 
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex').slice(0, 24); }
 
+/** Stable execution content only: random plan ids and timestamps are not authorization. */
+export function planHashFor(plan: RotationPlan): string {
+  return createHash('sha256').update(canonicalJson({ steps: plan.steps, services: plan.services })).digest('hex');
+}
+
+function scanErrorReason(inventory: Inventory): string {
+  const hosts = [...new Set(inventory.errors.map(error => PLATFORM[error.host] ?? 'Unknown platform'))].sort().join(', ');
+  return `Some platforms could not be scanned (${hosts}); keysentry won't rotate automatically until every copy can be checked.`;
+}
+
+const ownName = (name: string, extra: readonly string[] = []) => CREDENTIAL_NAMES.includes(name)
+  || name.startsWith('KEYSENTRY_') || extra.includes(name);
+const keyNames = (inventory: Inventory, ids: string[]) => [...new Set(inventory.clusters.filter(cluster => ids.includes(cluster.id))
+  .flatMap(cluster => cluster.consumers.map(consumer => consumer.varName)))].filter(name => /^[A-Z][A-Z0-9_]{0,199}$/.test(name)).sort();
+
 /** The tick timestamp is authoritative; elapsed time comes from the engine's injected clock. */
 function operationClock(at: Date, deps: AutopilotDeps): () => Date {
   const start = at.getTime();
@@ -101,16 +132,47 @@ function reporter(deps: AutopilotDeps, incidentId: string, waveId: string, clust
 
 type Reporter = ReturnType<typeof reporter>;
 
-async function ask(deps: AutopilotDeps, r: Reporter, incidentId: string, clusterIds: string[], reasons: string[]): Promise<void> {
-  if (clusterIds.length === 0) return;
-  const proposed = `approval-${digest(JSON.stringify([incidentId, clusterIds, reasons]))}`;
-  await r.audit('ask', { asked: clusterIds.length });
-  const result = await deps.requestApproval(clusterIds, reasons, proposed);
-  const actionId = typeof result === 'string' ? result : result?.actionId ?? proposed;
-  await r.notify('ask', 'warning', `${clusterIds.length} keys need your approval.`, [], actionId);
+function queueAsk(state: AutopilotState, incidentId: string, clusterIds: string[], reasons: string[], inventory: Inventory, now: Date): void {
+  if (!clusterIds.length) return;
+  const planHash = planHashFor(buildPlan(inventory, { clusterIds }));
+  const actionId = `approval-${digest(canonicalJson([incidentId, clusterIds, planHash]))}`;
+  const pending = state.pendingAsks ??= [];
+  if (pending.some(item => item.actionId === actionId)) return;
+  pending.push({ actionId, incidentId, clusterIds: [...clusterIds], reasons: [...reasons],
+    action: { id: actionId, kind: 'autopilot', clusterIds: [...clusterIds], planHash }, attempts: 0, nextAttemptAt: now.toISOString() });
 }
 
-function options(deps: AutopilotDeps, armed: ArmedPlan): RotateOptions {
+async function sendPendingAsks(state: AutopilotState, deps: AutopilotDeps, now: () => Date): Promise<void> {
+  for (const pending of [...state.pendingAsks ?? []]) {
+    if (Date.parse(pending.nextAttemptAt) > now().getTime()) continue;
+    const r = reporter(deps, pending.incidentId, `wave-${pending.incidentId}`, pending.clusterIds, now);
+    // The exact proposed action is durable before an external request or notification.
+    pending.attempts++;
+    pending.nextAttemptAt = new Date(now().getTime() + Math.min(3_600_000, 60_000 * 2 ** Math.min(6, pending.attempts - 1))).toISOString();
+    await deps.saveState(state);
+    try {
+      await r.audit('ask', { asked: pending.clusterIds.length });
+      const result = await deps.requestApproval([...pending.clusterIds], [...pending.reasons], pending.actionId, structuredClone(pending.action));
+      const actionId = typeof result === 'string' ? result : result?.actionId ?? pending.actionId;
+      await r.notify('ask', 'warning', `${pending.clusterIds.length} keys need your approval.`, [...pending.reasons], actionId);
+    } catch {
+      await r.audit('ask-pending', { asked: pending.clusterIds.length, attempts: pending.attempts });
+      continue;
+    }
+    state.pendingAsks = state.pendingAsks!.filter(item => item.actionId !== pending.actionId);
+    await deps.saveState(state);
+  }
+}
+
+/** Call on every watcher tick, including ticks with no newly triggered incident. */
+export function retryPendingAsks(input: { state: AutopilotState; now: Date }, deps: AutopilotDeps): Promise<void> {
+  return serialize(input.state, () => sendPendingAsks(input.state, deps, operationClock(input.now, deps)));
+}
+
+type WavePolicy = Pick<ArmedPlan, 'clusters' | 'healthChecks' | 'graceSeconds' | 'nextDeployAcceptance'>;
+const defaultPolicy = (): WavePolicy => ({ clusters: [], healthChecks: [], graceSeconds: 900, nextDeployAcceptance: [] });
+
+function options(deps: AutopilotDeps, armed: WavePolicy): RotateOptions {
   return { ...deps.options, revoke: 'after-deploy', redeploy: true, revokeUnconfirmed: false,
     acceptUnplannedSealed: false, allowGenerate: true, deployConcurrency: 1,
     stopOnFirstFailure: true, holdRevocationOnAnyFailure: true,
@@ -120,15 +182,28 @@ function options(deps: AutopilotDeps, armed: ArmedPlan): RotateOptions {
       .map(cluster => [cluster.clusterId, cluster.adopted!.keyRef!])) };
 }
 
-function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState, env: NodeJS.ProcessEnv,
+function engineDeps(deps: AutopilotDeps, armed: WavePolicy, state: AutopilotState, env: NodeJS.ProcessEnv,
   selfCheck: SelfCheckResult, now: () => Date, r: Reporter, trustedKeyIds: string[], forcedDisarm = false,
-  settling = false, priorRevocationPossible = false) {
+  settling = false, priorRevocationPossible = false, authorized?: () => boolean) {
   let failed = false;
   let healthFailed = false;
   let oldRevocationAttempted = priorRevocationPossible;
+  let polledStop = false;
   const blocked = () => forcedDisarm || isAlertOnly({ env, state, selfCheck }).alertOnly
-    || state.armedPlanId !== armed.id || !verifyArmedPlan(armed, { now: now(), trustedKeyIds }).ok;
-  function active(): void { if (blocked()) throw new RotationAbortedError(); }
+    || polledStop || (authorized ? !authorized() : !('id' in armed) || state.armedPlanId !== armed.id
+      || !verifyArmedPlan(armed, { now: now(), trustedKeyIds }).ok);
+  async function shouldStop(): Promise<boolean> {
+    if (!polledStop) {
+      try {
+        const stopped = Boolean(await deps.shouldStop?.()) || Boolean(await deps.engine.shouldStop?.());
+        polledStop ||= stopped;
+      }
+      catch { polledStop = true; }
+      if (polledStop) { state.disarmed = true; state.disarmedAt = now().toISOString(); await deps.saveState(state); }
+    }
+    return blocked();
+  }
+  async function active(): Promise<void> { if (await shouldStop()) throw new StopRequestedError(); }
   async function firstFailure(reason: string): Promise<void> {
     if (failed) return;
     failed = true;
@@ -141,8 +216,8 @@ function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState
     if (!host) continue;
     hosts[id] = { id: host.id, capabilities: host.capabilities,
       listServices: () => host.listServices(), readVariables: service => host.readVariables(service),
-      async writeVariables(service, vars, opts) { active(); await host.writeVariables(service, vars, opts); },
-      async redeploy(service) { active(); return host.redeploy(service); },
+      async writeVariables(service, vars, opts) { await active(); await host.writeVariables(service, vars, opts); },
+      async redeploy(service) { await active(); return host.redeploy(service); },
       deploymentStatus: (service, id) => host.deploymentStatus(service, id),
     };
   }
@@ -152,8 +227,9 @@ function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState
       get(target, property) {
         const value: unknown = Reflect.get(target, property, target);
         if (typeof value !== 'function') return value;
-        return (...args: unknown[]) => {
-          if (property === 'rotate' || property === 'rotateByRef' || property === 'revoke' || property === 'cap') active();
+        if (!['rotate', 'rotateByRef', 'revoke', 'cap'].includes(String(property))) return value.bind(target);
+        return async (...args: unknown[]) => {
+          await active();
           if (settling && property === 'revoke') oldRevocationAttempted = true;
           return Reflect.apply(value, target, args);
         };
@@ -161,12 +237,12 @@ function engineDeps(deps: AutopilotDeps, armed: ArmedPlan, state: AutopilotState
     }) as ProviderAdapter;
   };
   const sleep = deps.engine.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
-  const engine: EngineDeps = { ...deps.engine, hosts, providers, now, prompt: async () => null, reveal: undefined,
+  const engine: EngineDeps = { ...deps.engine, hosts, providers, now, shouldStop, prompt: async () => null, reveal: undefined,
     providerCtx: { ...deps.engine.providerCtx, http: {
       async request(request) {
         // A reference lookup can await I/O before creation; authorization must
         // still hold at the subsequent HTTP effect, not just at adapter entry.
-        if (request.method !== 'GET') active();
+        if (request.method !== 'GET') await active();
         return deps.engine.providerCtx.http.request(request);
       },
     } },
@@ -288,19 +364,39 @@ export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): 
     const { state } = input;
     const incident = structuredClone(input.incident);
     const inventory = structuredClone(input.inventory);
-    const candidates = inventory.clusters.filter(cluster => cluster.consumers.some(c => c.service.host === incident.host)).map(c => c.id);
+    const hostClusters = inventory.clusters.filter(cluster => cluster.consumers.some(c => c.service.host === incident.host));
+    const skipped = hostClusters.filter(cluster => cluster.consumers.some(c => ownName(c.varName, input.ownTokenNames)));
+    const candidates = hostClusters.filter(cluster => !skipped.includes(cluster)).map(c => c.id);
     const waveId = `wave-${incident.id}`;
     const r = reporter(deps, incident.id, waveId, candidates, now);
+    const ask = async (ids: string[], reasons: string[]) => {
+      queueAsk(state, incident.id, ids, reasons, inventory, now());
+      await deps.saveState(state);
+      await sendPendingAsks(state, deps, now);
+    };
     if (!verified.ok) {
       await r.audit('verification-failed', { asked: candidates.length });
       await r.notify('verification-failed', 'urgent', `Your armed plan could not be verified (${verified.reason}); nothing was rotated.`);
-      await ask(deps, r, incident.id, candidates, [verified.reason]);
+      await ask(candidates, [verified.reason]);
       return { executed: [], asked: candidates };
     }
     await r.audit('verified');
     if (state.waves.some(wave => wave.incidentId === incident.id)) {
       await r.audit('duplicate');
+      await sendPendingAsks(state, deps, now);
       return { executed: [], asked: [] };
+    }
+    const ownLines = skipped.length || input.watcherHost === incident.host ? [
+      `Keys handled by rotation or approval: ${keyNames(inventory, candidates).join(', ') || 'none'}.`,
+      `Watcher credentials skipped: ${[...new Set([...keyNames(inventory, skipped.map(cluster => cluster.id)), ...input.ownTokenNames ?? []])]
+        .filter(name => /^[A-Z][A-Z0-9_]{0,199}$/.test(name)).join(', ') || 'the configured watcher credentials'}. Rotate these on your own computer.`,
+    ] : [];
+    if (ownLines.length) await r.notify('own-credentials', 'warning', 'Incident rotation coverage.', ownLines);
+    if (inventory.errors.length) {
+      const reason = scanErrorReason(inventory);
+      await r.audit('scan-incomplete', { asked: candidates.length });
+      await ask(candidates, [reason]);
+      return { executed: [], asked: candidates };
     }
     const gate = isAlertOnly({ env: input.env, state, selfCheck: input.selfCheck });
     const wrongPlan = state.armedPlanId !== null && state.armedPlanId !== verified.plan.id;
@@ -308,7 +404,7 @@ export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): 
       const reasons = gate.alertOnly ? gate.reasons : [wrongPlan ? 'The active armed plan changed.' : 'This incident does not authorize automatic rotation.'];
       await r.audit('alert-only', { asked: candidates.length });
       await r.notify('alert', 'warning', `${PLATFORM[incident.host]} incident: ${candidates.length} keys need review.`);
-      await ask(deps, r, incident.id, candidates, reasons);
+      await ask(candidates, reasons);
       return { executed: [], asked: candidates };
     }
     const armed = verified.plan;
@@ -329,34 +425,186 @@ export async function runAutopilot(input: AutopilotInput, deps: AutopilotDeps): 
       reasons: ['The adopted key changed; re-arm on your own computer before another automatic rotation.'] })));
     await r.audit('scope', { execute: scope.execute.length, asked: scope.ask.length });
     const asked = scope.ask.map(item => item.clusterId);
-    await ask(deps, r, incident.id, asked, [...new Set(scope.ask.flatMap(item => item.reasons))]);
-    if (scope.execute.length === 0) return { executed: [], asked };
+    queueAsk(state, incident.id, asked, [...new Set(scope.ask.flatMap(item => item.reasons))], inventory, now());
+    if (scope.execute.length === 0) {
+      await deps.saveState(state);
+      await sendPendingAsks(state, deps, now);
+      return { executed: [], asked };
+    }
     const currentVerification = verifyArmedPlan(armed, { now: now(), trustedKeyIds: input.trustedKeyIds });
     const currentGate = isAlertOnly({ env: input.env, state, selfCheck: input.selfCheck });
     if (!currentVerification.ok || currentGate.alertOnly || state.armedPlanId !== null && state.armedPlanId !== armed.id) {
       const reason = !currentVerification.ok ? currentVerification.reason : 'Automatic rotation is no longer authorized.';
       await r.audit('authorization-changed', { asked: scope.execute.length });
-      await ask(deps, r, incident.id, scope.execute, [reason]);
+      await ask(scope.execute, [reason]);
       return { executed: [], asked: [...asked, ...scope.execute] };
     }
     const plan = buildPlan(inventory, { clusterIds: scope.execute });
     const wave: AutopilotWave = { id: waveId, incidentId: incident.id, planId: plan.id,
       startedAt: now().toISOString(), status: 'running', plan: structuredClone(plan),
-      inventory: structuredClone(inventory), armed: structuredClone(armed) };
+      inventory: structuredClone(inventory), armed: structuredClone(armed), executionStarted: false };
     state.waves.push(wave);
     state.armedPlanId = armed.id;
     await deps.saveState(state);
     await r.audit('start', { execute: scope.execute.length });
+    await deps.engine.journal.append({ planId: plan.id, at: now().toISOString(), event: 'plan-start',
+      data: { dryRun: deps.options.dryRun, steps: plan.steps.length, autopilot: true } });
     const hints = deps.options.showHints ? plan.steps.map(step => step.hint)
       .filter((hint): hint is string => hint !== null && /^[A-Za-z0-9_-]{1,7}…[A-Za-z0-9_-]{4}$/.test(hint)) : [];
     await r.notify('start', 'info', `${PLATFORM[incident.host]} reported a security incident. Rotating ${scope.execute.length} keys you armed for this.`, hints);
+    wave.executionStarted = true;
+    await deps.saveState(state);
     const execution = engineDeps(deps, armed, state, input.env, input.selfCheck, now, r, input.trustedKeyIds);
     const report = await executePlan(plan, inventory, execution.engine, options(deps, armed));
     const adoptionUpdates = await recordAdoptions(state, armed, report, deps, r, now);
     await outcome(state, wave, report, deps, r, execution.firstFailure, execution.blocked);
+    await sendPendingAsks(state, deps, now);
     return { executed: scope.execute, asked, report,
       ...(Object.keys(adoptionUpdates).length ? { adoptionUpdates } : {}) };
   });
+}
+
+export interface ApprovedActionInput {
+  /** Obtain this grant from the trusted approval service, never directly from a relay or HTTP body. */
+  grant: ApprovalGrant;
+  action: PendingAutopilotAction;
+  inventory: Inventory;
+  armed?: ArmedPlan;
+  state: AutopilotState;
+  now: Date;
+}
+
+function validGrant(grant: ApprovalGrant, action: PendingAutopilotAction, now: Date, trustedKeyIds: string[]): boolean {
+  try {
+    return action.kind === 'autopilot' && action.clusterIds.length > 0
+      && new Set(action.clusterIds).size === action.clusterIds.length && /^[a-f0-9]{64}$/.test(action.planHash)
+      && grant.actionId === action.id && grant.digest === actionDigest(action)
+      && Number.isFinite(Date.parse(grant.at)) && Date.parse(grant.at) <= now.getTime() + 300_000
+      && Number.isFinite(now.getTime()) && (grant.by.kind === 'passkey'
+        ? typeof grant.by.credentialId === 'string' && grant.by.credentialId.length > 0
+        : grant.by.kind === 'device' && trustedKeyIds.includes(grant.by.keyId));
+  } catch { return false; }
+}
+
+function approvedIds(inventory: Inventory, ids: string[], armed: ArmedPlan | undefined, deps: AutopilotDeps): string[] {
+  return ids.filter(id => {
+    const cluster = inventory.clusters.find(cluster => cluster.id === id);
+    if (!cluster || cluster.consumers.some(consumer => ownName(consumer.varName))) return false;
+    const signed = armed?.clusters.find(item => item.clusterId === id && item.provider === cluster.provider && item.method === cluster.method);
+    // A signed reference must still identify the current old key. Inventory adoption is never authority.
+    const adopted = signed?.adopted && cluster.consumers.every(consumer => consumer.fingerprint === null
+      || consumer.fingerprint === signed.adopted!.fingerprint) ? signed.adopted : undefined;
+    const effective: Cluster & { adopted?: typeof adopted } = { ...cluster, adopted };
+    if (!autopilotEligibility(effective).eligible) return false;
+    const provider = deps.engine.providers(cluster.provider);
+    if (provider.method !== cluster.method || typeof provider.rotate !== 'function' || typeof provider.verify !== 'function'
+      || cluster.method === 'auto' && typeof provider.revoke !== 'function') return false;
+    return cluster.method !== 'auto' || cluster.consumers.some(consumer => !consumer.reference && !consumer.sealed
+      && deps.engine.hosts[consumer.service.host]?.capabilities.readValues)
+      || Boolean(adopted?.keyRef && typeof provider.rotateByRef === 'function');
+  });
+}
+
+function approvedPolicy(armed: ArmedPlan | undefined, inventory: Inventory): WavePolicy {
+  if (!armed) return defaultPolicy();
+  return { ...armed, clusters: armed.clusters.map(signed => {
+    const current = inventory.clusters.find(cluster => cluster.id === signed.clusterId
+      && cluster.provider === signed.provider && cluster.method === signed.method);
+    const adopted = signed.adopted && current?.consumers.every(consumer => consumer.fingerprint === null
+      || consumer.fingerprint === signed.adopted!.fingerprint) ? signed.adopted : undefined;
+    return { ...signed, adopted };
+  }) };
+}
+
+/** Execute one service-verified grant under the same mutation and settlement rails as an armed wave. */
+export async function executeApprovedAction(input: ApprovedActionInput, deps: WaveRecoveryDeps): Promise<{
+  executed: string[]; asked: string[]; guided: string[]; report?: RotationReport; reason?: string;
+  adoptionUpdates?: NonNullable<AutopilotState['adoptionUpdates']>;
+}> {
+  const now = operationClock(input.now, deps);
+  const snapshot = structuredClone({ grant: input.grant, action: input.action, inventory: input.inventory, armed: input.armed });
+  return serialize(input.state, async () => {
+    const { state } = input;
+    const { grant, action, inventory } = snapshot;
+    const empty = { executed: [] as string[], asked: [] as string[], guided: [] as string[] };
+    const waveId = `wave-approved-${action.id}`;
+    const r = reporter(deps, action.id, waveId, action.clusterIds, now);
+    if (!validGrant(grant, action, now(), deps.trustedKeyIds)) {
+      await r.audit('approval-rejected');
+      return { ...empty, reason: 'This approval does not match the proposed action.' };
+    }
+    if (state.waves.some(wave => wave.approval?.action.id === action.id)) {
+      await r.audit('duplicate');
+      return empty;
+    }
+    const env = deps.env ?? process.env;
+    const selfCheck = deps.selfCheck ?? { ok: false, reasons: ['The watcher self-check is unavailable.'] };
+    if (isAlertOnly({ state, env, selfCheck }).alertOnly) {
+      await r.audit('approval-paused');
+      return { ...empty, reason: 'Approved rotation is paused by the watcher checks.' };
+    }
+    let armed: ArmedPlan | undefined;
+    if (snapshot.armed) {
+      const verified = verifyArmedPlan(snapshot.armed, { now: now(), trustedKeyIds: deps.trustedKeyIds });
+      if (!verified.ok || state.armedPlanId !== null && state.armedPlanId !== verified.plan.id) {
+        await r.audit('approval-plan-rejected');
+        return { ...empty, reason: 'The armed plan could not be verified for this approval.' };
+      }
+      armed = verified.plan;
+    }
+    const fullPlan = buildPlan(inventory, { clusterIds: action.clusterIds });
+    if (inventory.errors.length || fullPlan.steps.length !== action.clusterIds.length || planHashFor(fullPlan) !== action.planHash) {
+      const reason = inventory.errors.length ? scanErrorReason(inventory)
+        : 'The inventory changed since this approval was requested. Review a new request before rotating.';
+      await r.audit('approval-inventory-changed');
+      queueAsk(state, action.id, action.clusterIds, [reason], inventory, now());
+      await deps.saveState(state);
+      await sendPendingAsks(state, deps, now);
+      return { ...empty, asked: [...action.clusterIds], reason };
+    }
+    const execute = approvedIds(inventory, action.clusterIds, armed, deps);
+    const guided = action.clusterIds.filter(id => !execute.includes(id));
+    const plan = buildPlan(inventory, { clusterIds: execute });
+    const wave: AutopilotWave = { id: waveId, incidentId: action.id, planId: plan.id,
+      startedAt: now().toISOString(), status: execute.length ? 'running' : 'done', plan, inventory,
+      ...(armed ? { armed } : {}), executionStarted: false, approval: { grant, action } };
+    state.waves.push(wave);
+    await deps.saveState(state);
+    if (guided.length) {
+      await r.audit('guided', { guided: guided.length });
+      await r.notify('guided', 'warning', `${guided.length} approved keys need you for a guided rotation.`,
+        [`Keys needing you: ${keyNames(inventory, guided).join(', ') || 'the selected keys'}.`]);
+    }
+    if (!execute.length) return { ...empty, guided };
+    await r.audit('start', { execute: execute.length });
+    await deps.engine.journal.append({ planId: plan.id, at: now().toISOString(), event: 'plan-start',
+      data: { dryRun: deps.options.dryRun, steps: plan.steps.length, autopilot: true } });
+    await r.notify('start', 'info', `Rotating ${execute.length} keys you approved.`);
+    wave.executionStarted = true;
+    await deps.saveState(state);
+    const authorized = () => approvedWaveValid(wave, deps, now())
+      && (!armed || state.armedPlanId === null || state.armedPlanId === armed.id);
+    const policy = approvedPolicy(armed, inventory);
+    const execution = engineDeps(deps, policy, state, env, selfCheck, now, r, deps.trustedKeyIds, false, false, false, authorized);
+    const report = await executePlan(plan, inventory, execution.engine, options(deps, policy));
+    const adoptionUpdates = armed ? await recordAdoptions(state, armed, report, deps, r, now) : {};
+    await outcome(state, wave, report, deps, r, execution.firstFailure, execution.blocked);
+    return { executed: execute, asked: [], guided, report,
+      ...(Object.keys(adoptionUpdates).length ? { adoptionUpdates } : {}) };
+  });
+}
+
+function approvedWaveValid(wave: AutopilotWave, deps: WaveRecoveryDeps, now: Date): boolean {
+  try {
+    if (!wave.approval || !wave.plan || !wave.inventory || wave.inventory.errors.length || wave.plan.id !== wave.planId) return false;
+    const { action, grant } = wave.approval;
+    if (!validGrant(grant, action, now, deps.trustedKeyIds)) return false;
+    if (wave.armed && (!verifyArmedPlan(wave.armed, { now, trustedKeyIds: deps.trustedKeyIds }).ok)) return false;
+    const fullPlan = buildPlan(wave.inventory, { clusterIds: action.clusterIds });
+    if (fullPlan.steps.length !== action.clusterIds.length || planHashFor(fullPlan) !== action.planHash) return false;
+    const ids = approvedIds(wave.inventory, action.clusterIds, wave.armed, deps);
+    return ids.length > 0 && planHashFor(buildPlan(wave.inventory, { clusterIds: ids })) === planHashFor(wave.plan);
+  } catch { return false; }
 }
 
 async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput & { inventory?: Inventory }, deps: WaveRecoveryDeps): Promise<WaveRecoveryResult> {
@@ -381,10 +629,20 @@ async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput 
       const ids = wave.plan?.steps.map(step => step.clusterId) ?? [];
       const r = reporter(deps, wave.incidentId, wave.id, ids, now);
       const verified = verifyArmedPlan(wave.armed, { now: now(), trustedKeyIds: deps.trustedKeyIds });
-      if (!verified.ok || state.armedPlanId !== verified.plan.id || !wave.plan || !wave.inventory
+      const approved = wave.approval !== undefined;
+      const armed = verified.ok ? verified.plan : undefined;
+      const authorized = approved ? approvedWaveValid(wave, deps, now())
+        && (!armed || state.armedPlanId === null || state.armedPlanId === armed.id)
+        : armed !== undefined && state.armedPlanId === armed.id && recoveryScopeValid(wave, armed);
+      if (!authorized || !wave.plan || !wave.inventory || wave.inventory.errors.length
         || mode === 'settle' && !latestInventory
-        || wave.plan.id !== wave.planId || !recoveryScopeValid(wave, verified.plan)) {
+        || wave.plan.id !== wave.planId) {
         await r.audit(`${mode}-blocked`);
+        continue;
+      }
+      if (mode === 'settle' && latestInventory!.errors.length) {
+        await r.audit('settle-scan-incomplete');
+        await r.notify('settle-scan-incomplete', 'warning', scanErrorReason(latestInventory!));
         continue;
       }
       const entries: JournalEntry[] = await deps.engine.journal.read(wave.planId);
@@ -394,25 +652,38 @@ async function recoverWaves(mode: 'resume' | 'settle', input: WaveRecoveryInput 
         wave.settlementStarted = true;
         await deps.saveState(state);
       }
-      const execution = engineDeps(deps, verified.plan, state, env, selfCheck, now, r, deps.trustedKeyIds,
-        input.disarmed, mode === 'settle', priorRevocationPossible);
+      const policy = approved ? approvedPolicy(armed, wave.inventory) : armed!;
+      const execution = engineDeps(deps, policy, state, env, selfCheck, now, r, deps.trustedKeyIds,
+        input.disarmed, mode === 'settle', priorRevocationPossible,
+        approved ? () => approvedWaveValid(wave, deps, now())
+          && (!armed || state.armedPlanId === null || state.armedPlanId === armed.id) : undefined);
       await r.audit(mode);
       // Null scan fingerprints stay null in signed scope and saved recovery
       // metadata. For finish only, the signed adoption supplies the known old
       // fingerprint needed to detect its reappearance in the latest inventory.
       const plan = mode === 'settle' ? structuredClone(wave.plan) : wave.plan;
       if (mode === 'settle') for (const step of plan.steps) {
-        const adopted = verified.plan.clusters.find(cluster => cluster.clusterId === step.clusterId)?.adopted;
+        const adopted = policy.clusters.find(cluster => cluster.clusterId === step.clusterId)?.adopted;
         if (!adopted?.keyRef) continue;
         for (const consumer of step.consumers) {
           if (consumer.sealed && consumer.fingerprint === null) consumer.fingerprint = adopted.fingerprint;
         }
       }
       const recovery = { plan, inventory: mode === 'settle' ? latestInventory! : wave.inventory, entries };
+      // This marker is persisted only after start notification succeeds, before any engine effects.
+      // A notification-only interruption therefore cannot have orphaned a provider key.
+      const notificationOnly = mode === 'resume' && wave.executionStarted === false;
+      if (notificationOnly) {
+        await r.notify('start', 'info', `Starting the saved rotation of ${ids.length} keys.`);
+        wave.executionStarted = true;
+        await deps.saveState(state);
+      }
       const report = mode === 'resume'
-        ? await resumeRotation(recovery, execution.engine, options(deps, verified.plan))
-        : await finishRotation(recovery, execution.engine, options(deps, verified.plan));
-      const adoptionUpdates = await recordAdoptions(state, verified.plan, report, deps, r, now);
+        ? notificationOnly
+          ? await executePlan(plan, wave.inventory, execution.engine, options(deps, policy))
+          : await resumeRotation(recovery, execution.engine, options(deps, policy))
+        : await finishRotation(recovery, execution.engine, options(deps, policy));
+      const adoptionUpdates = armed ? await recordAdoptions(state, armed, report, deps, r, now) : {};
       if (Object.keys(adoptionUpdates).length) result.adoptionUpdates = { ...result.adoptionUpdates, ...adoptionUpdates };
       await outcome(state, wave, report, deps, r, execution.firstFailure, execution.blocked);
       result.reports.push(report);

@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'vitest';
 import { buildArmedPlan, signArmedPlan } from '../../src/autopilot/armed-plan.js';
 import { isAlertOnly } from '../../src/autopilot/kill-switch.js';
-import { runAutopilot, resumeWaves, settleWaves, type AutopilotState } from '../../src/autopilot/runner.js';
+import { runAutopilot, resumeWaves, settleWaves, retryPendingAsks, planHashFor, type AutopilotState, type PendingAutopilotAction } from '../../src/autopilot/runner.js';
 import { generateDeviceKey } from '../../src/security/index.js';
-import { buildInventory } from '../../src/core/index.js';
+import { buildInventory, buildPlan } from '../../src/core/index.js';
 import type { ArmedCluster, AuditEvent, AuditLog, Cluster, Incident, NotifyMessage } from '../../src/types.js';
 import { FakeHttp, text } from '../helpers/fake-http.js';
 import { recoveryFixture } from '../rotate/recovery-fixture.js';
@@ -37,6 +37,148 @@ async function fixture() {
 }
 
 describe('autopilot runner', () => {
+  test('an incomplete scan asks about the whole wave without rotating', async () => {
+    const f = await fixture();
+    f.input.inventory = { ...f.inv, errors: [{ host: 'render', message: 'private error' }] };
+    const result = await runAutopilot(f.input, f.deps);
+    expect(result.executed).toEqual([]);
+    expect(result.asked).toEqual([f.clusterId, f.generatedClusterId]);
+    expect(f.host.writes).toHaveLength(0);
+    expect(f.approvals[0]?.reasons).toContain("Some platforms could not be scanned (Render); keysentry won't rotate automatically until every copy can be checked.");
+  });
+
+  test('settlement holds revocation while the latest scan has any error and retries a complete scan', async () => {
+    const f = await fixture();
+    await runAutopilot(f.input, f.deps);
+    f.clock.ms += 900_001;
+    await settleWaves({ state: f.state, inventory: { ...f.inv, errors: [{ host: 'render', message: 'private error' }] },
+      now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+    expect(f.state.waves[0]?.status).toBe('grace');
+    await settleWaves({ state: f.state, inventory: f.inv, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(false);
+  });
+
+  test.each(['request', 'notification'] as const)('a failed ask %s cannot block armed work and is retried with backoff', async failure => {
+    const f = await fixture();
+    let calls = 0;
+    const deps = { ...f.deps,
+      async requestApproval(ids: string[], reasons: string[], actionId?: string) {
+        calls++;
+        if (failure === 'request' && calls === 1) throw new Error('private error');
+        await f.deps.requestApproval(ids, reasons, actionId);
+      },
+      async notify(message: NotifyMessage) {
+        if (failure === 'notification' && message.kind === 'autopilot:ask' && calls === 1) throw new Error('private error');
+        await f.deps.notify(message);
+      },
+    };
+    const result = await runAutopilot(f.input, deps);
+    expect(result.executed).toEqual([f.clusterId]);
+    expect(f.host.writes).toHaveLength(2);
+    expect(f.state.pendingAsks).toHaveLength(1);
+    const id = f.state.pendingAsks![0]!.actionId;
+    await runAutopilot(f.input, deps);
+    expect(calls).toBe(1);
+    f.clock.ms += 60_000;
+    await runAutopilot({ ...f.input, now: f.deps.engine.now!() }, deps);
+    expect(calls).toBe(2);
+    expect(f.approvals.at(-1)?.actionId).toBe(id);
+    expect(f.state.pendingAsks).toHaveLength(0);
+    expect(f.state.waves).toHaveLength(1);
+  });
+
+  test('an ask retries on a later tick without an incident and retains the exact requested plan hash', async () => {
+    const f = await fixture();
+    const actions: PendingAutopilotAction[] = [];
+    const deps = { ...f.deps, async requestApproval(_ids: string[], _reasons: string[], _id?: string, action?: PendingAutopilotAction) {
+      actions.push(structuredClone(action!));
+      if (actions.length === 1) throw new Error('delivery unavailable');
+    } };
+    await runAutopilot(f.input, deps);
+    expect(actions[0]?.planHash).toBe(planHashFor(buildPlan(f.inv, { clusterIds: [f.generatedClusterId] })));
+    const restored = structuredClone(f.state);
+    f.clock.ms += 60_000;
+    await retryPendingAsks({ state: restored, now: f.deps.engine.now!() }, deps);
+    expect(actions[1]).toEqual(actions[0]);
+    expect(restored.pendingAsks).toHaveLength(0);
+    expect(restored.waves).toHaveLength(1);
+  });
+
+  test('a failed start notification leaves a journaled plan that resumes without an orphan', async () => {
+    const f = await fixture();
+    await expect(runAutopilot(f.input, { ...f.deps, async notify(message) {
+      if (message.kind === 'autopilot:start') throw new Error('delivery unavailable');
+    } })).rejects.toThrow('delivery unavailable');
+    const wave = f.state.waves[0]!;
+    expect(f.journal.entries.some(entry => entry.planId === wave.planId && entry.event === 'plan-start')).toBe(true);
+    await resumeWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    expect(f.state.waves[0]?.status).toBe('grace');
+    expect(f.host.writes).toHaveLength(2);
+  });
+
+  test('a crash after an unjournaled creation still resumes as an orphan and never creates twice', async () => {
+    const f = await fixture();
+    const death = new Error('process death');
+    f.deps.engine.crashHook = point => { if (point === 'after-create') throw death; };
+    await expect(runAutopilot(f.input, f.deps)).rejects.toBe(death);
+    expect(f.state.waves[0]?.executionStarted).toBe(true);
+    delete f.deps.engine.crashHook;
+    await resumeWaves({ state: f.state, now: f.deps.engine.now!(), disarmed: false }, f.recoveryDeps);
+    expect(f.trace.filter(item => item === 'rotate:openai')).toHaveLength(1);
+    expect(f.host.writes).toHaveLength(0);
+    expect(f.state.waves[0]?.status).toBe('stopped');
+  });
+
+  test('a polled stop between writes stops the wave and urgently reports the retained old key', async () => {
+    const f = await fixture();
+    f.deps.engine.shouldStop = async () => f.host.writes.length > 0;
+    await runAutopilot(f.input, f.deps);
+    expect(f.host.writes).toHaveLength(1);
+    expect(f.host.redeploys).toHaveLength(0);
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+    expect(f.state.waves[0]?.status).toBe('stopped');
+    expect(f.notifications.some(message => message.severity === 'urgent')).toBe(true);
+  });
+
+  test('a stop detected by the inner adapter check retains a prepared replacement for reconciliation', async () => {
+    const f = await fixture();
+    f.input.armed = f.arm({}, [f.clusterId, f.generatedClusterId]);
+    f.state.armedPlanId = f.input.armed.id;
+    let afterFirst = 0;
+    f.deps.engine.shouldStop = async () => f.trace.includes('rotated:openai') && ++afterFirst >= 2;
+    await runAutopilot(f.input, f.deps);
+    expect(f.trace.filter(item => item === 'rotate:app-secret')).toHaveLength(0);
+    expect(f.provider.keys.size).toBe(2);
+    expect(await f.inflight.get(f.state.waves[0]!.planId, `new:${f.clusterId}`)).not.toBeNull();
+    expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
+  });
+
+  test('a stop at the inner cleanup check keeps recovery values for the unrevoked replacement', async () => {
+    const f = await fixture();
+    f.provider.failVerifyOfNew = true;
+    let afterFirst = 0;
+    f.deps.engine.shouldStop = async () => f.trace.includes('rotated:openai') && ++afterFirst >= 2;
+    await runAutopilot(f.input, f.deps);
+    expect(f.provider.keys.size).toBe(2);
+    expect(f.provider.revoked).toEqual([]);
+    expect(await f.inflight.get(f.state.waves[0]!.planId, `new:${f.clusterId}`)).not.toBeNull();
+  });
+
+  test('own credentials are skipped as a whole cluster and the other armed keys still rotate', async () => {
+    const f = await fixture();
+    const own = structuredClone(f.inv.clusters.find(cluster => cluster.id === f.clusterId)!);
+    own.id = 'watcher-credential';
+    own.consumers = [{ ...own.consumers[0]!, varName: 'RAILWAY_TOKEN' }];
+    f.input.inventory = { ...f.inv, clusters: [...f.inv.clusters, own] };
+    const result = await runAutopilot(f.input, f.deps);
+    expect(result.executed).toEqual([f.clusterId]);
+    expect(result.asked).not.toContain(own.id);
+    expect(JSON.stringify(f.notifications)).toContain('RAILWAY_TOKEN');
+    expect(JSON.stringify(f.notifications)).toContain('OPENAI_API_KEY');
+    expect(f.host.writes.every(write => !Object.hasOwn(write.vars, 'RAILWAY_TOKEN'))).toBe(true);
+  });
+
   test('autopilot rotates armed clusters for an official incident and asks for the rest', async () => {
     const f = await fixture();
     const result = await runAutopilot(f.input, f.deps);
@@ -318,11 +460,11 @@ describe('autopilot runner', () => {
     expect(f.provider.keys.get(f.old.ref)?.active).toBe(true);
   });
 
-  test('plan expiration while requesting approval prevents starting automatic work', async () => {
+  test('a slow approval request runs only after the armed work has finished', async () => {
     const f = await fixture();
     await runAutopilot(f.input, { ...f.deps, async requestApproval() { f.clock.ms = Date.parse('2027-12-01T00:00:00Z'); } });
-    expect(f.trace.filter(line => line === 'rotate:openai')).toEqual([]);
-    expect(f.host.writes).toEqual([]);
+    expect(f.trace.filter(line => line === 'rotate:openai')).toHaveLength(1);
+    expect(f.host.writes).toHaveLength(2);
   });
 
   test('changing the input inventory during approval cannot widen the checked scope', async () => {

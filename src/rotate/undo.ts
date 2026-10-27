@@ -4,6 +4,7 @@ import type {
 } from '../types.js';
 import type { EngineDeps, RotateOptions } from './engine.js';
 import { crash, isCrash } from './recovery.js';
+import { withStopChecks } from './stop.js';
 
 interface UndoInput {
   plan: RotationPlan;
@@ -40,6 +41,7 @@ class UndoJournalFailure extends Error {
 
 /** Restore every consumer before retiring a replacement. All values stay in memory or InFlightStore. */
 export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: RotateOptions): Promise<UndoReport> {
+  deps = withStopChecks(deps);
   const { plan } = input;
   const entries = input.entries.filter(entry => entry.planId === plan.id);
   const report: UndoReport = { restored: [], unavailable: [], newKeysRevoked: [] };

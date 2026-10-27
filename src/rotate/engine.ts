@@ -2,6 +2,7 @@ import { classify, fingerprint, serviceKey } from '../core/index.js';
 import { RotationAbortedError } from '../types.js';
 import { crash, isCrash, unresolvedOrphans } from './recovery.js';
 import { undoRotation } from './undo.js';
+import { StopRequestedError, withStopChecks } from './stop.js';
 import type {
   ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
@@ -23,6 +24,8 @@ export interface EngineDeps {
   grace?: (info: GraceInfo) => Promise<GraceDecision>;
   crashHook?: (point: CrashPoint, detail: { clusterId?: string; serviceKey?: string }) => void;
   healthCheck?: (serviceKey: string) => Promise<{ ok: boolean; detail: string }>;
+  /** Poll remote disarm before effects. True or a failed poll stops further mutations. */
+  shouldStop?: () => Promise<boolean>;
   /** True only when the replacement was actually presented to a human. */
   reveal?: (info: { clusterId: string; provider: ProviderId; hint: string | null; reason: string }, value: string) => Promise<boolean>;
 }
@@ -102,6 +105,7 @@ export async function executePlan(
 export async function runRotation(
   plan: RotationPlan, inv: Inventory, deps: EngineDeps, opts: RotateOptions, resumeEntries?: JournalEntry[],
 ): Promise<RotationReport> {
+  deps = withStopChecks(deps);
   // Only an explicit false authorizes mutations, including for callers supplying incomplete JS options.
   const dryRun = opts?.dryRun !== false;
   const redeploy = opts?.redeploy ?? true;
@@ -323,6 +327,7 @@ export async function runRotation(
       work.unusedCleanupSucceeded = true;
     } catch (error) {
       if (isCrash(error)) throw error;
+      if (error instanceof StopRequestedError) throw error;
       if (error instanceof JournalFailure) throw error;
       warn(work, 'Unused replacement cleanup failed; revoke the new key manually.');
     }
@@ -932,6 +937,7 @@ export async function runRotation(
           work.ready = true;
         } catch (error) {
           if (isCrash(error)) throw error;
+          if (error instanceof StopRequestedError) throw error;
           if (error instanceof RotationAbortedError) {
             aborted = true;
             if (!providerProducedResult) throw error;
@@ -1086,7 +1092,7 @@ export async function runRotation(
             crash(deps, 'after-write', { serviceKey: key });
             service.rewritten = resumeEntries !== undefined;
             written = true;
-          } catch (error) { if (isCrash(error)) throw error; /* retry atomically rolled credentials before giving up */ }
+          } catch (error) { if (isCrash(error) || error instanceof StopRequestedError) throw error; /* retry atomically rolled credentials before giving up */ }
           if ((!written || mismatched.length > 0) && attempt < attempts - 1) {
             await sleep(1_000 * 2 ** attempt);
             // Conflicting atomic outputs cannot all inhabit one variable, but still
@@ -1183,6 +1189,7 @@ export async function runRotation(
           log.info('Old credential revoked.', { clusterId: work.step.clusterId });
         } catch (error) {
           if (isCrash(error)) throw error;
+          if (error instanceof StopRequestedError) throw error;
           if (error instanceof JournalFailure) throw error;
           await fail(work, 'Old credential revocation failed; check the provider before retrying.');
         }
@@ -1218,7 +1225,7 @@ export async function runRotation(
               waited += delay;
             }
           }
-        } catch (error) { if (isCrash(error)) throw error; if (error instanceof JournalFailure) throw error; }
+        } catch (error) { if (isCrash(error) || error instanceof StopRequestedError) throw error; if (error instanceof JournalFailure) throw error; }
         if (state === 'success' && deps.healthCheck) {
           let health: { ok: boolean; detail: string };
           try { health = await deps.healthCheck(key); }
@@ -1447,6 +1454,11 @@ export async function runRotation(
   } catch (error) {
     if (isCrash(error)) throw error;
     if (error instanceof RotationAbortedError) {
+      // A remote stop forbids cleanup too. Keep prepared values available for
+      // manual reconciliation rather than shredding an unused live key.
+      if (error instanceof StopRequestedError && works.some(work => work.result && !work.oldRevoked)) {
+        unusedReplacementMayBeLive = true;
+      }
       // No provider result exists yet: cancel all delivery as well as creation.
       for (const work of works) {
         if (['pending', 'created', 'verified'].includes(work.report.status)) {
