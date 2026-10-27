@@ -27,6 +27,7 @@ interface DeployedMachine {
   id: string;
   version: string;
   wasRunning: boolean;
+  instanceId?: string;
 }
 
 // Like requestJson's errors, retain only local text and the HTTP status, never
@@ -53,6 +54,21 @@ function parseResponse(response: HttpResponse): unknown {
   catch { throw new Error('Fly returned invalid JSON'); }
 }
 
+function leaseNonce(lease: unknown): string {
+  if (!isRecord(lease)) throw new Error('Fly returned an invalid machine lease');
+  const hasNonce = 'nonce' in lease;
+  const hasData = 'data' in lease;
+  if (hasNonce && !nonempty(lease.nonce)
+    || hasData && (!isRecord(lease.data) || !nonempty(lease.data.nonce))) {
+    throw new Error('Fly returned an invalid machine lease');
+  }
+  const nested = isRecord(lease.data) ? lease.data.nonce : undefined;
+  if (hasNonce && hasData && lease.nonce !== nested) throw new Error('Fly returned an invalid machine lease');
+  const nonce = hasNonce ? lease.nonce : nested;
+  if (!nonempty(nonce)) throw new Error('Fly returned an invalid machine lease');
+  return nonce;
+}
+
 function decodeDeployment(id: string, app: string): DeployedMachine[] {
   let value: unknown;
   try {
@@ -65,12 +81,16 @@ function decodeDeployment(id: string, app: string): DeployedMachine[] {
   const seen = new Set<string>();
   return value.machines.map((machine: unknown) => {
     if (!isRecord(machine) || !nonempty(machine.id) || !nonempty(machine.version)
-      || typeof machine.wasRunning !== 'boolean' || seen.has(machine.id)) {
+      || typeof machine.wasRunning !== 'boolean' || seen.has(machine.id)
+      || 'instanceId' in machine && !nonempty(machine.instanceId)) {
       throw new Error('Fly deployment id is invalid');
     }
     pathSegment(machine.id);
     seen.add(machine.id);
-    return { id: machine.id, version: machine.version, wasRunning: machine.wasRunning };
+    return {
+      id: machine.id, version: machine.version, wasRunning: machine.wasRunning,
+      ...(nonempty(machine.instanceId) ? { instanceId: machine.instanceId } : {}),
+    };
   });
 }
 
@@ -142,11 +162,16 @@ export function createFlyHost(options: FlyHostOptions): HostAdapter {
 
   async function machineStatus(app: string, machine: DeployedMachine): Promise<DeployState> {
     const path = `${pathSegment(app)}/machines/${pathSegment(machine.id)}`;
+    // flyctl targets the returned instance; old deployment IDs and API shapes
+    // without an instance retain their version-bound wait.
+    const target = machine.instanceId === undefined
+      ? `version=${encodeURIComponent(machine.version)}`
+      : `instance_id=${encodeURIComponent(machine.instanceId)}`;
     let response: HttpResponse;
     try {
       response = await machinesRequest('GET', machine.wasRunning
         // Fly blocks for at most the given seconds; stay under the HTTP client's 30 s timeout.
-        ? `${path}/wait?state=started&version=${encodeURIComponent(machine.version)}&timeout=25`
+        ? `${path}/wait?state=started&${target}&timeout=25`
         : path);
     } catch (error) {
       if (error instanceof FlyApiError) {
@@ -157,6 +182,11 @@ export function createFlyHost(options: FlyHostOptions): HostAdapter {
     }
     const status = parseResponse(response);
     if (!isRecord(status)) throw new Error('Fly returned an invalid machine status');
+    if ('id' in status && status.id !== machine.id
+      || 'instance_id' in status && (!nonempty(status.instance_id)
+        || machine.instanceId !== undefined && status.instance_id !== machine.instanceId)) {
+      throw new Error('Fly returned an invalid machine status');
+    }
     if (status.state === 'failed' || status.state === 'destroyed') return 'failed';
     if (!nonempty(status.state) || status.version !== machine.version) return 'pending';
     if (machine.wasRunning) return status.ok === true && status.state === 'started' ? 'success' : 'pending';
@@ -246,10 +276,9 @@ export function createFlyHost(options: FlyHostOptions): HostAdapter {
       const deployed: DeployedMachine[] = [];
       for (const machine of machines) {
         const path = `${pathSegment(app)}/machines/${pathSegment(machine.id)}`;
-        const lease = parseResponse(await machinesRequest('POST', `${path}/lease`, {
+        const nonce = leaseNonce(parseResponse(await machinesRequest('POST', `${path}/lease`, {
           ttl: 120, description: 'keysentry secrets update',
-        }));
-        if (!isRecord(lease) || !nonempty(lease.nonce)) throw new Error('Fly returned an invalid machine lease');
+        })));
         const wasRunning = machine.state !== 'stopped' && machine.state !== 'suspended';
         let updated: DeployedMachine;
         let updateFailed = false;
@@ -258,16 +287,20 @@ export function createFlyHost(options: FlyHostOptions): HostAdapter {
             config: machine.config,
             ...(version === undefined ? {} : { min_secrets_version: version }),
             current_version: machine.version, skip_launch: !wasRunning,
-          }, lease.nonce));
-          if (!isRecord(result) || result.id !== machine.id || !nonempty(result.version) || result.version === machine.version) {
+          }, nonce));
+          if (!isRecord(result) || result.id !== machine.id || !nonempty(result.version) || result.version === machine.version
+            || 'instance_id' in result && !nonempty(result.instance_id)) {
             throw new Error('Fly returned an invalid machine update');
           }
-          updated = { id: machine.id, version: result.version, wasRunning };
+          updated = {
+            id: machine.id, version: result.version, wasRunning,
+            ...(nonempty(result.instance_id) ? { instanceId: result.instance_id } : {}),
+          };
         } catch (error) {
           updateFailed = true;
           throw error;
         } finally {
-          try { await machinesRequest('DELETE', `${path}/lease`, undefined, lease.nonce); }
+          try { await machinesRequest('DELETE', `${path}/lease`, undefined, nonce); }
           catch (error) { if (!updateFailed) throw error; }
         }
         deployed.push(updated);

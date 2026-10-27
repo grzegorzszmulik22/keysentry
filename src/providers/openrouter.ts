@@ -15,6 +15,46 @@ class OpenRouterGuidedRotationRequiredError extends Error {
 }
 
 type Row = Record<string, unknown>;
+interface KeyRestrictions {
+  limit_reset?: 'daily' | 'weekly' | 'monthly' | null;
+  include_byok_in_limit?: boolean;
+}
+
+// Only these management fields are understood. A new field could constrain the
+// old key, so reference rotation must stop until it can reproduce that policy.
+const KNOWN_KEY_FIELDS = new Set([
+  'hash', 'label', 'name', 'disabled', 'limit', 'limit_remaining',
+  'created_at', 'updated_at', 'usage', 'usage_daily', 'usage_weekly', 'usage_monthly',
+  'byok_usage', 'byok_usage_daily', 'byok_usage_weekly', 'byok_usage_monthly',
+  'limit_reset', 'limitReset', 'include_byok_in_limit', 'includeByokInLimit',
+]);
+
+function restrictionAlias(row: Row, snake: string, camel: string): unknown {
+  if (Object.hasOwn(row, snake) && Object.hasOwn(row, camel) && row[snake] !== row[camel]) {
+    throw new OpenRouterGuidedRotationRequiredError();
+  }
+  return Object.hasOwn(row, snake) ? row[snake] : row[camel];
+}
+
+function keyRestrictions(row: Row): KeyRestrictions {
+  if (Object.keys(row).some(field => !KNOWN_KEY_FIELDS.has(field))) {
+    throw new OpenRouterGuidedRotationRequiredError();
+  }
+  const restrictions: KeyRestrictions = {};
+  const reset = restrictionAlias(row, 'limit_reset', 'limitReset');
+  if (reset !== undefined) {
+    if (reset !== null && reset !== 'daily' && reset !== 'weekly' && reset !== 'monthly') {
+      throw new OpenRouterGuidedRotationRequiredError();
+    }
+    restrictions.limit_reset = reset;
+  }
+  const byok = restrictionAlias(row, 'include_byok_in_limit', 'includeByokInLimit');
+  if (byok !== undefined) {
+    if (typeof byok !== 'boolean') throw new OpenRouterGuidedRotationRequiredError();
+    restrictions.include_byok_in_limit = byok;
+  }
+  return restrictions;
+}
 
 function record(value: unknown): Row | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Row : undefined;
@@ -72,8 +112,9 @@ async function oldKey(value: string, ctx: ProviderContext): Promise<Row | null> 
   return matches.length === 1 ? matches[0]! : null;
 }
 
-async function createKey(ctx: ProviderContext, name: string, limit: number | null | undefined): Promise<{ value: string; keyRef: string }> {
-  const body: { name: string; limit?: number | null } = { name };
+async function createKey(ctx: ProviderContext, name: string, limit: number | null | undefined,
+  restrictions: KeyRestrictions = {}): Promise<{ value: string; keyRef: string }> {
+  const body: { name: string; limit?: number | null } & KeyRestrictions = { name, ...restrictions };
   if (limit !== undefined) body.limit = limit;
   const response = await request(ctx, { method: 'POST', url: `${BASE}/keys`, headers: headers(ctx), body: JSON.stringify(body) }, PROVIDER);
   ensureOk(response, PROVIDER);
@@ -161,7 +202,7 @@ export const openrouterProvider: OpenRouterAdapter = {
         || !Number.isFinite(previous.limit) || previous.limit < 0))) {
       throw new OpenRouterGuidedRotationRequiredError();
     }
-    const created = await createKey(ctx, previous.name, previous.limit as number | null);
+    const created = await createKey(ctx, previous.name, previous.limit as number | null, keyRestrictions(previous));
     return { newValue: created.value, oldKeyRef: previousRef, newKeyRef: created.keyRef, oldRevoked: false };
   },
 

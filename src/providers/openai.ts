@@ -6,13 +6,13 @@ import { credential, ensureOk, matchHint, readJson, request, safeIdentity, verif
 const BASE = 'https://api.openai.com/v1';
 const PROVIDER = 'OpenAI';
 
-/** Automatic rotation must preserve both ownership and explicit per-key permissions. */
+/** Automatic rotation must preserve ownership, permissions and expiry. */
 export class OpenAIGuidedRotationRequiredError extends Error {
   readonly code = 'GUIDED_ROTATION_REQUIRED';
   readonly provider = 'openai';
 
   constructor() {
-    super('OpenAI key ownership or permissions cannot be preserved safely; use guided rotation.');
+    super('OpenAI key ownership, permissions or expiry cannot be preserved safely; use guided rotation.');
     this.name = 'OpenAIGuidedRotationRequiredError';
   }
 }
@@ -45,7 +45,7 @@ export const OPENAI_MODEL_PRICES: Record<string, OpenAIModelPrice> = {
 
 type Row = Record<string, unknown>;
 interface Page { data: unknown[]; has_more?: boolean; last_id?: unknown; next_page?: unknown }
-interface KeyRecord { info: ProviderKeyInfo; rawHint?: string; scopes: unknown }
+interface KeyRecord { info: ProviderKeyInfo; rawHint?: string; scopes: unknown; expiresAt: unknown }
 interface KeyRef { projectId: string; keyId: string; serviceAccountId?: string }
 
 function object(value: unknown): value is Row {
@@ -157,6 +157,7 @@ async function keyRecords(ctx: ProviderContext): Promise<KeyRecord[]> {
         },
         ...(typeof key.redacted_value === 'string' ? { rawHint: key.redacted_value } : {}),
         scopes: key.scopes,
+        expiresAt: key.expires_at,
       });
     }
   }
@@ -175,7 +176,7 @@ async function resolveKeyRef(value: string, ctx: ProviderContext): Promise<strin
 async function rotate(oldValue: string, ctx: ProviderContext): Promise<RotationResult> {
   const oldKey = await resolveKey(oldValue, ctx);
   if (!oldKey) throw new Error('OpenAI key could not be resolved to a project; create a key through the dashboard.');
-  return createReplacement(oldKey.info.keyRef, oldKey.scopes, ctx, oldValue);
+  return createReplacement(oldKey.info.keyRef, oldKey.scopes, oldKey.expiresAt, ctx, oldValue);
 }
 
 async function rotateByRef(oldKeyRef: string, ctx: ProviderContext): Promise<RotationResult> {
@@ -192,10 +193,11 @@ async function rotateByRef(oldKeyRef: string, ctx: ProviderContext): Promise<Rot
   const account = owner && object(owner.service_account) ? owner.service_account : undefined;
   if (!object(key) || key.id !== ref.keyId || owner?.type !== 'service_account'
     || account?.id !== ref.serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
-  return createReplacement(oldKeyRef, key.scopes, ctx);
+  return createReplacement(oldKeyRef, key.scopes, key.expires_at, ctx);
 }
 
-async function createReplacement(oldKeyRef: string, scopes: unknown, ctx: ProviderContext, oldValue?: string): Promise<RotationResult> {
+async function createReplacement(oldKeyRef: string, scopes: unknown, expiresAt: unknown,
+  ctx: ProviderContext, oldValue?: string): Promise<RotationResult> {
   const { projectId, serviceAccountId } = parseRef(oldKeyRef, ctx);
   if (!serviceAccountId) throw new OpenAIGuidedRotationRequiredError();
   // Missing scopes do not prove unrestricted access. Empty/default scope semantics
@@ -205,11 +207,24 @@ async function createReplacement(oldKeyRef: string, scopes: unknown, ctx: Provid
     || safeLabel(scope, '', ctx, oldValue === undefined ? [] : [oldValue]) !== scope)) {
     throw new OpenAIGuidedRotationRequiredError();
   }
+  let expiresInSeconds: number | undefined;
+  if (expiresAt !== undefined && expiresAt !== null) {
+    // The create endpoint accepts a relative TTL, not the old absolute expiry.
+    // Round the remaining lifetime down; never grant a fresh full lifetime.
+    if (typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
+      throw new OpenAIGuidedRotationRequiredError();
+    }
+    expiresInSeconds = expiresAt - Math.ceil(Date.now() / 1000);
+    if (!Number.isSafeInteger(expiresInSeconds) || expiresInSeconds <= 0) {
+      throw new OpenAIGuidedRotationRequiredError();
+    }
+  }
   const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
   const response = await request(ctx, {
     method: 'POST', url: `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys`,
     headers: { ...headers(ctx), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}`, scopes }),
+    body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}`, scopes,
+      ...(expiresInSeconds === undefined ? {} : { expires_in_seconds: expiresInSeconds }) }),
   }, PROVIDER);
   // A rejected scoped request must never be retried with broader default permissions.
   if ([400, 404, 405, 422, 501].includes(response.status)) throw new OpenAIGuidedRotationRequiredError();
