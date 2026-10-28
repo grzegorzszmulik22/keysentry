@@ -192,6 +192,8 @@ export function createRailwayHost(options: RailwayHostOptions): HostAdapter {
   return {
     id: 'railway',
     capabilities: { readValues: true, batchWrite: true, redeploy: true },
+    // Shared variables activate through the services that reference them (the engine follows those references).
+    activationFor: service => service.serviceId === '' ? 'manual' : 'redeploy',
     async listServices() {
       const services: ServiceRef[] = [];
       for (const project of await listProjects()) {

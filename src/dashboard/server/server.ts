@@ -6,13 +6,15 @@ import type { DashboardApi } from './api.js';
 import { createPasskeyGate, PasskeyGateError, REGISTER_IN_TERMINAL } from './passkey-gate.js';
 import type { PasskeyStore } from './passkey-gate.js';
 import { createSession, sameToken } from './session.js';
-import { checkRequest, CSP, DashboardError, json, readJson, securityHeaders } from './security.js';
+import { checkRequest, CSP, DashboardError, json, operationalError, readJson, securityHeaders } from './security.js';
+import { startTeamDashboard, type TeamDashboardOptions } from './team-server.js';
 
 export interface DashboardOptions {
   api: DashboardApi;
   readOnly: boolean;
-  /** Share the encrypted passkey store used by terminal registration. */
+  /** Share the encrypted passkey store used by terminal registration. Unused in team mode. */
   passkeys?: PasskeyStore;
+  /** Local mode: shut down after this much inactivity. Team mode: sign a member out after this much inactivity. */
   idleMs?: number;
   open?: (url: string) => void;
   /** Called once after the one-time sign-in token was exchanged, so the launcher can delete its local file. */
@@ -20,6 +22,11 @@ export interface DashboardOptions {
   now?: () => number;
   /** Receives only fixed, value-free operational error classes. */
   onError?: (errorClass: string) => void;
+  /**
+   * Team mode: OIDC single sign-on behind the team's TLS-terminating proxy, roster roles, and each member's own
+   * passkeys. The one-time link is disabled. Omit for the local dashboard, which behaves exactly as before.
+   */
+  team?: TeamDashboardOptions;
 }
 
 const START_PAGE = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>keysentry</title><body><p>Open keysentry from your terminal with keysentry ui.</p></body></html>';
@@ -29,22 +36,8 @@ const unavailablePasskeys: PasskeyStore = {
   update: async () => { throw new DashboardError(409, 'Connect passkey storage before using a passkey.'); },
 };
 
-function operationalError(error: unknown): { status: 500 | 503; errorClass: string } {
-  const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
-  // Older state-store writers use this fixed diagnostic rather than a code.
-  if (code === 'STATE_BUSY' || (error instanceof Error && error.message === "keysentry's saved state is busy. Try again when the other operation finishes.")) {
-    return { status: 503, errorClass: 'STATE_BUSY' };
-  }
-  if (code === 'VAULT_UNAVAILABLE') return { status: 503, errorClass: 'VAULT_UNAVAILABLE' };
-  if (error instanceof Error && error.message === 'The vault is busy in another keysentry process. Try again after it finishes.') {
-    return { status: 503, errorClass: 'VAULT_BUSY' };
-  }
-  // Never forward arbitrary names, codes, messages or stacks from handlers/storage.
-  const known = ['STATE_LOCKED', 'STATE_CORRUPT', 'VAULT_LOCKED', 'VAULT_READ_ONLY'] as const;
-  return { status: 500, errorClass: known.find(value => value === code) ?? 'ERROR' };
-}
-
 export async function startDashboard(opts: DashboardOptions): Promise<{ url: string; port: number; close(): Promise<void> }> {
+  if (opts.team !== undefined) return startTeamDashboard(opts, opts.team);
   validateApi(opts.api);
   const idleMs = opts.idleMs ?? 15 * 60_000;
   if (!Number.isFinite(idleMs) || idleMs <= 0 || idleMs > 2_147_483_647) throw new Error('Choose a positive dashboard idle time.');

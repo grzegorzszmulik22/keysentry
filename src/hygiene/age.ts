@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { z } from 'zod';
 import { createRedactor } from '../core/redact.js';
+import { PROVIDER_IDS } from '../core/provider-ids.js';
 import type { StateStore } from '../core/store.js';
 import { usageKey, type MonitorState } from '../monitor/state.js';
 import type { Inventory, JournalEntry, KeyHygiene, ProviderId, ProviderKeyInfo } from '../types.js';
@@ -13,9 +14,7 @@ const safeId = z.string().min(1).max(4096).refine(value => redactor.redact(value
   && !['__proto__', 'constructor', 'prototype'].includes(value));
 const date = z.string().datetime();
 const amount = z.number().finite().nonnegative();
-const providerId = z.enum(['openai', 'anthropic', 'openrouter', 'stripe', 'resend', 'cloudflare', 'github',
-  'aws', 'supabase', 'database', 'slack', 'sendgrid', 'twilio', 'google', 'private-key', 'crypto-wallet',
-  'app-secret', 'encryption-key', 'unknown']);
+const providerId = z.enum(PROVIDER_IDS);
 
 export interface HygieneState {
   version: 1;

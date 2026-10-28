@@ -3,6 +3,9 @@ import { RotationAbortedError } from '../types.js';
 import { crash, isCrash, unresolvedOrphans } from './recovery.js';
 import { undoRotation } from './undo.js';
 import { StopRequestedError, withStopChecks } from './stop.js';
+import { activationMode, needsManualActivation } from '../hosts/activation.js';
+import { hasPublicKeyIds, isPublicKeyId } from './public-refs.js';
+import { secretCredentialValues } from '../providers/credential-kinds.js';
 import type {
   ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
@@ -90,6 +93,29 @@ interface StepWork {
   unusedCleanupSucceeded?: boolean;
 }
 
+const TWILIO_KEY_SID = /^SK[0-9a-fA-F]{32}$/;
+
+/**
+ * The Twilio API key SID paired with a secret held under `holders` in one service, and every variable holding it.
+ * Same naming rules as src/providers/twilio.ts (X_API_SECRET → X_API_KEY, X_API_KEY_SECRET → X_API_KEY_SID, ...), else
+ * the only distinct SK… value in the service.
+ */
+function twilioKeySid(holders: string[], siblings: Record<string, string>): { sid: string | null; names: string[] } {
+  const candidates: string[] = [];
+  for (const holder of holders) {
+    let match: RegExpExecArray | null;
+    if ((match = /^(.*)API_KEY_SECRET$/.exec(holder))) candidates.push(`${match[1]}API_KEY_SID`, `${match[1]}API_KEY`);
+    else if ((match = /^(.*)API_SECRET$/.exec(holder))) candidates.push(`${match[1]}API_KEY`, `${match[1]}API_KEY_SID`, `${match[1]}API_SID`);
+    else if ((match = /^(.*)SECRET$/.exec(holder))) candidates.push(`${match[1]}SID`, `${match[1]}KEY_SID`);
+  }
+  let sid = candidates.map(name => siblings[name]).find((value): value is string => typeof value === 'string' && TWILIO_KEY_SID.test(value)) ?? null;
+  if (sid === null) {
+    const values = new Set(Object.values(siblings).filter(value => typeof value === 'string' && TWILIO_KEY_SID.test(value)));
+    sid = values.size === 1 ? [...values][0]! : null;
+  }
+  return { sid, names: sid === null ? [] : Object.keys(siblings).filter(name => siblings[name] === sid).sort() };
+}
+
 class JournalFailure extends Error {
   constructor() { super('Unable to record rotation journal; execution stopped.'); }
 }
@@ -162,7 +188,7 @@ export async function runRotation(
     debug: (msg, data) => logger.debug(clean(msg), data === undefined ? undefined : sanitize(data)),
   });
   const log = safeLogger(deps.log);
-  for (const value of Object.values(deps.providerCtx.credentials)) if (value !== undefined) register(value);
+  for (const value of secretCredentialValues(deps.providerCtx.credentials)) register(value);
   for (const [name, value] of Object.entries(deps.providerCtx.siblingVars ?? {})) if (classify(name, value).isSecret) register(value);
   const report: RotationReport = {
     planId: plan.id, dryRun, startedAt: now().toISOString(), finishedAt: '',
@@ -193,8 +219,8 @@ export async function runRotation(
   const orphanClusters = new Set(pendingOrphans.map(suspect => suspect.clusterId));
   const cleanedOrphanClusters = new Set(history.filter(entry => entry.event === 'orphan-suspected'
     && entry.clusterId && !orphanClusters.has(entry.clusterId)).map(entry => entry.clusterId));
-  for (const suspect of pendingOrphans) if (suspect.provider === 'aws' && suspect.keyRef
-    && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(suspect.keyRef)) publicKeyRefs.add(suspect.keyRef);
+  for (const suspect of pendingOrphans) if (suspect.keyRef
+    && isPublicKeyId(suspect.keyRef, suspect.provider)) publicKeyRefs.add(suspect.keyRef);
   if (pendingOrphans.length > 0) report.orphanSuspects = pendingOrphans
     .filter((suspect): suspect is typeof suspect & { keyRef: string } => suspect.keyRef !== null);
   const services = new Map<string, ServiceWork>();
@@ -283,6 +309,27 @@ export async function runRotation(
     return Object.fromEntries(Object.entries(values).filter(([name]) =>
       !/_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)$/.test(name)
       || name === secretName || name === `${prefix}_ACCESS_KEY_ID` || name === `${prefix}_SESSION_TOKEN`));
+  }
+  /**
+   * Like the AWS pair check: every writable consumer of a Twilio API key secret must hold the same key SID under the
+   * same variable names, so the replacement SID the adapter returns (as companions) fits every consumer. Auth Tokens
+   * have no SID and stay with the adapter, which rotates them only as guided.
+   */
+  function twilioPairsConsistent(work: StepWork): boolean {
+    const writable = work.step.consumers.filter(consumer => !consumer.reference);
+    const holders = [...new Set(writable.map(consumer => consumer.varName))];
+    if (holders.some(name => /AUTH_TOKEN$/.test(name))) return true;
+    if (!holders.some(name => /SECRET$/.test(name)) && work.oldValue !== undefined && /^[0-9a-f]{32}$/.test(work.oldValue)) return true;
+    const pairs = [...new Set(writable.map(consumer => serviceKey(consumer.service)))].map(key => twilioKeySid(
+      writable.filter(consumer => serviceKey(consumer.service) === key).map(consumer => consumer.varName),
+      siblingValues(services.get(key)!)));
+    // Without any SID the adapter cannot pair the secret and falls back to guided rotation before any change.
+    if (pairs.every(pair => pair.sid === null)) return true;
+    const expected = new Set([work.result?.oldKeyRef, ...Object.values(work.result?.companions ?? {}), ...Object.values(work.oldCompanions ?? {})]
+      .filter((value): value is string => typeof value === 'string'));
+    const first = pairs[0]!;
+    return pairs.every(pair => pair.sid !== null && pair.names.join('\0') === first.names.join('\0')
+      && (work.recovered ? expected.has(pair.sid) : pair.sid === first.sid));
   }
   async function storeOld(work: StepWork): Promise<void> {
     if (!deps.inflight || work.oldValue === undefined) return;
@@ -379,9 +426,7 @@ export async function runRotation(
       const references = referenceServiceKeys(work, key);
       return references.length === 0 || references.some(ref => cannotConfirmActivation(work, ref));
     }
-    return !redeploy || !service.host?.capabilities.redeploy
-      || ['dotenv', 'github-actions', 'fly'].includes(service.service.host)
-      || (service.service.host === 'vercel' && service.service.environmentId !== 'production');
+    return !service.host || needsManualActivation(service.service, service.host, redeploy);
   }
   async function referenceIsCurrent(work: StepWork, consumer: Consumer, visited = new Set<string>()): Promise<boolean> {
     const key = serviceKey(consumer.service);
@@ -473,6 +518,32 @@ export async function runRotation(
       revealed: work.revealed === true, valueLost: work.revealed !== true, error: message,
     } }); } catch (error) { if (isCrash(error)) throw error; if (!bestEffort) throw error; }
   }
+  /**
+   * Companion values (an AWS access key id, a Twilio key SID, other forms of an Upstash credential) belong to the
+   * credential the provider rotated in the context service. Another consumer service receives a companion only when it
+   * already defines that variable with the same old value (or already holds the new one); keysentry never adds
+   * variables there or overwrites a value that belongs to a different credential.
+   */
+  function companionsFor(work: StepWork, key: string): Record<string, string> {
+    const result: Record<string, string> = Object.create(null);
+    const companions = work.result?.companions ?? {};
+    if (Object.keys(companions).length === 0) return result;
+    const context = work.contextService ? services.get(work.contextService) : undefined;
+    const contextValues = context ? siblingValues(context) : {};
+    const service = services.get(key);
+    for (const [name, value] of Object.entries(companions)) {
+      if (key === work.contextService) { result[name] = value; continue; }
+      const current = service?.variables.filter(variable => variable.name === name) ?? [];
+      const readable = current.length === 1 && !current[0]!.sealed ? current[0]!.value : undefined;
+      const old = work.oldCompanions?.[name] ?? contextValues[name];
+      if (readable !== undefined && (readable === old || readable === value)) { result[name] = value; continue; }
+      if (current.length > 0 && readable === undefined) {
+        const message = `Companion ${name} at ${key} is write-only and was not changed; update it by hand if it belongs to the rotated credential.`;
+        if (!work.report.warnings.includes(clean(message))) warn(work, message);
+      }
+    }
+    return result;
+  }
   // Deliver earlier rolls before a late human prompt or after execution stops.
   // Emergency recovery is deliberately independent of failing injected facilities.
   async function preserveRolledValues(reason: 'execution-failure' | 'guided-fallback'): Promise<void> {
@@ -487,7 +558,7 @@ export async function runRotation(
       for (const work of rolled) {
         const additions: Record<string, string> = Object.create(null);
         const direct = work.step.consumers.filter(c => !c.reference && serviceKey(c.service) === key);
-        if (direct.length > 0) Object.assign(additions, work.result!.companions);
+        if (direct.length > 0) Object.assign(additions, companionsFor(work, key));
         for (const c of direct) additions[c.varName] = work.result!.newValue;
         expected.set(work, additions);
         for (const [name, value] of Object.entries(additions)) if (!referenceLocations.has(`${key}\0${name}`)) payload[name] = value;
@@ -659,6 +730,10 @@ export async function runRotation(
           continue;
         }
       }
+      if (work.step.provider === 'twilio' && !twilioPairsConsistent(work)) {
+        await fail(work, 'Twilio API key SIDs are missing or held under different variable names across consumers; rotate complete matching pairs.');
+        continue;
+      }
       work.contextService ??= serviceKey(work.step.consumers[0]!.service);
       work.ctx = {
         ...deps.providerCtx,
@@ -719,7 +794,10 @@ export async function runRotation(
     if (dryRun) {
       for (const [key, service] of services) {
         if (!works.some(work => work.ready && work.services.has(key))) continue;
-        if (redeploy && service.host?.capabilities.redeploy && !isRailwayShared(service.service)) report.diff.push(`Redeploy ${key}`);
+        const mode = service.host ? activationMode(service.service, service.host) : 'manual';
+        if (mode === 'on-write') report.diff.push(`Writing deploys ${key}; keysentry confirms that deployment`);
+        else if (mode === 'immediate') report.diff.push(`Live once written ${key}; no deployment needed`);
+        else if (redeploy && service.host?.capabilities.redeploy && !isRailwayShared(service.service)) report.diff.push(`Redeploy ${key}`);
         report.deployments.push({ serviceKey: key, deploymentId: null, state: 'skipped' });
       }
     } else {
@@ -881,7 +959,11 @@ export async function runRotation(
             const idName = work.step.consumers.find(c => !c.reference)!.varName.replace(/_SECRET_ACCESS_KEY$/, '_ACCESS_KEY_ID');
             const oldId = ctx.siblingVars?.[idName];
             const newId = result.companions?.[idName];
-            for (const id of [oldId, newId]) if (id && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(id) && !sensitiveValues.has(id)) publicKeyRefs.add(id);
+            for (const id of [oldId, newId]) if (id && isPublicKeyId(id, 'aws') && !sensitiveValues.has(id)) publicKeyRefs.add(id);
+          }
+          // Twilio key references are the public SK… SIDs; finish and grace revocation read them back from the journal.
+          if (work.step.provider === 'twilio') for (const id of [result.oldKeyRef, result.newKeyRef]) {
+            if (id && isPublicKeyId(id, 'twilio') && !sensitiveValues.has(id)) publicKeyRefs.add(id);
           }
           work.report.newFingerprint = fingerprint(result.newValue, deps.fingerprintKey);
           work.report.oldKeyRef = result.oldKeyRef;
@@ -961,8 +1043,8 @@ export async function runRotation(
             // key. Record its references and clean it up instead of losing it.
             register(work.result.newValue);
             for (const [name, value] of Object.entries(work.result.companions ?? {})) register(value, classify(name, value).isSecret);
-            if (work.step.provider === 'aws') for (const keyRef of [work.result.oldKeyRef, work.result.newKeyRef]) {
-              if (keyRef && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(keyRef) && !sensitiveValues.has(keyRef)) publicKeyRefs.add(keyRef);
+            if (hasPublicKeyIds(work.step.provider)) for (const keyRef of [work.result.oldKeyRef, work.result.newKeyRef]) {
+              if (keyRef && isPublicKeyId(keyRef, work.step.provider) && !sensitiveValues.has(keyRef)) publicKeyRefs.add(keyRef);
             }
             work.report.newFingerprint = fingerprint(work.result.newValue, deps.fingerprintKey);
             work.report.oldKeyRef = work.result.oldKeyRef;
@@ -1050,7 +1132,7 @@ export async function runRotation(
       function additionsFor(work: StepWork, key: string): Record<string, string> {
         const additions: Record<string, string> = Object.create(null);
         const direct = work.step.consumers.filter(c => !c.reference && serviceKey(c.service) === key);
-        if (direct.length > 0) Object.assign(additions, work.result!.companions);
+        if (direct.length > 0) Object.assign(additions, companionsFor(work, key));
         for (const c of direct) additions[c.varName] = work.result!.newValue;
         return additions;
       }
@@ -1201,8 +1283,16 @@ export async function runRotation(
         let deploymentId: string | null = null;
         let state: ServiceWork['activation'] = 'failed';
         let timedOut = false;
+        const mode = activationMode(service.service, service.host!);
+        if (service.written && mode === 'on-write' && !redeploy) for (const work of service.steps) {
+          warn(work, `${service.service.host}/${service.service.serviceName} (${key}) deploys on every write, so the new values went live without a separate redeploy.`);
+        }
         if (!service.written) state = 'skipped';
-        else if (!redeploy || !service.host!.capabilities.redeploy) state = 'unconfirmed';
+        // The write itself made the values live (Supabase Edge Function secrets): there is no deployment to wait for.
+        else if (mode === 'immediate') state = 'success';
+        // An on-write host already deployed with the write; its redeploy() only reports that deployment, so it is
+        // confirmed even when redeploys are turned off.
+        else if (mode !== 'on-write' && (!redeploy || !service.host!.capabilities.redeploy)) state = 'unconfirmed';
         else try {
           const previous = history.filter(entry => entry.serviceKey === key && entry.event === 'redeploy' && entry.data?.undo !== true).at(-1);
           if (!service.rewritten && previous && typeof previous.data?.deploymentId === 'string') deploymentId = previous.data.deploymentId;

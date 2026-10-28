@@ -1,13 +1,24 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '../../security/index.js';
+import type { TeamRole } from '../../types.js';
 import { DashboardError } from './security.js';
+
+/**
+ * Handler context. The local dashboard passes only `session`. Team mode adds the signed-in roster member and, for
+ * mutating routes, the id of the member's own passkey that confirmed this exact request.
+ */
+export interface DashboardRequestContext {
+  session: string;
+  member?: { id: string; role: TeamRole };
+  passkey?: string;
+}
 
 export interface DashboardApi {
   [route: string]: {
     method: 'GET' | 'POST';
     /** True for changes and explicit secret reveals. Disarm may be declared false. */
     mutating: boolean;
-    handler(body: unknown, ctx: { session: string }): Promise<unknown>;
+    handler(body: unknown, ctx: DashboardRequestContext): Promise<unknown>;
   };
 }
 

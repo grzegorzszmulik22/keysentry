@@ -541,6 +541,15 @@ describe('breach feeds', () => {
       ['fly', 'https://fly.io/blog/feed.xml'],
       ['fly', 'https://status.flyio.net/history.rss'],
       ['github-actions', 'https://github.blog/changelog/feed/'],
+      // Phase 6 platform feeds (verified 28 October 2026).
+      ['netlify', 'https://www.netlifystatus.com/history.rss'],
+      ['heroku', 'https://status.heroku.com/feed'],
+      ['digitalocean', 'https://status.digitalocean.com/history.rss'],
+      ['cloudflare-workers', 'https://www.cloudflarestatus.com/history.atom'],
+      ['cloudflare-workers', 'https://blog.cloudflare.com/rss/'],
+      ['supabase-functions', 'https://status.supabase.com/history.rss'],
+      ['supabase-functions', 'https://supabase.com/rss.xml'],
+      ['zeabur', 'https://status.zeabur.com/feed.rss'],
     ];
     let baseline = true;
     const http = new FakeHttp().on('GET', /^https:\/\//, req => text(200, baseline ? rssFeed()

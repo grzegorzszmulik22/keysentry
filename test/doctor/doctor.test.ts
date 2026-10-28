@@ -227,7 +227,10 @@ describe('doctor', () => {
 
   test('capability guidance covers verified platforms with a source for every token', () => {
     expect(Object.keys(TOKEN_CAPABILITIES).sort()).toEqual([
-      'anthropic', 'aws', 'cloudflare', 'fly', 'github-actions', 'openai', 'openrouter', 'railway', 'render', 'resend', 'vercel',
+      'anthropic', 'aws', 'aws-secrets-manager', 'clerk', 'cloudflare', 'cloudflare-workers', 'coolify', 'digitalocean', 'doppler',
+      'fly', 'github-actions', 'google', 'groq', 'heroku', 'infisical', 'kubernetes', 'mistral', 'neon', 'netlify', 'openai',
+      'openrouter', 'postmark', 'railway', 'render', 'replicate', 'resend', 'sendgrid', 'supabase-functions', 'twilio', 'upstash',
+      'vault-kv', 'vercel', 'zeabur',
     ]);
     for (const capability of Object.values(TOKEN_CAPABILITIES)) {
       expect(capability.source).toMatch(/^https:\/\//);

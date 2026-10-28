@@ -20,7 +20,9 @@ describe('createRedactor', () => {
     `ghp_${random}`, `gho_${random}`, `ghs_${random}`, `ghu_${random}`, `github_pat_${random}`, `sb_secret_${random}`,
     'xoxb-1234567890-1234567890-fakeABC1234567890', 'xoxp-1234567890-1234567890-fakeABC1234567890',
     'https://hooks.slack.com/services/T00000000/B00000000/fakeABC123fakeABC123fakeAB',
-    `SG.${random.slice(0, 22)}.${random}${random}`, `SK${hex.slice(0, 32)}`, `AIza${random}abc`,
+    `SG.${random.slice(0, 22)}.${random}${random}`, `AIza${random}abc`,
+    // Phase 6 value shapes (Groq, Replicate, Neon).
+    `gsk_${random}`, `r8_${random}`, `napi_${random}${random}`,
     'postgres://user:fake-password@localhost/db', 'mongodb://user:fake-password@db1,db2/db',
     'postgresql://localhost/db?user=app&password=fake-database-password',
     'postgresql://app:fake-database-password@${{Postgres.HOST}}/db',
@@ -36,7 +38,8 @@ describe('createRedactor', () => {
   });
 
   it('preserves public and ordinary values', () => {
-    const text = `pk_live_${random} AKIA0123456789ABCDEF https://example.test 123 true`;
+    // Twilio SK… key SIDs are public identifiers (like AKIA ids), so they stay readable in key references.
+    const text = `pk_live_${random} AKIA0123456789ABCDEF SK${hex.slice(0, 32)} https://example.test 123 true`;
     expect(createRedactor().redact(text)).toBe(text);
   });
 

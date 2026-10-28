@@ -29,7 +29,10 @@ const HOST_MENTIONS: Record<HostId, RegExp[]> = {
   infisical: [/(?<![\w-])infisical\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Infisical(?![\w-]|\.[\w-])/],
 };
 
-export const PLATFORM_HOSTS: readonly HostId[] = ['railway', 'vercel', 'render', 'fly', 'github-actions'];
+// Hosts whose names news coverage can mention. Phase 6 adds every host with a mention pattern above; self-hosted
+// servers (Coolify, Kubernetes, Vault) and AWS Secrets Manager have none by design.
+export const PLATFORM_HOSTS: readonly HostId[] = ['railway', 'vercel', 'render', 'fly', 'github-actions',
+  'netlify', 'cloudflare-workers', 'supabase-functions', 'heroku', 'digitalocean', 'zeabur', 'doppler', 'infisical'];
 
 export function mentionsHost(host: HostId, text: string): boolean {
   return HOST_MENTIONS[host].some(pattern => pattern.test(text));
@@ -61,6 +64,31 @@ export const DEFAULT_SOURCES: readonly FeedSource[] = [
   { id: 'github-changelog', kind: 'official', url: 'https://github.blog/changelog/feed/', hosts: ['github-actions'], outlet: 'GitHub changelog', owner: 'GitHub', maxBytes: 4 * MiB },
   { id: 'github-security', kind: 'official', url: 'https://github.blog/security/feed/', hosts: ['github-actions'], outlet: 'GitHub security blog', owner: 'GitHub', maxBytes: 4 * MiB },
   { id: 'github-status', kind: 'official', url: 'https://www.githubstatus.com/history.rss', hosts: ['github-actions'], outlet: 'GitHub status', owner: 'GitHub', maxBytes: 4 * MiB },
+  // Phase 6 official sources; each URL was fetched on 2026-10-28 (notes/hosts-a.md, notes/hosts-b.md).
+  // Netlify: the Statuspage linked from netlify.com (channel "Netlify Status"); blog and changelog feeds advertised by
+  // <link rel=alternate> on netlify.com/blog.
+  { id: 'netlify-status', kind: 'official', url: 'https://www.netlifystatus.com/history.rss', hosts: ['netlify'], outlet: 'Netlify status', owner: 'Netlify', maxBytes: 4 * MiB },
+  { id: 'netlify-blog', kind: 'official', url: 'https://www.netlify.com/feed.xml', hosts: ['netlify'], outlet: 'Netlify blog', owner: 'Netlify', maxBytes: 4 * MiB },
+  { id: 'netlify-changelog', kind: 'official', url: 'https://www.netlify.com/changelog/feed.xml', hosts: ['netlify'], outlet: 'Netlify changelog', owner: 'Netlify', maxBytes: 4 * MiB },
+  // Heroku: status on Heroku's own domain (Atom, author Heroku; its April 2022 OAuth token notice was published there),
+  // the blog feed advertised on heroku.com/blog and the Dev Center changelog.
+  { id: 'heroku-status', kind: 'official', url: 'https://status.heroku.com/feed', hosts: ['heroku'], outlet: 'Heroku status', owner: 'Heroku (Salesforce)', maxBytes: 4 * MiB },
+  { id: 'heroku-blog', kind: 'official', url: 'https://www.heroku.com/feed/', hosts: ['heroku'], outlet: 'Heroku blog', owner: 'Heroku (Salesforce)', maxBytes: 4 * MiB },
+  { id: 'heroku-changelog', kind: 'official', url: 'https://devcenter.heroku.com/changelog/feed', hosts: ['heroku'], outlet: 'Heroku changelog', owner: 'Heroku (Salesforce)', maxBytes: 4 * MiB },
+  // DigitalOcean: its status subdomain and the blog feed advertised on digitalocean.com/blog.
+  { id: 'digitalocean-status', kind: 'official', url: 'https://status.digitalocean.com/history.rss', hosts: ['digitalocean'], outlet: 'DigitalOcean status', owner: 'DigitalOcean', maxBytes: 4 * MiB },
+  { id: 'digitalocean-blog', kind: 'official', url: 'https://www.digitalocean.com/rss/blog.atom', hosts: ['digitalocean'], outlet: 'DigitalOcean blog', owner: 'DigitalOcean', maxBytes: 4 * MiB },
+  // Cloudflare: Statuspage incident history on Cloudflare's own status domain (noisy maintenance entries are filtered by
+  // the security-title rules), and Cloudflare's blog, which publishes incident post-mortems and security disclosures.
+  { id: 'cloudflare-status', kind: 'official', url: 'https://www.cloudflarestatus.com/history.atom', hosts: ['cloudflare-workers'], outlet: 'Cloudflare status', owner: 'Cloudflare', maxBytes: 4 * MiB },
+  { id: 'cloudflare-blog', kind: 'official', url: 'https://blog.cloudflare.com/rss/', hosts: ['cloudflare-workers'], outlet: 'Cloudflare blog', owner: 'Cloudflare', maxBytes: 4 * MiB },
+  // Supabase: Statuspage incident history on its own status domain, and its own blog on supabase.com.
+  { id: 'supabase-status', kind: 'official', url: 'https://status.supabase.com/history.rss', hosts: ['supabase-functions'], outlet: 'Supabase status', owner: 'Supabase', maxBytes: 4 * MiB },
+  { id: 'supabase-blog', kind: 'official', url: 'https://supabase.com/rss.xml', hosts: ['supabase-functions'], outlet: 'Supabase blog', owner: 'Supabase', maxBytes: 4 * MiB },
+  // Zeabur: its Better Stack status page on its own domain (it carried the October 2026 unauthorized-access incident).
+  { id: 'zeabur-status', kind: 'official', url: 'https://status.zeabur.com/feed.rss', hosts: ['zeabur'], outlet: 'Zeabur status', owner: 'Zeabur', maxBytes: 4 * MiB },
+  // Coolify (self-hosted), Kubernetes, Vault and AWS Secrets Manager have no platform advisory feed; Doppler and
+  // Infisical have no verified feed yet, so only news coverage mentions them.
   // §7 BleepingComputer: recorded independent incident coverage; validators supported.
   { id: 'bleepingcomputer', kind: 'news', url: 'https://www.bleepingcomputer.com/feed/', hosts: [...PLATFORM_HOSTS], outlet: 'BleepingComputer', owner: 'BleepingComputer LLC', maxBytes: 4 * MiB },
   // §7 The Record: security reporting, published by Recorded Future.

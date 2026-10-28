@@ -1,6 +1,8 @@
 import { classify } from '../core/index.js';
 import type { CrashPoint, Inventory, JournalEntry, ProviderContext, ProviderId, RotationPlan } from '../types.js';
 import type { EngineDeps } from './engine.js';
+import { secretCredentialValues } from '../providers/credential-kinds.js';
+import { isPublicKeyId } from './public-refs.js';
 
 export interface RecoveryInput {
   plan: RotationPlan;
@@ -52,12 +54,12 @@ export async function createRecoverySafety(input: RecoveryInput, deps: EngineDep
     if (secret) sensitive.add(value);
     if (value.length > 0) { values.add(value); deps.redactor.register(value); }
   };
-  for (const value of Object.values(deps.providerCtx.credentials)) if (value !== undefined) register(value);
+  for (const value of secretCredentialValues(deps.providerCtx.credentials)) register(value);
   for (const [name, value] of Object.entries(deps.providerCtx.siblingVars ?? {})) if (classify(name, value).isSecret) register(value);
   if (deps.inflight) for (const slot of await deps.inflight.slots(input.plan.id)) {
     const value = await deps.inflight.get(input.plan.id, slot);
     if (value !== null) {
-      const publicId = (slot.startsWith('companion:') || slot.startsWith('old-companion:')) && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(value);
+      const publicId = (slot.startsWith('companion:') || slot.startsWith('old-companion:')) && isPublicKeyId(value);
       register(value, !publicId);
       if (publicId) publicRefs.add(value);
     }

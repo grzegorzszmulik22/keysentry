@@ -27,7 +27,11 @@ import { approvedOutcome } from '../approvals/index.js';
 import { listPasskeys } from './passkeys.js';
 import { bootstrapWatcher } from './watcher-bootstrap.js';
 import { registerBoxCommands, type BoxCommandsOptions } from './box.js';
-import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
+import { registerKmsCommands } from './kms.js';
+import { registerAuditExportCommands } from './audit-export.js';
+import { ruleAuthority } from '../net/index.js';
+import { VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
+import { acceptedCredentialName } from './credential-names.js';
 import { trustedWatcherKeys } from './watcher-keys.js';
 
 export { createRuntime } from './runtime.js';
@@ -58,7 +62,7 @@ function role(value: string): TokenRole {
   return value;
 }
 function credentialName(name: string): void {
-  if (!CREDENTIAL_NAMES.includes(name)) throw new CliError('Unknown credential name. Run keysentry vault status for supported names.');
+  if (!acceptedCredentialName(name)) throw new CliError('Unknown credential name. Run keysentry vault status for supported names.');
 }
 async function readPipedValue(io?: PromptIO): Promise<string> {
   const input = io?.input ?? process.stdin;
@@ -166,6 +170,11 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser, signal: options.signal });
   registerBoxCommands(program, { getRuntime: () => getRuntime(), human, emit, diagnostic, json: () => !!program.opts().json,
     setExit: code => { exitCode = code; }, promptIO: options.promptIO, env: options.env ?? process.env, ...options.box });
+  // Phase 5 KMS for the state key (notes/kms.md). Without an injected client the commands use the runtime's
+  // proxy-aware transport.
+  registerKmsCommands(program, { getRuntime: () => getRuntime(), human, emit, diagnostic, json: () => !!program.opts().json,
+    setExit: code => { exitCode = code; }, promptIO: options.promptIO, ...(options.http ? { transport: options.http } : {}),
+    ...(options.now ? { now: options.now } : {}) });
   program.commands.find(command => command.name() === 'autopilot')!.command('resume')
     .description('Publish a signed recovery message for a paused Actions watcher')
     .option('--relay', 'Send recovery through the configured watcher relay')
@@ -182,7 +191,11 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     env: options.env ?? runtime?.mutationContext.env ?? process.env, promptIO: options.promptIO,
     firstRunGit: options.firstRunGit, guardGit: options.guardGit,
     confirmFirstRunSave: options.confirmFirstRunSave, confirmDashboard: options.confirmDashboard,
-    openBrowser: options.openBrowser });
+    openBrowser: options.openBrowser,
+    // ORCHESTRATOR HOOK (OIDC team members, notes/oidc.md wiring 1): pass teamMembers here once the governance roster
+    // wiring lands (loadTeam + vaultTeamAnchor). Until then `ui --team` refuses with "team roster" guidance. Team approvals
+    // (notes/oidc.md wiring 4) also wait for the governance quorum entry point.
+  });
 
   program.command('init').description('Create private local state and sample config without overwriting files').action(async () => {
     const rt = await getRuntime(); const result = await rt.init();
@@ -387,10 +400,10 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       const groups = new Map<string, string[]>();
       for (const rule of result.rules) {
         const group = groups.get(rule.purpose) ?? [];
-        const host = `${rule.host}${rule.owner === 'user' ? ' (added by you)' : ''}`;
+        const host = `${ruleAuthority(rule)}${rule.owner === 'user' ? ' (added by you)' : ''}`;
         if (!group.includes(host)) group.push(host); groups.set(rule.purpose, group);
       }
-      emit(result, ['Allowed hosts', ...[...groups].map(([purpose, hosts]) => `${purpose}:\n  ${hosts.join('\n  ')}`),
+      emit(result, [...result.status, 'Allowed hosts', ...[...groups].map(([purpose, hosts]) => `${purpose}:\n  ${hosts.join('\n  ')}`),
         'Network receipt: host | purpose | requests | blocked | last contact',
         ...result.receipt.map(row => `${row.host} | ${row.purpose} | ${row.count} | ${row.blocked} | ${row.lastAt}`),
         ...(result.receipt.length ? [] : ['No contacts recorded.'])].join('\n'));
@@ -403,6 +416,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       : `Audit check failed: ${result.problem ?? 'the recorded chain did not verify.'}`);
     if (!result.ok) exitCode = 1;
   });
+  // Phase 5 audit export (notes/audit-export.md): reuses the `audit` command above, so it must follow `audit verify`.
+  registerAuditExportCommands(program, { getRuntime: () => getRuntime(), emit, diagnostic, human,
+    setExit: code => { exitCode = code; }, env: options.env ?? process.env, promptIO: options.promptIO });
   program.command('verify').description('Check this installation locally and against signed release checksums')
     .option('--offline', 'Run only the local integrity check').action(async opts => {
       const result = await inspectRelease(effectiveOptions(), opts.offline === true);

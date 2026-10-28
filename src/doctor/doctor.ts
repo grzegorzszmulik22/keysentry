@@ -4,6 +4,9 @@ import type { checkLocalIntegrity } from '../release/index.js';
 import { credentialVaultName } from '../vault/credentials.js';
 import { detectAgentEnvironment, MEMORY_ONLY_ROTATION_WARNING, sandboxSupport } from '../safety/index.js';
 import { TOKEN_CAPABILITIES, type PlatformCapabilities } from './capabilities.js';
+import type { NetworkSummary } from '../net/transport.js';
+import { networkDoctorItems } from './network.js';
+import { HOST_CREDENTIALS as SHARED_HOST_CREDENTIALS } from '../hosts/credentials.js';
 
 export interface DoctorItem {
   area: string;
@@ -23,6 +26,8 @@ export interface DoctorInput {
   previous?: Record<string, string>;
   integrity: Awaited<ReturnType<typeof checkLocalIntegrity>>;
   sandboxed: boolean;
+  /** Phase 5: proxy, extra certificate authorities and offline mode (summarizeNetwork). */
+  network?: NetworkSummary;
 }
 
 export interface DoctorResult {
@@ -30,12 +35,11 @@ export interface DoctorResult {
   fingerprints: Record<string, string>;
 }
 
-// These names match the hosting adapter configuration and vault credential API.
-const HOST_CREDENTIALS: Record<string, readonly string[]> = {
-  railway: ['RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN'],
-  vercel: ['VERCEL_TOKEN'], render: ['RENDER_API_KEY'], fly: ['FLY_API_TOKEN'],
-  'github-actions': ['GITHUB_TOKEN'],
-};
+// These names match the hosting adapter configuration and vault credential API (src/hosts/credentials.ts). The AWS
+// Secrets Manager session token is optional, so doctor does not ask for it.
+const HOST_CREDENTIALS: Record<string, readonly string[]> = Object.fromEntries(Object.entries(SHARED_HOST_CREDENTIALS)
+  .filter(([, names]) => names.length > 0)
+  .map(([host, names]) => [host, host === 'aws-secrets-manager' ? names.filter(name => !name.endsWith('_SESSION_TOKEN')) : names]));
 
 // The public input has no configured-provider list. A provider is configured when
 // at least one of its credentials is present. AWS needs both members of its pair.
@@ -43,6 +47,18 @@ const PROVIDER_CREDENTIALS: Record<string, readonly string[]> = {
   openai: ['OPENAI_ADMIN_KEY'], anthropic: ['ANTHROPIC_ADMIN_KEY'],
   openrouter: ['OPENROUTER_PROVISIONING_KEY'], resend: ['RESEND_ADMIN_KEY'],
   cloudflare: ['CLOUDFLARE_ADMIN_TOKEN'], aws: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'],
+  // Phase 6 providers (notes/providers-a.md, notes/providers-b.md).
+  sendgrid: ['SENDGRID_ADMIN_KEY'], twilio: ['TWILIO_ADMIN_KEY_SID', 'TWILIO_ADMIN_KEY'],
+  neon: ['NEON_ADMIN_KEY'], upstash: ['UPSTASH_ADMIN_EMAIL', 'UPSTASH_ADMIN_KEY'],
+  google: ['GOOGLE_API_KEYS_ADMIN_KEY', 'GOOGLE_OAUTH_ACCESS_TOKEN'], mistral: ['MISTRAL_ADMIN_KEY'],
+};
+
+/** Credentials that only work together: a missing member is reported. Other lists are alternatives. */
+const REQUIRED_TOGETHER: Record<string, readonly string[]> = {
+  aws: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'],
+  'aws-secrets-manager': ['AWS_SECRETS_MANAGER_ACCESS_KEY_ID', 'AWS_SECRETS_MANAGER_SECRET_ACCESS_KEY'],
+  twilio: ['TWILIO_ADMIN_KEY_SID', 'TWILIO_ADMIN_KEY'],
+  upstash: ['UPSTASH_ADMIN_EMAIL', 'UPSTASH_ADMIN_KEY'],
 };
 
 type Credential = Awaited<ReturnType<CredentialSource['get']>>;
@@ -146,6 +162,7 @@ export async function runDoctor(input: DoctorInput): Promise<DoctorResult> {
       if (!credential) {
         // Host names are alternatives. AWS credentials are a required pair.
         if (platform === 'aws') items.push({ area: 'tokens', status: 'warn', title: `${capability.platform}: ${name}`, detail: 'This credential is missing from the configured AWS access-key pair.', fix: `keysentry vault set ${name}` });
+        else if (REQUIRED_TOGETHER[platform]?.includes(name)) items.push({ area: 'tokens', status: 'warn', title: `${capability.platform}: ${name}`, detail: 'This credential is missing from a pair that only works together.', fix: `keysentry vault set ${name}` });
         continue;
       }
       const environment = state.write?.source === 'env' || state.read?.source === 'env';
@@ -173,6 +190,8 @@ export async function runDoctor(input: DoctorInput): Promise<DoctorResult> {
     for (const name of names) tokens.push({ name, state: await tokenState(name) });
     if (tokens.some(({ state }) => state.write || state.read)) reportTokens(provider, tokens);
   }
+
+  if (input.network) items.push(...networkDoctorItems(input.network));
 
   const agent = detectAgentEnvironment(input.env);
   if (agent) items.push({

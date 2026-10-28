@@ -10,7 +10,10 @@ import type { PromptIO } from './prompts.js';
 import type { GitRunner } from '../firstrun/index.js';
 import { guardStaged, formatGuardStaged, installHook, uninstallHook } from '../guard/index.js';
 import { detectAgentEnvironment } from '../safety/index.js';
-import { startDashboard } from '../dashboard/server/index.js';
+import { createStatePasskeyCounters, startDashboard } from '../dashboard/server/index.js';
+import { createOidcClient, OIDC_CLIENT_SECRET_NAME, OidcError, parseTeamUiOptions, teamAuditEvent } from '../dashboard/oidc/index.js';
+import type { TeamMember } from '../types.js';
+import { credentialVaultName } from '../vault/index.js';
 import { createDashboardApi, createDashboardPasskeyStore } from './dashboard-api.js';
 import { createPhase3Runtime } from './phase3-runtime.js';
 import { runFirstRun, formatFirstRun, type FirstRunOptions } from './first-run.js';
@@ -34,6 +37,8 @@ export interface Phase3CommandsOptions {
   confirmFirstRunSave?: () => Promise<boolean>;
   confirmDashboard?: () => Promise<boolean>;
   openBrowser?: (url: string) => Promise<void>;
+  /** Team mode (`ui --team`): members of the verified signed roster. Read on every request; throwing denies. */
+  teamMembers?: (rt: KeysentryRuntime) => Promise<TeamMember[]>;
 }
 
 async function ask(question: string, opts: Phase3CommandsOptions, defaultYes = false): Promise<boolean> {
@@ -148,10 +153,64 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
       && await (opts.confirmDashboard ?? (() => ask('Open the dashboard? [Y/n]', opts, true)))()) await openDashboard();
   });
 
+  /** Team mode: serve behind the team's TLS proxy; members sign in with OIDC and confirm changes with their own passkeys. */
+  const openTeamDashboard = async (options: Record<string, unknown>) => {
+    let settings: ReturnType<typeof parseTeamUiOptions>;
+    try { settings = parseTeamUiOptions(options); } catch (error) { throw new CliError((error as Error).message); }
+    if (!opts.teamMembers) throw new CliError('Team mode needs a team roster. Run keysentry team init first.');
+    const rt = await opts.getRuntime();
+    const members = () => opts.teamMembers!(rt);
+    let http: ReturnType<typeof rt.httpForUrls>;
+    try { http = rt.httpForUrls([settings.issuer, ...settings.hosts.map(host => `https://${host}/`)], 'single sign-on for the team dashboard'); }
+    catch { throw new CliError('Use identity provider hosts on https with the default port.'); }
+    let clientSecret: (() => Promise<string | null>) | undefined;
+    if (!settings.publicClient) {
+      // Vault only: never a flag, keysentry.yaml or (unlike provider tokens) an environment fallback.
+      const read = async () => {
+        for (const role of ['read', 'write'] as const) {
+          const bytes = await rt.vault.get(credentialVaultName(OIDC_CLIENT_SECRET_NAME, role));
+          if (!bytes) continue;
+          try { const value = bytes.toString('utf8'); rt.redactor.register(value); return value; } finally { bytes.fill(0); }
+        }
+        return null;
+      };
+      if (await read() === null) throw new CliError(`Store the client secret with keysentry vault set ${OIDC_CLIENT_SECRET_NAME}, or use --oidc-public-client.`);
+      clientSecret = read;
+    }
+    const oidc = createOidcClient({ issuer: settings.issuer, clientId: settings.clientId, redirectUri: `${settings.publicOrigin}/auth/callback`, http, clientSecret, allowedHosts: settings.hosts });
+    try { await oidc.metadata(); } catch (error) { throw new CliError(error instanceof OidcError ? error.message : 'The identity provider could not be reached.'); }
+    if (!(await members()).some(member => typeof member.email === 'string')) opts.diagnostic('No roster member has an email address yet, so nobody can sign in. Add emails with keysentry team.');
+    const dashboard = await startDashboard({ api: createDashboardApi(rt),
+      readOnly: options.readOnly === true || detectAgentEnvironment(opts.env) !== null,
+      onError: (name: string) => { opts.diagnostic(`Dashboard request failed: ${/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name) ? name : 'Error'}`); },
+      team: { publicOrigin: settings.publicOrigin, listen: settings.listen, oidc, members, passkeyCounters: createStatePasskeyCounters(rt.store),
+        onAuthEvent: async event => { await rt.audit.append(teamAuditEvent(event)).catch(() => opts.diagnostic('A dashboard sign-in event could not be added to the audit log.')); } },
+    });
+    opts.emit({ url: dashboard.url, listen: `${settings.listen.host}:${dashboard.port}` },
+      `Team dashboard: ${dashboard.url}\nListening on ${settings.listen.host}:${dashboard.port}. Serve it through your TLS proxy and keep the Host header unchanged.`);
+  };
+
+  const collect = (value: string, previous: string[]) => [...previous, value];
   program.command('ui').description('Open the local dashboard; changes require a passkey')
     .option('--read-only', 'Browse with no key changes')
     .option('--print-url', 'Print the one-time URL at an interactive human terminal')
-    .action(async options => { await openDashboard(options.readOnly === true, options.printUrl === true); });
+    .option('--team', 'Serve the team dashboard with single sign-on behind your TLS proxy')
+    .option('--public-origin <url>', 'Team mode: the https address members open')
+    .option('--oidc-issuer <url>', 'Team mode: your identity provider issuer URL')
+    .option('--oidc-client-id <id>', 'Team mode: the client id registered for keysentry')
+    .option('--oidc-public-client', `Team mode: sign in with PKCE and no client secret (otherwise the secret is read from ${OIDC_CLIENT_SECRET_NAME} in the vault)`)
+    .option('--oidc-host <host>', 'Team mode: another host your provider uses for token or key endpoints (repeatable)', collect, [])
+    .option('--listen <host:port>', 'Team mode: interface and port behind your TLS proxy (default 127.0.0.1:8484)')
+    .action(async options => {
+      if (options.team !== true) {
+        if (['publicOrigin', 'oidcIssuer', 'oidcClientId', 'oidcPublicClient', 'listen'].some(name => options[name] !== undefined) || options.oidcHost.length) {
+          throw new CliError('Use the team dashboard options together with --team.');
+        }
+        await openDashboard(options.readOnly === true, options.printUrl === true); return;
+      }
+      if (options.printUrl) throw new CliError('The team dashboard has no one-time link; members sign in at the public origin.');
+      await openTeamDashboard(options);
+    });
 
   const guard = program.command('guard').description('Check the working tree for keys; --history includes git history')
     .option('--staged', 'Check only the staged diff and stop commits containing keys')

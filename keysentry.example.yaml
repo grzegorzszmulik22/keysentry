@@ -26,12 +26,34 @@ hosts:
     # Sandbox grants these roots read access only. Dotenv updates need explicit
     # KEYSENTRY_NO_SANDBOX=1 when outside .keysentry/ and the user data directory.
     includeTemplates: false
+  # More platforms and secret stores are opt-in (README: "More deploy platforms and secret stores").
+  # netlify: { accountSlug: acme, contexts: [production, deploy-preview, branch-deploy], shared: true }
+  # heroku: { team: acme }                       # or apps: [api-prod, worker-prod]
+  # digitalocean: { apps: [4f6c71e2-1e90-4762-9fee-6cc4a0a9f2cf] }
+  # cloudflare: { accountId: 0123456789abcdef0123456789abcdef, products: [workers, pages] }
+  # supabase: { projectRefs: [abcdefghijklmnopqrst] }
+  # coolify: { baseUrl: "https://coolify.example.com:8000", redeploy: restart }
+  # zeabur: { ownerId: team-id }
+  # kubernetes: { server: "https://k8s.example.com:6443", namespaces: [apps], restartDeployments: { "apps/api-secrets": [api] } }
+  # awsSecretsManager: { region: eu-west-1, namePrefixes: [prod/] }  # activation: immediate if consumers read at use time
+  # vault: { address: "https://vault.example.com:8200", mount: secret, paths: [apps/] }
+  # doppler: { configs: [{ project: api, config: prd }] }
+  # infisical: { projects: [{ projectId: 6f1c, environments: [prod] }] }
 
 network:
   # Exact additional HTTPS hostnames you approve (no paths, wildcards or IPs).
   # Custom Supabase domains belong here; ordinary *.supabase.co is built in.
   allowHosts: []
   # allowHosts: [database.example.com]
+  # proxy: http://proxy.corp.example:3128   # credentials: keysentry vault set KEYSENTRY_PROXY_AUTH
+  # noProxy: [vault.corp.example]
+  # caFile: certs/corp-root.pem             # added to the system roots, never replacing them
+  # offline: true                           # no breach feeds or security news
+
+# kms: { provider: vault-transit, address: "https://vault.corp.example", keyName: keysentry }
+# audit:
+#   export:
+#     - { kind: otlp, id: otel, url: "https://otel.corp.example" }
 
 rotation:
   graceSeconds: 120 # 0 disables grace; undo needs a readable, still-valid old key

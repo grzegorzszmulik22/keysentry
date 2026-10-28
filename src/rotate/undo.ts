@@ -5,6 +5,9 @@ import type {
 import type { EngineDeps, RotateOptions } from './engine.js';
 import { crash, isCrash } from './recovery.js';
 import { withStopChecks } from './stop.js';
+import { activationMode } from '../hosts/activation.js';
+import { hasPublicKeyIds, isPublicKeyId } from './public-refs.js';
+import { secretCredentialValues } from '../providers/credential-kinds.js';
 
 interface UndoInput {
   plan: RotationPlan;
@@ -60,7 +63,8 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
     deps.redactor.register(value);
   }
   function registerNamed(name: string, value: string): void {
-    const publicId = name.endsWith('_ACCESS_KEY_ID') && /^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(value);
+    // AWS access key ids and Twilio API key SIDs are public references needed to retire keys later.
+    const publicId = name.endsWith('_ACCESS_KEY_ID') && isPublicKeyId(value, 'aws') || isPublicKeyId(value, 'twilio');
     if (publicId) publicKeyRefs.add(value);
     register(value, !publicId);
   }
@@ -96,7 +100,7 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
   function unavailable(clusterId: string, reason: string): void {
     if (!report.unavailable.some(item => item.clusterId === clusterId)) report.unavailable.push({ clusterId, reason });
   }
-  for (const value of Object.values(deps.providerCtx.credentials)) if (value !== undefined) register(value);
+  for (const value of secretCredentialValues(deps.providerCtx.credentials)) register(value);
   for (const [name, value] of Object.entries(deps.providerCtx.siblingVars ?? {})) registerNamed(name, value);
   if (opts?.dryRun !== false) return report;
   if (deps.inflight) for (const slot of await deps.inflight.slots(plan.id)) {
@@ -201,6 +205,8 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
     let newKeyRef: string | null = null;
     let newFingerprint: string | null = null;
     for (const entry of history) if (typeof entry.data?.newKeyRef === 'string') newKeyRef = entry.data.newKeyRef;
+    // A journaled public key id (AWS access key id, Twilio key SID) stays readable in this undo's journal entries.
+    if (newKeyRef && hasPublicKeyIds(step.provider) && isPublicKeyId(newKeyRef, step.provider) && !sensitiveValues.has(newKeyRef)) publicKeyRefs.add(newKeyRef);
     for (const entry of history) if (typeof entry.data?.newFingerprint === 'string') newFingerprint = entry.data.newFingerprint;
     const prefix = `old-companion:${step.clusterId}:`;
     const oldCompanions = Object.fromEntries([...values].filter(([slot]) => slot.startsWith(prefix))
@@ -357,7 +363,16 @@ export async function undoRotation(input: UndoInput, deps: EngineDeps, opts: Rot
     if (service.service.host === 'railway' && service.service.serviceId === '') continue;
     try {
       const host = deps.hosts[service.service.host];
-      if (!host || opts?.redeploy === false || !host.capabilities.redeploy) throw new Error('Activation unconfirmed.');
+      if (!host) throw new Error('Activation unconfirmed.');
+      const mode = activationMode(service.service, host);
+      if (mode === 'immediate') {
+        // The restoring write made the old values live; there is no deployment to wait for.
+        await journal('deploy-result', { serviceKey: key,
+          data: { undo: true, deploymentId: null, state: 'success', immediate: true, clusterIds: [...service.works].map(work => work.step.clusterId) } });
+        continue;
+      }
+      // On-write hosts deployed with the restoring write; redeploy() reports that deployment and starts none.
+      if (mode !== 'on-write' && (opts?.redeploy === false || !host.capabilities.redeploy)) throw new Error('Activation unconfirmed.');
       const deploymentId = await host.redeploy(service.service);
       crash(deps, 'after-redeploy', { serviceKey: key });
       await journal('redeploy', { serviceKey: key,

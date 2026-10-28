@@ -108,6 +108,10 @@ export function autopilotEligibility(cluster: Cluster): Eligibility {
   if (cluster.tier === 'crypto' || cluster.provider === 'crypto-wallet') return refuse('Wallet keys are never rotated automatically.');
   if (cluster.provider === 'private-key') return refuse('Private keys are never rotated automatically.');
   if (cluster.consumers.length === 0) return refuse('The cluster has no consumers.');
+  // Inventory plans Google service-account JSON keys as guided (methodForValue); a person rotates them.
+  if (cluster.provider === 'google' && cluster.method === 'guided') {
+    return refuse('Google service-account keys are always rotated by a person, so they cannot be armed.');
+  }
 
   let adapter;
   try { adapter = getProvider(cluster.provider); }

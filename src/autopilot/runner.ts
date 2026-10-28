@@ -222,6 +222,7 @@ function engineDeps(deps: AutopilotDeps, armed: WavePolicy, state: AutopilotStat
       async writeVariables(service, vars, opts) { await active(); await host.writeVariables(service, vars, opts); },
       async redeploy(service) { await active(); return host.redeploy(service); },
       deploymentStatus: (service, id) => host.deploymentStatus(service, id),
+      ...(host.activationFor ? { activationFor: (service: Parameters<NonNullable<HostAdapter['activationFor']>>[0]) => host.activationFor!(service) } : {}),
     };
   }
   const providers: EngineDeps['providers'] = id => {

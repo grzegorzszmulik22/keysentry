@@ -10,7 +10,7 @@ export interface PasskeyStore {
 
 export interface PasskeyRequestOptions {
   challenge: string;
-  rpId: 'localhost';
+  rpId: string;
   userVerification: 'required';
   timeout: number;
   allowCredentials: { id: string; type: 'public-key' }[];
@@ -56,11 +56,25 @@ function wire(value: unknown): { id: string; response: Record<string, unknown>; 
   return { id, response, clientData, challenge: challenge.toString('base64url') };
 }
 
-/** Authorize actions with passkeys registered through the human terminal command. */
-export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string; now?: () => number }) {
-  if (!/^http:\/\/localhost:[1-9][0-9]{0,4}$/.test(opts.origin) || Number(opts.origin.split(':').at(-1)) > 65535) {
-    throw new Error('Dashboard origin must be http://localhost with a port.');
-  }
+function teamOrigin(origin: string, rpId: string): boolean {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'https:' && url.origin === origin && url.hostname === rpId && /^[a-z0-9.-]+$/.test(rpId) && !/^[0-9.]+$/.test(rpId);
+  } catch { return false; }
+}
+
+/**
+ * Authorize actions with passkeys registered through the human terminal command. Team mode passes the public
+ * HTTPS origin and its RP ID, and a store scoped to the signed-in member on every call.
+ */
+export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string; rpId?: string; noPasskeyMessage?: string; now?: () => number }) {
+  if (opts.rpId === undefined) {
+    if (!/^http:\/\/localhost:[1-9][0-9]{0,4}$/.test(opts.origin) || Number(opts.origin.split(':').at(-1)) > 65535) {
+      throw new Error('Dashboard origin must be http://localhost with a port.');
+    }
+  } else if (!teamOrigin(opts.origin, opts.rpId)) throw new Error('Team dashboard origin must be https on its RP ID host.');
+  const rpId = opts.rpId ?? 'localhost';
+  const noPasskey = opts.noPasskeyMessage ?? REGISTER_IN_TERMINAL;
   const now = opts.now ?? Date.now;
   const pending = new Map<string, Pending>();
   let queue: Promise<unknown> = Promise.resolve();
@@ -88,6 +102,7 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
     return entry;
   }
   function usable(credential: PasskeyCredential): boolean {
+    if (opts.rpId !== undefined) return credential.rpId === rpId && Array.isArray(credential.origins) && credential.origins.includes(opts.origin);
     return credential.rpId === 'localhost' && Array.isArray(credential.origins)
       && (credential.origins.includes(opts.origin) || credential.origins.includes('http://localhost'));
   }
@@ -96,24 +111,27 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
   }
 
   return {
-    challenge(session: string, route: string, bodyDigest: string): Promise<PasskeyRequestOptions> {
+    challenge(session: string, route: string, bodyDigest: string, scoped?: PasskeyStore): Promise<PasskeyRequestOptions> {
+      const store = scoped ?? opts.passkeys;
       return serial(async () => {
         checkSession(session);
         if (typeof route !== 'string' || route.length > 200 || !/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(route)
           || typeof bodyDigest !== 'string' || !/^[a-f0-9]{64}$/.test(bodyDigest)) {
           throw new PasskeyGateError(400, 'Choose an action and try again.');
         }
-        const credentials = (await opts.passkeys.list()).filter(usable);
-        if (credentials.length === 0) throw new PasskeyGateError(403, REGISTER_IN_TERMINAL);
+        const credentials = (await store.list()).filter(usable);
+        if (credentials.length === 0) throw new PasskeyGateError(403, noPasskey);
         return {
           challenge: create({ session, route, digest: bodyDigest }),
-          rpId: 'localhost', userVerification: 'required', timeout: LIFETIME_MS,
+          rpId, userVerification: 'required', timeout: LIFETIME_MS,
           allowCredentials: credentials.map(c => ({ id: c.id, type: 'public-key' })),
         };
       });
     },
 
-    verify(session: string, route: string, bodyDigest: string, header: string | undefined): Promise<void> {
+    /** Resolves with the id of the credential that signed the assertion. */
+    verify(session: string, route: string, bodyDigest: string, header: string | undefined, scoped?: PasskeyStore): Promise<string> {
+      const store = scoped ?? opts.passkeys;
       return serial(async () => {
         // Consume any submitted challenge before an awaited storage operation can fail.
         // Empty storage still takes precedence over a missing or invalid proof.
@@ -124,8 +142,8 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
           assertion = wire(parseJson(decode(header, 24_576)));
           entry = take(assertion.challenge, session);
         } catch (error) { invalid = error; }
-        const credentials = await opts.passkeys.list();
-        if (credentials.length === 0) throw new PasskeyGateError(403, REGISTER_IN_TERMINAL);
+        const credentials = await store.list();
+        if (credentials.length === 0) throw new PasskeyGateError(403, noPasskey);
         if (invalid) throw invalid;
         if (!assertion || !entry) return reject();
         if (entry.route !== route || entry.digest !== bodyDigest) return reject();
@@ -143,8 +161,9 @@ export function createPasskeyGate(opts: { passkeys: PasskeyStore; origin: string
           });
         } catch { return reject(); }
         if (result.cloneWarning || now() >= entry.expires) return reject();
-        await opts.passkeys.update({ ...credential, origins: [...credential.origins], signCount: result.signCount });
+        await store.update({ ...credential, origins: [...credential.origins], signCount: result.signCount });
         if (now() >= entry.expires) return reject();
+        return credential.id;
       });
     },
   };

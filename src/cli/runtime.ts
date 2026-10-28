@@ -8,10 +8,16 @@ import {
   buildPlan, classify, createLogger, createRedactor, createStateStore, createStateCipher, createInFlightStore,
   renderBlastRadius, renderRunbook, scanHosts, serviceKey, statePaths, StateLockedError, type StateStore,
 } from '../core/index.js';
-import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { getProvider, NON_SECRET_CREDENTIALS, PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { executePlan, resumeRotation, finishRotation, undoRotation, type RotateOptions, type EngineDeps } from '../rotate/index.js';
 import { createAuditLog } from '../security/index.js';
-import { CREDENTIAL_NAMES, credentialVaultName, createCredentialSource, createMemoryVault, deviceKey, fingerprintKey as vaultFingerprintKey, getProjectId, importFromEnv, openVault, stateKey } from '../vault/index.js';
+import { CREDENTIAL_NAMES, credentialVaultName, createCredentialSource, createMemoryVault, deviceKey, fingerprintKey as vaultFingerprintKey, getProjectId, importFromEnv, openVault } from '../vault/index.js';
+import { createKeyWrapper, createKmsHttp, KMS_CREDENTIAL_NAMES, kmsEgressRules, loadProjectStateKey } from '../kms/index.js';
+import { auditExportEgressRules } from '../audit-export/index.js';
+import { offlineEgressRules } from '../feeds/index.js';
+import { setupNetwork } from './network-setup.js';
+import { needsManualActivation } from '../hosts/activation.js';
+import { acceptedCredentialName, VAULT_SET_NAMES } from './credential-names.js';
 import { createGuardedHttp, createFileReceipt, EGRESS_RULES, rulesForUserFeeds, rulesForUserUrls } from '../net/index.js';
 import { createFetchHttp } from '../http.js';
 import { checkLocalIntegrity } from '../release/index.js';
@@ -22,7 +28,7 @@ import {
   runMonitorOnce, type BreachFeed, type DetectorContext, type MonitorState, type MonitorStateStore, type RotateExecutor,
 } from '../monitor/index.js';
 import type {
-  GuidedPrompt, HostAdapter, HostId, HttpClient, Inventory, Logger, Policy, ProviderAdapter,
+  GuidedPrompt, HostAdapter, HostId, HttpClient, Inventory, Logger, Policy, ProviderAdapter, TeamPolicy,
   ProviderId, Redactor, RotationPlan, RotationReport, ServiceRef, AuditLog, InFlightStore, Vault, TokenRole, GraceInfo, GraceDecision,
 } from '../types.js';
 import { loadConfig, loadConfigMetadata, type ConfigSettings } from './config.js';
@@ -155,7 +161,22 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     ...(interactive ? { chooseBackend: (backend: import('../types.js').VaultBackendId) => promptVaultBackend(backend, diagnostic, options.promptIO) } : {}),
   });
   const projectId = await getProjectId(paths.dir);
-  const key = await stateKey(vault, projectId);
+  const receipt = createFileReceipt(join(paths.dir, 'network.jsonl'));
+  // Phase 5 network (notes/network-enterprise.md): proxy, extra CA and offline mode.
+  // ORCHESTRATOR HOOK (team policy): pass the *verified* SignedTeamPolicy.policy from the governance wiring here, or
+  // keep null when team mode is off. Its network.offline and network.requireProxy then take effect, and
+  // network.allowHosts should narrow metadata.userHostRules below. An unverifiable policy must stop the command first.
+  const teamPolicy: TeamPolicy | null = null;
+  const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env, vault, redactor,
+    policy: teamPolicy, ...(options.http ? { injected: options.http } : {}) });
+  const rawTransport = network.transport;
+  // With kms configured the state key exists only wrapped and is unwrapped into memory here; a KMS failure
+  // refuses to start and never creates a new key (src/kms/state-key.ts).
+  const stateKms = metadata.settings.kms;
+  const key = await loadProjectStateKey({ vault, projectId, log, now: options.now,
+    envWrapped: vault.backend === 'env' ? env.KEYSENTRY_STATE_KEY_WRAPPED || undefined : undefined,
+    ...(stateKms ? { wrapper: createKeyWrapper(stateKms, { http: createKmsHttp(rawTransport, stateKms, { receipt, log }),
+      credentials: createCredentialSource(vault, env), now: options.now }) } : {}) });
   // The env backend has no writable durable store. Keep internal binding markers
   // process-local, like its in-flight values; supplied environment markers win.
   const transientMetadata = createMemoryVault();
@@ -228,16 +249,20 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const store: StateStore = createWatcherStateStore({ ...baseStore, journal: () => journal }, env.GITHUB_ACTIONS === 'true' && options.watcherAuthorized === true);
   const inflight = options.inflight ?? createInFlightStore({ dir: join(paths.dir, 'inflight'), vault, projectId });
   const credentials = createCredentialSource(vault, env);
-  const receipt = createFileReceipt(join(paths.dir, 'network.jsonl'));
+  // Defence in depth: KMS credentials are not CREDENTIAL_NAMES (loadConfig does not read them), so register them here.
+  if (metadata.settings.kms) for (const name of KMS_CREDENTIAL_NAMES) {
+    const found = await credentials.get(name, 'read');
+    if (found?.value) redactor.register(found.value);
+  }
   let automaticGuard: (() => Promise<void>) | undefined;
-  const rawTransport = options.http ?? createFetchHttp();
   const transport: HttpClient = { async request(request) {
     const notificationUrl = [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls]
       .some(value => new URL(value).href === new URL(request.url).href);
     if (request.method !== 'GET' && !notificationUrl) await automaticGuard?.();
     return rawTransport.request(request);
   } };
-  const feedUrls = options.feeds?.map(feed => feed.url) ?? metadata.feedUrls;
+  // Offline mode polls no feed: none is configured here, and offlineEgressRules below blocks a forgotten call site.
+  const feedUrls = network.feedMode.offline ? [] : options.feeds?.map(feed => feed.url) ?? metadata.feedUrls;
   const notification = { rules: [] as import('../types.js').EgressRule[], trustedUrls: [] as string[] };
   for (const setting of metadata.settings.notify.channels) {
     try {
@@ -267,9 +292,13 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       } finally { topic.fill(0); }
     }
   }
-  const rules = [...EGRESS_RULES, ...rulesForUserFeeds(feedUrls), ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'),
+  const allRules = [...EGRESS_RULES, ...rulesForUserFeeds(feedUrls), ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'),
     ...metadata.userHostRules, ...notification.rules, ...rulesForUserUrls(healthUrls, 'health check you configured'),
-    ...rulesForUserUrls(relayUrls, 'approval relay you configured')];
+    ...rulesForUserUrls(relayUrls, 'approval relay you configured'),
+    // Shown in `keysentry network`; the KMS and audit export clients also carry their own narrower rule lists.
+    ...(metadata.settings.kms ? kmsEgressRules(metadata.settings.kms) : []),
+    ...auditExportEgressRules(metadata.settings.audit.export)];
+  const rules = network.feedMode.offline ? offlineEgressRules(allRules) : allRules;
   const http = createGuardedHttp(transport, { rules, receipt,
     trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls], log });
   const config = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
@@ -289,6 +318,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
   if (options.policy) config.monitor.policy = options.policy;
   if (options.feeds) config.monitor.feeds = options.feeds;
+  // Offline mode: the legacy monitor detector would otherwise fall back to DEFAULT_BREACH_FEEDS.
+  if (network.feedMode.offline) config.monitor.feeds = [];
   const providers = options.providers ?? getProvider;
   const stateStore = createFileMonitorStateStore(config.cwd, store);
 
@@ -319,6 +350,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     },
     async redeploy(service) { await automaticGuard?.(); return host.redeploy(service); },
     deploymentStatus: (service, id) => host.deploymentStatus(service, id),
+    ...(host.activationFor ? { activationFor: (service: ServiceRef) => host.activationFor!(service) } : {}),
   }));
   const hosts = wrapHosts(options.hosts ?? config.hosts);
   config.hosts = hosts;
@@ -686,9 +718,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   function manualActivation(service: ServiceRef): boolean {
-    return !hostMap[service.host]?.capabilities.redeploy || ['dotenv', 'fly', 'github-actions'].includes(service.host)
-      || service.host === 'vercel' && service.environmentId !== 'production'
-      || service.host === 'railway' && service.serviceId === '';
+    const host = hostMap[service.host];
+    return !host || needsManualActivation(service, host);
   }
 
   function describeAction(id: string, inv: Inventory, state: MonitorState) {
@@ -767,7 +798,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const canaries = (await stateStore.load()).canaries.length;
     return safe({ ...readinessScore({ inventory: inv, canaries,
       configuredCredentials: Object.keys(config.providerCtx.credentials).filter(name => !!config.providerCtx.credentials[name]),
-      redeploy: Object.fromEntries(hosts.map(host => [host.id, host.capabilities.redeploy])) }),
+      redeploy: Object.fromEntries(hosts.map(host => [host.id, host.capabilities.redeploy])), manualActivation }),
       elapsedMs: Math.round(performance.now() - start), report });
   }
 
@@ -815,14 +846,14 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   function credentialName(name: string, role: TokenRole) {
-    if (!CREDENTIAL_NAMES.includes(name)) throw new CliError('Unknown credential name. Run keysentry vault status for supported names.');
+    if (!acceptedCredentialName(name)) throw new CliError('Unknown credential name. Run keysentry vault status for supported names.');
     if (role !== 'read' && role !== 'write') throw new CliError('Credential role must be read or write.');
     return credentialVaultName(name, role);
   }
 
   async function vaultList() {
     const names = new Set(await vault.list('cred/'));
-    return CREDENTIAL_NAMES.flatMap(name => (['read', 'write'] as const).filter(role => names.has(credentialVaultName(name, role))).map(role => ({ name, role })));
+    return VAULT_SET_NAMES.flatMap(name => (['read', 'write'] as const).filter(role => names.has(credentialVaultName(name, role))).map(role => ({ name, role })));
   }
 
   async function assertStateResetSafe(force = false) {
@@ -892,6 +923,15 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       rules: [...rules, ...rulesForUserUrls(urls, purpose)], receipt, log,
       trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls],
     }),
+    /**
+     * A guarded client that reaches exactly one configured host and follows no redirect, over the raw (proxy-aware)
+     * transport. Audit export gives each target its own, so a custom header can never be redirected elsewhere.
+     */
+    singleHostHttp: (url: string, purpose: string) => createGuardedHttp(rawTransport, {
+      rules: rulesForUserUrls([url], purpose, 'config'), receipt, log, maxRedirects: 0,
+    }),
+    /** Proxy, extra CA and offline state (notes/network-enterprise.md); `transport` is only ever wrapped by a guard. */
+    network: { feedMode: network.feedMode, summary: network.summary, transport: rawTransport },
     freshInventory: async () => rotationInventory(await scan()),
     async watcherMonitor(context: import('../watcher/index.js').WatcherActionContext, notifier: import('../types.js').Notifier,
       assertActive?: () => Promise<void>) {
@@ -944,7 +984,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       await scan(); return safe(report);
     }),
     resetState: command(resetState), vaultList,
-    async vaultStatus() { return { backend: vault.backend, ...(vault.weakness ? { weakness: vault.weakness } : {}), credentials: await vaultList(), supportedNames: [...CREDENTIAL_NAMES] }; },
+    async vaultStatus() { return { backend: vault.backend, ...(vault.weakness ? { weakness: vault.weakness } : {}), credentials: await vaultList(), supportedNames: [...VAULT_SET_NAMES] }; },
     vaultSet: command(async (name: string, value: string, role: TokenRole = 'write', opts: { stdin?: boolean } = {}) => {
       assertHuman('store a credential', opts.stdin === true); const item = credentialName(name, role);
       if (!value) throw new CliError('The credential value was empty. Nothing was stored.');
@@ -961,7 +1001,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     }),
     vaultImportEnv: command(async () => {
       assertHuman('import credentials');
-      for (const name of CREDENTIAL_NAMES) if (env[name]) redactor.register(env[name]!);
+      for (const name of CREDENTIAL_NAMES) if (env[name] && !NON_SECRET_CREDENTIALS.includes(name)) redactor.register(env[name]!);
       const names = await importFromEnv(vault, env);
       for (const name of names) await audit.append({ kind: 'vault-import', summary: 'Credential imported.', data: { name, role: 'write' } });
       return { names };
@@ -972,7 +1012,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       const enabledHosts = [...new Set([...config.hosts.map(host => host.id), ...config.disabledHosts.filter(item => item.reason !== 'Disabled in configuration.').map(item => item.host)])];
       const result = await runDoctor({ vault, credentials, enabledHosts, env, nodeVersion: process.versions.node,
         ...(probe ? { probe: { http } } : {}), previous, integrity: await checkLocalIntegrity(),
-        sandboxed: !!process.permission });
+        sandboxed: !!process.permission, network: network.summary });
       if (probe) await store.writeJson('doctor', path, result.fingerprints);
       await audit.append({ kind: 'doctor', summary: 'Doctor checks completed.', data: { probe, checks: result.items.length, warnings: result.items.filter(item => item.status === 'warn').length } });
       return safe(result);

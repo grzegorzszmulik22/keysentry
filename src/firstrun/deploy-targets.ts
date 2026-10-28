@@ -13,6 +13,20 @@ const CONFIGS: readonly DeployTarget[] = [
   { host: 'vercel', evidence: '.vercel/project.json' },
   { host: 'fly', evidence: 'fly.toml' },
   { host: 'render', evidence: 'render.yaml' },
+  // Phase 6 (notes/hosts-a.md, notes/hosts-b.md). Only file existence is checked, never contents.
+  { host: 'netlify', evidence: 'netlify.toml' },
+  { host: 'netlify', evidence: '.netlify/state.json' }, // written by `netlify link` (holds the site id)
+  { host: 'heroku', evidence: 'heroku.yml' },
+  { host: 'heroku', evidence: 'app.json' }, // Heroku app manifest (also read by Dokku)
+  { host: 'heroku', evidence: 'Procfile' }, // weak: Railway/Nixpacks, Dokku and Scalingo read it too
+  { host: 'digitalocean', evidence: '.do/app.yaml' },
+  { host: 'digitalocean', evidence: '.do/deploy.template.yaml' }, // "Deploy to DigitalOcean" button template
+  { host: 'cloudflare-workers', evidence: 'wrangler.toml' },
+  { host: 'cloudflare-workers', evidence: 'wrangler.json' },
+  { host: 'cloudflare-workers', evidence: 'wrangler.jsonc' },
+  { host: 'supabase-functions', evidence: 'supabase/config.toml' }, // created by `supabase init` next to supabase/functions/
+  { host: 'zeabur', evidence: 'zbpack.json' },
+  // Coolify deploys generic Dockerfile, Compose and Nixpacks projects, so no local file identifies it.
 ];
 const MAX_WORKFLOW_BYTES = 1024 * 1024;
 

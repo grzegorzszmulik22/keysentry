@@ -245,3 +245,21 @@ test('bootstrap takes trust and health rules from the sealed plan without rewrit
   } finally { opened.dispose(); }
 });
 
+
+test('deployment copies phase 5/6 host credentials only for scoped hosts, and audit export secrets only for configured targets', async () => {
+  const f = await fixture();
+  for (const name of ['NETLIFY_TOKEN', 'KUBERNETES_TOKEN', 'VAULT_TOKEN', 'COOLIFY_TOKEN']) await f.sourceVault.set(`cred/${name}`, Buffer.from(`planted-${name}`));
+  await f.sourceVault.set('audit-export/otel/bearer', Buffer.from('planted-otlp-bearer'));
+  await f.sourceVault.set('audit-export/removed-target/bearer', Buffer.from('planted-stale-bearer'));
+  const settings = configSchema.parse({ ...f.settings, hosts: { ...f.settings.hosts,
+    kubernetes: { server: 'https://k8s.example.test:6443', namespaces: ['apps'] }, vault: { enabled: false, address: 'https://vault.example.test' } },
+    audit: { export: [{ kind: 'otlp', id: 'otel', url: 'https://otel.example.test' }] } });
+  const result = await prepareWatcherDeployment({ sourceVault: f.sourceVault, settings, outputDir: join(f.dir, 'phase6'), openVault: fastVault },
+    { config: f.config, watcherKey: f.key, stateKey: f.state, vaultPassphrase: Buffer.from('planted-vault-passphrase') });
+  const names = Object.keys(JSON.parse(await readFile(result.vaultPath, 'utf8')).entries);
+  expect(names).toEqual(expect.arrayContaining(['cred/NETLIFY_TOKEN', 'cred/KUBERNETES_TOKEN', 'audit-export/otel/bearer']));
+  // Vault is disabled and Coolify has no base URL; the removed export target's secret stays home.
+  for (const name of ['cred/VAULT_TOKEN', 'cred/COOLIFY_TOKEN', 'audit-export/removed-target/bearer']) expect(names).not.toContain(name);
+  // The sealed runtime settings carry the export targets.
+  expect(settings.audit.export).toHaveLength(1);
+});

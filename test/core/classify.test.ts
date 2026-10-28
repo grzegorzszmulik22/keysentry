@@ -73,9 +73,11 @@ const cases: Case[] = [
   ['SendGrid', 'ODD_NAME', `SG.${random.slice(0, 22)}.${random}${random}`, 'sendgrid', true],
   ['SendGrid name', 'SENDGRID_API_KEY', random, 'sendgrid', true],
   ['Twilio auth', 'TWILIO_AUTH_TOKEN', hex.slice(0, 32), 'twilio', true],
-  ['Twilio API key id', 'TWILIO_API_KEY', `SK${hex.slice(0, 32)}`, 'twilio', true],
-  ['Twilio name-free SK key', 'ODD_NAME', `SK${hex.slice(0, 32)}`, 'twilio', true],
-  ['Twilio account id', 'TWILIO_ACCOUNT_SID', `AC${hex.slice(0, 32)}`, 'unknown', false],
+  // Phase 6: SK… and AC… values are public Twilio SIDs; the secret is the API key secret beside them.
+  ['Twilio API key id', 'TWILIO_API_KEY', `SK${hex.slice(0, 32)}`, 'twilio', false],
+  ['Twilio name-free SK key', 'ODD_NAME', `SK${hex.slice(0, 32)}`, 'twilio', false],
+  ['Twilio account id', 'TWILIO_ACCOUNT_SID', `AC${hex.slice(0, 32)}`, 'twilio', false],
+  ['Twilio API key secret', 'TWILIO_API_SECRET', 'aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY', 'twilio', true],
   ['Google API', 'ODD_NAME', `AIza${random}abc`, 'google', true],
   ['Google account JSON', 'GOOGLE_CREDENTIALS', JSON.stringify({ type: 'service_account', private_key: '-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n' }), 'google', true],
   ['Google name', 'GOOGLE_API_KEY', random, 'google', true],
@@ -216,11 +218,11 @@ describe('classify', () => {
 
   const mappings: [ProviderId, string, string][] = [
     ['crypto-wallet', 'crypto', 'guided'], ['aws', 'cloud', 'auto'], ['cloudflare', 'cloud', 'atomic-roll'],
-    ['github', 'cloud', 'guided'], ['google', 'cloud', 'guided'], ['private-key', 'cloud', 'guided'],
+    ['github', 'cloud', 'guided'], ['google', 'cloud', 'auto'], ['private-key', 'cloud', 'guided'],
     ['database', 'database', 'guided'], ['supabase', 'database', 'guided'], ['stripe', 'payments', 'guided'],
     ['openai', 'ai', 'auto'], ['anthropic', 'ai', 'guided'], ['openrouter', 'ai', 'auto'],
-    ['resend', 'comms', 'auto'], ['sendgrid', 'comms', 'guided'], ['slack', 'comms', 'guided'],
-    ['twilio', 'comms', 'guided'], ['app-secret', 'app', 'generate'], ['encryption-key', 'app', 'guided'], ['unknown', 'unknown', 'guided'],
+    ['resend', 'comms', 'auto'], ['sendgrid', 'comms', 'auto'], ['slack', 'comms', 'guided'],
+    ['twilio', 'comms', 'auto'], ['app-secret', 'app', 'generate'], ['encryption-key', 'app', 'guided'], ['unknown', 'unknown', 'guided'],
   ];
   it.each(mappings)('maps %s to tier %s and method %s', (provider, tier, method) => {
     expect(tierFor(provider)).toBe(tier);

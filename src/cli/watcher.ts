@@ -50,6 +50,8 @@ export interface WatchRuntimeDependencies {
   saveRotationReport?: (report: RotationReport) => Promise<void>;
   /** Re-evaluated at each automatic-action boundary, including sealed/container execution. */
   integrityCheck?: () => Promise<{ ok: boolean; reasons: string[] }>;
+  /** Runs after every watcher cycle (audit export). Failures are logged with fixed text and never stop the watcher. */
+  afterCycle?: () => Promise<void>;
 }
 
 const path = (store: StateStore, name: string) => join(store.paths.dir, name);
@@ -459,14 +461,22 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
 export async function runWatch(deps: WatchRuntimeDependencies, options: { once?: boolean; port?: number; signal?: AbortSignal } = {}): Promise<number> {
   if (!deps.sealed) deps.assertHuman('run the watcher');
   const watcher = await createWatchRuntime(deps);
+  const tick: typeof watcher.tick = async (...args) => {
+    const result = await watcher.tick(...args);
+    if (deps.afterCycle) {
+      try { await deps.afterCycle(); }
+      catch { deps.log.warn('Audit export did not finish after this cycle. Run keysentry audit export status.'); }
+    }
+    return result;
+  };
   const controller = new AbortController();
   const stop = () => controller.abort();
   if (!options.signal) { process.once('SIGINT', stop); process.once('SIGTERM', stop); }
   let server: Awaited<ReturnType<typeof watcher.server>> | undefined;
   try {
     server = options.port === undefined ? undefined : await watcher.server(options.port);
-    if (options.once) return await runOnce({ tick: watcher.tick, settleWaves: watcher.settle, selfCheck: watcher.check });
-    await runWatcherLoop({ tick: watcher.tick, intervalMs: (deps.intervalSeconds ?? 300) * 1000, signal: options.signal ?? controller.signal, sleep: deps.sleep });
+    if (options.once) return await runOnce({ tick, settleWaves: watcher.settle, selfCheck: watcher.check });
+    await runWatcherLoop({ tick, intervalMs: (deps.intervalSeconds ?? 300) * 1000, signal: options.signal ?? controller.signal, sleep: deps.sleep });
     return 0;
   } finally {
     await server?.close(); await deps.audit.checkpoint();

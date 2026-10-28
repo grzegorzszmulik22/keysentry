@@ -147,7 +147,7 @@ keysentry vault set GITHUB_TOKEN --role write
 keysentry vault remove GITHUB_TOKEN --role read
 ```
 
-`status` shows the backend, any weakness, and credential names by role. `list` shows names only. `set` never accepts a token argument; use its hidden prompt. With explicit `--stdin`, a human may pipe one value from their terminal while stdout remains a TTY. Without `--stdin`, both input and output must be TTYs. Known coding-agent environments are refused in either case. The default role is `write`. Use only the supported host and provider credential names listed in the tables below. `vault import-env` copies present credentials into the vault; they can then be removed from the environment.
+`status` shows the backend, any weakness, and credential names by role. `list` shows names only. `set` never accepts a token argument; use its hidden prompt. With explicit `--stdin`, a human may pipe one value from their terminal while stdout remains a TTY. Without `--stdin`, both input and output must be TTYs. Known coding-agent environments are refused in either case. The default role is `write`. Use only the supported host and provider credential names listed in the tables below, plus `KEYSENTRY_PROXY_AUTH` for an authenticating proxy, the KMS credentials listed under [Bring your own KMS](#bring-your-own-kms-for-the-state-key), and `KEYSENTRY_OIDC_CLIENT_SECRET` for the team dashboard's single sign-on. `vault import-env` copies present host, provider and proxy credentials into the vault; they can then be removed from the environment. It never copies KMS credentials or the OIDC client secret, and the watcher keeps treating application variables with those names (for example an app's own `AWS_ACCESS_KEY_ID`) as keys to protect.
 
 Scanning, reports, plans, drills and monitor detection use read-role credentials. Reads fall back from the dedicated read token to the base token, then the existing environment variable. Approved mutations rebuild adapters with the write token; they never substitute the dedicated read token for writes. A role name does not reduce a token's actual vendor permissions: `doctor` explains those limits.
 
@@ -171,7 +171,23 @@ keysentry network --since 2026-10-27T00:00:00Z
 
 The command lists allowed hosts grouped by purpose, labels rules added by you, then summarizes requests, blocked requests and last contact. The receipt contains hostnames and purposes, never URL paths, queries, headers or bodies. It keeps the active log and one rotated backup; older history is replaced.
 
-All HTTP uses the injected guarded client: HTTPS only, approved hostnames, bounded responses, and redirects checked against the same rules. Configured feeds and notification webhooks add explicit rules. Add a custom HTTPS service hostname, such as a Supabase custom domain, with `network.allowHosts` in [keysentry.example.yaml](keysentry.example.yaml). Entries must be exact DNS hostnames; wildcards and IP addresses are refused. Local HTTP endpoints remain blocked. Dotenv scanning makes no network requests. `network`, help and version output do not open the vault.
+All HTTP uses the injected guarded client: HTTPS only, approved hostnames, bounded responses, and redirects checked against the same rules. Configured feeds and notification webhooks add explicit rules. Add a custom HTTPS service hostname, such as a Supabase custom domain, with `network.allowHosts` in [keysentry.example.yaml](keysentry.example.yaml). Entries must be exact DNS hostnames; wildcards and IP addresses are refused. Local HTTP endpoints remain blocked. Dotenv scanning makes no network requests. `network`, help and version output do not open the vault. Rules derived from a self-hosted server you configured may carry that URL's port and are shown as `host:port`.
+
+## Corporate proxy, private CA and offline mode
+
+```yaml
+network:
+  proxy: http://proxy.corp.example:3128   # or HTTPS_PROXY; credentials never go in this file
+  noProxy: [vault.corp.example]            # plus NO_PROXY; exact hosts here, .suffix entries from NO_PROXY
+  caFile: certs/corp-root.pem              # PEM certificates trusted in addition to the system roots
+  offline: false                           # true: no breach feeds or security news
+```
+
+- **Proxy.** Every request goes through an HTTP CONNECT tunnel; TLS still runs end to end to the destination and verifies its name, so the proxy sees only host names. `network.proxy` wins over `HTTPS_PROXY`. Store proxy credentials with `keysentry vault set KEYSENTRY_PROXY_AUTH` (value `username:password`); they are sent only as `Proxy-Authorization` on the CONNECT request. Only Basic authentication is supported (no NTLM or Kerberos). An `http://` proxy carries that credential across your network unencrypted; doctor warns about it.
+- **Private CA.** `network.caFile` adds certificates to the system roots; it never replaces them. The file may hold only PEM certificates; a private key or anything else rejects the whole file. Adding a CA widens trust for every host keysentry contacts, so add only your organization's root.
+- **Fail closed.** A proxy, CA file or team policy setting that cannot be used refuses every request with a fixed message; keysentry never silently connects directly. `keysentry doctor` explains the problem, and `keysentry network` shows the current proxy, CA and offline state above the allowed hosts.
+- **Offline mode.** keysentry stops polling breach feeds and security news, and removes their hosts from the allowed list as a backstop. Autopilot waves start only from feed incidents, so they never start; alerts and automatic actions come only from your own signals (GitHub secret-scanning alerts, canaries, keys revoked upstream and usage anomalies). Provider and host APIs, notifications and health checks keep working, and you can still rotate any key yourself. `watcher setup` carries offline mode into the deployed watcher.
+- **Not proxied:** syslog audit export (it connects directly; add its host to `noProxy`) and the cloud box, which has its own egress.
 
 ## Verify and audit
 
@@ -186,6 +202,43 @@ The offline command compares the bundle with its adjacent local manifest. The on
 `.keysentry/audit.jsonl` records metadata for scans, saved plans, approvals, vault changes, doctor runs, state resets and every rotation journal event. Every hash-chain record has an HMAC under a vault-held key, and checkpoints are signed; registered secrets are redacted. Forged appends require the vault MAC key. The saved vault head detects truncation behind the last checkpoint; an uncheckpointed suffix can still be removed. `audit verify` always consults the vault for this log path and returns exit status 1 for a failed MAC, a changed chain, or a nonempty log without an anchor. The audit log remains after a state reset.
 
 Public markers under `~/.keysentry/audit-heads/` are hints only; removing one never skips the vault lookup. The environment vault cannot persist audit heads, so a later `audit verify` refuses a nonempty unanchored log. Its audit MAC key is process-local unless `KEYSENTRY_VAULT_AUDIT_MAC` supplies the same 32 UTF-8 bytes on every run. These backends provide no durable tail-truncation check across runs.
+
+### Audit export
+
+```yaml
+audit:
+  export:
+    - { kind: syslog, id: siem, host: logs.corp.example, port: 6514 }        # RFC 5425 syslog over TLS
+    - { kind: otlp, id: otel, url: https://otel.corp.example }               # OpenTelemetry logs (OTLP/HTTP JSON)
+    - { kind: s3, id: archive, endpoint: https://s3.eu-west-1.amazonaws.com, bucket: audit-archive, region: eu-west-1 }
+    - { kind: webhook, id: hook, url: https://hooks.corp.example/keysentry } # Standard Webhooks, Ed25519 signature
+```
+
+```sh
+keysentry audit export --dry-run          # what would be sent; contacts nothing
+keysentry audit export                    # send now
+keysentry audit export status             # progress per target and the webhook public key
+keysentry audit export secret otel bearer # store a target credential (hidden input or --stdin)
+```
+
+Export sends only records whose hash chain verified, in order, and remembers per target how far it got: a crash can resend a batch, never skip one. Receivers should deduplicate on `(source, log, seq)`. The watcher exports after every cycle. Each HTTPS target gets its own network client that reaches only its host and follows no redirect, so an OTLP target may use any custom header name. Records carry metadata only: no key values, tokens or URLs with credentials. Before 1.0, keysentry's syslog structured-data ID `keysentry@32473` uses the documentation enterprise number from RFC 5612; a registered IANA Private Enterprise Number must replace it. Details: [notes/audit-export.md](notes/audit-export.md).
+
+### Bring your own KMS for the state key
+
+```yaml
+kms: { provider: vault-transit, address: https://vault.corp.example, keyName: keysentry }
+# or: { provider: aws-kms, keyId: arn:aws:kms:eu-west-1:111122223333:key/…, region: eu-west-1 }
+#     { provider: gcp-kms, keyName: projects/p/locations/europe-west1/keyRings/r/cryptoKeys/k }
+#     { provider: azure-key-vault, vaultUrl: https://name.vault.azure.net, keyName: keysentry }
+```
+
+```sh
+keysentry kms status    # provider, key and a live unwrap check
+keysentry kms migrate   # wrap the existing state key; type MIGRATE to confirm
+keysentry kms rotate    # re-wrap under the key's current version
+```
+
+With a `kms` section, the project's state key is stored only wrapped by your key and is unwrapped into memory at start. A KMS that is unreachable, denies access, or holds a disabled or deleted key stops keysentry with a fixed message; it never creates a new state key in its place. Deleting or disabling the KMS key therefore makes saved state unreadable, by design. `watcher setup` then prints `KEYSENTRY_STATE_KEY_WRAPPED` instead of `KEYSENTRY_STATE_KEY`, and the watcher needs the KMS credentials in its secret settings. Store KMS credentials with `keysentry vault set` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_SERVICE_ACCOUNT_KEY` or `GOOGLE_OAUTH_ACCESS_TOKEN`, `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`, `VAULT_TOKEN`); `--role read` is enough for unwrapping at start. Required key permissions: AWS `kms:Encrypt` and `kms:Decrypt`; Google `roles/cloudkms.cryptoKeyEncrypterDecrypter`; Azure `keys/get`, `keys/wrapKey`, `keys/unwrapKey` on an RSA key; Vault `read` on the transit key plus `update` on its encrypt and decrypt paths. KMS addresses must use port 443. Details: [notes/kms.md](notes/kms.md).
 
 ## Resume, undo and finish
 
@@ -229,6 +282,29 @@ keysentry refuses known agent environments for key changes, dismissing pending a
 
 List environment settings are comma-separated. Use YAML `enabled: false` to exclude a host. `FLY_API_TOKEN` without `FLY_ORG` or configured app names disables Fly with a scope message. Template dotenv files are excluded unless `includeTemplates: true`. Scanning skips `.git`, `node_modules`, build output, and `.keysentry`.
 
+### More deploy platforms and secret stores
+
+These hosts are opt-in: a host you have neither configured nor given a token is not listed in scans or doctor. Store each token with `keysentry vault set <NAME>`; a `--role read` copy is used for scans.
+
+| Host | What keysentry reads and writes | How new values take effect | Token to create |
+|---|---|---|---|
+| Netlify (`hosts.netlify`) | Site and shared team variables per deploy context; secret values stay sealed except their `dev` value. Writes change only the selected context value. | Production: keysentry rebuilds the published commit and confirms it. Previews, branch deploys and shared variables: on their next deploy (unconfirmed). | `NETLIFY_TOKEN`: a personal access token with an expiry |
+| Heroku (`hosts.heroku`) | App config vars; add-on owned vars are refused. | On write: every config var change creates a release; keysentry confirms that release and never starts another. `--no-redeploy` cannot hold it back. | `HEROKU_API_KEY`: an OAuth authorization with `read-protected,write-protected` |
+| DigitalOcean App Platform (`hosts.digitalocean`) | App spec variables; SECRET values are encrypted and stay sealed. Writes send the spec back unchanged apart from the selected values. | On write: every spec update creates a deployment, which keysentry confirms. | `DIGITALOCEAN_TOKEN`: custom scopes `app:read` and `app:update` |
+| Cloudflare Workers and Pages (`hosts.cloudflare`, needs `accountId`) | Worker plain-text bindings and secret names; Pages variables per environment. | Workers: on write (each secret write deploys a new version, confirmed from the deployment list). Pages: on the next Pages deployment (unconfirmed). | `CLOUDFLARE_WORKERS_TOKEN`: an account API token with Workers Scripts and Cloudflare Pages permissions |
+| Supabase Edge Functions (`hosts.supabase`) | Secret names only; values are never read. Writes add or replace the named secrets. | Immediate: functions read a new secret on their next invocation; no deploy. | `SUPABASE_FUNCTIONS_TOKEN`: a scoped personal access token with Edge Functions secrets read/write |
+| Coolify (`hosts.coolify`, needs `baseUrl`) | Application and service variables (values need the `read:sensitive` permission). | Applications: keysentry restarts (or, with `redeploy: deploy`, deploys) and confirms the deployment. Services: restart only, unconfirmed. | `COOLIFY_TOKEN`: an API token with `read:sensitive`, `write` and `deploy` |
+| Zeabur (`hosts.zeabur`) | Service variables per environment. Writes replace the set with only the selected values changed. | keysentry restarts the service, but Zeabur returns no deployment to confirm (unconfirmed). | `ZEABUR_TOKEN`: an API key |
+| Kubernetes Secrets (`hosts.kubernetes`, needs `server` and `namespaces`) | Secrets in the namespaces you list (controller-owned types are skipped). Conditional writes keep every other key. | Manual, unless `restartDeployments` names the Deployments that use a Secret: keysentry then rolls them like `kubectl rollout restart` and confirms. | `KUBERNETES_TOKEN`: a short-lived ServiceAccount token (`kubectl create token`) bound to a namespaced Role |
+| AWS Secrets Manager (`hosts.awsSecretsManager`, needs `region`) | JSON secret keys, or one variable for a plain secret. A new version becomes current only if the secret did not change meanwhile. | Manual by default; set `activation: immediate` when every consumer reads the secret at use time. | `AWS_SECRETS_MANAGER_ACCESS_KEY_ID` and `AWS_SECRETS_MANAGER_SECRET_ACCESS_KEY` (optional `AWS_SECRETS_MANAGER_SESSION_TOKEN`) for a dedicated IAM principal |
+| HashiCorp Vault KV v2 (`hosts.vault`, needs `address`) | String keys under the configured paths. Writes patch only the selected keys with check-and-set. | Manual by default; `activation: immediate` when consumers read at use time (Vault Agent templates re-render on their own schedule, so leave those manual). | `VAULT_TOKEN`: a token with a read policy, plus `patch` for rotation |
+| Doppler (`hosts.doppler`) | Raw secret values of root configs (branch configs only with `includeBranchConfigs`). Writes carry a current-value precondition. | Manual by default; `activation: immediate` only when every consumer fetches at use time. `doppler run` injects values at process start, and Doppler integrations sync on their own. | `DOPPLER_TOKEN`: a service token for the config |
+| Infisical (`hosts.infisical`, needs `projects`) | Shared secrets per project, environment and folder. | Manual by default; `activation: immediate` when consumers read at use time (SDK caches and Infisical Agent refresh on their own schedule). | `INFISICAL_TOKEN`, or `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET` for a Universal Auth machine identity |
+
+How a host applies new values decides when an old key may be retired. A host that keysentry can confirm (a confirmed deployment, an on-write release, or an immediate write) lets the old key be revoked after the grace period. An unconfirmed host keeps the old key until you accept its next deploy or finish the rotation yourself, exactly as for Fly, GitHub Actions and dotenv. Secret-store automation you configured (Doppler or Infisical integrations, AWS rotation functions, Kubernetes controllers such as Reloader, Vault Agent) may react to a change; keysentry neither starts nor waits for it.
+
+Self-hosted servers (Coolify, the Kubernetes API server, Vault, a self-hosted Infisical) must be addressed by an https DNS name; IP addresses are refused everywhere. A URL may name a port (`https://coolify.example.com:8000`, `https://k8s.example.com:6443`, `https://vault.example.com:8200`); keysentry then allows exactly that host and port and nothing else. Use `network.caFile` for a private certificate authority. Environment scope overrides: `NETLIFY_ACCOUNT_SLUG`, `NETLIFY_SITE_IDS`, `HEROKU_APPS`, `HEROKU_TEAM`, `DIGITALOCEAN_APPS`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_WORKERS_SCRIPTS`, `CLOUDFLARE_PAGES_PROJECTS`, `SUPABASE_PROJECT_REFS`, `COOLIFY_URL`, `ZEABUR_OWNER_ID`, `ZEABUR_PROJECT_IDS`. The first-run scan (`npx keysentry`) also infers these platforms from `netlify.toml`, `.netlify/state.json`, `heroku.yml`, `app.json`, `Procfile`, `.do/app.yaml`, `wrangler.toml`/`.json`/`.jsonc`, `supabase/config.toml` and `zbpack.json` (`Procfile` and `app.json` are also read by other platforms, so treat them as hints).
+
 ## Supported providers
 
 `auto` creates an overlapping replacement, `atomic roll` invalidates the old value immediately, `generate` creates a local random value, and `guided` asks a human to create a replacement. Management credentials are separate from the application secrets being rotated.
@@ -248,14 +324,19 @@ List environment settings are comma-separated. Use YAML `enabled: false` to excl
 | Supabase | guided | Human project access; sibling `SUPABASE_URL` enables verification; legacy JWT signing changes can affect sessions and other keys |
 | Database credentials/URLs | guided | Database administrator access; change the database password before replacing its connection URL |
 | Slack | guided | Workspace/app administration; token verification where available; webhooks are unverified |
-| SendGrid | guided | Human API-key administration; application key is used for verification |
-| Twilio | guided | Human console access; application-specific verification required |
-| Google credentials | guided | Human Cloud Console/service-account administration; application-specific verification required |
+| SendGrid | auto | `SENDGRID_ADMIN_KEY` (Full Access, or a restricted key with API Keys permissions) in the same account or subuser; the replacement gets the old key's exact scopes; the management key itself is never rotated |
+| Twilio API keys | auto | A Main API key (`TWILIO_ADMIN_KEY_SID` + `TWILIO_ADMIN_KEY`) or the Account SID and Auth Token (`TWILIO_ADMIN_KEY_SID` = `AC…`, plus `TWILIO_ADMIN_ACCOUNT_SID` for a Main key); the secret and its `SK…` SID must sit side by side, under the same names, in every consumer; Auth Tokens and Main keys stay guided |
+| Google Cloud API keys | auto | `GOOGLE_API_KEYS_ADMIN_KEY` (a service-account JSON key with API Keys Admin) or a short-lived `GOOGLE_OAUTH_ACCESS_TOKEN`, plus `GOOGLE_API_KEYS_PROJECT` (not a secret); restrictions, annotations and the bound service account are copied; deleted keys stay restorable for 30 days |
+| Google service-account JSON keys | guided | Human Cloud Console administration; never armed for autopilot |
+| Neon personal API keys | auto | `NEON_ADMIN_KEY` from the same user; delete the old key by hand (Neon shows no value hints); organization and project keys and connection strings stay guided |
+| Upstash Redis and QStash | atomic roll | `UPSTASH_ADMIN_EMAIL` + `UPSTASH_ADMIN_KEY` (Developer API, Read/Write, native Upstash accounts); a reset invalidates the old password or token at once; other forms of the same credential in a consumer are updated only where that consumer already holds them |
+| Mistral | guided | Human console access; an Enterprise `MISTRAL_ADMIN_KEY` lets keysentry identify and delete the old key |
+| Groq, Replicate, Postmark, Clerk | guided | Human console access; keysentry verifies the key and guides the replacement (no key-management API) |
 | Private keys | guided | Issuer/owner access and a certificate or trust-distribution procedure |
 | Crypto wallets | guided | Move funds to a new wallet first; replacing a variable cannot protect already exposed funds |
 | Unknown secrets | guided | Identify the issuer and every consumer before replacement |
 
-Verification differs by provider. Some read endpoints accept restricted credentials but return limited access; some credential types have no safe verification endpoint. Provider permissions, endpoint behavior, and account scope must be checked for the target account. See module notes under [notes/](notes/) for API assumptions and gaps.
+Verification differs by provider. Some read endpoints accept restricted credentials but return limited access; some credential types have no safe verification endpoint. Provider permissions, endpoint behavior, and account scope must be checked for the target account. See module notes under [notes/](notes/) for API assumptions and gaps. The phase 6 adapters were built from vendor documentation without live accounts; [notes/providers-a.md](notes/providers-a.md) and [notes/providers-b.md](notes/providers-b.md) list what is unverified.
 
 ## Peacetime setup
 

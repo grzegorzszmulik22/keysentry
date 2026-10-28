@@ -8,9 +8,14 @@ import { createLogger, createRedactor } from '../core/index.js';
 import { createFetchHttp } from '../http.js';
 import {
   createRailwayHost, createVercelHost, createRenderHost, createFlyHost,
-  createGithubActionsHost, createDotenvHost,
+  createGithubActionsHost, createDotenvHost, createNetlifyHost, createHerokuHost, createDigitalOceanHost,
+  createCloudflareWorkersHost, createSupabaseFunctionsHost, createCoolifyHost, coolifyApiRoot, createZeaburHost,
+  createKubernetesHost, createAwsSecretsManagerHost, createVaultKvHost, createDopplerHost, createInfisicalHost,
+  type InfisicalAuth,
 } from '../hosts/index.js';
-import { PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { NON_SECRET_CREDENTIALS, PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { HOST_CREDENTIALS } from '../hosts/credentials.js';
+import { rulesForUserUrls } from '../net/allowlist.js';
 import { CREDENTIAL_NAMES, createCredentialSource, createEnvVault } from '../vault/index.js';
 import {
   combineNotifiers, createConsoleNotifier, createWebhookNotifier, defaultPolicy,
@@ -46,6 +51,22 @@ const guardedUrl = safeUrl.refine(value => {
   return url.protocol === 'https:' && !url.port && !url.hash && !isIP(url.hostname.replace(/^\[|\]$/g, ''))
     && !/^[a-z]+:\/\/[^/]*@/i.test(value);
 });
+/**
+ * A self-hosted server's https origin (optionally followed by the documented API prefix). It must be a DNS name: the
+ * egress guard refuses IP literals. An explicit port is allowed; egress then allows exactly that port.
+ */
+const selfHostedOrigin = (apiPrefix?: string) => z.string().trim().refine(value => {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.replace(/\/+$/, '');
+    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash
+      && !/[?#\\]/.test(value) && (path === '' || path === apiPrefix) && isIP(url.hostname.replace(/^\[|\]$/g, '')) === 0;
+  } catch { return false; }
+});
+const k8sLabel = z.string().regex(/^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/);
+const zeaburId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+/** Secret stores: `immediate` only when every consumer reads the store at use time (see the README). */
+const storeActivation = z.enum(['manual', 'immediate']).optional();
 const channelId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const channelSettings = z.object({
   id: channelId,
@@ -68,6 +89,74 @@ export const configSchema = z.object({
     fly: z.object({ enabled: z.boolean().optional(), org: nonempty.optional(), apps: list.optional() }).strict().prefault({}),
     github: z.object({ enabled: z.boolean().optional(), repos: z.array(repository).default([]) }).strict().prefault({}),
     dotenv: z.object({ enabled: z.boolean().optional(), roots: list.default(['.']), includeTemplates: z.boolean().default(false) }).strict().prefault({}),
+    // Phase 6 deploy platforms (notes/hosts-a.md, notes/hosts-b.md).
+    netlify: z.object({
+      enabled: z.boolean().optional(), accountSlug: nonempty.optional(), siteIds: list.optional(),
+      contexts: z.array(z.enum(['production', 'deploy-preview', 'branch-deploy', 'dev'])).min(1).optional(),
+      shared: z.boolean().optional(),
+    }).strict().prefault({}),
+    heroku: z.object({ enabled: z.boolean().optional(), apps: list.optional(), team: nonempty.optional() }).strict().prefault({}),
+    digitalocean: z.object({ enabled: z.boolean().optional(), apps: list.optional() }).strict().prefault({}),
+    cloudflare: z.object({
+      enabled: z.boolean().optional(),
+      accountId: z.string().regex(/^[A-Za-z0-9]{1,32}$/).optional(),
+      products: z.array(z.enum(['workers', 'pages'])).min(1).optional(),
+      scripts: list.optional(),
+      pagesProjects: list.optional(),
+      pagesEnvironments: z.array(z.enum(['production', 'preview'])).min(1).optional(),
+    }).strict().prefault({}),
+    supabase: z.object({
+      enabled: z.boolean().optional(),
+      projectRefs: z.array(z.string().regex(/^[a-z]{20}$/)).min(1).optional(),
+    }).strict().prefault({}),
+    coolify: z.object({
+      enabled: z.boolean().optional(),
+      baseUrl: nonempty.refine(value => { try { coolifyApiRoot(value); return true; } catch { return false; } }).optional(),
+      include: z.array(z.enum(['applications', 'services'])).min(1).optional(),
+      applications: list.optional(),
+      services: list.optional(),
+      redeploy: z.enum(['restart', 'deploy']).optional(),
+    }).strict().prefault({}),
+    zeabur: z.object({ enabled: z.boolean().optional(), ownerId: zeaburId.optional(), projectIds: z.array(zeaburId).min(1).optional() }).strict().prefault({}),
+    // Phase 5 secret stores (notes/secret-stores.md).
+    kubernetes: z.object({
+      enabled: z.boolean().optional(),
+      server: selfHostedOrigin().optional(),
+      namespaces: z.array(k8sLabel).default([]),
+      labelSelector: nonempty.optional(),
+      cluster: nonempty.optional(),
+      excludeTypes: z.array(nonempty).optional(),
+      restartDeployments: z.record(z.string().regex(/^[a-z0-9-]{1,63}\/[a-z0-9.-]{1,253}$/), z.array(nonempty).min(1)).optional(),
+    }).strict().prefault({}),
+    awsSecretsManager: z.object({
+      enabled: z.boolean().optional(),
+      region: z.string().regex(/^(?:[a-z]+-)+\d+$/).optional(),
+      secretIds: list.optional(),
+      namePrefixes: z.array(z.string().regex(/^[a-zA-Z0-9 :_@/+=.-]{1,512}$/)).max(10).optional(),
+      activation: storeActivation,
+    }).strict().prefault({}),
+    vault: z.object({
+      enabled: z.boolean().optional(),
+      address: selfHostedOrigin('/v1').optional(),
+      namespace: nonempty.optional(),
+      mount: nonempty.optional(),
+      paths: list.optional(),
+      activation: storeActivation,
+    }).strict().prefault({}),
+    doppler: z.object({
+      enabled: z.boolean().optional(),
+      configs: z.array(z.object({ project: nonempty, config: nonempty }).strict()).optional(),
+      projects: list.optional(),
+      includeBranchConfigs: z.boolean().default(false),
+      activation: storeActivation,
+    }).strict().prefault({}),
+    infisical: z.object({
+      enabled: z.boolean().optional(),
+      siteUrl: selfHostedOrigin('/api').optional(),
+      organizationSlug: nonempty.optional(),
+      projects: z.array(z.object({ projectId: nonempty, environments: z.array(nonempty).min(1), secretPath: nonempty.optional() }).strict()).default([]),
+      activation: storeActivation,
+    }).strict().prefault({}),
   }).strict().prefault({}),
   rotation: z.object({
     graceSeconds: z.number().finite().nonnegative().default(120),
@@ -253,6 +342,20 @@ export async function loadConfigMetadata(options: Pick<LoadConfigOptions, 'cwd' 
   }
   fly.org = envValue(env, 'FLY_ORG') ?? fly.org;
   fly.apps = envList(env, 'FLY_APPS') ?? fly.apps;
+  // Phase 6 hosts: identifiers only, never secrets.
+  const { netlify, heroku, digitalocean, cloudflare, supabase, coolify, zeabur } = settings.hosts;
+  netlify.accountSlug = envValue(env, 'NETLIFY_ACCOUNT_SLUG') ?? netlify.accountSlug;
+  netlify.siteIds = envList(env, 'NETLIFY_SITE_IDS') ?? netlify.siteIds;
+  heroku.apps = envList(env, 'HEROKU_APPS') ?? heroku.apps;
+  heroku.team = envValue(env, 'HEROKU_TEAM') ?? heroku.team;
+  digitalocean.apps = envList(env, 'DIGITALOCEAN_APPS') ?? digitalocean.apps;
+  cloudflare.accountId = envValue(env, 'CLOUDFLARE_ACCOUNT_ID') ?? cloudflare.accountId;
+  cloudflare.scripts = envList(env, 'CLOUDFLARE_WORKERS_SCRIPTS') ?? cloudflare.scripts;
+  cloudflare.pagesProjects = envList(env, 'CLOUDFLARE_PAGES_PROJECTS') ?? cloudflare.pagesProjects;
+  supabase.projectRefs = envList(env, 'SUPABASE_PROJECT_REFS') ?? supabase.projectRefs;
+  coolify.baseUrl = envValue(env, 'COOLIFY_URL') ?? coolify.baseUrl;
+  zeabur.ownerId = envValue(env, 'ZEABUR_OWNER_ID') ?? zeabur.ownerId;
+  zeabur.projectIds = envList(env, 'ZEABUR_PROJECT_IDS') ?? zeabur.projectIds;
   github.repos = envList(env, 'GITHUB_REPOS') ?? github.repos;
   dotenv.roots = envList(env, 'KEYSENTRY_DOTENV_ROOTS') ?? dotenv.roots;
   dotenv.roots = dotenv.roots.map(root => resolve(cwd, root));
@@ -271,8 +374,32 @@ export async function loadConfigMetadata(options: Pick<LoadConfigOptions, 'cwd' 
     userHostRules: [
       ...[...new Set(settings.network.allowHosts)].map(host => ({ host, owner: 'user', purpose: 'host you added in keysentry.yaml' })),
       ...settings.autopilot.healthChecks.map(check => ({ host: new URL(check.url).hostname, owner: 'user', purpose: 'health check you configured' })),
+      ...selfHostedRules(settings),
     ],
   };
+}
+
+/**
+ * Egress for servers you configured: exactly their host, and their explicit port if they name one (decision 2 in
+ * notes/integration-phase6.md), only while that host is enabled. Coolify Cloud and Infisical Cloud have built-in rules.
+ */
+function selfHostedRules(settings: ConfigSettings): EgressRule[] {
+  const { coolify, kubernetes, awsSecretsManager, vault, infisical } = settings.hosts;
+  const rules: EgressRule[] = [];
+  const add = (enabled: boolean | undefined, url: string | undefined, purpose: string) => {
+    if (enabled !== false && url) rules.push(...rulesForUserUrls([url], purpose, 'config', { allowPort: true }));
+  };
+  if (coolify.baseUrl && !/^https:\/\/app\.coolify\.io\/?$/i.test(coolify.baseUrl)) add(coolify.enabled, coolify.baseUrl, 'Coolify instance you configured');
+  add(kubernetes.enabled, kubernetes.server, 'Kubernetes API server you configured');
+  add(vault.enabled, vault.address, 'Vault server you configured');
+  if (infisical.siteUrl && !/^https:\/\/(?:app|eu)\.infisical\.com(?:\/api)?\/?$/i.test(infisical.siteUrl)) {
+    add(infisical.enabled, infisical.siteUrl, 'Infisical server you configured');
+  }
+  // The AWS endpoint is fixed except for the validated region: one exact rule for the configured region.
+  if (awsSecretsManager.enabled !== false && awsSecretsManager.region) {
+    rules.push({ host: `secretsmanager.${awsSecretsManager.region}.amazonaws.com`, owner: 'aws-secrets-manager', purpose: 'AWS Secrets Manager in the region you configured' });
+  }
+  return rules;
 }
 
 /** Persist only the non-secret notification metadata; secrets live in the vault. */
@@ -292,6 +419,20 @@ export async function saveNotificationRelay(path: string, server: string): Promi
   await writeFile(path, stringify(next), { mode: 0o600 });
 }
 
+/**
+ * A secret store's consumers decide when a new value takes effect. `activation: immediate` in keysentry.yaml says
+ * every consumer reads the store at use time, so a successful write confirms activation; the default stays manual.
+ */
+function withStoreActivation(host: HostAdapter, activation: 'manual' | 'immediate' | undefined): HostAdapter {
+  if (activation !== 'immediate') return host;
+  return {
+    id: host.id, capabilities: { ...host.capabilities, activation },
+    listServices: () => host.listServices(), readVariables: service => host.readVariables(service),
+    writeVariables: (service, vars, opts) => host.writeVariables(service, vars, opts),
+    redeploy: service => host.redeploy(service), deploymentStatus: (service, id) => host.deploymentStatus(service, id),
+  };
+}
+
 /** Vault credentials take precedence; environment remains the last fallback. */
 export async function loadConfig(options: LoadConfigOptions = {}): Promise<RuntimeConfig> {
   const metadata = await loadConfigMetadata(options);
@@ -306,7 +447,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
   const tokens: Record<string, string | undefined> = Object.create(null);
   for (const name of CREDENTIAL_NAMES) {
     const credential = await source.get(name, options.role ?? 'read');
-    if (credential?.value) { tokens[name] = credential.value; redactor.register(credential.value); }
+    if (credential?.value) { tokens[name] = credential.value; if (!NON_SECRET_CREDENTIALS.includes(name)) redactor.register(credential.value); }
   }
   const credentials: ProviderContext['credentials'] = Object.create(null);
   for (const name of new Set(Object.values(PROVIDER_CREDENTIALS).flat())) {
@@ -316,11 +457,17 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
 
   const hosts: HostAdapter[] = [];
   const disabledHosts: RuntimeConfig['disabledHosts'] = [];
-  function enable(host: HostId, enabled: boolean | undefined, token: string | undefined, missing: string, factory: (value: string) => HostAdapter) {
+  /** `reportMissing: false` keeps a host you neither configured nor gave a token out of scan, doctor and status lists. */
+  function enable(host: HostId, enabled: boolean | undefined, token: string | undefined, missing: string, factory: (value: string) => HostAdapter,
+    reportMissing = true) {
     if (enabled === false) disabledHosts.push({ host, reason: 'Disabled in configuration.' });
-    else if (!token) disabledHosts.push({ host, reason: missing });
+    else if (!token) { if (reportMissing) disabledHosts.push({ host, reason: missing }); }
     else hosts.push(factory(token));
   }
+  /** Phase 5 and 6 hosts are opt-in: listed as disabled only once a setting or one of their credentials exists. */
+  const optedIn = (host: HostId, section: Record<string, unknown>): boolean =>
+    HOST_CREDENTIALS[host].some(name => tokens[name]) || Object.entries(section).some(([field, value]) =>
+      field === 'enabled' ? value === true : value !== undefined && value !== false && !(Array.isArray(value) && value.length === 0));
   const accountToken = tokens.RAILWAY_TOKEN;
   const projectToken = tokens.RAILWAY_PROJECT_TOKEN;
   const railwayType = railway.tokenType ?? (accountToken ? 'account' : 'project');
@@ -336,6 +483,65 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Runti
     github.repos.length ? 'Set GITHUB_TOKEN.' : 'Configure hosts.github.repos or GITHUB_REPOS.', token => createGithubActionsHost({ token, repos: github.repos, http, log }));
   if (dotenv.enabled === false) disabledHosts.push({ host: 'dotenv', reason: 'Disabled in configuration.' });
   else hosts.push(createDotenvHost({ roots: dotenv.roots, includeTemplates: dotenv.includeTemplates, log }));
+
+  // Phase 6 deploy platforms (notes/hosts-a.md, notes/hosts-b.md).
+  const { netlify, heroku, digitalocean, cloudflare, supabase, coolify, zeabur } = settings.hosts;
+  enable('netlify', netlify.enabled, tokens.NETLIFY_TOKEN, 'Set NETLIFY_TOKEN.', token => createNetlifyHost({
+    token, accountSlug: netlify.accountSlug, siteIds: netlify.siteIds, contexts: netlify.contexts, shared: netlify.shared, http, log }),
+    optedIn('netlify', netlify));
+  enable('heroku', heroku.enabled, tokens.HEROKU_API_KEY, 'Set HEROKU_API_KEY.', token => createHerokuHost({
+    token, apps: heroku.apps, team: heroku.team, http, log }), optedIn('heroku', heroku));
+  enable('digitalocean', digitalocean.enabled, tokens.DIGITALOCEAN_TOKEN, 'Set DIGITALOCEAN_TOKEN.', token => createDigitalOceanHost({
+    token, apps: digitalocean.apps, http, log }), optedIn('digitalocean', digitalocean));
+  enable('cloudflare-workers', cloudflare.enabled, cloudflare.accountId ? tokens.CLOUDFLARE_WORKERS_TOKEN : undefined,
+    cloudflare.accountId ? 'Set CLOUDFLARE_WORKERS_TOKEN.' : 'Configure hosts.cloudflare.accountId or CLOUDFLARE_ACCOUNT_ID.',
+    token => createCloudflareWorkersHost({ accountId: cloudflare.accountId!, products: cloudflare.products, scripts: cloudflare.scripts,
+      pagesProjects: cloudflare.pagesProjects, pagesEnvironments: cloudflare.pagesEnvironments, token, http, log }),
+    optedIn('cloudflare-workers', cloudflare));
+  enable('supabase-functions', supabase.enabled, tokens.SUPABASE_FUNCTIONS_TOKEN, 'Set SUPABASE_FUNCTIONS_TOKEN.',
+    token => createSupabaseFunctionsHost({ projectRefs: supabase.projectRefs, token, http, log }), optedIn('supabase-functions', supabase));
+  enable('coolify', coolify.enabled, coolify.baseUrl ? tokens.COOLIFY_TOKEN : undefined,
+    coolify.baseUrl ? 'Set COOLIFY_TOKEN.' : 'Configure hosts.coolify.baseUrl or COOLIFY_URL.',
+    token => createCoolifyHost({ baseUrl: coolify.baseUrl!, include: coolify.include, applications: coolify.applications,
+      services: coolify.services, redeploy: coolify.redeploy, token, http, log }), optedIn('coolify', coolify));
+  enable('zeabur', zeabur.enabled, tokens.ZEABUR_TOKEN, 'Set ZEABUR_TOKEN.',
+    token => createZeaburHost({ ownerId: zeabur.ownerId, projectIds: zeabur.projectIds, token, http, log }), optedIn('zeabur', zeabur));
+
+  // Phase 5 secret stores (notes/secret-stores.md).
+  const { kubernetes, awsSecretsManager, vault: vaultKv, doppler, infisical } = settings.hosts;
+  const k8sReady = Boolean(kubernetes.server && kubernetes.namespaces.length);
+  enable('kubernetes', kubernetes.enabled, k8sReady ? tokens.KUBERNETES_TOKEN : undefined,
+    k8sReady ? 'Set KUBERNETES_TOKEN.' : 'Configure hosts.kubernetes.server and hosts.kubernetes.namespaces.',
+    token => createKubernetesHost({ server: kubernetes.server!, namespaces: kubernetes.namespaces, labelSelector: kubernetes.labelSelector,
+      cluster: kubernetes.cluster, excludeTypes: kubernetes.excludeTypes, restartDeployments: kubernetes.restartDeployments, token, http, log }),
+    optedIn('kubernetes', kubernetes));
+  const awsId = tokens.AWS_SECRETS_MANAGER_ACCESS_KEY_ID;
+  const awsSession = tokens.AWS_SECRETS_MANAGER_SESSION_TOKEN;
+  enable('aws-secrets-manager', awsSecretsManager.enabled, awsSecretsManager.region && awsId ? tokens.AWS_SECRETS_MANAGER_SECRET_ACCESS_KEY : undefined,
+    awsSecretsManager.region ? 'Set AWS_SECRETS_MANAGER_ACCESS_KEY_ID and AWS_SECRETS_MANAGER_SECRET_ACCESS_KEY.' : 'Configure hosts.awsSecretsManager.region.',
+    secretAccessKey => withStoreActivation(createAwsSecretsManagerHost({
+      region: awsSecretsManager.region!, secretIds: awsSecretsManager.secretIds, namePrefixes: awsSecretsManager.namePrefixes, http, log,
+      credentials: { accessKeyId: awsId!, secretAccessKey, ...(awsSession ? { sessionToken: awsSession } : {}) },
+    }), awsSecretsManager.activation), optedIn('aws-secrets-manager', awsSecretsManager));
+  enable('vault-kv', vaultKv.enabled, vaultKv.address ? tokens.VAULT_TOKEN : undefined,
+    vaultKv.address ? 'Set VAULT_TOKEN.' : 'Configure hosts.vault.address.',
+    token => withStoreActivation(createVaultKvHost({ address: vaultKv.address!, namespace: vaultKv.namespace, mount: vaultKv.mount,
+      paths: vaultKv.paths, token, http, log }), vaultKv.activation), optedIn('vault-kv', vaultKv));
+  // An explicit enabled: true is consent to list every project the token can see.
+  const dopplerScoped = Boolean(doppler.configs?.length || doppler.projects?.length || doppler.enabled);
+  enable('doppler', doppler.enabled, dopplerScoped ? tokens.DOPPLER_TOKEN : undefined,
+    dopplerScoped ? 'Set DOPPLER_TOKEN.' : 'Configure hosts.doppler.configs or hosts.doppler.projects.',
+    token => withStoreActivation(createDopplerHost({ configs: doppler.configs, projects: doppler.projects,
+      includeBranchConfigs: doppler.includeBranchConfigs, token, http, log }), doppler.activation), optedIn('doppler', doppler));
+  const infisicalAuth: InfisicalAuth | undefined = tokens.INFISICAL_TOKEN ? { accessToken: tokens.INFISICAL_TOKEN }
+    : tokens.INFISICAL_CLIENT_ID && tokens.INFISICAL_CLIENT_SECRET
+      ? { clientId: tokens.INFISICAL_CLIENT_ID, clientSecret: tokens.INFISICAL_CLIENT_SECRET,
+        ...(infisical.organizationSlug ? { organizationSlug: infisical.organizationSlug } : {}) }
+      : undefined;
+  enable('infisical', infisical.enabled, infisical.projects.length && infisicalAuth ? 'configured' : undefined,
+    infisical.projects.length ? 'Set INFISICAL_TOKEN, or INFISICAL_CLIENT_ID and INFISICAL_CLIENT_SECRET.' : 'Configure hosts.infisical.projects.',
+    () => withStoreActivation(createInfisicalHost({ siteUrl: infisical.siteUrl, projects: infisical.projects, auth: infisicalAuth!, http, log }),
+      infisical.activation), optedIn('infisical', infisical));
 
   const policy = defaultPolicy();
   policy.autoExecute = settings.monitor.autoExecute;

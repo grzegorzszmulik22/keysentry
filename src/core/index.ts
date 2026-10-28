@@ -1,5 +1,5 @@
 export { loadOrCreateFingerprintKey, fingerprint, makeHint } from './fingerprint.js';
-export { classify, methodFor, tierFor } from './classify.js';
+export { classify, methodFor, methodForValue, tierFor } from './classify.js';
 export { serviceKey } from './service-key.js';
 export { buildInventory, scanHosts } from './inventory.js';
 export type { HostScan } from './inventory.js';

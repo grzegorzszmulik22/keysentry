@@ -1,11 +1,13 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { StateStore } from '../core/store.js';
-import type { ApprovalGrant, ApprovalRequest, AuditEvent } from '../types.js';
+import type { ApprovalApprover, ApprovalGrant, ApprovalRequest, AuditEvent } from '../types.js';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'expired' | 'rejected' | 'superseded' | 'executed';
 export interface ApprovalCluster { clusterId: string; hint: string | null }
 export interface ApprovalAction { id: string; kind: string; clusterIds: string[]; clusters?: ApprovalCluster[]; planHash?: string }
+/** Team quorum progress (phase 5). Absent without a team. */
+export interface ApprovalQuorumState { required: number; admins: boolean; approvers: ApprovalApprover[] }
 export interface StoredApproval extends ApprovalRequest {
   kind: string;
   keyCount: number;
@@ -16,6 +18,7 @@ export interface StoredApproval extends ApprovalRequest {
   action?: ApprovalAction;
   clusters?: ApprovalCluster[];
   executedAt?: string;
+  quorum?: ApprovalQuorumState;
 }
 export interface ApprovalState {
   v: 1;
@@ -30,8 +33,15 @@ const date = z.string().datetime();
 const cluster = z.object({ clusterId: z.string().min(1).max(512), hint: z.string().max(80).nullable() }).strict();
 const action = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), kind: z.string().min(1).max(80),
   clusterIds: z.array(z.string().min(1).max(512)).max(10000), clusters: z.array(cluster).max(10000).optional(), planHash: z.string().max(512).optional() }).strict();
+const memberId = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
+const approver = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('passkey'), credentialId: z.string(), memberId: memberId.optional(), at: date.optional() }).strict(),
+  z.object({ kind: z.literal('device'), keyId: z.string(), memberId: memberId.optional(), at: date.optional() }).strict(),
+]);
 const grant = z.object({ actionId: z.string(), digest: z.string().regex(/^[a-f0-9]{64}$/), at: date,
-  by: z.discriminatedUnion('kind', [z.object({ kind: z.literal('passkey'), credentialId: z.string() }).strict(), z.object({ kind: z.literal('device'), keyId: z.string() }).strict()]) }).strict();
+  by: z.discriminatedUnion('kind', [z.object({ kind: z.literal('passkey'), credentialId: z.string() }).strict(), z.object({ kind: z.literal('device'), keyId: z.string() }).strict()]),
+  approvers: z.array(approver).max(200).optional() }).strict();
+const quorum = z.object({ required: z.number().int().min(1).max(200), admins: z.boolean(), approvers: z.array(approver).max(200) }).strict();
 const stateSchema = z.object({
   v: z.literal(1),
   requests: z.array(z.object({
@@ -39,7 +49,7 @@ const stateSchema = z.object({
     challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/), widening: z.boolean(), kind: z.string().min(1).max(80),
     keyCount: z.number().int().min(0).max(10000), status: z.enum(['pending', 'approved', 'expired', 'rejected', 'superseded', 'executed']),
     attempts: z.number().int().min(0).max(5), grant: grant.optional(),
-    action: action.optional(), clusters: z.array(cluster).max(10000).optional(), executedAt: date.optional(),
+    action: action.optional(), clusters: z.array(cluster).max(10000).optional(), executedAt: date.optional(), quorum: quorum.optional(),
   }).strict()),
   usedChallenges: z.array(z.string().regex(/^[A-Za-z0-9_-]{43}$/)),
   usedDeviceApprovals: z.array(z.string().regex(/^[a-f0-9]{64}$/)),

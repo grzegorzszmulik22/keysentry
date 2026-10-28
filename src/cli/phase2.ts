@@ -18,6 +18,9 @@ import { CliError } from './errors.js';
 import { assertHumanForMutation } from '../safety/index.js';
 import { providerName } from './display.js';
 import { trustedWatcherKeys } from './watcher-keys.js';
+import { offlineNotice, selectFeedSources } from '../feeds/index.js';
+import { runAuditExportForRuntime } from './audit-export.js';
+import { createKeyWrapper, createKmsHttp, wrapWatcherStateKey } from '../kms/index.js';
 
 export interface Phase2CommandsOptions {
   getRuntime(watcher?: boolean): Promise<KeysentryRuntime>;
@@ -194,10 +197,17 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault,
         notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
         intervalSeconds: rt.config.monitor.intervalMs / 1000, publicOrigin: options.origin,
-        relayServer: options.relayServer ?? rt.config.settings.notify.relay?.server });
+        relayServer: options.relayServer ?? rt.config.settings.notify.relay?.server,
+        // Offline mode travels in the sealed config, so a deployed watcher stays offline without keysentry.yaml.
+        ...(rt.network.feedMode.offline ? { sources: { disabled: DEFAULT_SOURCES.map(source => source.id), extra: [] } } : {}) });
+      const kms = rt.config.settings.kms;
       const outputDir = resolve(rt.config.cwd, options.output ?? `.keysentry/watcher-setup-${Date.now()}`);
       const result = await setupWatcher({ assertHuman: opts.human, interactive: opts.interactive(), json: opts.json(), vault: rt.vault, audit: rt.audit,
         config, outputDir, writeTerminal: text => (opts.promptIO?.output ?? process.stdout).write(`${text}\n`),
+        // With a kms section the watcher receives KEYSENTRY_STATE_KEY_WRAPPED (notes/kms.md).
+        ...(kms ? { wrapStateKey: (key: Buffer, projectId: string) => wrapWatcherStateKey({ projectId, stateKey: key,
+          wrapper: createKeyWrapper(kms, { http: createKmsHttp(rt.network.transport, kms, { receipt: rt.receipt, log: rt.log }),
+            credentials: rt.credentials, now: rt.now }) }) } : {}),
         prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir,
           confirmEnvironmentCredential: async name => {
             opts.diagnostic(`Copy ${name} from your environment into the hosted watcher? [y/N]`);
@@ -233,7 +243,11 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
         }
       }
       const publicKeys = sealed ? async () => sealed.devicePublicKeys.map(key => ({ keyId: key.keyId, publicKeyDer: Buffer.from(key.publicKeyDer, 'base64') })) : () => localDeviceKeys(rt);
-      const sources: FeedSource[] = [...DEFAULT_SOURCES.filter(source => !sealed?.sources.disabled.includes(source.id)), ...sealed?.sources.extra ?? []];
+      // Offline mode (keysentry.yaml or a signed team policy) polls no feed at all.
+      const sources: FeedSource[] = selectFeedSources([...DEFAULT_SOURCES.filter(source => !sealed?.sources.disabled.includes(source.id)),
+        ...sealed?.sources.extra ?? []], rt.network.feedMode);
+      const offline = offlineNotice(rt.network.feedMode);
+      if (offline) rt.log.info(offline);
       opts.setExit(await runWatch({ store: watchStore, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
         saveRotationReport: rt.saveRotationReport,
         signingKey: rt.signingKey, fingerprintKey: rt.fingerprintKey, deviceKeys: publicKeys,
@@ -252,6 +266,15 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
           return { ok, reasons: ok ? [] : ['The watcher installation integrity could not be verified.'] };
         },
         ...(!sealed ? { applyAdoptionUpdates: async updates => { await rt.autopilotManager().applyAdoptionUpdates(updates); } } : {}),
+        // Audit export after each cycle (notes/audit-export.md); unforced, so a failing target waits out its cooldown.
+        afterCycle: async () => {
+          const result = await runAuditExportForRuntime(rt, { env: opts.env });
+          for (const target of result?.targets ?? []) {
+            if (target.status === 'failed' || target.status === 'refused') rt.log.warn(`Audit export to ${target.id} did not complete: ${target.error ?? 'delivery failed'}`);
+          }
+        },
+        // ORCHESTRATOR HOOK (team policy): when a verified TeamPolicy.audit.exportRequired is true and audit.export is empty,
+        // refuse to run the watcher here (and in doctor and autopilot arm), as notes/audit-export.md suggests.
       }, { ...options, ...(opts.signal ? { signal: opts.signal } : {}) }));
     });
 }

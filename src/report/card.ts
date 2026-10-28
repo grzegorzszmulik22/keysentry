@@ -17,6 +17,9 @@ const platforms = new Map([
   ['railway', 'Railway'], ['vercel', 'Vercel'], ['render', 'Render'],
   ['fly', 'Fly.io'], ['fly.io', 'Fly.io'],
   ['github-actions', 'GitHub Actions'], ['github actions', 'GitHub Actions'],
+  ['netlify', 'Netlify'], ['cloudflare-workers', 'Cloudflare Workers'], ['supabase-functions', 'Supabase Edge Functions'],
+  ['heroku', 'Heroku'], ['digitalocean', 'DigitalOcean App Platform'], ['coolify', 'Coolify'], ['zeabur', 'Zeabur'],
+  ['kubernetes', 'Kubernetes'], ['aws-secrets-manager', 'AWS Secrets Manager'], ['vault-kv', 'HashiCorp Vault'], ['doppler', 'Doppler'], ['infisical', 'Infisical'],
 ]);
 
 function escapeXml(text: string): string {

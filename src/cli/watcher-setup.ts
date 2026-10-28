@@ -28,6 +28,11 @@ export interface WatcherSetupDependencies {
   writeTerminal(text: string): void;
   /** Initialize the portable encrypted vault/state before any deploy secrets are shown. */
   prepareDeployment(input: WatcherDeploymentSecrets): Promise<void | { vaultBlob: string; exportedCredentialNames?: string[] }>;
+  /**
+   * With a kms section (notes/kms.md): wrap the new deployment state key with the configured KMS key. The watcher then
+   * receives KEYSENTRY_STATE_KEY_WRAPPED instead of the plain KEYSENTRY_STATE_KEY.
+   */
+  wrapStateKey?: (stateKey: Buffer, projectId: string) => Promise<string>;
 }
 
 const TEMPLATES: Record<WatcherPlatform, string> = {
@@ -53,7 +58,8 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
     write(deployment?.exportedCredentialNames?.length ? `Exported credential names: ${deployment.exportedCredentialNames.join(', ')}.` : 'Exported credential names: none.');
     write('Store the following values in the platform\'s secret settings only. They are shown once. Keep a separate secure backup.');
     write(`KEYSENTRY_WATCHER_KEY=${values.KEYSENTRY_WATCHER_KEY}`);
-    write(`KEYSENTRY_STATE_KEY=${values.KEYSENTRY_STATE_KEY}`);
+    if (values.KEYSENTRY_STATE_KEY_WRAPPED) write(`KEYSENTRY_STATE_KEY_WRAPPED=${values.KEYSENTRY_STATE_KEY_WRAPPED}`);
+    else write(`KEYSENTRY_STATE_KEY=${values.KEYSENTRY_STATE_KEY}`);
     write(`KEYSENTRY_VAULT_PASSPHRASE=${values.KEYSENTRY_VAULT_PASSPHRASE}`);
     write(`KEYSENTRY_WATCHER_CONFIG=${values.KEYSENTRY_WATCHER_CONFIG}`);
     if (deployment) {
@@ -62,6 +68,7 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
     } else {
       write('Copy the encrypted deployment vault and state to the private persistent state volume before starting the watcher. Keep these four variables outside that volume.');
     }
+    if (values.KEYSENTRY_STATE_KEY_WRAPPED) write('The state key is wrapped by your KMS key. The watcher also needs the KMS credentials (for example VAULT_TOKEN, or the AWS, Google or Azure credentials the kms section uses) in its secret settings, and the KMS host must be reachable from it.');
     write('A 30-second token guide: read-role tokens inspect your services; write-role tokens change selected variables and deploy. Use a separate token per protected project or app where the platform supports it. keysentry cannot prove the scope of an opaque token.');
     const capabilityIds = [...new Set([...protectedHosts, ...deps.config.armed?.clusters.map(cluster => cluster.provider) ?? []])];
     for (const id of capabilityIds) {
@@ -88,7 +95,9 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
 
 export interface WatcherDeploymentValues {
   /** The deployment variables, as the hosted platform or the cloud box receives them. */
-  values: { KEYSENTRY_WATCHER_KEY: string; KEYSENTRY_STATE_KEY: string; KEYSENTRY_VAULT_PASSPHRASE: string; KEYSENTRY_WATCHER_CONFIG: string };
+  values: { KEYSENTRY_WATCHER_KEY: string; KEYSENTRY_STATE_KEY: string; KEYSENTRY_VAULT_PASSPHRASE: string; KEYSENTRY_WATCHER_CONFIG: string;
+    /** Present when the setup wrapped the state key with the configured KMS; the plain KEYSENTRY_STATE_KEY is then not shown. */
+    KEYSENTRY_STATE_KEY_WRAPPED?: string };
   deployment: { vaultBlob: string; exportedCredentialNames?: string[] } | undefined;
   sealedConfigPath: string;
   watcherKeyId: string;
@@ -97,7 +106,7 @@ export interface WatcherDeploymentValues {
 }
 
 /** New deploy, state and watcher keys, the sealed config and the portable vault. Shared by watcher setup and the cloud box. */
-export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencies, 'vault' | 'audit' | 'config' | 'outputDir' | 'prepareDeployment'>,
+export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencies, 'vault' | 'audit' | 'config' | 'outputDir' | 'prepareDeployment' | 'wrapStateKey'>,
   platform: WatcherPlatform | 'cloud-box', options: { persistSigningKey?: boolean } = {}): Promise<WatcherDeploymentValues> {
   const config: WatcherConfig = { ...deps.config, notify: { channels: deps.config.notify.channels.filter(channel => channel.kind !== 'console') } };
   const deployKey = randomBytes(32), stateKey = randomBytes(32), vaultPassphrase = randomBytes(32);
@@ -111,6 +120,8 @@ export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencie
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     await writeFile(sealedConfigPath, `${sealed}\n`, { mode: 0o600, flag: 'wx' });
     const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config });
+    // A KMS failure stops setup before any secret is shown; nothing is deployed.
+    const wrappedState = deps.wrapStateKey ? await deps.wrapStateKey(stateKey, config.projectId) : undefined;
     // A cloud box records its watcher key only after the box confirms it sealed the deployment, and never in the
     // self-hosted watcher's slot, which would stop this computer trusting a watcher that is still running.
     if (options.persistSigningKey !== false) {
@@ -120,7 +131,8 @@ export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencie
     }
     return { sealedConfigPath, watcherKeyId: watcherKey.keyId, deployment: deployment ?? undefined, watcherPublicKeyDer: Buffer.from(watcherKey.publicKeyDer),
       values: { KEYSENTRY_WATCHER_KEY: deployKey.toString('base64'), KEYSENTRY_STATE_KEY: stateKey.toString('base64'),
-        KEYSENTRY_VAULT_PASSPHRASE: printablePassphrase.toString(), KEYSENTRY_WATCHER_CONFIG: sealed } };
+        KEYSENTRY_VAULT_PASSPHRASE: printablePassphrase.toString(), KEYSENTRY_WATCHER_CONFIG: sealed,
+        ...(wrappedState ? { KEYSENTRY_STATE_KEY_WRAPPED: wrappedState } : {}) } };
   } catch (error) {
     if (error instanceof CliError) throw error;
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError('A watcher config already exists in the output directory. Choose a new directory for this setup.');

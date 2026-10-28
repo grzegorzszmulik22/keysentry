@@ -116,6 +116,8 @@ export function createVercelHost(opts: VercelHostOptions): HostAdapter {
   return {
     id: 'vercel',
     capabilities: { readValues: true, batchWrite: false, redeploy: true },
+    // Only production is redeployed; preview and development values apply on their next deployment.
+    activationFor: service => service.environmentId === 'production' ? 'redeploy' : 'manual',
 
     async listServices() {
       const projects = await pages('/v10/projects', 'projects', { limit: '100' });

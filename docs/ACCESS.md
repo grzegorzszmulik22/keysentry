@@ -106,6 +106,27 @@ keysentry uses a Bearer token at `https://api.github.com`. It lists `GET /repos/
 
 Actions **variables** are different: their values are readable with Variables: read, and writes need Variables: write. The current adapter scans repository secrets only; readable variables are not yet included. Dispatching or rerunning a workflow would require Actions: write, which this adapter does not need. `doctor --probe` can call `GET /user`. OAuth scope response headers describe classic/OAuth tokens; an endpoint's accepted-permissions header describes what the endpoint needs, not a complete inventory of a fine-grained token's grants. See [OAuth scopes](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps).
 
+### Phase 5 and 6 hosts and secret stores
+
+These adapters were built from vendor documentation without live accounts. Every request shape, the token choice and what is **unverified** are in the module notes: [notes/hosts-a.md](../notes/hosts-a.md) (Netlify, Heroku, DigitalOcean), [notes/hosts-b.md](../notes/hosts-b.md) (Cloudflare Workers and Pages, Supabase Edge Functions, Coolify, Zeabur) and [notes/secret-stores.md](../notes/secret-stores.md) (Kubernetes, AWS Secrets Manager, Vault KV, Doppler, Infisical). `keysentry doctor` shows the same token guidance.
+
+| Host | Choose | What keysentry reads | What an approved write changes |
+|---|---|---|---|
+| Netlify | A personal access token with an expiry (`NETLIFY_TOKEN`); no read-only or site-scoped token is documented | Site and shared variables at `api.netlify.com`; secret values stay sealed | One context value per variable; a production rebuild of the published commit |
+| Heroku | `heroku authorizations:create --scope read-protected,write-protected` (`HEROKU_API_KEY`); `read-protected` alone for scans | Config vars at `api.heroku.com` | Only the given config vars, one release per write; add-on owned vars are refused |
+| DigitalOcean | A custom-scope token with `app:read` and `app:update` (`DIGITALOCEAN_TOKEN`) | App specs at `api.digitalocean.com`; SECRET values are encrypted | The app spec with only the selected values changed; DigitalOcean deploys it |
+| Cloudflare Workers and Pages | An account API token with Workers Scripts and Cloudflare Pages permissions (`CLOUDFLARE_WORKERS_TOKEN`); the global API key is refused | Worker bindings and Pages variables at `api.cloudflare.com`; secret values never | One Worker secret per write (each deploys a version) or a Pages variable patch |
+| Supabase Edge Functions | A scoped personal access token with Edge Functions secrets read/write (`SUPABASE_FUNCTIONS_TOKEN`) | Secret names only at `api.supabase.com` | Add or replace the named secrets |
+| Coolify | An API token with `read:sensitive`, `write` and `deploy` (`COOLIFY_TOKEN`) | Variables on your instance (your configured host and port) | Variables by key, then an application restart or deployment |
+| Zeabur | An API key (`ZEABUR_TOKEN`); no narrower key is documented | Variables through `api.zeabur.com` (GraphQL) | The service variable set with only the selected values changed, then a restart |
+| Kubernetes | A short-lived ServiceAccount token bound to a namespaced Role (`KUBERNETES_TOKEN`) | Secrets in the namespaces you list on your API server | One conditional Secret update; a `restartedAt` annotation on Deployments you listed |
+| AWS Secrets Manager | A dedicated IAM principal (`AWS_SECRETS_MANAGER_*`) with read, plus `PutSecretValue` and `UpdateSecretVersionStage` for rotation | Secrets in the configured region at `secretsmanager.<region>.amazonaws.com` | A new version that becomes current only if the secret did not change |
+| HashiCorp Vault KV v2 | A token with a read policy, plus `patch` for rotation (`VAULT_TOKEN`) | String values under the configured paths on your server | A check-and-set patch of the selected keys |
+| Doppler | A service token for the config (`DOPPLER_TOKEN`) | Raw values of root configs at `api.doppler.com` | Change requests with a current-value precondition |
+| Infisical | A machine identity with the Viewer (scan) or Member (rotation) role (`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`, or `INFISICAL_TOKEN`) | Shared secrets in the configured folders | Bulk update or create of the selected secrets |
+
+Self-hosted servers are reached only at the exact host and port you configured, and only by DNS name.
+
 ## Providers that issue your application keys
 
 Host access reads or replaces a copy of a key. Provider access creates or retires the key at its issuer. Keep the two separate. A scan does not need an organization admin key merely to identify a local value. Verification can send the value to the issuer's read/authentication endpoint. These calls do not invoke an AI model or send prompts.
@@ -133,6 +154,16 @@ AWS allows at most **two access keys per IAM user, including inactive keys**. Au
 
 Usage costs calculated from OpenAI or Anthropic token counts are estimates from editable price tables, not billing statements.
 
+| Provider (phase 6) | Credential and narrowest available choice | Reads and verification used by keysentry | Approved writes used by keysentry |
+|---|---|---|---|
+| SendGrid | `SENDGRID_ADMIN_KEY`, Full Access (or a restricted key with API Keys permissions) in the same account or subuser | `GET https://api.sendgrid.com/v3/scopes` with the application key; `GET /v3/api_keys/{id}` with the management key | `POST /v3/api_keys` with the old key's exact scopes; `DELETE /v3/api_keys/{id}` for the old key |
+| Twilio API keys | A Main API key (`TWILIO_ADMIN_KEY_SID`, `TWILIO_ADMIN_KEY`, `TWILIO_ADMIN_ACCOUNT_SID`) or the Account SID and Auth Token | `GET https://api.twilio.com/2010-04-01/Accounts/{sid}/Applications.json?PageSize=1`; `GET https://iam.twilio.com/v1/Keys/{SK}` | `POST https://iam.twilio.com/v1/Keys` with the same policy, the new SID delivered beside its secret; `DELETE /v1/Keys/{SK}`. Auth Tokens and Main keys stay guided |
+| Google Cloud API keys | `GOOGLE_API_KEYS_ADMIN_KEY` (service account with API Keys Admin) or a short-lived `GOOGLE_OAUTH_ACCESS_TOKEN`; `GOOGLE_API_KEYS_PROJECT` | `GET https://generativelanguage.googleapis.com/v1beta/models?pageSize=1`; key list and `getKeyString` at `apikeys.googleapis.com` to identify a key (never `lookupKey`, which puts the key in a URL) | `POST .../keys` with the same restrictions, annotations and service account; `DELETE` the old key (restorable for 30 days) |
+| Neon | `NEON_ADMIN_KEY`, a personal API key of the same user | `GET https://console.neon.tech/api/v2/auth` | `POST /api_keys`; delete the old key by hand because Neon exposes no value hints |
+| Upstash | `UPSTASH_ADMIN_EMAIL` + `UPSTASH_ADMIN_KEY`, a Developer API key with Read/Write | Redis `GET https://<db>.upstash.io/ping`; QStash `GET /v2/queues`; database and QStash user lists at `api.upstash.com` | `POST /v2/redis/reset-password/{id}` or `/v2/qstash/rotate-token/{id}`: an atomic roll that invalidates the old credential at once |
+
+See [notes/providers-a.md](../notes/providers-a.md) and [notes/providers-b.md](../notes/providers-b.md) for what is unverified.
+
 ### Guided and local providers
 
 These adapters do not receive a separate organization management token. Give the replacement the same required application access, using the issuer's own settings. A result labelled `unverified` means keysentry did not test application access; it does not prove the replacement works.
@@ -143,9 +174,12 @@ These adapters do not receive a separate organization management token. Give the
 | GitHub application token | `GET https://api.github.com/user` | You create the replacement with the needed repository/organization permissions in [token settings](https://github.com/settings/tokens) |
 | Supabase | If `SUPABASE_URL` is configured, `GET <project-origin>/rest/v1/` with `apikey` and Bearer headers; otherwise unverified. The egress guard must permit the project host | You replace the key in the [project dashboard](https://supabase.com/dashboard); rotating a legacy JWT signing secret can affect other keys and sessions |
 | Slack | For `xox...` tokens, `POST https://slack.com/api/auth.test` with an empty body; webhook URLs are unverified and are not called | You replace the token or webhook in the [issuing Slack app](https://api.slack.com/apps) |
-| SendGrid | `GET https://api.sendgrid.com/v3/scopes` with the application key | You create a suitably scoped replacement in [API key settings](https://app.sendgrid.com/settings/api_keys) |
-| Twilio | No verification request; unverified | You use the [Twilio Console](https://console.twilio.com/) secondary-token or API-key flow and update the matching identifier too |
-| Google API/service-account keys | No verification request; unverified | You create a restricted replacement in [Cloud credentials](https://console.cloud.google.com/apis/credentials) or IAM and test the application's actual API calls |
+| Google service-account keys | A token exchange signed by the key itself (scope `cloud-platform.read-only`) | You create the replacement key in IAM and test the application's actual API calls; never armed for autopilot |
+| Groq | `GET https://api.groq.com/openai/v1/models` | You create the replacement in the [Groq console](https://console.groq.com/keys) |
+| Replicate | `GET https://api.replicate.com/v1/account` | You create the replacement on the [API tokens page](https://replicate.com/account/api-tokens) |
+| Postmark | `GET https://api.postmarkapp.com/deliverystats`, then `/domains` for account tokens (responses carry no tokens) | You generate the replacement in the server's API Tokens tab |
+| Clerk | `GET https://api.clerk.com/v1/jwks` for `sk_live_`/`sk_test_`; webhook secrets unverified | You add a secret key in the [Clerk dashboard](https://dashboard.clerk.com), redeploy, then delete the old key |
+| Mistral | `GET https://api.mistral.ai/v1/models` | You create the replacement in the console; with an Enterprise `MISTRAL_ADMIN_KEY`, keysentry identifies the old key by its masked hint and deletes it after approval |
 | Database credentials | No database connection or verification request; unverified | You change the credential at the database first, using your provider or database administrator; changing only the connection URL is insufficient |
 | Private keys | No verification request; unverified | You generate the replacement with the appropriate trusted tool, update verifier trust, and test before removing the old public key/certificate |
 | Wallet keys or seeds | No verification request; unverified | You create a new wallet and move funds/permissions with a trusted wallet tool. Replacing a variable does not protect the old wallet |

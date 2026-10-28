@@ -71,7 +71,18 @@ export interface HostCapabilities {
   batchWrite: boolean;
   /** Has a deploy step that must run for running instances to pick up new values. */
   redeploy: boolean;
+  /**
+   * How written values take effect. Absent means today's `redeploy` (`manual` when `redeploy` is false).
+   * - `redeploy`: keysentry starts one deploy per service and confirms it.
+   * - `on-write`: the write itself deploys, even with `skipDeploy`; `redeploy()` returns the deployment that write
+   *   created and must not start another; activation is confirmed when that deployment succeeds.
+   * - `immediate`: values are live once the write succeeds; confirmed without a deploy.
+   * - `manual`: keysentry cannot confirm activation (restarts without a deployment id, next-deploy targets).
+   */
+  activation?: ActivationMode;
 }
+
+export type ActivationMode = 'redeploy' | 'on-write' | 'immediate' | 'manual';
 
 export type DeployState = 'pending' | 'success' | 'failed';
 
@@ -88,6 +99,8 @@ export interface HostAdapter {
   /** Start one deployment so running instances pick up current values. Returns a deployment id, or null if none. */
   redeploy(service: ServiceRef): Promise<string | null>;
   deploymentStatus(service: ServiceRef, deploymentId: string): Promise<DeployState>;
+  /** Per-service activation when it differs from `capabilities.activation` (for example preview contexts). */
+  activationFor?(service: ServiceRef): ActivationMode;
 }
 
 // ---------------------------------------------------------------- classification
@@ -493,6 +506,12 @@ export interface EgressRule {
   purpose: string;
   /** Host or provider id, `'feed'`, `'release'` or `'user'`. Redirects may only stay within one owner. */
   owner: string;
+  /**
+   * Only on user rules derived from a self-hosted base URL you configured (Coolify, Kubernetes API server, Vault,
+   * Infisical): that URL's explicit port, matched exactly. Rules without a port accept only 443, and built-in rules
+   * never carry one. IP literals stay refused either way.
+   */
+  port?: number;
 }
 
 export interface NetworkReceiptEntry {

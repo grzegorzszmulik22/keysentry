@@ -1,5 +1,6 @@
-import type { HostId, Inventory } from '../types.js';
+import type { HostId, Inventory, ServiceRef } from '../types.js';
 import { PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { builtInActivation, canConfirmActivation } from '../hosts/activation.js';
 
 /** Runtime facts needed for the drill score. Pass credential names, never their values. */
 export interface ReadinessInput {
@@ -9,6 +10,18 @@ export interface ReadinessInput {
   /** Host redeploy support; a missing host is treated as unsupported. */
   redeploy: Readonly<Partial<Record<HostId, boolean>>>;
   canaries: number;
+  /**
+   * Whether a service needs a manual restart or next deploy, decided by the connected adapters (the runtime passes
+   * its shared activation check). Without it, the built-in host rules and `redeploy` decide.
+   */
+  manualActivation?: (service: ServiceRef) => boolean;
+}
+
+function builtInManual(service: ServiceRef, redeploy: ReadinessInput['redeploy']): boolean {
+  const supported = redeploy[service.host];
+  if (supported === undefined) return true;
+  const mode = builtInActivation(service);
+  return mode === 'redeploy' && !supported || !canConfirmActivation(mode);
 }
 
 /** The CLI's six-factor readiness score, without scanning, storage or a dry run. */
@@ -21,8 +34,8 @@ export function readinessScore(input: ReadinessInput): { score: number; reasons:
   const sealed = inv.clusters.filter(cluster => cluster.fingerprint === null).length;
   const duplicate = inv.clusters.filter(cluster => cluster.consumers.length > 1).length;
   const missing = inv.clusters.filter(cluster => PROVIDER_CREDENTIALS[cluster.provider].some(name => !credentials.has(name))).length;
-  const manualDeploys = inv.services.filter(service => !redeploy[service.host] || service.host === 'fly' ||
-    service.host === 'vercel' && service.environmentId !== 'production' || service.host === 'railway' && service.serviceId === '').length;
+  const manual = input.manualActivation ?? ((service: ServiceRef) => builtInManual(service, redeploy));
+  const manualDeploys = inv.services.filter(service => manual(service)).length;
   const ratio = (count: number, denominator = total) => denominator ? count / denominator : 0;
   const score = total ? Math.round(40 * ratio(automatic) + 15 * (1 - ratio(sealed)) + 15 * (1 - ratio(duplicate)) +
     15 * (1 - ratio(missing)) + 10 * (1 - ratio(manualDeploys, inv.services.length)) + (canaries ? 5 : 0)) : 0;

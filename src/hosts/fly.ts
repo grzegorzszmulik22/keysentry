@@ -211,7 +211,9 @@ export function createFlyHost(options: FlyHostOptions): HostAdapter {
 
   return {
     id: 'fly',
+    // Machine updates restart the app, but activation cannot be confirmed before writing (handled like dotenv).
     capabilities: { readValues: false, batchWrite: true, redeploy: true },
+    activationFor: () => 'manual',
 
     async listServices() {
       if (options.apps !== undefined) {

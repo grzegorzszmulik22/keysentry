@@ -128,6 +128,38 @@ adds exact configured HTTP destinations as user rules/trusted URLs, and never re
 Health-check hosts require explicit user rules. SMTP is an explicit non-HTTP exception: it uses TLS or mandatory
 STARTTLS with certificate checks and writes one `smtp:<host>` metadata entry to the receipt.
 
+**Proxy, extra CA and offline mode (phase 5).** With `network.proxy` (or `HTTPS_PROXY`) every request is tunnelled
+through HTTP CONNECT and TLS still runs end to end, with the destination name verified, so the proxy learns host
+names and timing but not request content. A TLS-inspecting proxy only works if you add its CA, and then it can read
+and alter everything, including tokens: treat adding a CA as trusting that party with all keysentry traffic.
+`network.caFile` adds certificates to the system roots for every host keysentry contacts; it never replaces them
+and refuses files that contain anything but certificates. Proxy credentials come from the vault
+(`KEYSENTRY_PROXY_AUTH`) or `HTTPS_PROXY`, are sent only on the CONNECT request, and cross the LAN unencrypted to an
+`http://` proxy. A broken proxy, CA or policy setting refuses every request instead of silently going direct.
+Offline mode stops feed and news polling and removes their hosts from the allow-list; it trades early breach
+warning for fewer outbound contacts, and an autopilot wave can then never start.
+
+**Self-hosted servers (phase 5 and 6).** Coolify, the Kubernetes API server, Vault and a self-hosted Infisical are
+reached at exactly the host and explicit port you configured; rules without a port allow only 443, built-in rules
+never carry a port, and IP literals are refused everywhere, so such a server needs a DNS name. These servers, like
+any configured destination, are trusted to answer honestly; a compromised self-hosted server can see the values
+keysentry writes to it and fake a successful write. Secret stores do not deploy: unless you declare that consumers
+read at use time (`activation: immediate`), activation stays unconfirmed and the old key is retained until you
+finish. On-write hosts (Heroku, DigitalOcean, Cloudflare Workers) deploy with every write, including writes a
+grace-period undo makes, so `--no-redeploy` cannot stage a change there.
+
+**Customer KMS for the state key (phase 5).** With a `kms` section the state key is stored only wrapped, bound to
+the project (encryption context, AAD or a context hash), and unwrapped into memory at start through a client that
+reaches only the KMS hosts. Whoever controls the KMS key and its credentials can unwrap the state key, and can also
+make saved state permanently unreadable by disabling or deleting the key; keysentry refuses to start rather than
+create a new key. The KMS credentials stay outside `CREDENTIAL_NAMES`: loadConfig does not read them and the watcher
+deployment does not export them, so they must be supplied to a watcher separately.
+
+**Audit export (phase 5).** Exported records are value-free metadata from the verified prefix of the audit chain;
+each HTTPS target gets a single-host client that follows no redirect, syslog connects only to the configured
+host:port over TLS, and webhook batches are signed. A receiver or anyone on its path learns event kinds, timing and
+names such as variable names. Duplicates are possible after a crash; gaps are not.
+
 **The CLI to the operating system.** The optional Node permission model limits file access and
 child-process use on supported patched versions. On Node 22 it is enabled only at **22.23.4 or
 later**. Node 22 has no network permission flag; the client allow-list remains the network control.
@@ -319,7 +351,9 @@ messages, but a substituted key or an old attestation fails a named check and no
 |---|---|---|
 | Network attacker | Read or alter API traffic, redirect it, or supply oversized responses. | HTTPS certificate checks, validated destinations, guarded redirects, and body/time limits. DNS, TLS trust roots, and the destination service remain trusted. Availability failures can still stop a scan or rotation. |
 | Malicious package or build tool | Read credentials or change released code. | Locked source dependencies, ignored install scripts, bundled releases with no install hooks/dependencies, reviewable code, and reproducibility checks. A bundled malicious dependency still runs with the CLI's effective access; a compromised toolchain can produce consistently bad output. |
-| Breached hosting platform | Read values it already hosts, lie about state, or undo an update. | Scope credentials narrowly, track every known consumer, verify and revoke in order. A platform can expose keys it holds and fake a successful deployment; keysentry cannot repair that trust boundary. |
+| Breached hosting platform | Read values it already hosts, lie about state, or undo an update. | Scope credentials narrowly, track every known consumer, verify and revoke in order. A platform can expose keys it holds and fake a successful deployment; keysentry cannot repair that trust boundary. The same holds for secret stores and self-hosted servers. |
+| Proxy operator or added CA | Observe destinations and timing; with a CA you trusted, read or alter all traffic including tokens. | CONNECT tunnelling keeps end-to-end TLS when no extra CA is configured; a broken setting fails closed. A CA you add for TLS inspection is fully trusted. |
+| KMS operator | Unwrap the state key, or disable or delete the KMS key. | Context binding stops a wrapped key being reused for another project; a KMS failure refuses to start. Disabling the key makes saved state unreadable by design. |
 | Breached notification channel | Read, suppress, alter or replay alerts; lure the user into taking action. | Signed watcher messages contain no values, hints are opt-in, and trusted-key verification detects edits. A message grants no approval. The operator can suppress delivery or retain metadata; legacy monitor webhook messages do not gain signature guarantees merely by using the same channel. |
 | News feed author | Publish a misleading story, replay an old item or abuse a platform mention to provoke changes. | Bounded parsing, first-read baselines, freshness checks, platform-subject exposure rules, publisher-owner corroboration and incident cooldowns limit triggers. Uncorroborated news alerts; automatic rotation requires signed-plan scope. Incorrect official evidence or colluding independent owners remain possible. |
 | Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |

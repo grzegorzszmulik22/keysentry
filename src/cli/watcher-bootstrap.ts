@@ -1,7 +1,11 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { CredentialSource, TokenRole, Vault } from '../types.js';
-import { credentialVaultName, createEncryptedFileVault } from '../vault/index.js';
+import type { CredentialSource, HostId, HttpClient, TokenRole, Vault } from '../types.js';
+import { HOST_CREDENTIALS } from '../hosts/credentials.js';
+import { setupNetwork } from './network-setup.js';
+import { credentialVaultName, createCredentialSource, createEncryptedFileVault } from '../vault/index.js';
+import { createFetchHttp } from '../http.js';
+import { unwrapDeploymentStateKey } from '../kms/index.js';
 import { PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { deviceKeyFromPrivate } from '../security/index.js';
 import { loadWatcherConfigFromEnv, type WatcherConfig } from '../watcher/index.js';
@@ -90,6 +94,20 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
     if (settings.hosts.render.enabled !== false) await exportCredential('RENDER_API_KEY');
     if (settings.hosts.fly.enabled !== false && (settings.hosts.fly.org || settings.hosts.fly.apps?.length)) await exportCredential('FLY_API_TOKEN');
     if (settings.hosts.github.enabled !== false && settings.hosts.github.repos.length) await exportCredential('GITHUB_TOKEN');
+    // Phase 5 and 6 hosts: exported when enabled and scoped like their loadConfig wiring (src/cli/config.ts).
+    const h = settings.hosts;
+    const phaseHosts: [HostId, boolean | undefined, boolean][] = [
+      ['netlify', h.netlify.enabled, true], ['heroku', h.heroku.enabled, true], ['digitalocean', h.digitalocean.enabled, true],
+      ['cloudflare-workers', h.cloudflare.enabled, !!h.cloudflare.accountId], ['supabase-functions', h.supabase.enabled, true],
+      ['coolify', h.coolify.enabled, !!h.coolify.baseUrl], ['zeabur', h.zeabur.enabled, true],
+      ['kubernetes', h.kubernetes.enabled, !!h.kubernetes.server && h.kubernetes.namespaces.length > 0],
+      ['aws-secrets-manager', h.awsSecretsManager.enabled, !!h.awsSecretsManager.region], ['vault-kv', h.vault.enabled, !!h.vault.address],
+      ['doppler', h.doppler.enabled, !!(h.doppler.configs?.length || h.doppler.projects?.length || h.doppler.enabled)],
+      ['infisical', h.infisical.enabled, h.infisical.projects.length > 0],
+    ];
+    for (const [host, enabled, scoped] of phaseHosts) {
+      if (enabled !== false && scoped) for (const name of HOST_CREDENTIALS[host]) await exportCredential(name);
+    }
     for (const name of new Set(input.config.armed?.clusters.flatMap(cluster => PROVIDER_CREDENTIALS[cluster.provider]) ?? [])) await exportCredential(name);
     const channelIds = new Set(input.config.notify.channels.filter(channel => channel.kind !== 'console').map(channel => channel.settings.id));
     const notificationNames = (await options.sourceVault.list('notify/')).filter(name => {
@@ -97,6 +115,17 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
       return id === 'relay' ? input.config.approvals.relay !== null : channelIds.has(id);
     });
     for (const name of notificationNames) {
+      const value = await options.sourceVault.get(name);
+      if (value === null) continue;
+      try {
+        if (options.sourceVault.backend === 'env' && !await consent(`KEYSENTRY_VAULT_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`)) continue;
+        await vault.set(name, value); exported.add(name);
+      } finally { value.fill(0); }
+    }
+    // Audit export credentials (notes/audit-export.md): only the configured targets' entries.
+    const exportIds = new Set(settings.audit.export.map(target => target.id));
+    const exportNames = (await options.sourceVault.list('audit-export/')).filter(name => exportIds.has(name.split('/')[1] ?? ''));
+    for (const name of exportNames) {
       const value = await options.sourceVault.get(name);
       if (value === null) continue;
       try {
@@ -112,7 +141,11 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
   } finally { fp.fill(0); }
 }
 
-export interface WatcherBootstrapOptions { cwd?: string; platform?: NodeJS.Platform; openVault?: VaultFactory }
+export interface WatcherBootstrapOptions {
+  cwd?: string; platform?: NodeJS.Platform; openVault?: VaultFactory;
+  /** Raw transport for unwrapping KEYSENTRY_STATE_KEY_WRAPPED with the deployment's KMS (tests inject a fake). */
+  http?: HttpClient; now?: () => Date;
+}
 
 /** A deployment state key is supplied externally and is never written to its vault. */
 function externalStateVault(vault: Vault, projectId: string, externalKey: Buffer): Vault {
@@ -167,9 +200,12 @@ async function bindIdentity(stateDir: string, projectId: string): Promise<void> 
 export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherBootstrapOptions = {}): Promise<{
   options: RuntimeOptions; config: WatcherConfig; dispose(): void;
 }> {
+  // KEYSENTRY_STATE_KEY_WRAPPED is the alternative: it is unwrapped with the deployment's kms settings once its vault is open.
+  const wrappedState = env.KEYSENTRY_STATE_KEY_WRAPPED;
+  if (wrappedState && env.KEYSENTRY_STATE_KEY) throw new CliError('Set KEYSENTRY_STATE_KEY or KEYSENTRY_STATE_KEY_WRAPPED, not both.');
   const encoded = env.KEYSENTRY_STATE_KEY;
-  const stateKey = Buffer.from(encoded ?? '', 'base64');
-  if (!encoded || stateKey.length !== 32 || stateKey.toString('base64') !== encoded) {
+  let stateKey: Buffer = Buffer.from(encoded ?? '', 'base64');
+  if (!wrappedState && (!encoded || stateKey.length !== 32 || stateKey.toString('base64') !== encoded)) {
     stateKey.fill(0);
     throw new CliError('KEYSENTRY_STATE_KEY must be base64 encoding of exactly 32 bytes.');
   }
@@ -221,6 +257,16 @@ export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherB
     catch { throw new CliError('The watcher signing key could not be opened. Restore its encrypted deployment vault.'); }
     finally { signer?.fill(0); }
     await bindIdentity(loaded.stateDir, loaded.config.projectId);
+    if (wrappedState) {
+      stateKey = await unwrapDeploymentStateKey({ encoded: wrappedState, kms: settings.kms, projectId: loaded.config.projectId,
+        credentials: createCredentialSource(vault, env),
+        // The deployment's proxy and CA settings apply to the KMS call too. ORCHESTRATOR HOOK (team policy): pass the
+        // verified team policy instead of null once the sealed deployment carries it.
+        transport: options.http ?? (await setupNetwork({ settings: settings.network, cwd: loaded.stateDir, env, vault, policy: null })).transport,
+        receiptPath: join(loaded.stateDir, '.keysentry', 'network.jsonl'), ...(options.now ? { now: options.now } : {}) });
+    }
+    // The state key now comes from the environment in either form, so the runtime does not unwrap it again.
+    delete settings.kms;
     const wrapped = externalStateVault(vault, loaded.config.projectId, stateKey);
     return {
       config: loaded.config,

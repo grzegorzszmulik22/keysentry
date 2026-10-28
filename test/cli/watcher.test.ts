@@ -489,3 +489,15 @@ test('approval URLs are included only for passkeys registered to the exact publi
   const message = f.messages.find(message => message.actionId)!;
   expect(message.approveUrl).toBe(`https://watcher.example/a/${message.actionId}`);
 });
+
+test('watch runs the audit export hook after each cycle, and a failing hook only logs fixed text', async () => {
+  const f = await fixture();
+  const warnings: string[] = [];
+  let calls = 0;
+  const deps: WatchRuntimeDependencies = { ...f.deps, log: { ...f.deps.log, warn: (message: string) => { warnings.push(message); } },
+    afterCycle: async () => { calls++; throw new Error('upstream-body-with-secret-value'); } };
+  expect(await runWatch(deps, { once: true })).toBe(0);
+  expect(calls).toBe(1);
+  expect(warnings).toContain('Audit export did not finish after this cycle. Run keysentry audit export status.');
+  expect(warnings.join(' ')).not.toContain('secret-value');
+});

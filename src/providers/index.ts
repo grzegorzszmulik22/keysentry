@@ -9,10 +9,10 @@ import { githubProvider } from './github.js';
 import { awsProvider } from './aws.js';
 import { supabaseProvider } from './supabase.js';
 import { databaseProvider } from './database.js';
-import {
-  slackProvider, sendgridProvider, twilioProvider, googleProvider,
-  privateKeyProvider, cryptoWalletProvider, unknownProvider,
-} from './guided.js';
+import { slackProvider, privateKeyProvider, cryptoWalletProvider, unknownProvider } from './guided.js';
+import { googleProvider } from './google.js';
+import { twilioProvider } from './twilio.js';
+import { sendgridProvider } from './sendgrid.js';
 import { appSecretProvider } from './app-secret.js';
 import { encryptionKeyProvider } from './encryption-key.js';
 import { groqProvider } from './groq.js';
@@ -35,18 +35,20 @@ export { signAwsRequest, type AwsCredentials, type AwsSigningOptions } from './a
 export { supabaseProvider } from './supabase.js';
 export { databaseProvider } from './database.js';
 export {
-  createGuidedAdapter, slackProvider, sendgridProvider, twilioProvider, googleProvider,
-  privateKeyProvider, cryptoWalletProvider, unknownProvider, type GuidedProviderId,
+  createGuidedAdapter, slackProvider, privateKeyProvider, cryptoWalletProvider, unknownProvider, type GuidedProviderId,
 } from './guided.js';
+export { googleProvider, createGoogleProvider, GoogleGuidedRotationRequiredError, GOOGLE_CREDENTIALS, GOOGLE_PROJECT } from './google.js';
+export { twilioProvider, TwilioGuidedRotationRequiredError } from './twilio.js';
+export { sendgridProvider, SendGridGuidedRotationRequiredError } from './sendgrid.js';
 export { appSecretProvider } from './app-secret.js';
 export { encryptionKeyProvider } from './encryption-key.js';
 export { groqProvider } from './groq.js';
-export { mistralProvider } from './mistral.js';
+export { mistralProvider, MISTRAL_ADMIN_KEY } from './mistral.js';
 export { replicateProvider } from './replicate.js';
 export { postmarkProvider } from './postmark.js';
 export { clerkProvider } from './clerk.js';
-export { upstashProvider } from './upstash.js';
-export { neonProvider } from './neon.js';
+export { upstashProvider, UpstashGuidedRotationRequiredError } from './upstash.js';
+export { neonProvider, NeonGuidedRotationRequiredError } from './neon.js';
 
 const providers: Record<ProviderId, ProviderAdapter> = {
   openai: openaiProvider,
@@ -90,22 +92,26 @@ export const PROVIDER_CREDENTIALS: Record<ProviderId, string[]> = {
   supabase: [],
   database: [],
   slack: [],
-  sendgrid: [],
-  twilio: [],
-  google: [],
+  sendgrid: ['SENDGRID_ADMIN_KEY'],
+  // The SIDs are identifiers stored next to their secret: a Main API key SID (SK…) or the Account SID (AC…).
+  twilio: ['TWILIO_ADMIN_KEY_SID', 'TWILIO_ADMIN_KEY', 'TWILIO_ADMIN_ACCOUNT_SID'],
+  // GOOGLE_API_KEYS_PROJECT is a project id or number, not a secret: it is never registered with the redactor.
+  google: ['GOOGLE_API_KEYS_ADMIN_KEY', 'GOOGLE_OAUTH_ACCESS_TOKEN', 'GOOGLE_API_KEYS_PROJECT'],
   'private-key': [],
   'crypto-wallet': [],
   'app-secret': [],
   'encryption-key': [],
   unknown: [],
   groq: [],
-  mistral: [],
+  mistral: ['MISTRAL_ADMIN_KEY'],
   replicate: [],
   postmark: [],
   clerk: [],
-  upstash: [],
-  neon: [],
+  upstash: ['UPSTASH_ADMIN_EMAIL', 'UPSTASH_ADMIN_KEY'],
+  neon: ['NEON_ADMIN_KEY'],
 };
+
+export { NON_SECRET_CREDENTIALS, secretCredentialValues } from './credential-kinds.js';
 
 export function getProvider(id: ProviderId): ProviderAdapter {
   if (!Object.hasOwn(providers, id)) throw new Error('Unsupported provider');

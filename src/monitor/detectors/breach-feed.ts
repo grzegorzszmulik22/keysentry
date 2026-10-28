@@ -25,6 +25,15 @@ export const DEFAULT_BREACH_FEEDS: readonly BreachFeed[] = [
   { host: 'fly', url: 'https://fly.io/blog/feed.xml' },
   { host: 'fly', url: 'https://status.flyio.net/history.rss' },
   { host: 'github-actions', url: 'https://github.blog/changelog/feed/' },
+  // Phase 6 platform status and blog feeds (verified 28 Oct 2026; notes/hosts-a.md, notes/hosts-b.md).
+  { host: 'netlify', url: 'https://www.netlifystatus.com/history.rss' },
+  { host: 'heroku', url: 'https://status.heroku.com/feed' },
+  { host: 'digitalocean', url: 'https://status.digitalocean.com/history.rss' },
+  { host: 'cloudflare-workers', url: 'https://www.cloudflarestatus.com/history.atom' },
+  { host: 'cloudflare-workers', url: 'https://blog.cloudflare.com/rss/' },
+  { host: 'supabase-functions', url: 'https://status.supabase.com/history.rss' },
+  { host: 'supabase-functions', url: 'https://supabase.com/rss.xml' },
+  { host: 'zeabur', url: 'https://status.zeabur.com/feed.rss' },
 ];
 
 const MAX_FEED_BYTES = 16 * 1024 * 1024;

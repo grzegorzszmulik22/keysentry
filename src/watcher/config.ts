@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { verifyArmedPlan } from '../autopilot/armed-plan.js';
+import { parseTeamBundle, type TeamBundle } from '../policy/governance.js';
 import type { ArmedPlan, FeedSource, NotifyChannelKind, PasskeyCredential } from '../types.js';
 import { openWatcherConfig } from './seal.js';
 import { HOST_IDS } from '../types.js';
@@ -19,6 +20,8 @@ export interface WatcherConfig {
   sources: { disabled: string[]; extra: FeedSource[] };
   approvals: { publicOrigin: string | null; relay: { server: string; topic: string } | null };
   intervalSeconds: number;
+  /** Phase 5: the signed roster and policy in force. Absent without a team (configs sealed before phase 5 have none). */
+  team?: TeamBundle;
 }
 
 export const MAX_WATCHER_CONFIG_BYTES = 2 * 1024 * 1024;
@@ -81,6 +84,7 @@ const schema = z.object({
     relay: z.object({ server: z.string().max(8192).refine(value => httpsUrl(value, true)), topic: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }).strict().nullable(),
   }).strict(),
   intervalSeconds: z.number().int().positive().max(86400),
+  team: z.unknown().optional(),
 }).strict();
 
 /** Configuration validity is separate from present-day authorization to rotate. */
@@ -97,7 +101,10 @@ export function parseWatcherConfig(input: unknown): WatcherConfig {
       if (!verified.ok || verified.plan.projectId !== parsed.projectId) throw new WatcherConfigError();
       armed = verified.plan;
     }
-    return { ...parsed, armed };
+    const { team: rawTeam, ...rest } = parsed;
+    if (rawTeam === undefined) return { ...rest, armed };
+    const { roster, policy } = parseTeamBundle(rawTeam);
+    return { ...rest, armed, team: { roster, policy } };
   } catch { throw new WatcherConfigError(INVALID_CONFIG); }
 }
 

@@ -15,6 +15,8 @@ import type { ApprovalAction, StoredApproval } from '../approvals/store.js';
 import { providerName } from './provider-names.js';
 import { executeLocalApprovedAction } from './phase2.js';
 import { CREDENTIAL_NAMES } from '../vault/index.js';
+import { HOST_CREDENTIALS } from '../hosts/credentials.js';
+import { PROVIDER_IDS } from '../core/provider-ids.js';
 import type { DashboardApi } from '../dashboard/server/api.js';
 import type { PasskeyStore } from '../dashboard/server/passkey-gate.js';
 import { DashboardError } from '../dashboard/server/security.js';
@@ -38,7 +40,7 @@ const planInput = z.object({ planId: planIdSchema }).strict();
 const settingsInput = z.object({
   graceMinutes: z.number().finite().min(0).max(525_600).optional(),
   rotateEveryDays: z.number().int().min(1).max(36_500).optional(),
-  spendCapsUsd: z.partialRecord(z.enum(['openai', 'anthropic', 'openrouter', 'stripe', 'resend', 'cloudflare', 'github', 'aws', 'supabase', 'database', 'slack', 'sendgrid', 'twilio', 'google', 'private-key', 'crypto-wallet', 'app-secret', 'encryption-key', 'unknown']), z.number().finite().nonnegative()).optional(),
+  spendCapsUsd: z.partialRecord(z.enum(PROVIDER_IDS), z.number().finite().nonnegative()).optional(),
   digestDay: z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun', 'off']).optional(),
   showHints: z.boolean().optional(),
 }).strict();
@@ -51,9 +53,8 @@ function parse<S extends z.ZodType>(schema: S, value: unknown): z.output<S> {
   return result.data;
 }
 const planHash = (plan: RotationPlan) => createHash('sha256').update(canonicalJson(plan)).digest('hex');
-const hostCredentials: Partial<Record<HostId, string[]>> = {
-  railway: ['RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN'], vercel: ['VERCEL_TOKEN'], render: ['RENDER_API_KEY'], fly: ['FLY_API_TOKEN'], 'github-actions': ['GITHUB_TOKEN'],
-};
+// Every host with a credential (dotenv has none), in HOST_IDS order (src/hosts/credentials.ts).
+const hostCredentials: Partial<Record<HostId, readonly string[]>> = Object.fromEntries(Object.entries(HOST_CREDENTIALS).filter(([, names]) => names.length > 0));
 
 /** The CLI ceremony and dashboard assertions use the same encrypted state record. */
 export function createDashboardPasskeyStore(store: StateStore, vault?: Vault): PasskeyStore {

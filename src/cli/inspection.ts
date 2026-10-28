@@ -8,6 +8,11 @@ import { BUILD_VERSION, checkLocalIntegrity, verifyRelease } from '../release/in
 import { createAuditLog, deviceKeyFromPrivate } from '../security/index.js';
 import { openVault } from '../vault/index.js';
 import { loadConfigMetadata } from './config.js';
+import { setupNetwork } from './network-setup.js';
+import { kmsEgressRules } from '../kms/index.js';
+import { auditExportEgressRules } from '../audit-export/index.js';
+import { offlineEgressRules } from '../feeds/index.js';
+import { networkStatusLines } from '../net/transport.js';
 import { CliError } from './errors.js';
 import { confirmVaultFallback, promptPassphrase, promptVaultBackend } from './prompts.js';
 import type { RuntimeOptions } from './runtime.js';
@@ -28,10 +33,15 @@ export async function inspectNetwork(options: RuntimeOptions, since?: string) {
     throw new CliError('Use an ISO timestamp for --since.');
   }
   const metadata = await loadConfigMetadata(options);
-  const rules = [...EGRESS_RULES, ...rulesForUserFeeds(metadata.feedUrls),
-    ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules];
+  // ORCHESTRATOR HOOK (team policy): pass the verified team policy here, as in createRuntime.
+  const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env: options.env ?? process.env,
+    policy: null, injected: options.http ?? { request: async () => { throw new CliError('keysentry network does not contact any host.'); } } });
+  const all = [...EGRESS_RULES, ...rulesForUserFeeds(network.feedMode.offline ? [] : metadata.feedUrls),
+    ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules,
+    ...(metadata.settings.kms ? kmsEgressRules(metadata.settings.kms) : []), ...auditExportEgressRules(metadata.settings.audit.export)];
+  const rules = network.feedMode.offline ? offlineEgressRules(all) : all;
   const receipt = await createFileReceipt(join(metadata.cwd, '.keysentry', 'network.jsonl')).summarize(since);
-  return { rules, receipt };
+  return { rules, receipt, status: networkStatusLines(network.summary) };
 }
 
 export async function inspectRelease(options: RuntimeOptions, offline = false) {
@@ -40,7 +50,11 @@ export async function inspectRelease(options: RuntimeOptions, offline = false) {
   const metadata = await loadConfigMetadata(options);
   const redactor = createRedactor();
   const log = options.log ?? createLogger({ redactor });
-  const http = createGuardedHttp(options.http ?? createFetchHttp(), {
+  // Release checks use the configured proxy and CA like every other request. Proxy credentials come from HTTPS_PROXY
+  // here, because this check opens no vault.
+  const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env: options.env ?? process.env,
+    redactor, policy: null, ...(options.http ? { injected: options.http } : {}) });
+  const http = createGuardedHttp(network.transport, {
     rules: [...EGRESS_RULES, ...rulesForUserFeeds(metadata.feedUrls),
       ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules],
     receipt: createFileReceipt(join(metadata.cwd, '.keysentry', 'network.jsonl')),

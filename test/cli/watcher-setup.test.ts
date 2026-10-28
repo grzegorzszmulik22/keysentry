@@ -124,3 +124,26 @@ test('watcher status never reflects a response body or URL secrets in errors', a
   await expect(watcherStatus(http, 'https://watcher.example', '1.0.0')).rejects.toThrow('The watcher health check did not succeed.');
   await expect(watcherStatus(http, 'https://user:planted-value@watcher.example', '1.0.0')).rejects.toThrow('Use an HTTPS watcher origin without credentials.');
 });
+
+test('with a kms section, watcher setup prints only the wrapped state key and names the KMS credentials', async () => {
+  const f = await fixture();
+  const wrapped: { key: string; projectId: string }[] = [];
+  const result = await setupWatcher({ ...f.deps, wrapStateKey: async (stateKey: Buffer, projectId: string) => {
+    wrapped.push({ key: stateKey.toString('base64'), projectId }); return 'd3JhcHBlZC1zdGF0ZS1rZXk=';
+  } }, { platform: 'compose' });
+  const text = f.output.join('\n');
+  expect(wrapped).toEqual([{ key: f.prepared[0]!.stateKey.toString('base64'), projectId: '0123456789abcdef' }]);
+  expect(text).toMatch(/^KEYSENTRY_STATE_KEY_WRAPPED=d3JhcHBlZC1zdGF0ZS1rZXk=$/m);
+  expect(text).not.toMatch(/^KEYSENTRY_STATE_KEY=/m);
+  expect(text).not.toContain(wrapped[0]!.key);
+  expect(text).toContain('KMS credentials');
+  expect(JSON.stringify(result)).not.toContain('d3JhcHBlZC1zdGF0ZS1rZXk=');
+});
+
+test('a KMS failure stops watcher setup before any deploy secret is shown', async () => {
+  const f = await fixture();
+  const { KmsError } = await import('../../src/kms/index.js');
+  await expect(setupWatcher({ ...f.deps, wrapStateKey: async () => { throw new KmsError('unreachable', 'The KMS could not be reached. Saved state stays locked, and keysentry did not create a new state key.'); } }, {}))
+    .rejects.toThrow(/KMS could not be reached/);
+  expect(f.output.some(line => line.startsWith('KEYSENTRY_'))).toBe(false);
+});

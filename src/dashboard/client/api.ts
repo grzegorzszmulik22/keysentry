@@ -102,10 +102,13 @@ export async function postWithPasskey<T = unknown>(route: string, body: unknown 
   const digestBytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
   const bodyDigest = Array.from(new Uint8Array(digestBytes), byte => byte.toString(16).padStart(2, '0')).join('');
   const options = publicOptions(await post<WireOptions>('passkey/challenge', { route: name, bodyDigest }));
+  // The server names the RP ID: localhost in local mode, the public host in team mode. The browser still checks that
+  // it matches this page's origin.
+  const rpId = typeof options.rpId === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(options.rpId) ? options.rpId : 'localhost';
   let credential: Credential | null;
   try {
     const publicKey: PublicKeyCredentialRequestOptions = {
-      challenge: decode(options.challenge), rpId: 'localhost', userVerification: 'required', timeout: 120_000,
+      challenge: decode(options.challenge), rpId, userVerification: 'required', timeout: 120_000,
       allowCredentials: descriptors(options.allowCredentials),
     };
     credential = await navigator.credentials.get({ publicKey });

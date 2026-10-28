@@ -10,7 +10,7 @@ import type {
   SecretFinding,
   ServiceRef,
 } from '../types.js';
-import { classify, methodFor } from './classify.js';
+import { classify, methodForValue } from './classify.js';
 import { fingerprint, makeHint } from './fingerprint.js';
 import { serviceKey } from './service-key.js';
 
@@ -140,7 +140,7 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
               fingerprint: consumer.fingerprint,
               provider: classification.provider,
               tier: classification.tier,
-              method: methodFor(classification.provider),
+              method: methodForValue(classification.provider, value),
               hint: consumer.hint,
               consumers: [consumer],
             },
@@ -158,7 +158,7 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
         if (safetyDifference > 0 || (safetyDifference === 0 && confidenceDifference > 0)) {
           existing.cluster.provider = classification.provider;
           existing.cluster.tier = classification.tier;
-          existing.cluster.method = methodFor(classification.provider);
+          existing.cluster.method = methodForValue(classification.provider, value);
           existing.confidence = classification.confidence;
         }
       }

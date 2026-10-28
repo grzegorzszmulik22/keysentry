@@ -291,7 +291,9 @@ describe('rotation wave safety rails', () => {
     const rotate = h.provider.rotate.bind(h.provider);
     let count = 0;
     h.provider.rotate = async (value, ctx) => ({ ...await rotate(value, ctx), companions: { SAME_COMPANION: String(++count) } });
-    // All clusters share a service, so conflicting companions are detected before writes.
+    // All clusters share a service, so conflicting companions are detected before writes. A companion reaches another
+    // consumer service only where that service already holds the same old companion value.
+    for (const service of h.services) await h.host.writeVariables(service, { SAME_COMPANION: 'old-companion' }, { skipDeploy: true });
     const shared = h.services[0]!;
     for (let i = 1; i < h.plan.steps.length; i++) {
       const step = h.plan.steps[i]!;

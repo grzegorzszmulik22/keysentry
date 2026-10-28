@@ -12,10 +12,21 @@ export function tierFor(provider: ProviderId): RiskTier {
 }
 
 export function methodFor(provider: ProviderId): RotationMethod {
-  if (provider === 'cloudflare') return 'atomic-roll';
+  // Upstash documents no second password or token beside the old one: a reset replaces it at once.
+  if (provider === 'cloudflare' || provider === 'upstash') return 'atomic-roll';
   if (provider === 'app-secret') return 'generate';
-  if (provider === 'openai' || provider === 'openrouter' || provider === 'resend' || provider === 'aws') return 'auto';
+  if (provider === 'openai' || provider === 'openrouter' || provider === 'resend' || provider === 'aws'
+    || provider === 'google' || provider === 'sendgrid' || provider === 'twilio' || provider === 'neon') return 'auto';
   return 'guided';
+}
+
+/**
+ * The rotation method for one readable value. Google service-account JSON keys share the `google` provider with API
+ * keys, but their rotation is always guided, so they are never planned (or armed) as automatic.
+ */
+export function methodForValue(provider: ProviderId, value: string | undefined): RotationMethod {
+  if (provider === 'google' && value !== undefined && isGoogleAccount(value.trim())) return 'guided';
+  return methodFor(provider);
 }
 
 function result(provider: ProviderId, isSecret: boolean, confidence: Classification['confidence']): Classification {
@@ -36,7 +47,10 @@ const KEY_RULES: readonly { provider: ProviderId; pattern: RegExp }[] = [
   { provider: 'slack', pattern: /^xox[bp]-[A-Za-z0-9-]{20,}$/ },
   { provider: 'slack', pattern: /^(?:https:\/\/)?hooks\.slack\.com\/services\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/ },
   { provider: 'sendgrid', pattern: /^SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{20,}$/ },
-  { provider: 'twilio', pattern: /^SK[A-Fa-f0-9]{32}$/ },
+  // Phase 6 value shapes. Twilio SK… values are public key SIDs (handled in classify), not secrets.
+  { provider: 'groq', pattern: /^gsk_[A-Za-z0-9]{20,}$/ },
+  { provider: 'replicate', pattern: /^r8_[A-Za-z0-9]{20,}$/ },
+  { provider: 'neon', pattern: /^napi_[A-Za-z0-9]{32,}$/ },
   { provider: 'google', pattern: /^AIza[A-Za-z0-9_-]{35}$/ },
   { provider: 'private-key', pattern: /^-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?-----END \1-----$/ },
 ];
@@ -115,7 +129,10 @@ function providerFromName(name: string): ProviderId | undefined {
   const names: readonly [RegExp, ProviderId][] = [
     [/OPENROUTER/, 'openrouter'], [/OPENAI/, 'openai'], [/ANTHROPIC/, 'anthropic'], [/STRIPE/, 'stripe'],
     [/RESEND/, 'resend'], [/GITHUB|(?:^|_)GH_TOKEN$/, 'github'], [/SLACK/, 'slack'], [/SENDGRID/, 'sendgrid'],
-    [/GOOGLE|GCP|FIREBASE/, 'google'],
+    [/GOOGLE|GCP|FIREBASE|GEMINI/, 'google'],
+    // Phase 6 (names alone are medium confidence).
+    [/GROQ/, 'groq'], [/MISTRAL/, 'mistral'], [/REPLICATE/, 'replicate'], [/CLERK/, 'clerk'],
+    [/POSTMARK/, 'postmark'], [/NEON.*(?:API_KEY|TOKEN)/, 'neon'], [/UPSTASH|QSTASH|^KV_REST_API_(?:READ_ONLY_)?TOKEN$/, 'upstash'],
   ];
   return names.find(([pattern]) => pattern.test(name))?.[1];
 }
@@ -128,18 +145,29 @@ export function classify(name: string, value: string | undefined): Classificatio
   if (text !== undefined) {
     if (!text || /^(?:true|false|null|undefined)$/i.test(text)
       || /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) return no();
-    if (/^pk_/.test(text)) return result('stripe', false, 'high');
+    // Clerk and Stripe share the pk_/sk_ prefixes: only a CLERK name decides Clerk.
+    if (/^pk_/.test(text)) return result(/CLERK/.test(upper) ? 'clerk' : 'stripe', false, 'high');
     if (/^(?:AKIA|ASIA)[A-Z0-9]{16}$/.test(text)) return result('aws', false, 'high');
+    // Twilio Account and API key SIDs are public identifiers that name a credential pair (like AKIA ids).
+    if (/^(?:AC|SK)[0-9a-fA-F]{32}$/.test(text)) return result('twilio', false, 'high');
+    // Postmark's documented test token delivers nothing.
+    if (text === 'POSTMARK_API_TEST') return result('postmark', false, 'high');
+    // A whole-value reference such as DigitalOcean's ${db.PASSWORD} or Doppler's ${OTHER} names a secret defined elsewhere.
+    if (/^\$\{[A-Za-z_][\w.-]*\}$/.test(text)) return no();
     if (/^sb_publishable_/.test(text)) return result('supabase', false, 'high');
     const role = jwtRole(text);
     if (role === 'anon') return result('supabase', false, 'high');
     if (role === 'service_role') return result('supabase', true, 'high');
     if (isGoogleAccount(text)) return result('google', true, 'high');
+    // Clerk webhooks use whsec_ and Clerk secret keys sk_live_/sk_test_, like Stripe: a CLERK name decides.
+    if (/CLERK/.test(upper) && /^(?:sk_(?:live|test)_|whsec_)[A-Za-z0-9+/=_-]{16,}$/.test(text)) return result('clerk', true, 'high');
+    if (/MISTRAL/.test(upper) && /^[A-Za-z0-9]{32}$/.test(text)) return result('mistral', true, 'high');
     for (const rule of KEY_RULES) {
       if (rule.pattern.test(text)) return result(rule.provider, true, 'high');
     }
     if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text)) {
       if (passwordInUrl(text)) {
+        if (/^rediss?:\/\/[^/?#]*@[a-z0-9-]+\.upstash\.io(?::\d+)?(?:[/?#]|$)/i.test(text)) return result('upstash', true, 'high');
         return result(/^(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?):\/\//i.test(text) ? 'database' : 'unknown', true, 'high');
       }
       return no();
@@ -173,7 +201,9 @@ export function classify(name: string, value: string | undefined): Classificatio
   if (APP_NAME.test(upper)) return result('app-secret', true, 'medium');
   // Issuer-specific secrets cannot be replaced by locally generated bytes or
   // assumed to use a provider's ordinary API-key rotation endpoint. Recognized
-  // value shapes have already been handled above.
+  // value shapes have already been handled above. Twilio's API key secret (TWILIO_API_SECRET) is the documented
+  // exception: the Twilio adapter rotates it with its SID.
+  if (/TWILIO/.test(upper) && /AUTH_TOKEN|API_KEY|API_SECRET|_SECRET$/.test(upper)) return result('twilio', true, 'medium');
   if (ISSUED_SECRET_NAME.test(upper)) return result('unknown', true, 'low');
   const namedProvider = providerFromName(upper);
   if (namedProvider) return result(namedProvider, true, 'medium');

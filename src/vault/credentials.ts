@@ -1,9 +1,16 @@
 import type { CredentialSource, TokenRole, Vault } from '../types.js';
 import { PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { HOST_CREDENTIALS } from '../hosts/credentials.js';
 import { validateVaultName } from './names.js';
 
+/**
+ * keysentry's own credentials: host tokens, the proxy credential (`username:password` for network.proxy, see
+ * src/net/transport.ts) and provider management credentials. loadConfig reads every one of them, `vault import-env`
+ * copies them, and the watcher never treats an application variable with one of these names as a key to rotate.
+ */
 export const CREDENTIAL_NAMES: readonly string[] = Object.freeze([...new Set([
-  'RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN', 'VERCEL_TOKEN', 'RENDER_API_KEY', 'FLY_API_TOKEN', 'GITHUB_TOKEN',
+  ...Object.values(HOST_CREDENTIALS).flat(),
+  'KEYSENTRY_PROXY_AUTH',
   ...Object.values(PROVIDER_CREDENTIALS).flat(),
 ])]);
 

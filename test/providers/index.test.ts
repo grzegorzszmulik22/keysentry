@@ -6,9 +6,12 @@ import { getProvider, PROVIDER_CREDENTIALS } from '../../src/providers/index.js'
 const providers: [ProviderId, RotationMethod][] = [
   ['openai', 'auto'], ['anthropic', 'guided'], ['openrouter', 'auto'], ['stripe', 'guided'],
   ['resend', 'auto'], ['cloudflare', 'atomic-roll'], ['github', 'guided'], ['aws', 'auto'],
-  ['supabase', 'guided'], ['database', 'guided'], ['slack', 'guided'], ['sendgrid', 'guided'],
-  ['twilio', 'guided'], ['google', 'guided'], ['private-key', 'guided'], ['crypto-wallet', 'guided'],
+  ['supabase', 'guided'], ['database', 'guided'], ['slack', 'guided'], ['sendgrid', 'auto'],
+  ['twilio', 'auto'], ['google', 'auto'], ['private-key', 'guided'], ['crypto-wallet', 'guided'],
   ['app-secret', 'generate'], ['encryption-key', 'guided'], ['unknown', 'guided'],
+  // Phase 6 adapters (notes/providers-a.md, notes/providers-b.md).
+  ['groq', 'guided'], ['mistral', 'guided'], ['replicate', 'guided'], ['clerk', 'guided'],
+  ['postmark', 'guided'], ['neon', 'auto'], ['upstash', 'atomic-roll'],
 ];
 
 describe('provider registry', () => {
@@ -28,9 +31,12 @@ describe('provider registry', () => {
       openai: ['OPENAI_ADMIN_KEY'], anthropic: ['ANTHROPIC_ADMIN_KEY'],
       openrouter: ['OPENROUTER_PROVISIONING_KEY'], stripe: [], resend: ['RESEND_ADMIN_KEY'],
       cloudflare: ['CLOUDFLARE_ADMIN_TOKEN'], github: [], aws: [], supabase: [], database: [],
-      slack: [], sendgrid: [], twilio: [], google: [], 'private-key': [], 'crypto-wallet': [],
+      slack: [], sendgrid: ['SENDGRID_ADMIN_KEY'],
+      twilio: ['TWILIO_ADMIN_KEY_SID', 'TWILIO_ADMIN_KEY', 'TWILIO_ADMIN_ACCOUNT_SID'],
+      google: ['GOOGLE_API_KEYS_ADMIN_KEY', 'GOOGLE_OAUTH_ACCESS_TOKEN', 'GOOGLE_API_KEYS_PROJECT'], 'private-key': [], 'crypto-wallet': [],
       'app-secret': [], 'encryption-key': [], unknown: [],
-      groq: [], mistral: [], replicate: [], postmark: [], clerk: [], upstash: [], neon: [],
+      groq: [], mistral: ['MISTRAL_ADMIN_KEY'], replicate: [], postmark: [], clerk: [],
+      upstash: ['UPSTASH_ADMIN_EMAIL', 'UPSTASH_ADMIN_KEY'], neon: ['NEON_ADMIN_KEY'],
     });
   });
 

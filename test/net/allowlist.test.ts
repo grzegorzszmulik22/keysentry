@@ -24,6 +24,11 @@ async function sources(dir: string): Promise<string[]> {
 test('every https literal in network-calling modules is allow-listed or display-only', async () => {
   const templateHosts: Record<string, string[]> = {
     '${service}.amazonaws.com': ['iam.amazonaws.com', 'sts.amazonaws.com'],
+    // Not a built-in rule: loadConfigMetadata derives exactly one rule for the configured region
+    // (test/cli/phase6-wiring.test.ts checks it).
+    'secretsmanager.${opts.region}.amazonaws.com': [],
+    // Upstash QStash regional hosts, validated by qstashHost() to qstash(-region).upstash.io.
+    '${host}': ['qstash-eu-central-1.upstash.io', 'qstash-us-east-1.upstash.io', 'qstash.upstash.io'],
   };
   let literals = 0;
   // Phase 2 modules are scanned as soon as they exist.

@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { StateStore } from '../core/store.js';
 import { canonicalJson, verifyDetached } from '../security/index.js';
-import type { ApprovalGrant, ApprovalRequest, AuditEvent, AuditLog, PasskeyCredential } from '../types.js';
+import type { ApprovalApprover, ApprovalGrant, ApprovalRequest, AuditEvent, AuditLog, PasskeyCredential, RiskTier, TeamMember, TeamPolicy, TeamRoster } from '../types.js';
+import { approvalsRequired } from '../policy/effective.js';
+import { hasRole, memberForDeviceKey, memberForPasskey } from '../team/roster.js';
 import { verifyAssertion } from './webauthn/index.js';
 import { transactApprovals } from './store.js';
 import type { ApprovalAction, ApprovalCluster, ApprovalState, ApprovalStatus, StoredApproval } from './store.js';
@@ -11,6 +13,16 @@ export interface ApprovalRequestDetails extends ApprovalRequest { clusters: Appr
 export interface ApprovedAction { action: ApprovalAction; request: ApprovalRequestDetails; grant: ApprovalGrant }
 export interface PasskeyAssertion { credentialId: string; clientDataJSON: Buffer; authenticatorData: Buffer; signature: Buffer }
 export interface DeviceApproval { keyId: string; digest: string; at: string; sig: string }
+/**
+ * Team quorum (phase 5). With a roster, an action needs `requiredByTier[tier] ?? required` distinct members with role
+ * operator or admin (policy-widening actions: `wideningAdmins` admins); the request stays pending until then.
+ */
+export interface ApprovalQuorum {
+  /** The verified roster and policy in force, read at every request and approval; null means no team. A throw pauses approvals. */
+  team(): Promise<{ roster: TeamRoster; policy: TeamPolicy | null } | null>;
+  /** Risk tiers the action touches. Unknown (null, or a throw) applies the strictest tier rule. */
+  tiers?(action: ApprovalAction): Promise<RiskTier[] | null> | RiskTier[] | null;
+}
 export interface ApprovalServiceOptions {
   store: StateStore;
   audit: AuditLog;
@@ -22,8 +34,12 @@ export interface ApprovalServiceOptions {
   mode?: 'interactive' | 'actions';
   /** Defaults to ten minutes interactively, or sixty minutes in Actions mode. */
   requestTtlMs?: number;
+  /** Without it (or while it returns no team) the service behaves exactly as the single-user service. */
+  quorum?: ApprovalQuorum;
 }
-export interface ApprovalDescription { kind: string; keyCount: number; digest: string; expiresAt: string; status: ApprovalStatus }
+export interface ApprovalDescription { kind: string; keyCount: number; digest: string; expiresAt: string; status: ApprovalStatus;
+  /** Team quorum progress; absent without a team. */
+  quorum?: { approvals: number; required: number } }
 export interface ApprovalChallenge { challenge: string; rpId: string; allowCredentials: { type: 'public-key'; id: string }[] }
 export interface ApprovalService {
   request(action: ApprovalAction, widening: boolean): Promise<ApprovalRequestDetails>;
@@ -41,10 +57,20 @@ export class ApprovalError extends Error {
   readonly code = 'APPROVAL_REJECTED';
   constructor(message: string) { super(message); this.name = 'ApprovalError'; }
 }
+/** A team approval was verified and recorded, but more distinct members must approve before the action may run. */
+export class ApprovalPendingError extends ApprovalError {
+  readonly pending = true;
+  constructor(readonly approvals: number, readonly required: number) {
+    super(`Your approval was recorded: ${approvals} of ${required} team approvals so far. The action runs only after ${required} different team members approve it.`);
+    this.name = 'ApprovalPendingError';
+  }
+}
 const TEN_MINUTES = 10 * 60 * 1000;
 const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
 const WIDENING = 'This change can only be approved on your own computer with `keysentry approve`.';
 const REJECTED = 'This approval could not be verified.';
+const PAUSED = 'The team roster or policy could not be verified, so approvals are paused.';
+type Team = { roster: TeamRoster; policy: TeamPolicy | null };
 const APPROVAL_PREFIX = 'keysentry-approval:v1\n';
 function reject(message = REJECTED): never { throw new ApprovalError(message); }
 function sha256(value: string): string { return createHash('sha256').update(value).digest('hex'); }
@@ -138,13 +164,80 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       return { ...credential, origins: [...credential.origins], signCount: Math.max(credential.signCount, saved?.signCount ?? 0) };
     });
   }
-  function approve(state: ApprovalState, request: StoredApproval, by: ApprovalGrant['by'], at: Date, events: AuditEvent[]): ApprovalGrant {
-    const grant: ApprovalGrant = { actionId: request.actionId, digest: request.digest, at: at.toISOString(), by };
+  function approve(state: ApprovalState, request: StoredApproval, by: ApprovalGrant['by'], at: Date, events: AuditEvent[], approvers?: ApprovalApprover[]): ApprovalGrant {
+    const grant: ApprovalGrant = { actionId: request.actionId, digest: request.digest, at: at.toISOString(), by, ...(approvers ? { approvers } : {}) };
     request.status = 'approved';
     request.grant = grant;
     state.usedChallenges.push(request.challenge);
     events.push(event('approved', request.actionId));
     return structuredClone(grant);
+  }
+
+  // ---------------------------------------------------------------------------------------------- team quorum
+  async function teamNow(): Promise<Team | null> {
+    if (!opts.quorum) return null;
+    let team: Team | null;
+    try { team = await opts.quorum.team(); } catch { return reject(PAUSED); }
+    if (team === null) return null;
+    if (!team || !team.roster || !Array.isArray(team.roster.members)) return reject(PAUSED);
+    return team;
+  }
+  async function requirement(team: Team, request: StoredApproval): Promise<{ required: number; admins: boolean }> {
+    let tiers: RiskTier[] | null = null;
+    if (request.action && opts.quorum?.tiers) {
+      try { tiers = (await opts.quorum.tiers(actionCopy(request.action))) ?? null; } catch { tiers = null; }
+    }
+    const rule = approvalsRequired({ widening: request.widening, tiers }, team.policy, team.roster);
+    // A rule that changes while a request is pending can only make it stricter.
+    return { required: Math.max(rule.count, request.quorum?.required ?? 0), admins: rule.role === 'admin' || request.quorum?.admins === true };
+  }
+  /** An earlier approver still counts only while the same credential belongs to a member with the needed role. */
+  function stillEligible(team: Team, approver: ApprovalApprover, admins: boolean): boolean {
+    const member = approver.memberId === undefined ? undefined : team.roster.members.find(candidate => candidate.id === approver.memberId);
+    if (!member || !hasRole(member, admins ? 'admin' : 'operator')) return false;
+    return approver.kind === 'passkey' ? member.passkeys.some(passkey => passkey.id === approver.credentialId)
+      : member.deviceKeys.some(key => key.keyId === approver.keyId);
+  }
+  function sameCredential(approver: ApprovalApprover, by: ApprovalGrant['by']): boolean {
+    return approver.kind === 'passkey' ? by.kind === 'passkey' && approver.credentialId === by.credentialId : by.kind === 'device' && approver.keyId === by.keyId;
+  }
+  /** Count a verified approver toward the quorum; approve when it is met, otherwise persist and report progress. */
+  async function recordApprover(state: ApprovalState, request: StoredApproval, team: Team, by: ApprovalGrant['by'], member: TeamMember | undefined,
+    at: Date, events: AuditEvent[]): Promise<ApprovalGrant> {
+    if (!member) { events.push(event('not-a-member', request.actionId)); return reject('This passkey or device key is not on the team roster.'); }
+    if (!hasRole(member, 'operator')) { events.push(event('role-refused', request.actionId)); return reject('Viewers can see approval requests but cannot approve them.'); }
+    const need = await requirement(team, request);
+    if (need.admins && !hasRole(member, 'admin')) { events.push(event('role-refused', request.actionId)); return reject('This change needs approval from team admins.'); }
+    const quorum = request.quorum ??= { required: need.required, admins: need.admins, approvers: [] };
+    quorum.required = need.required; quorum.admins = need.admins;
+    if (quorum.approvers.some(approver => sameCredential(approver, by))) { events.push(event('replay', request.actionId)); return reject('This approval has already been used.'); }
+    const counted = quorum.approvers.filter(approver => stillEligible(team, approver, need.admins));
+    if (counted.some(approver => approver.memberId === member.id)) {
+      events.push(event('duplicate-member', request.actionId));
+      return reject('You have already approved this action. Another team member needs to approve it.');
+    }
+    const approver: ApprovalApprover = { ...by, memberId: member.id, at: at.toISOString() };
+    quorum.approvers.push(approver);
+    counted.push(approver);
+    if (counted.length < need.required) {
+      events.push({ kind: 'approvals:quorum-progress', summary: 'Team approval recorded; more approvals are needed.',
+        data: { actionId: request.actionId, memberId: member.id, approvals: counted.length, required: need.required } });
+      throw new ApprovalPendingError(counted.length, need.required);
+    }
+    return approve(state, request, by, at, events, counted.map(entry => ({ ...entry })));
+  }
+  /** Locally registered credentials first (callers may adapt their origins), then members' passkeys from the roster. */
+  async function teamCredential(state: ApprovalState, team: Team, credentialId: unknown): Promise<PasskeyCredential | undefined> {
+    if (typeof credentialId !== 'string') return undefined;
+    const local = (await registered(state)).find((c) => c.id === credentialId);
+    if (local) return local;
+    for (const member of team.roster.members) {
+      const passkey = member.passkeys.find(candidate => candidate.id === credentialId && candidate.rpId === opts.rpId);
+      if (!passkey) continue;
+      const saved = state.counters.find((c) => c.credentialId === passkey.id && c.publicKeyCose === passkey.publicKeyCose);
+      return { ...passkey, origins: [...passkey.origins], signCount: Math.max(passkey.signCount, saved?.signCount ?? 0) };
+    }
+    return undefined;
   }
 
   return {
@@ -154,6 +247,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
         try { action = actionCopy(input); if (typeof widening !== 'boolean') reject(); }
         catch { events.push(event('rejected')); return reject('This action description is not valid.'); }
         const digest = actionDigest(action);
+        const team = await teamNow();
         const existing = currentRequest(state, action.id);
         if (existing?.digest === digest && existing.widening !== widening) {
           events.push(event('rejected', action.id)); return reject('This approval request has different authorization requirements.');
@@ -175,6 +269,10 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
         const request: StoredApproval = { actionId: action.id, digest, createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + requestTtlMs).toISOString(), challenge, widening,
           kind: action.kind, keyCount: action.clusterIds.length, status: 'pending', attempts: 0, action,
           clusters: action.clusters ?? action.clusterIds.map(clusterId => ({ clusterId, hint: null })) };
+        if (team) {
+          const need = await requirement(team, request);
+          request.quorum = { required: need.required, admins: need.admins, approvers: [] };
+        }
         state.requests.push(request);
         events.push(event('requested', action.id));
         return requestCopy(request);
@@ -184,6 +282,22 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       return transaction(async (state, events, at) => {
         const request = pending(state, actionId, events, expectedDigest);
         if (request.widening) return attemptFailed(request, events, WIDENING, 'widening-refused');
+        const team = await teamNow();
+        if (team) {
+          // Every member asserts the same single-use challenge; each credential may be counted once.
+          let credential: PasskeyCredential | undefined;
+          try {
+            credential = await teamCredential(state, team, input?.credentialId);
+            if (!credential) reject();
+            const result = verifyAssertion({ credential, clientDataJSON: input.clientDataJSON, authenticatorData: input.authenticatorData, signature: input.signature,
+              expectedChallenge: Buffer.from(request.challenge, 'base64url'), expectedOrigins: origins, requireUserVerification: true });
+            if (result.cloneWarning) reject();
+            const saved = state.counters.find((c) => c.credentialId === credential!.id && c.publicKeyCose === credential!.publicKeyCose);
+            if (saved) saved.signCount = result.signCount;
+            else state.counters.push({ credentialId: credential.id, publicKeyCose: credential.publicKeyCose, signCount: result.signCount });
+          } catch { return attemptFailed(request, events); }
+          return recordApprover(state, request, team, { kind: 'passkey', credentialId: credential.id }, memberForPasskey(team.roster, credential), at, events);
+        }
         try {
           const credential = (await registered(state)).find((c) => c.id === input?.credentialId);
           if (!credential) reject();
@@ -200,6 +314,8 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     approveWithDevice(actionId, signed) {
       return transaction(async (state, events, at) => {
         const request = pending(state, actionId, events);
+        const team = await teamNow();
+        let verified: { keyId: string; member: TeamMember | undefined } | undefined;
         try {
           if (!signed || typeof signed.keyId !== 'string' || signed.digest !== request.digest || typeof signed.at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(signed.at) || !Number.isFinite(Date.parse(signed.at)) || Math.abs(at.getTime() - Date.parse(signed.at)) > TEN_MINUTES || typeof signed.sig !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(signed.sig)) reject();
           const bytes = Buffer.from(signed.sig, 'base64');
@@ -207,11 +323,21 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           const message = APPROVAL_PREFIX + canonicalJson({ actionId, digest: signed.digest, at: signed.at });
           const replayId = sha256(canonicalJson({ keyId: signed.keyId, message }));
           if (state.usedDeviceApprovals.includes(replayId)) { events.push(event('replay', actionId)); return reject('This approval has already been used.'); }
-          const key = (await opts.deviceKeys()).find((k) => k.keyId === signed.keyId);
-          if (!key || !verifyDetached(key.publicKeyDer, Buffer.from(message), bytes)) reject();
-          state.usedDeviceApprovals.push(replayId);
-          return approve(state, request, { kind: 'device', keyId: key.keyId }, at, events);
+          if (team) {
+            // The roster is the authority for members' device keys; a local key outside it verifies but is not a member.
+            const listed = memberForDeviceKey(team.roster, signed.keyId);
+            const publicKeyDer = listed?.publicKeyDer ?? (await opts.deviceKeys()).find((k) => k.keyId === signed.keyId)?.publicKeyDer;
+            if (!publicKeyDer || !verifyDetached(publicKeyDer, Buffer.from(message), bytes)) reject();
+            state.usedDeviceApprovals.push(replayId);
+            verified = { keyId: signed.keyId, member: listed?.member };
+          } else {
+            const key = (await opts.deviceKeys()).find((k) => k.keyId === signed.keyId);
+            if (!key || !verifyDetached(key.publicKeyDer, Buffer.from(message), bytes)) reject();
+            state.usedDeviceApprovals.push(replayId);
+            return approve(state, request, { kind: 'device', keyId: key.keyId }, at, events);
+          }
         } catch { return attemptFailed(request, events); }
+        return recordApprover(state, request, team!, { kind: 'device', keyId: verified!.keyId }, verified!.member, at, events);
       });
     },
     status(actionId) {
@@ -224,13 +350,29 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     describe(actionId) {
       return transaction(async (state) => {
         const request = currentRequest(state, actionId);
-        return request ? { kind: request.kind, keyCount: request.keyCount, digest: request.digest, expiresAt: request.expiresAt, status: request.status } : null;
+        return request ? { kind: request.kind, keyCount: request.keyCount, digest: request.digest, expiresAt: request.expiresAt, status: request.status,
+          ...(request.quorum ? { quorum: { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required } } : {}) } : null;
       });
     },
     challenge(actionId, expectedDigest) {
       return transaction(async (state, events) => {
         const request = pending(state, actionId, events, expectedDigest);
         if (request.widening) { events.push(event('widening-refused', actionId)); return reject(WIDENING); }
+        const team = await teamNow();
+        if (team) {
+          // Offer only credentials of members who may still approve this request.
+          const need = await requirement(team, request);
+          const done = new Set((request.quorum?.approvers ?? []).filter(approver => stillEligible(team, approver, need.admins)).map(approver => approver.memberId));
+          const ids = new Set<string>();
+          const local = await registered(state);
+          for (const member of team.roster.members) {
+            if (done.has(member.id) || !hasRole(member, need.admins ? 'admin' : 'operator')) continue;
+            for (const passkey of member.passkeys) {
+              if (passkey.rpId === opts.rpId || local.some(c => c.id === passkey.id && c.publicKeyCose === passkey.publicKeyCose)) ids.add(passkey.id);
+            }
+          }
+          return { challenge: request.challenge, rpId: opts.rpId, allowCredentials: [...ids].map(id => ({ type: 'public-key' as const, id })) };
+        }
         const credentials = await registered(state);
         return { challenge: request.challenge, rpId: opts.rpId, allowCredentials: credentials.map((c) => ({ type: 'public-key' as const, id: c.id })) };
       });

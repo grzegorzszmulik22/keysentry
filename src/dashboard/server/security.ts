@@ -7,6 +7,22 @@ export class DashboardError extends Error {
   constructor(readonly status: number, message: string) { super(message); this.name = 'DashboardError'; }
 }
 
+/** Map handler and storage failures to fixed, value-free classes. */
+export function operationalError(error: unknown): { status: 500 | 503; errorClass: string } {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+  // Older state-store writers use this fixed diagnostic rather than a code.
+  if (code === 'STATE_BUSY' || (error instanceof Error && error.message === "keysentry's saved state is busy. Try again when the other operation finishes.")) {
+    return { status: 503, errorClass: 'STATE_BUSY' };
+  }
+  if (code === 'VAULT_UNAVAILABLE') return { status: 503, errorClass: 'VAULT_UNAVAILABLE' };
+  if (error instanceof Error && error.message === 'The vault is busy in another keysentry process. Try again after it finishes.') {
+    return { status: 503, errorClass: 'VAULT_BUSY' };
+  }
+  // Never forward arbitrary names, codes, messages or stacks from handlers/storage.
+  const known = ['STATE_LOCKED', 'STATE_CORRUPT', 'VAULT_LOCKED', 'VAULT_READ_ONLY'] as const;
+  return { status: 500, errorClass: known.find(value => value === code) ?? 'ERROR' };
+}
+
 export function securityHeaders(res: ServerResponse): void {
   res.setHeader('Content-Security-Policy', CSP);
   res.setHeader('X-Content-Type-Options', 'nosniff');

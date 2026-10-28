@@ -10,6 +10,7 @@ import { createNotificationChannels, notificationEgress, cacheNotificationMessag
 import { providerIdSchema } from './schemas.js';
 import { runFirstRun } from './first-run.js';
 import { CliError } from './errors.js';
+import { needsManualActivation } from '../hosts/activation.js';
 import type { KeysentryRuntime } from './runtime.js';
 import type { FirstRunResult, Incident, Inventory, NotifyMessage, Signal, ProviderKeyInfo, KeyHygiene } from '../types.js';
 
@@ -110,7 +111,11 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
     const inventory = await rt.store.loadInventory() ?? { version: 1, scannedAt: clock().toISOString(), hosts: [], services: [], findings: [], clusters: [], errors: [] } satisfies Inventory;
     const monitor = await monitorStore.load();
     const redeploy = Object.fromEntries(rt.config.hosts.map(host => [host.id, host.capabilities.redeploy]));
-    const score = readinessScore({ inventory, configuredCredentials: Object.keys(rt.config.providerCtx.credentials).filter(name => !!rt.config.providerCtx.credentials[name]), redeploy, canaries: monitor.canaries.length }).score;
+    const manualActivation = (service: Inventory['services'][number]) => {
+      const host = rt.config.hosts.find(candidate => candidate.id === service.host);
+      return !host || needsManualActivation(service, host);
+    };
+    const score = readinessScore({ inventory, configuredCredentials: Object.keys(rt.config.providerCtx.credentials).filter(name => !!rt.config.providerCtx.credentials[name]), redeploy, canaries: monitor.canaries.length, manualActivation }).score;
     const report = await rt.rotationReport();
     let rotated: { keys: number; seconds: number; platform?: string } | undefined;
     let incidentResponse = false;

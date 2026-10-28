@@ -4,6 +4,7 @@ const providers: Readonly<Record<string, string>> = {
   cloudflare: 'Cloudflare', github: 'GitHub', aws: 'AWS', supabase: 'Supabase', database: 'Database', slack: 'Slack',
   sendgrid: 'SendGrid', twilio: 'Twilio', google: 'Google', 'private-key': 'Private key', 'crypto-wallet': 'Wallet',
   'app-secret': 'App secret', 'encryption-key': 'Encryption key', unknown: 'Unknown provider',
+  groq: 'Groq', mistral: 'Mistral', replicate: 'Replicate', postmark: 'Postmark', clerk: 'Clerk', upstash: 'Upstash', neon: 'Neon',
 };
 
 export function providerName(provider: string): string { return providers[provider] ?? provider; }

@@ -3,11 +3,22 @@ import { createFakeVault } from '../helpers/fake-vault.js';
 import { PROVIDER_CREDENTIALS } from '../../src/providers/index.js';
 import { CREDENTIAL_NAMES, createCredentialSource, credentialVaultName, importFromEnv } from '../../src/vault/index.js';
 
-test('credential names include hosting tokens then deduplicated provider names', () => {
+test('credential names include hosting tokens, the proxy credential, then deduplicated provider names', () => {
   expect(CREDENTIAL_NAMES).toEqual([...new Set([
     'RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN', 'VERCEL_TOKEN', 'RENDER_API_KEY', 'FLY_API_TOKEN', 'GITHUB_TOKEN',
+    // Phase 5 and 6 hosts (src/hosts/credentials.ts).
+    'NETLIFY_TOKEN', 'HEROKU_API_KEY', 'DIGITALOCEAN_TOKEN', 'CLOUDFLARE_WORKERS_TOKEN', 'SUPABASE_FUNCTIONS_TOKEN',
+    'COOLIFY_TOKEN', 'ZEABUR_TOKEN', 'KUBERNETES_TOKEN', 'AWS_SECRETS_MANAGER_ACCESS_KEY_ID',
+    'AWS_SECRETS_MANAGER_SECRET_ACCESS_KEY', 'AWS_SECRETS_MANAGER_SESSION_TOKEN', 'VAULT_TOKEN', 'DOPPLER_TOKEN',
+    'INFISICAL_TOKEN', 'INFISICAL_CLIENT_ID', 'INFISICAL_CLIENT_SECRET',
+    'KEYSENTRY_PROXY_AUTH',
     ...Object.values(PROVIDER_CREDENTIALS).flat(),
   ])]);
+  // KMS credentials and the OIDC client secret are accepted by vault set, but are never keysentry's own credential
+  // names (src/cli/credential-names.ts).
+  for (const name of ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AZURE_CLIENT_SECRET', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'KEYSENTRY_OIDC_CLIENT_SECRET']) {
+    expect(CREDENTIAL_NAMES).not.toContain(name);
+  }
 });
 test('read role prefers @read; write role never returns the @read token', async () => {
   const vault = createFakeVault({ 'cred/NAME': Buffer.from('vault-write'), 'cred/NAME@read': Buffer.from('vault-read') });
