@@ -523,7 +523,8 @@ Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-ar
 Team mode is part of the open core (Apache-2.0, no licence checks). A team shares one signed **roster** (who is on the
 team, their roles, device keys and passkeys) and, optionally, one signed **policy file** (rules that only narrow what
 keysentry may do). Both live beside your project: the roster in encrypted state, the policy as a JSON file you can
-commit. Admins sign changes with their own computer's device key.
+commit. Admins sign changes with their own computer's device key. For security reviews, `docs/CONTROLS.md` maps these
+features to SOC 2 and ISO 27001 and names the evidence each one produces.
 
 **Roles.**
 
