@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import {
   BOX_DEPLOYMENT_VARIABLES, BOX_STATE_DIR, createHttpBoxRelay, createNoticeSender, encodeBoxPayload, isAllowed, isBoxId, startBoxAgent,
-  startProductionBoxAgent, verifyAllowList,
+  startProductionBoxAgent, verifyAllowList, BoxAgentError, BoxRelayError, TeeTokenError,
   type AllowListVerificationKey, type BoxEnrollPayload, type BoxNoticeKit, type BoxRelay, type BoxSettings,
 } from '../box/index.js';
 import { createFetchHttp } from '../http.js';
@@ -193,7 +193,7 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
         return runCli(['watch'], { env, cwd, signal, stdinIsTTY: false, stdoutIsTTY: false, output: () => {}, error: () => {} });
       });
       const local = await runner.startLocalBox({ boxId: options.name, bootBox: runtime => startBoxAgent({ boxId: runtime.boxId, relay: runtime.relay,
-        tee: runtime.tee, http: runtime.http, stateDir, enrollmentDeviceKeys: device, log: quietLog,
+        tee: runtime.tee, http: runtime.http, stateDir, enrollmentDeviceKeys: device, log: quietLog, pollIntervalMs: 1_000,
         startWatcher: (env, signal) => startWatcher(env, signal, stateDir),
         sendNotice: createNoticeSender({ transport: createFetchHttp(), log: quietLog }) }) });
       const entry: BoxRecord = { boxId: local.boxId, emulator: true, mode: options.mode as BoxSealMode, relayOrigin: local.origin,
@@ -322,10 +322,17 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
       assertHumanForMutation({ env: opts.env, stdinIsTTY: true, stdoutIsTTY: true, action: 'run the cloud box agent' });
       const line = (level: string) => (message: string) => { process.stderr.write(`${JSON.stringify({ level, message })}\n`); };
       const log: Logger = { debug() {}, info: line('info'), warn: line('warn'), error: line('error') };
-      const agent = await startProductionBoxAgent({ stateDir: options.stateDir, log, startWatcher: async (env, signal) => {
-        const { runCli } = await import('./index.js');
-        return runCli(['watch'], { env, cwd: options.stateDir, signal, stdinIsTTY: false, stdoutIsTTY: false, output: () => {}, error: () => {} });
-      } });
+      let agent;
+      try {
+        agent = await startProductionBoxAgent({ stateDir: options.stateDir, log, startWatcher: async (env, signal) => {
+          const { runCli } = await import('./index.js');
+          return runCli(['watch'], { env, cwd: options.stateDir, signal, stdinIsTTY: false, stdoutIsTTY: false, output: () => {}, error: () => {} });
+        } });
+      } catch (error) {
+        // These errors carry fixed text only.
+        if (error instanceof BoxAgentError || error instanceof TeeTokenError || error instanceof BoxRelayError) throw new CliError(error.message);
+        throw error;
+      }
       await new Promise<void>(resolve => { process.once('SIGTERM', () => resolve()); process.once('SIGINT', () => resolve()); });
       await agent.stop();
     });

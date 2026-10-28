@@ -30,6 +30,7 @@ describe('provider registry', () => {
       cloudflare: ['CLOUDFLARE_ADMIN_TOKEN'], github: [], aws: [], supabase: [], database: [],
       slack: [], sendgrid: [], twilio: [], google: [], 'private-key': [], 'crypto-wallet': [],
       'app-secret': [], 'encryption-key': [], unknown: [],
+      groq: [], mistral: [], replicate: [], postmark: [], clerk: [], upstash: [], neon: [],
     });
   });
 

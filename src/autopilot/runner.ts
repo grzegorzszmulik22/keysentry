@@ -77,6 +77,9 @@ export interface WaveRecoveryResult {
 
 const PLATFORM: Record<HostId, string> = {
   railway: 'Railway', vercel: 'Vercel', render: 'Render', fly: 'Fly', 'github-actions': 'GitHub Actions', dotenv: 'Your local environment',
+  netlify: 'Netlify', 'cloudflare-workers': 'Cloudflare Workers', 'supabase-functions': 'Supabase Edge Functions',
+  heroku: 'Heroku', digitalocean: 'DigitalOcean App Platform', coolify: 'Coolify', zeabur: 'Zeabur',
+  kubernetes: 'Kubernetes', 'aws-secrets-manager': 'AWS Secrets Manager', 'vault-kv': 'HashiCorp Vault', doppler: 'Doppler', infisical: 'Infisical',
 };
 const queues = new WeakMap<AutopilotState, Promise<void>>();
 

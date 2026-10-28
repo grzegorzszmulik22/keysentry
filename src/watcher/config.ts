@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { verifyArmedPlan } from '../autopilot/armed-plan.js';
 import type { ArmedPlan, FeedSource, NotifyChannelKind, PasskeyCredential } from '../types.js';
 import { openWatcherConfig } from './seal.js';
+import { HOST_IDS } from '../types.js';
 
 export interface WatcherConfig {
   v: 1;
@@ -22,7 +23,7 @@ export interface WatcherConfig {
 
 export const MAX_WATCHER_CONFIG_BYTES = 2 * 1024 * 1024;
 const INVALID_CONFIG = 'The watcher config is invalid. Run keysentry watcher setup again.';
-const hostSchema = z.enum(['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+const hostSchema = z.enum(HOST_IDS);
 const metadata = z.string().min(1).max(4096).refine(value => !/[\u0000-\u001f\u007f]/.test(value));
 const keyId = z.string().regex(/^[a-f0-9]{16}$/);
 const unique = (values: string[]): boolean => new Set(values).size === values.length;

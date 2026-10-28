@@ -18,11 +18,12 @@ import {
 } from '../monitor/index.js';
 import type { RotateOptions } from '../rotate/index.js';
 import type { EgressRule, HostAdapter, HostId, HttpClient, Logger, Notifier, Policy, ProviderContext, Redactor, TokenRole, Vault } from '../types.js';
+import { HOST_IDS } from '../types.js';
 
 const nonempty = z.string().trim().min(1);
 const list = z.array(nonempty);
 const positive = z.number().finite().positive();
-const hostId = z.enum(['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+const hostId = z.enum(HOST_IDS);
 const exactHostname = z.string().trim().toLowerCase().refine(value => {
   if (value.length > 253 || !value.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return false;
   try {

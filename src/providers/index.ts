@@ -15,6 +15,13 @@ import {
 } from './guided.js';
 import { appSecretProvider } from './app-secret.js';
 import { encryptionKeyProvider } from './encryption-key.js';
+import { groqProvider } from './groq.js';
+import { mistralProvider } from './mistral.js';
+import { replicateProvider } from './replicate.js';
+import { postmarkProvider } from './postmark.js';
+import { clerkProvider } from './clerk.js';
+import { upstashProvider } from './upstash.js';
+import { neonProvider } from './neon.js';
 
 export { openaiProvider, OpenAIGuidedRotationRequiredError, OPENAI_MODEL_PRICES, type OpenAIModelPrice } from './openai.js';
 export { anthropicProvider, ANTHROPIC_MODEL_PRICES } from './anthropic.js';
@@ -33,6 +40,13 @@ export {
 } from './guided.js';
 export { appSecretProvider } from './app-secret.js';
 export { encryptionKeyProvider } from './encryption-key.js';
+export { groqProvider } from './groq.js';
+export { mistralProvider } from './mistral.js';
+export { replicateProvider } from './replicate.js';
+export { postmarkProvider } from './postmark.js';
+export { clerkProvider } from './clerk.js';
+export { upstashProvider } from './upstash.js';
+export { neonProvider } from './neon.js';
 
 const providers: Record<ProviderId, ProviderAdapter> = {
   openai: openaiProvider,
@@ -54,6 +68,13 @@ const providers: Record<ProviderId, ProviderAdapter> = {
   'app-secret': appSecretProvider,
   'encryption-key': encryptionKeyProvider,
   unknown: unknownProvider,
+  groq: groqProvider,
+  mistral: mistralProvider,
+  replicate: replicateProvider,
+  postmark: postmarkProvider,
+  clerk: clerkProvider,
+  upstash: upstashProvider,
+  neon: neonProvider,
 };
 
 /** Credential names read from ProviderContext.credentials; paired AWS values use siblingVars. */
@@ -77,6 +98,13 @@ export const PROVIDER_CREDENTIALS: Record<ProviderId, string[]> = {
   'app-secret': [],
   'encryption-key': [],
   unknown: [],
+  groq: [],
+  mistral: [],
+  replicate: [],
+  postmark: [],
+  clerk: [],
+  upstash: [],
+  neon: [],
 };
 
 export function getProvider(id: ProviderId): ProviderAdapter {

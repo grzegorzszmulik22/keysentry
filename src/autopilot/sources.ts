@@ -14,6 +14,19 @@ const HOST_MENTIONS: Record<HostId, RegExp[]> = {
   fly: [/(?<![\w-])fly\.io(?![\w-]|\.[\w-])/i],
   'github-actions': [/(?<![\w-])github\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])GitHub(?![\w-]|\.[\w-])/],
   dotenv: [],
+  netlify: [/(?<![\w-])netlify\.(?:com|app)(?![\w-]|\.[\w-])/i, /(?<![\w.-])Netlify(?![\w-]|\.[\w-])/],
+  'cloudflare-workers': [/(?<![\w-])cloudflare\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Cloudflare(?![\w-]|\.[\w-])/],
+  'supabase-functions': [/(?<![\w-])supabase\.(?:com|co)(?![\w-]|\.[\w-])/i, /(?<![\w.-])Supabase(?![\w-]|\.[\w-])/],
+  heroku: [/(?<![\w-])heroku\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Heroku(?![\w-]|\.[\w-])/],
+  digitalocean: [/(?<![\w-])digitalocean\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])DigitalOcean(?![\w-]|\.[\w-])/],
+  // Self-hosted: an incident is in the operator's own infrastructure, not a platform advisory.
+  coolify: [],
+  zeabur: [/(?<![\w-])zeabur\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Zeabur(?![\w-]|\.[\w-])/],
+  kubernetes: [],
+  'aws-secrets-manager': [],
+  'vault-kv': [],
+  doppler: [/(?<![\w-])doppler\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Doppler(?![\w-]|\.[\w-])/],
+  infisical: [/(?<![\w-])infisical\.com(?![\w-]|\.[\w-])/i, /(?<![\w.-])Infisical(?![\w-]|\.[\w-])/],
 };
 
 export const PLATFORM_HOSTS: readonly HostId[] = ['railway', 'vercel', 'render', 'fly', 'github-actions'];

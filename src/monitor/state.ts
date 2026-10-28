@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { createRedactor } from '../core/redact.js';
 import { readJson, statePaths, writeJsonAtomic, type StateStore } from '../core/store.js';
 import type { PendingAction, ProviderId, ServiceRef } from '../types.js';
+import { HOST_IDS } from '../types.js';
 
 export interface UsageBucket { hour: string; costUsd: number; requests?: number; byModel?: Record<string, number> }
 export interface CumulativeTotal { costUsd: number; requests?: number; byModel?: Record<string, number>; at: string }
@@ -64,7 +65,7 @@ const date = z.string().datetime();
 const amount = z.number().finite().nonnegative();
 const amounts = z.record(safeText, amount);
 const service = z.object({
-  host: z.enum(['railway','vercel','render','fly','github-actions','dotenv']),
+  host: z.enum(HOST_IDS),
   projectId: safeText, projectName: safeText, serviceId: safeText, serviceName: safeText,
   environmentId: safeText, environmentName: safeText,
 });

@@ -41,6 +41,8 @@ export interface BoxSessionOptions {
   trust: BoxTrust;
   now?: () => Date;
   timeoutMs?: number;
+  /** How long to wait for one box session to answer before trying a newer one. */
+  answerMs?: number;
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -60,10 +62,10 @@ function signingDer(raw: string): Buffer {
   return createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: raw }, format: 'jwk' }).export({ format: 'der', type: 'spki' });
 }
 
-async function until<T>(options: BoxSessionOptions, find: () => Promise<T | undefined>, message = NOT_ANSWERING): Promise<T> {
+async function until<T>(options: BoxSessionOptions, find: () => Promise<T | undefined>, message = NOT_ANSWERING, deadlineAt?: number): Promise<T> {
   const now = options.now ?? (() => new Date());
   const sleep = options.sleep ?? (ms => delay(ms));
-  const deadline = now().getTime() + (options.timeoutMs ?? 120_000);
+  const deadline = deadlineAt ?? now().getTime() + (options.timeoutMs ?? 120_000);
   while (true) {
     let found: T | undefined;
     // A busy or briefly unreachable relay only delays the session; the deadline still applies.
@@ -81,24 +83,38 @@ async function until<T>(options: BoxSessionOptions, find: () => Promise<T | unde
 export async function openVerifiedBoxSession(options: BoxSessionOptions): Promise<VerifiedBoxSession> {
   const now = options.now ?? (() => new Date());
   const { relay } = options;
-  const hello = await until(options, async () => {
-    const queued = (await relay.poll()).map(raw => ({ raw, message: parse(raw) }));
-    const answered = new Set(queued.filter(item => item.message?.type === 'cli-challenge').map(item => item.message!.sessionId));
-    const open = queued.filter((item): item is { raw: unknown; message: BoxHello } => item.message?.type === 'box-hello'
-      && !answered.has(item.message.sessionId) && Date.parse(item.message.expiresAt) > now().getTime() + 60_000);
-    return open.sort((a, b) => Date.parse(b.message.sentAt) - Date.parse(a.message.sentAt))[0];
-  });
-  let handshake: Handshake = createHandshake('cli', { deviceKey: options.deviceKey });
-  const challengeStep = handshake.next({ now: now(), message: hello.raw });
-  handshake = challengeStep.handshake;
-  const challenge = challengeStep.message as Extract<HandshakeMessage, { type: 'cli-challenge' }>;
-  await relay.publish(challenge);
+  const deadline = now().getTime() + (options.timeoutMs ?? 120_000);
+  const tried = new Set<string>();
+  let hello: { raw: unknown; message: BoxHello }, handshake: Handshake, challenge: Extract<HandshakeMessage, { type: 'cli-challenge' }>;
+  let attest: { raw: unknown; message: BoxAttest } | undefined;
+  do {
+    hello = await until(options, async () => {
+      const queued = (await relay.poll()).map(raw => ({ raw, message: parse(raw) }));
+      const answered = new Set(queued.filter(item => item.message?.type === 'cli-challenge').map(item => item.message!.sessionId));
+      const open = queued.filter((item): item is { raw: unknown; message: BoxHello } => item.message?.type === 'box-hello'
+        && !answered.has(item.message.sessionId) && !tried.has(item.message.sessionId)
+        && Date.parse(item.message.expiresAt) > now().getTime() + 60_000);
+      return open.sort((a, b) => Date.parse(b.message.sentAt) - Date.parse(a.message.sentAt))[0];
+    }, NOT_ANSWERING, deadline);
+    tried.add(hello.message.sessionId);
+    handshake = createHandshake('cli', { deviceKey: options.deviceKey });
+    const challengeStep = handshake.next({ now: now(), message: hello.raw });
+    handshake = challengeStep.handshake;
+    challenge = challengeStep.message as Extract<HandshakeMessage, { type: 'cli-challenge' }>;
+    await relay.publish(challenge);
+    const sessionId = hello.message.sessionId;
+    // A box that abandoned this session (it restarted, or its device list changed) never answers: try a newer one.
+    attest = await until(options, async () => (await relay.poll(sessionId))
+      .map(raw => ({ raw, message: parse(raw) }))
+      .find((item): item is { raw: unknown; message: BoxAttest } => item.message?.type === 'box-attest' && item.message.sessionId === sessionId),
+    NOT_ANSWERING, Math.min(deadline, now().getTime() + (options.answerMs ?? 20_000))).catch(error => {
+      if (now().getTime() >= deadline) throw error;
+      return undefined;
+    });
+  } while (!attest);
   // Expected nonces come from local state: the key in the hello this CLI answered and its own fresh challenge.
   const expectedNonces = [handshakeAttestationNonces(hello.message)[0]!, challenge.challenge];
   const sessionId = hello.message.sessionId;
-  const attest = await until(options, async () => (await relay.poll(sessionId))
-    .map(raw => ({ raw, message: parse(raw) }))
-    .find((item): item is { raw: unknown; message: BoxAttest } => item.message?.type === 'box-attest' && item.message.sessionId === sessionId));
 
   const own: BoxCheck[] = [];
   const signed = verifyHandshakeMessage(attest.message, signingDer(hello.message.boxSigningPublicKey));

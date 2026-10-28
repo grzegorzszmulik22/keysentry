@@ -6,6 +6,7 @@ import { classify } from '../core/classify.js';
 import { serviceKey } from '../core/service-key.js';
 import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { canonicalJson, signDetached, verifyDetached, type DeviceKey } from '../security/index.js';
+import { HOST_IDS } from '../types.js';
 
 export const ARMED_PLAN_PREFIX = 'keysentry-armed-plan:v1\n';
 const DAY_MS = 86_400_000;
@@ -17,7 +18,7 @@ type AdoptableCluster = Cluster & { adopted?: ArmedCluster['adopted'] };
 type PlanBody = Omit<ArmedPlan, 'signer' | 'sig'>;
 type Eligibility = { eligible: true; method: AutopilotMethod } | { eligible: false; reason: string };
 
-const hostSchema = z.enum(['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+const hostSchema = z.enum(HOST_IDS);
 const providerSchema = z.enum(Object.keys(PROVIDER_CREDENTIALS) as [ProviderId, ...ProviderId[]]);
 const metadata = z.string().min(1).max(4096).refine(value => !/[\u0000-\u001f\u007f]/.test(value));
 const fingerprintSchema = z.string().min(1).max(256);

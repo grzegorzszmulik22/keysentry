@@ -241,8 +241,13 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
     session.done = true;
     // The ack goes out only after the record is sealed at rest, so the CLI's success means the box kept the tokens.
     await deps.relay.publish(step.message!);
-    // Sessions opened under the previous device list must not outlive it.
-    sessions = sessions.filter(other => other === session);
+    // Sessions opened under the previous device list keep only devices still on the new one. Their announcements
+    // stay on the relay, so dropping a still-valid session would leave a CLI waiting on it.
+    sessions = sessions.filter(other => {
+      if (other === session) return true;
+      other.candidates = other.candidates.filter(candidate => deviceKeys.some(key => key.equals(candidate.deviceKey)));
+      return other.candidates.length > 0;
+    });
     return true;
   }
 

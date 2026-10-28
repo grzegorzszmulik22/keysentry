@@ -2,7 +2,7 @@ import { request as httpRequest, type ClientRequest, type IncomingMessage, type 
 import { createFetchHttp } from '../../http.js';
 import { EGRESS_RULES, createGuardedHttp } from '../../net/index.js';
 import type { HttpClient, Logger, SignedNotifyMessage } from '../../types.js';
-import { startBoxAgent, type BoxAgent } from './agent.js';
+import { BoxAgentError, startBoxAgent, type BoxAgent } from './agent.js';
 import { createNoticeSender } from './notice.js';
 import { isBoxId, type BoxNoticeKit } from './payload.js';
 import { createHttpBoxRelay } from './relay.js';
@@ -27,26 +27,26 @@ export function readMetadataAttribute(name: string, options: {
       path: `/computeMetadata/v1/instance/attributes/${name}`, headers: { 'Metadata-Flavor': 'Google' } }, response => {
       const chunks: Buffer[] = []; let length = 0;
       response.on('data', (chunk: Buffer) => { length += chunk.length; if (length > 4096) response.destroy(new Error('too large')); else chunks.push(chunk); });
-      response.on('error', () => reject(new Error('The box could not read its instance metadata.')));
+      response.on('error', () => reject(new BoxAgentError('The box could not read its instance metadata.')));
       response.on('end', () => {
-        if (response.statusCode !== 200 || response.headers['metadata-flavor'] !== 'Google') { reject(new Error('The box could not read its instance metadata.')); return; }
+        if (response.statusCode !== 200 || response.headers['metadata-flavor'] !== 'Google') { reject(new BoxAgentError('The box could not read its instance metadata.')); return; }
         resolve(Buffer.concat(chunks).toString('utf8').trim());
       });
     });
     req.on('timeout', () => req.destroy());
-    req.on('error', () => reject(new Error('The box could not read its instance metadata.')));
+    req.on('error', () => reject(new BoxAgentError('The box could not read its instance metadata.')));
     req.end();
   });
 }
 
 export async function readBoxRoute(read: (name: string) => Promise<string> = name => readMetadataAttribute(name)): Promise<BoxRouteMetadata> {
   const [boxId, relayOrigin, device] = await Promise.all([read(METADATA_ATTRIBUTES.boxId), read(METADATA_ATTRIBUTES.relay), read(METADATA_ATTRIBUTES.device)]);
-  if (!isBoxId(boxId)) throw new Error('The box id in the instance metadata is invalid.');
+  if (!isBoxId(boxId)) throw new BoxAgentError('The box id in the instance metadata is invalid.');
   let origin: URL;
-  try { origin = new URL(relayOrigin); } catch { throw new Error('The relay address in the instance metadata is invalid.'); }
-  if (origin.protocol !== 'https:' || origin.origin !== relayOrigin) throw new Error('The relay address in the instance metadata is invalid.');
+  try { origin = new URL(relayOrigin); } catch { throw new BoxAgentError('The relay address in the instance metadata is invalid.'); }
+  if (origin.protocol !== 'https:' || origin.origin !== relayOrigin) throw new BoxAgentError('The relay address in the instance metadata is invalid.');
   const key = Buffer.from(device, 'base64');
-  if (key.length !== 44 || key.toString('base64') !== device) throw new Error('The enrollment device key in the instance metadata is invalid.');
+  if (key.length !== 44 || key.toString('base64') !== device) throw new BoxAgentError('The enrollment device key in the instance metadata is invalid.');
   return { boxId, relayOrigin, enrollmentDeviceKey: key };
 }
 

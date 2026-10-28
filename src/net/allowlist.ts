@@ -88,6 +88,14 @@ export const DISPLAY_ONLY_URL_HOSTS: readonly string[] = [
   'resend.com',
   'supabase.com',
   'www.openssh.com',
+  // Phase 6 provider dashboards (guidance links only).
+  'account.postmarkapp.com',
+  'console.groq.com',
+  'console.mistral.ai',
+  'console.neon.tech',
+  'console.upstash.com',
+  'dashboard.clerk.com',
+  'replicate.com',
 ];
 
 function normalizedHost(host: string): string {

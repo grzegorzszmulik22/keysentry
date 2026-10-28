@@ -17,6 +17,7 @@ const PROVIDERS: Readonly<Record<Cluster['provider'], string>> = {
   cloudflare: 'Cloudflare', github: 'GitHub', aws: 'AWS', supabase: 'Supabase', database: 'Database',
   slack: 'Slack', sendgrid: 'SendGrid', twilio: 'Twilio', google: 'Google', 'private-key': 'Private',
   'crypto-wallet': 'Wallet', 'app-secret': 'App secret', 'encryption-key': 'Encryption', unknown: 'Unknown',
+  groq: 'Groq', mistral: 'Mistral', replicate: 'Replicate', postmark: 'Postmark', clerk: 'Clerk', upstash: 'Upstash', neon: 'Neon',
 };
 // Audit mirrors retain counts, but discard the journal's undo, cleanup, activation and outcome flags.
 const AUDIT_MIRRORS: Readonly<Partial<Record<JournalEntry['event'], Description>>> = {

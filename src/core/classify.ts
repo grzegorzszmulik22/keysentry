@@ -4,6 +4,7 @@ const TIERS: Record<ProviderId, RiskTier> = {
   'crypto-wallet': 'crypto', aws: 'cloud', cloudflare: 'cloud', github: 'cloud', google: 'cloud', 'private-key': 'cloud',
   database: 'database', supabase: 'database', stripe: 'payments', openai: 'ai', anthropic: 'ai', openrouter: 'ai',
   resend: 'comms', sendgrid: 'comms', slack: 'comms', twilio: 'comms', 'app-secret': 'app', 'encryption-key': 'app', unknown: 'unknown',
+  groq: 'ai', mistral: 'ai', replicate: 'ai', postmark: 'comms', clerk: 'cloud', upstash: 'database', neon: 'database',
 };
 
 export function tierFor(provider: ProviderId): RiskTier {

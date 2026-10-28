@@ -37,7 +37,11 @@ export interface Redactor {
 }
 
 // ---------------------------------------------------------------- hosts (where secrets are consumed)
-export type HostId = 'railway' | 'vercel' | 'render' | 'fly' | 'github-actions' | 'dotenv';
+/** Every host keysentry can scan and write. Phase 5 adds secret stores; phase 6 adds more deploy platforms. */
+export const HOST_IDS = ['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv',
+  'netlify', 'cloudflare-workers', 'supabase-functions', 'heroku', 'digitalocean', 'coolify', 'zeabur',
+  'kubernetes', 'aws-secrets-manager', 'vault-kv', 'doppler', 'infisical'] as const;
+export type HostId = typeof HOST_IDS[number];
 
 export interface ServiceRef {
   host: HostId;
@@ -102,6 +106,13 @@ export type ProviderId =
   | 'sendgrid'
   | 'twilio'
   | 'google'
+  | 'groq'
+  | 'mistral'
+  | 'replicate'
+  | 'postmark'
+  | 'clerk'
+  | 'upstash'
+  | 'neon'
   | 'private-key'
   | 'crypto-wallet'
   | 'app-secret'

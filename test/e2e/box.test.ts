@@ -200,6 +200,17 @@ describe('cloud box end to end against the local emulator', () => {
     expect(await bundlesSent(h)).toBe(0);
   });
 
+  it('moves on from an announced session nobody answers to one the box still serves', async () => {
+    const h = await harness();
+    await eventually(async () => expect((await h.relay.poll()).some(message => (message as { type?: string }).type === 'box-hello')).toBe(true));
+    // A newer hello that will never be answered: a box that restarted, or a relay replaying an abandoned session.
+    const ghost = createHandshake('box', { devicePublicKeyDer: h.device.publicKeyDer, boxKey: generateBoxKeyPair(), signingKey: generateDeviceKey() });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await h.relay.publish(ghost.next({ now: new Date(), attestationToken: h.local.emulator.mintToken({ audience: 'keysentry-box:test-box', nonces: ['g'.repeat(43)] }) }).message!);
+    const opened = await openVerifiedBoxSession({ relay: h.relay, boxId: 'test-box', deviceKey: h.device, trust: h.trust, pollMs: 20, timeoutMs: 10_000, answerMs: 300 });
+    expect(opened.verification.ok).toBe(true);
+  });
+
   it('a relay that replays an old attestation from an earlier session is refused', async () => {
     const h = await harness();
     const first = await session(h);

@@ -75,7 +75,10 @@ describe('keysentry box', () => {
       expect(check).toContain(BOX_HONEST_CLAIM);
 
       f.output.length = 0;
-      expect(await runCli(['box', 'send-tokens', 'demo-box'], f.options())).toBe(0);
+      f.errors.length = 0;
+      const sendCode = await runCli(['box', 'send-tokens', 'demo-box'], f.options());
+      expect(f.errors).toEqual([]);
+      expect(sendCode).toBe(0);
       expect(f.output.join('\n')).toContain('Box demo-box verified every check and confirmed it sealed the tokens (unlock-on-restart).');
       expect(await f.vault.get('box/demo-box/share-b')).toHaveLength(32);
       expect(Object.keys(f.watchers[0]!).sort()).toEqual(['KEYSENTRY_STATE_DIR', 'KEYSENTRY_STATE_KEY', 'KEYSENTRY_VAULT_PASSPHRASE',
@@ -83,7 +86,10 @@ describe('keysentry box', () => {
 
       await restart();
       f.output.length = 0;
-      expect(await runCli(['box', 'unlock', 'demo-box'], f.options())).toBe(0);
+      f.errors.length = 0;
+      const unlockCode = await runCli(['box', 'unlock', 'demo-box'], f.options());
+      expect(f.errors).toEqual([]);
+      expect(unlockCode).toBe(0);
       expect(f.output.join('\n')).toContain('received the device share');
       expect(f.watchers).toHaveLength(2);
     });

@@ -174,7 +174,10 @@ export async function runFirstRun(opts: FirstRunOptions): Promise<{ result: Firs
   return { result, saved: true };
 }
 
-const HOST_NAMES: Record<HostId, string> = { railway: 'Railway', vercel: 'Vercel', render: 'Render', fly: 'Fly.io', 'github-actions': 'GitHub Actions', dotenv: 'Local files' };
+const HOST_NAMES: Record<HostId, string> = { railway: 'Railway', vercel: 'Vercel', render: 'Render', fly: 'Fly.io', 'github-actions': 'GitHub Actions', dotenv: 'Local files',
+  netlify: 'Netlify', 'cloudflare-workers': 'Cloudflare Workers', 'supabase-functions': 'Supabase Edge Functions',
+  heroku: 'Heroku', digitalocean: 'DigitalOcean App Platform', coolify: 'Coolify', zeabur: 'Zeabur',
+  kubernetes: 'Kubernetes', 'aws-secrets-manager': 'AWS Secrets Manager', 'vault-kv': 'HashiCorp Vault', doppler: 'Doppler', infisical: 'Infisical', };
 const count = (value: number, noun: string) => `${value} ${noun}${value === 1 ? '' : 's'}`;
 
 export function formatFirstRun(result: FirstRunResult, includeHistory = true): string {

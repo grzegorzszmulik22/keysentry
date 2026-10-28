@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { HOST_IDS } from '../types.js';
 
-export const hostIdSchema = z.enum(['railway', 'vercel', 'render', 'fly', 'github-actions', 'dotenv']);
+export const hostIdSchema = z.enum(HOST_IDS);
 export const providerIdSchema = z.enum(['openai', 'anthropic', 'openrouter', 'stripe', 'resend', 'cloudflare', 'github', 'aws', 'supabase', 'database', 'slack', 'sendgrid', 'twilio', 'google', 'private-key', 'crypto-wallet', 'app-secret', 'encryption-key', 'unknown']);
 export const tierSchema = z.enum(['crypto', 'cloud', 'database', 'payments', 'ai', 'comms', 'app', 'unknown']);
 const method = z.enum(['auto', 'atomic-roll', 'generate', 'guided']);
