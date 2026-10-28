@@ -120,12 +120,14 @@ async function isOwnHook(path: string, size: number): Promise<boolean> {
 }
 
 /** Check the executable lookup without running a command or shell. */
-async function keysentryOnPath(root: string): Promise<boolean> {
+// null: the Node permission model kept keysentry from looking outside its grants, so the answer is unknown.
+async function keysentryOnPath(root: string): Promise<boolean | null> {
   const pathEntry = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'path');
   if (pathEntry?.[1] === undefined) return false;
   // The fixed hook uses POSIX sh, including Git for Windows. Its lookup does
   // not use cmd.exe's PATHEXT expansion for .cmd/.bat wrappers.
   const extensions = process.platform === 'win32' ? ['', '.exe'] : [''];
+  let unknown = false;
   for (const entry of pathEntry[1].split(delimiter)) {
     const directory = process.platform === 'win32' ? entry.replace(/^"(.*)"$/, '$1') : entry;
     for (const extension of extensions) {
@@ -134,16 +136,19 @@ async function keysentryOnPath(root: string): Promise<boolean> {
         if (!(await stat(candidate)).isFile()) continue;
         await access(candidate, constants.X_OK);
         return true;
-      } catch { /* Missing or non-executable entries do not resolve the command. */ }
+      } catch (error) {
+        // Missing or non-executable entries do not resolve the command.
+        if ((error as NodeJS.ErrnoException).code === 'ERR_ACCESS_DENIED') unknown = true;
+      }
     }
   }
-  return false;
+  return unknown ? null : false;
 }
 
 export async function installHook(
   root: string,
   opts: { force?: boolean; binPath: string; git?: GitRunner },
-): Promise<{ path: string; replaced: boolean; onPath: boolean }> {
+): Promise<{ path: string; replaced: boolean; onPath: boolean | null }> {
   const path = await hookPath(root, opts.git ?? queryGit);
   const current = await existing(path);
   const backup = `${path}.keysentry-backup`;
@@ -171,10 +176,12 @@ export async function installHook(
     const file = await open(path, 'wx', 0o755);
     try {
       await file.writeFile(HOOK, 'utf8');
-      if (process.platform !== 'win32') await file.chmod(0o755);
     } finally {
       await file.close();
     }
+    // Path-based chmod (umask may have narrowed the creation mode); FileHandle.chmod is disabled under the Node
+    // permission model.
+    if (process.platform !== 'win32') await chmod(path, 0o755);
   } catch (error) {
     if (replaced) {
       // Restore the original only if nobody has installed another hook meanwhile.

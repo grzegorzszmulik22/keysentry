@@ -111,6 +111,19 @@ it('audit verification supplies the noninteractive encrypted-file passphrase wit
   expect(f.opened).toHaveBeenCalledOnce();
 });
 
+it('a passphrase set in the environment is used in a terminal too, without a prompt', async () => {
+  const f = await fixture(); const vault = createFakeVault();
+  const audit = createAuditLog({ path: join(f.cwd, '.keysentry', 'audit.jsonl'), vault, deviceKey: () => vaultModule.deviceKey(vault) });
+  await audit.append({ kind: 'test', summary: 'Recorded metadata.' }); await audit.checkpoint();
+  f.opened.mockImplementation(async opts => {
+    const passphrase = await opts.passphrase!();
+    try { expect(passphrase.equals(Buffer.from('test-passphrase'))).toBe(true); } finally { passphrase.fill(0); }
+    return vault;
+  });
+  expect(await runCli(['audit', 'verify'], { ...f.options, env: { KEYSENTRY_VAULT: 'encrypted-file', KEYSENTRY_VAULT_PASSPHRASE: 'test-passphrase' }, stdinIsTTY: true, stdoutIsTTY: true })).toBe(0);
+  expect(f.output.join(' ')).not.toContain('Enter the encrypted-file passphrase');
+});
+
 it('bin permissions include the adjacent release manifest without granting the installation directory', async () => {
   const f = await fixture(); const bundle = join(f.cwd, 'installation', 'keysentry.mjs');
   // H3: permission grants use the real module path, with an explicit seam for a synthetic installed bundle.

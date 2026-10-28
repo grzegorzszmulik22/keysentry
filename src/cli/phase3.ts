@@ -176,7 +176,7 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
       const result = await installHook(opts.cwd(), { force: options.force === true, binPath: 'keysentry', git: opts.guardGit });
       opts.emit(result,
         'Pre-commit check installed. Run keysentry guard uninstall-hook to remove it.');
-      if (!result.onPath) opts.diagnostic('The hook calls keysentry from your PATH; install it with npm install -g keysentry so commits are checked.');
+      if (result.onPath === false) opts.diagnostic('The hook calls keysentry from your PATH; install it with npm install -g keysentry so commits are checked.');
     });
   guard.command('uninstall-hook').description('Remove only the unmodified keysentry pre-commit hook')
     .action(async () => {

@@ -53,7 +53,9 @@ export function permissionArgs(opts: PermissionOptions): string[] | null {
     '--permission',
     ...opts.readPaths.map(path => `--allow-fs-read=${permissionPath(path)}`),
     ...opts.writePaths.map(path => `--allow-fs-write=${permissionPath(path)}`),
-    ...(opts.allowChildProcess ? ['--allow-child-process'] : []),
+    // Node prints a SecurityWarning whenever child processes are allowed; keysentry grants it on purpose (OS vault
+    // helpers, git), so the warning would only alarm users. Other warning types still print.
+    ...(opts.allowChildProcess ? ['--allow-child-process', '--disable-warning=SecurityWarning'] : []),
   ];
 }
 

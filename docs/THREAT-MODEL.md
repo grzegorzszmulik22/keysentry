@@ -134,6 +134,10 @@ later**. Node 22 has no network permission flag; the client allow-list remains t
 The helper allowance needed for OS vaults is not a separate sandbox for those helpers. Node's
 permission model does not protect against malicious code; see [Node's documented limits](https://nodejs.org/docs/latest-v22.x/api/permissions.html)
 and the [recorded version facts](../notes/phase1-facts.md#4-nodejs-permission-model-versions).
+Inside the permission model Node refuses `fsync`, so keysentry's writes are atomic (temporary file and
+rename) but not forced to disk: they survive a keysentry crash, and a power loss within seconds of a
+rotation can lose the newest value. Recovery then reports a possible leftover key and revokes nothing;
+`keysentry doctor` states this when the sandbox is on.
 
 **A rotation across providers and consumers.** Dry-run is the default. A replacement is stored in
 the encrypted in-flight store before host writes; an old readable value is retained there when

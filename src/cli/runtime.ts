@@ -129,7 +129,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   await prepareDirectory(userDir, 'KEYSENTRY_USER_DIR');
   await prepareDirectory(paths.dir, 'KEYSENTRY_STATE_DIR');
   const passphrase = options.passphrase ?? (async () => {
-    if (!interactive) {
+    // A passphrase the user put in the environment is used as given, in a terminal too (like restic and borg).
+    if (env.KEYSENTRY_VAULT_PASSPHRASE || !interactive) {
       if (!env.KEYSENTRY_VAULT_PASSPHRASE) throw new CliError('The encrypted file needs KEYSENTRY_VAULT_PASSPHRASE when no interactive terminal is available.');
       redactor.register(env.KEYSENTRY_VAULT_PASSPHRASE);
       return Buffer.from(env.KEYSENTRY_VAULT_PASSPHRASE);

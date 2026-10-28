@@ -5,6 +5,7 @@ import type { Vault } from '../../types.js';
 import { VaultUnavailableError } from '../errors.js';
 import { runHelper } from '../exec.js';
 import { validateVaultName } from '../names.js';
+import { syncFile } from '../../security/durable.js';
 
 const FIX = 'check that Windows PowerShell (powershell.exe) can run';
 const INTERNAL = new Set(['__index__', '__probe__']);
@@ -63,7 +64,7 @@ export function createWindowsDpapiVault(opts: { dir: string; exec?: typeof runHe
     const temporary = join(opts.dir, `.tmp-${randomBytes(16).toString('hex')}`);
     try {
       const handle = await open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(value, 'utf8'); await handle.sync(); }
+      try { await handle.writeFile(value, 'utf8'); await syncFile(handle); }
       finally { await handle.close(); }
       await rename(temporary, file);
     } finally {

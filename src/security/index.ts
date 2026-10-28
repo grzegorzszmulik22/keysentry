@@ -5,3 +5,4 @@ export type { ScryptParams } from './kdf.js';
 export { deviceKeyFromPrivate, generateDeviceKey, signDetached, verifyDetached } from './signing.js';
 export type { DeviceKey } from './signing.js';
 export { AUDIT_CHECKPOINT_PREFIX, createAuditLog } from './audit.js';
+export { durableSyncLimited, syncFile } from './durable.js';

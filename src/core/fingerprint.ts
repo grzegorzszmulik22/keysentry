@@ -2,6 +2,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { link, mkdir, open, readFile, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { syncFile } from '../security/durable.js';
 
 const PREFIXES = [
   'sk-or-v1-', 'sk-svcacct-', 'sk-proj-', 'sk-ant-', 'sk_live_', 'sk_test_',
@@ -46,7 +47,7 @@ export async function loadOrCreateFingerprintKey(dir = join(homedir(), '.keysent
     temp = candidate;
     try {
       await handle.writeFile(randomBytes(32));
-      await handle.sync();
+      await syncFile(handle);
     } finally {
       await handle.close();
     }

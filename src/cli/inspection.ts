@@ -64,7 +64,7 @@ export async function inspectAudit(options: RuntimeOptions) {
   const vault = options.vault ?? await openVault({
     env, userDir, log,
     passphrase: options.passphrase ?? (async () => {
-      if (interactive) return promptPassphrase(diagnostic, options.promptIO);
+      if (interactive && !env.KEYSENTRY_VAULT_PASSPHRASE) return promptPassphrase(diagnostic, options.promptIO);
       if (!env.KEYSENTRY_VAULT_PASSPHRASE) throw new CliError('The encrypted file needs KEYSENTRY_VAULT_PASSPHRASE when no interactive terminal is available.');
       redactor.register(env.KEYSENTRY_VAULT_PASSPHRASE);
       return Buffer.from(env.KEYSENTRY_VAULT_PASSPHRASE);

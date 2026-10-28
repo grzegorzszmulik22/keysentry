@@ -71,7 +71,7 @@ function nodeItem(input: DoctorInput): DoctorItem {
     : 'Supported sandbox minimum versions: 22.23.4, 24.22.1 and 26.12.1.';
   if (input.sandboxed) return {
     area: 'node', status: support.supported ? 'ok' : 'warn', title: `Node ${input.nodeVersion}`,
-    detail: `Node permission sandbox is on.${support.reason ? ` ${support.reason}.` : ''} ${minimum} The egress guard controls network access.`,
+    detail: `Node permission sandbox is on.${support.reason ? ` ${support.reason}.` : ''} ${minimum} The egress guard controls network access. Inside the sandbox Node cannot force saved data to disk, so a power loss during a rotation can lose its newest value; keysentry then reports a possible leftover key instead of revoking anything.`,
     ...(!support.supported ? { fix: NODE_DOWNLOAD } : {}),
   };
   const reason = input.env.KEYSENTRY_NO_SANDBOX === '1'

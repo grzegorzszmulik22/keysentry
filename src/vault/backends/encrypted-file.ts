@@ -6,6 +6,7 @@ import type { Vault } from '../../types.js';
 import { DEFAULT_SCRYPT, deriveKeyFromPassphrase, openBytes, sealBytes, type ScryptParams } from '../../security/index.js';
 import { VaultLockedError } from '../errors.js';
 import { validateVaultName } from '../names.js';
+import { syncFile } from '../../security/durable.js';
 
 interface VaultFile {
   v: 1;
@@ -38,6 +39,9 @@ function parseFile(raw: string): VaultFile {
 export function createEncryptedFileVault(opts: { path: string; passphrase: () => Promise<Buffer>; scrypt?: ScryptParams }): Vault {
   const path = resolve(opts.path);
   let opened: Promise<{ key: Buffer; salt: string; params: ScryptParams }> | undefined;
+  // Asked for before the lock is taken, so a prompt left waiting never blocks other keysentry processes
+  // and closing the terminal at the prompt leaves no lock behind.
+  let asked: Promise<Buffer> | undefined;
   let tail = Promise.resolve();
 
   async function load(): Promise<{ file: VaultFile; key: Buffer }> {
@@ -49,7 +53,7 @@ export function createEncryptedFileVault(opts: { path: string; passphrase: () =>
     const params = file?.params ?? { ...(opts.scrypt ?? DEFAULT_SCRYPT) };
     opened ??= (async () => {
       // The callback's returned buffer is consumed here and cleared after derivation.
-      const passphrase = await opts.passphrase();
+      const passphrase = await (asked ??= opts.passphrase());
       let key: Buffer;
       try { key = await deriveKeyFromPassphrase(passphrase, Buffer.from(salt, 'base64'), params); }
       catch { throw new VaultLockedError(); }
@@ -85,7 +89,7 @@ export function createEncryptedFileVault(opts: { path: string; passphrase: () =>
     let acquired = false;
     try {
       const handle = await open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(JSON.stringify({ pid: process.pid })); await handle.sync(); }
+      try { await handle.writeFile(JSON.stringify({ pid: process.pid })); await syncFile(handle); }
       finally { await handle.close(); }
       while (!acquired) {
         // Linking a complete record gives exclusive publication without exposing
@@ -117,7 +121,10 @@ export function createEncryptedFileVault(opts: { path: string; passphrase: () =>
   }
 
   function serial<T>(fn: () => Promise<T>): Promise<T> {
-    const pending = tail.then(() => locked(fn));
+    const pending = tail.then(async () => {
+      if (!opened) await (asked ??= opts.passphrase());
+      return locked(fn);
+    });
     tail = pending.then(() => undefined, () => undefined);
     return pending;
   }
@@ -127,7 +134,7 @@ export function createEncryptedFileVault(opts: { path: string; passphrase: () =>
     const temporary = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
     try {
       const handle = await open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(JSON.stringify(file)); await handle.sync(); }
+      try { await handle.writeFile(JSON.stringify(file)); await syncFile(handle); }
       finally { await handle.close(); }
       await rename(temporary, path);
     } finally { await rm(temporary, { force: true }); }

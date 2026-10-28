@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomInt, timingSafeEqual } from 'node:crypto';
-import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, stat, unlink, utimes } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -8,6 +8,7 @@ import { canonicalJson } from './canonical.js';
 import { signDetached, verifyDetached } from './signing.js';
 import type { DeviceKey } from './signing.js';
 import { getOrCreateKey } from '../vault/keys.js';
+import { syncFile } from './durable.js';
 
 export const AUDIT_CHECKPOINT_PREFIX = 'keysentry-audit-checkpoint:v1:';
 
@@ -84,7 +85,8 @@ async function withLock<T>(path: string, work: (assertLock: AssertLock) => Promi
     try {
       if (lost || !sameFile(identity, await stat(lockPath))) throw new Error();
       const time = new Date();
-      await lock.utimes(time, time);
+      // Path-based: FileHandle.utimes is disabled under the Node permission model.
+      await utimes(lockPath, time, time);
     } catch {
       lost = true;
       throw new Error('The audit log lock changed or is no longer held. Try the operation again.');
@@ -288,7 +290,7 @@ export function createAuditLog(opts: {
     await assertLock();
     const { bytesWritten } = await file.write(bytes);
     if (bytesWritten !== bytes.length) throw new Error('The audit log entry could not be written completely. Run audit verify before continuing.');
-    await file.sync();
+    await syncFile(file);
     await assertLock();
   }
 

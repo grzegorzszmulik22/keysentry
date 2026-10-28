@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import type { InFlightStore, Vault } from '../types.js';
 import { DecryptError, openBytes, sealBytes } from '../security/index.js';
 import { deleteInflightKey, inflightKey } from '../vault/index.js';
+import { syncFile } from '../security/durable.js';
 
 export class InFlightClosedError extends Error {
   readonly code = 'INFLIGHT_CLOSED';
@@ -141,7 +142,7 @@ export function createInFlightStore(opts: { dir: string; vault: Vault; projectId
           try {
             const { bytesWritten } = await handle.write(line);
             if (bytesWritten !== line.length) throw new Error('Unable to store temporary rotation values completely.');
-            await handle.sync();
+            await syncFile(handle);
           } finally { await handle.close(); }
         } catch { throw new Error('Unable to store temporary rotation values.'); }
         finally { key.fill(0); }
@@ -182,7 +183,7 @@ export function createInFlightStore(opts: { dir: string; vault: Vault; projectId
               if (bytesWritten === 0) throw new Error('Unable to clear temporary rotation values completely.');
               offset += bytesWritten;
             }
-            await handle.sync();
+            await syncFile(handle);
           } finally { await handle.close(); }
           await unlink(path);
         } catch (error) { if (!missing(error)) throw new Error('Unable to remove temporary rotation values.'); }

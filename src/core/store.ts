@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { DecryptError, openBytes, sealBytes } from '../security/index.js';
 import type { Inventory, Journal, JournalEntry, StateCipher, Vault } from '../types.js';
 import { bindProjectPath, getProjectId } from '../vault/keys.js';
+import { syncFile } from '../security/durable.js';
 
 export interface StatePaths {
   dir: string;
@@ -124,7 +125,7 @@ async function writeTextAtomic(path: string, content: string, verify?: (saved: s
   try {
     const handle = await open(temp, 'wx', 0o600);
     created = true;
-    try { await handle.writeFile(content, 'utf8'); await handle.sync(); }
+    try { await handle.writeFile(content, 'utf8'); await syncFile(handle); }
     finally { await handle.close(); }
     if (verify) verify(await readFile(temp, 'utf8'));
     // Persist the migration boundary before publishing encrypted state, including on a partial migration.
@@ -369,7 +370,7 @@ async function appendDurable(path: string, line: string): Promise<void> {
   try {
     const { bytesWritten } = await handle.write(bytes);
     if (bytesWritten !== bytes.length) throw new Error('Unable to append a complete journal record.');
-    await handle.sync();
+    await syncFile(handle);
   } finally { await handle.close(); }
 }
 

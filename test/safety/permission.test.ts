@@ -16,7 +16,7 @@ const options = () => ({ ...paths, argv: ['/node', '/install/keysentry.mjs', 'do
 describe('permission arguments', () => {
   test('formats paths with spaces as separate arguments and marks directories', () => {
     expect(permissionArgs({ nodeVersion: 'v22.23.4', readPaths: ['/project with space/', '/install/keysentry.mjs'], writePaths: ['/state with space/'], allowChildProcess: true }))
-      .toEqual(['--permission', '--allow-fs-read=/project with space/*', '--allow-fs-read=/install/keysentry.mjs', '--allow-fs-write=/state with space/*', '--allow-child-process']);
+      .toEqual(['--permission', '--allow-fs-read=/project with space/*', '--allow-fs-read=/install/keysentry.mjs', '--allow-fs-write=/state with space/*', '--allow-child-process', '--disable-warning=SecurityWarning']);
   });
 
   test('preserves Windows drive letters and backslashes', () => {

@@ -6,6 +6,7 @@ import { deviceKeyFromPrivate, generateDeviceKey, type DeviceKey } from '../secu
 import { environmentVariableForName } from './backends/env.js';
 import { VaultLockedError, VaultReadOnlyError } from './errors.js';
 import { validateVaultName } from './names.js';
+import { syncFile } from '../security/durable.js';
 
 const projectLocks = new Map<string, Promise<unknown>>();
 const vaultLocks = new WeakMap<Vault, Map<string, Promise<unknown>>>();
@@ -57,7 +58,7 @@ export function getProjectId(stateDir: string): Promise<string> {
     const temporary = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
     try {
       const handle = await open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(JSON.stringify({ id })); await handle.sync(); }
+      try { await handle.writeFile(JSON.stringify({ id })); await syncFile(handle); }
       finally { await handle.close(); }
       // Publishing a completed inode prevents a partial project.json after a
       // crash; link also refuses to replace another process's project identity.

@@ -7,6 +7,7 @@ import { openBytes, sealBytes } from '../../security/index.js';
 import { assertKeyName, kmsDecrypt, kmsEncrypt } from './kms.js';
 import { assertAudience, exchangeForAccessToken } from './sts.js';
 import { assertDeviceShare, deriveUnlockDataKey } from './unlock.js';
+import { syncFile } from '../../security/durable.js';
 
 export const DEFAULT_ATTESTATION_TOKEN_PATH = '/run/container_launcher/attestation_verifier_claims_token';
 export const MAX_BOX_BUNDLE_BYTES = 1024 * 1024;
@@ -88,15 +89,14 @@ async function writeRecord(dir: string, path: string, record: RecordV1): Promise
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try {
-      await handle.chmod(0o600);
       await handle.writeFile(JSON.stringify(record) + '\n', 'utf8');
-      await handle.sync();
+      await syncFile(handle);
     } finally { await handle.close(); }
     // Both ciphertexts commit together, so a failed wrap/write cannot replace just half of the pair.
     await rename(temporary, path);
     if (process.platform !== 'win32') {
       const directory = await open(dir, constants.O_RDONLY);
-      try { await directory.sync(); } finally { await directory.close(); }
+      try { await syncFile(directory); } finally { await directory.close(); }
     }
   } catch { throw new Error('Could not store the sealed box bundle. Check the box state directory.'); }
   finally { await unlink(temporary).catch(() => undefined); }

@@ -154,6 +154,23 @@ test('separate encrypted-file instances serialize simultaneous writes', async ()
   expect(await create().list()).toHaveLength(6);
 });
 
+test('encrypted-file asks for the passphrase before taking the lock', async () => {
+  const path = await file();
+  const lockPath = `${path}.lock`;
+  let answer!: (value: Buffer) => void;
+  const asked = new Promise<void>(ready => {
+    const vault = createEncryptedFileVault({ path, scrypt, passphrase: () => { ready(); return new Promise(resolve => { answer = resolve; }); } });
+    void vault.set('item', Buffer.from('v'));
+  });
+  await asked;
+  // A prompt left waiting must not block other keysentry processes or leave a lock behind if the terminal closes.
+  await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  const other = createEncryptedFileVault({ path, passphrase: async () => Buffer.from('right'), scrypt });
+  await other.set('other', Buffer.from('o'));
+  answer(Buffer.from('right'));
+  await vi.waitFor(async () => expect(await other.list()).toEqual(['item', 'other']));
+});
+
 test('an abandoned encrypted-file lock fails closed and explains manual recovery', async () => {
   const path = await file();
   const lockPath = `${path}.lock`;

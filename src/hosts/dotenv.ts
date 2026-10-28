@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { chmod, lstat, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { HostAdapter, Logger, RawVariable, ServiceRef } from '../types.js';
+import { syncFile } from '../security/durable.js';
 
 export interface DotenvHostOptions {
   roots: string[];
@@ -219,10 +220,11 @@ export function createDotenvHost(options: DotenvHostOptions): HostAdapter {
         const mode = (await stat(service.serviceId)).mode & 0o777;
         file = await open(temporary, 'wx', 0o600);
         await file.writeFile(updated, 'utf8');
-        await file.sync();
+        await syncFile(file);
         await rename(temporary, service.serviceId);
-        // Keep the temp private until it becomes the requested destination.
-        await file.chmod(mode);
+        // Keep the temp private until it becomes the requested destination. Path-based chmod: the Node permission
+        // model disables FileHandle.chmod (fchmod) entirely but allows chmod on granted paths.
+        await chmod(service.serviceId, mode);
       } catch {
         throw new Error('dotenv atomic write failed');
       } finally {
