@@ -2,7 +2,7 @@
 // a host, provider, channel, egress destination or action that local configuration does not already allow.
 import type { ConfigSettings } from '../cli/config.js';
 import { tierFor } from '../core/classify.js';
-import type { ArmedPlan, EgressRule, HostId, ProviderId, RiskTier, TeamPolicy, TeamRoster } from '../types.js';
+import type { ArmedPlan, EgressRule, HostId, Policy, ProviderId, RiskTier, TeamPolicy, TeamRoster } from '../types.js';
 import { TIER_ORDER } from '../types.js';
 
 const REVOKE_RANK = { never: 0, 'after-deploy': 1, immediately: 2 } as const;
@@ -45,6 +45,34 @@ export function effectiveSettings(settings: ConfigSettings, policy: TeamPolicy |
   if (rotation.minGraceSeconds !== undefined) {
     result.rotation.graceSeconds = Math.max(result.rotation.graceSeconds, rotation.minGraceSeconds);
     result.autopilot.graceMinutes = Math.max(result.autopilot.graceMinutes, Math.ceil(rotation.minGraceSeconds / 60));
+    // A minimum grace period means old keys are kept after a rotation, which "revoke immediately" would skip.
+    if (rotation.minGraceSeconds > 0 && result.rotation.revoke === 'immediately') result.rotation.revoke = 'after-deploy';
+  }
+  // The monitor's automatic actions (and their KEYSENTRY_AUTO_* overrides) run only when the signed policy allows them
+  // (review H2). The runtime applies narrowMonitorPolicy again after environment overrides are read.
+  if (!monitorAutomationAllowed(policy)) {
+    result.monitor.autoExecute = false;
+    result.monitor.autoContain = false;
+    result.monitor.revokeUnconfirmedOnHighConfidence = false;
+  }
+  return result;
+}
+
+/** Does the policy let the monitor act without an approval? Without a policy nothing changes (single-user behaviour). */
+export function monitorAutomationAllowed(policy: TeamPolicy | null | undefined): boolean {
+  return !policy || policy.autopilot.allowMonitorAutomation === true;
+}
+
+/**
+ * The monitor policy with automatic rotation, containment and unconfirmed revocation turned off unless the team policy
+ * allows monitor automation. Returns a copy.
+ */
+export function narrowMonitorPolicy(monitor: Policy, policy: TeamPolicy | null | undefined): Policy {
+  const result = structuredClone(monitor);
+  if (!monitorAutomationAllowed(policy)) {
+    result.autoExecute = false;
+    result.autoContain = false;
+    result.revokeUnconfirmedOnHighConfidence = false;
   }
   return result;
 }
@@ -60,6 +88,8 @@ export function narrowRotationOptions<T extends { revoke?: 'after-deploy' | 'imm
   // Undefined means "use the configured value", which effectiveSettings has already narrowed.
   if (revoke !== undefined && result.revoke !== undefined && REVOKE_RANK[revoke] < REVOKE_RANK[result.revoke]) result.revoke = revoke;
   if (minGraceSeconds !== undefined && result.graceMs !== undefined) result.graceMs = Math.max(result.graceMs, minGraceSeconds * 1000);
+  // `rotate --revoke immediately` would revoke the old key with no grace period at all.
+  if (minGraceSeconds !== undefined && minGraceSeconds > 0 && result.revoke === 'immediately') result.revoke = 'after-deploy';
   return result;
 }
 

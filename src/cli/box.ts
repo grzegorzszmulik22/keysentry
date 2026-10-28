@@ -12,6 +12,7 @@ import { createFetchHttp } from '../http.js';
 import { RELEASE_PUBLIC_KEYS } from '../release/index.js';
 import { assertHumanForMutation } from '../safety/index.js';
 import type { BoxSealMode, HttpClient, Logger } from '../types.js';
+import type { ConfigSettings } from './config.js';
 import { BOX_HONEST_CLAIM, openVerifiedBoxSession, renderBoxVerification, type BoxTrust } from './box-flow.js';
 import { CliError } from './errors.js';
 import { localDeviceKeys } from './phase2.js';
@@ -133,15 +134,36 @@ async function noticeKit(rt: KeysentryRuntime): Promise<BoxNoticeKit> {
   return { channels: channels.map(channel => ({ ...channel })) as BoxNoticeKit['channels'], secrets };
 }
 
+/** Told when a box deployment leaves out the proxy settings. */
+export const BOX_PROXY_NOTE = 'The cloud box reaches provider APIs from Google\'s network and cannot reach your proxy, so network.proxy and network.noProxy are left out of its deployment. Extra CA certificates (network.caFile) are kept.';
+
+/**
+ * The settings a cloud box deployment carries. A box runs in Google's network and cannot reach a corporate proxy, so
+ * `network.proxy` and `network.noProxy` are dropped (with `note`); the extra CA bundle is kept. Returns a copy.
+ */
+export function boxDeploymentSettings(settings: ConfigSettings): { settings: ConfigSettings; note: string | null } {
+  const copy = structuredClone(settings);
+  if (!copy.network.proxy && !copy.network.noProxy.length) return { settings: copy, note: null };
+  delete copy.network.proxy;
+  copy.network.noProxy = [];
+  return { settings: copy, note: BOX_PROXY_NOTE };
+}
+
 /** The same deployment `watcher setup` makes, held in memory for the bundle instead of printed. */
 async function deploymentFor(rt: KeysentryRuntime, opts: BoxCommandsOptions): Promise<{ values: BoxEnrollPayload['deployment']; exported: string[]; watcherPublicKeyDer: Buffer; watcherKeyId: string }> {
+  // A team policy that requires the proxy for every request cannot be met from Google's network.
+  if (rt.teamPolicy?.network.requireProxy === true) {
+    throw new CliError('The team policy requires every request to go through your HTTP proxy, which a cloud box cannot reach, so nothing was sent. Run a self-hosted watcher inside your network instead (keysentry watcher setup).');
+  }
+  const network = boxDeploymentSettings(rt.config.settings);
+  if (network.note) opts.diagnostic(network.note);
   const outputDir = join(rt.paths.dir, `box-deploy-${randomBytes(8).toString('hex')}`);
   try {
     const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault,
       notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
       intervalSeconds: rt.config.monitor.intervalMs / 1000, relayServer: rt.config.settings.notify.relay?.server });
     const prepared = await createWatcherDeployment({ vault: rt.vault, audit: rt.audit, config, outputDir,
-      prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir, cwd: rt.config.cwd, env: opts.env,
+      prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: network.settings, outputDir, cwd: rt.config.cwd, env: opts.env,
         confirmEnvironmentCredential: async name => {
           opts.diagnostic(`Copy ${name} from your environment into the cloud box? [y/N]`);
           return /^(?:y|yes)$/i.test(await promptVaultValue(`y to copy ${name}`, opts.diagnostic, opts.promptIO) ?? '');

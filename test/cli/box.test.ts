@@ -6,7 +6,9 @@ import * as localBoxModule from '../../packages/control-plane/src/local-box.js';
 import type { LocalBox } from '../../packages/control-plane/src/local-box.js';
 import { ALLOWLIST_GENESIS_HASH, createAllowListEntry, createAllowListHead } from '../../src/box/index.js';
 import { BOX_HONEST_CLAIM } from '../../src/cli/box-flow.js';
-import type { LocalBoxRunner } from '../../src/cli/box.js';
+import { BOX_PROXY_NOTE, boxDeploymentSettings, type LocalBoxRunner } from '../../src/cli/box.js';
+import { configSchema } from '../../src/cli/config.js';
+import { createEncryptedFileVault } from '../../src/vault/index.js';
 import { runCli, type CliOptions } from '../../src/cli/index.js';
 import { createRuntime } from '../../src/cli/runtime.js';
 import { generateDeviceKey } from '../../src/security/index.js';
@@ -126,6 +128,42 @@ describe('keysentry box', () => {
       expect(f.errors.join('\n')).toMatch(/FAIL {2}debug /);
       expect(f.watchers).toHaveLength(0);
       expect(await runCli(['box', 'check', 'local-box'], f.options())).toBe(1);
+    });
+  }, 60_000);
+
+  it('leaves the proxy out of a cloud box deployment (the box cannot reach it), keeps extra certificates, and says so', async () => {
+    const f = await fixture();
+    f.runtime.config.settings.network.proxy = 'http://proxy.example.test:3128';
+    f.runtime.config.settings.network.noProxy = ['internal.example.test'];
+    await withEmulator(f, [], async () => {
+      f.errors.length = 0;
+      expect(await runCli(['box', 'send-tokens', 'local-box'], f.options())).toBe(0);
+      expect(f.errors.join('\n')).toContain(BOX_PROXY_NOTE);
+      const env = f.watchers[0]!;
+      const path = join(f.cwd, 'deployed-vault.enc');
+      await writeFile(path, Buffer.from(env.KEYSENTRY_WATCHER_VAULT!, 'base64'));
+      const deployed = createEncryptedFileVault({ path, passphrase: async () => Buffer.from(env.KEYSENTRY_VAULT_PASSPHRASE!) });
+      const settings = JSON.parse((await deployed.get('watcher/runtime-settings'))!.toString()).settings;
+      expect(settings.network.proxy).toBeUndefined();
+      expect(settings.network.noProxy).toEqual([]);
+      expect(await deployed.get('cred/KEYSENTRY_PROXY_AUTH')).toBeNull();
+    });
+    // The extra CA bundle stays; without a proxy nothing changes and nothing is said.
+    const kept = boxDeploymentSettings(configSchema.parse({ network: { proxy: 'http://proxy.example.test:3128', caFile: 'ca.pem' } }));
+    expect(kept).toMatchObject({ note: BOX_PROXY_NOTE, settings: { network: { caFile: 'ca.pem', noProxy: [] } } });
+    expect(kept.settings.network.proxy).toBeUndefined();
+    expect(boxDeploymentSettings(configSchema.parse({})).note).toBeNull();
+  }, 60_000);
+
+  it('refuses a cloud box when the team policy requires the proxy for every request', async () => {
+    const f = await fixture();
+    Object.assign(f.runtime, { teamPolicy: { v: 1, teamId: 'team-test-0001', version: 1, prev: null, updatedAt: '2026-10-28T00:00:00.000Z', autopilot: {},
+      approvals: { required: 1, wideningAdmins: 1 }, network: { requireProxy: true }, notify: {}, rotation: {}, audit: {} } });
+    await withEmulator(f, [], async () => {
+      f.errors.length = 0;
+      expect(await runCli(['box', 'send-tokens', 'local-box'], f.options())).toBe(1);
+      expect(f.errors.join('\n')).toContain('The team policy requires every request to go through your HTTP proxy, which a cloud box cannot reach, so nothing was sent.');
+      expect(f.watchers).toHaveLength(0);
     });
   }, 60_000);
 

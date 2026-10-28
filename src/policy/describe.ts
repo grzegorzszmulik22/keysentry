@@ -10,6 +10,9 @@ export function describePolicy(policy: TeamPolicy): string[] {
   if (autopilot.allowedProviders) lines.push(`Autopilot may rotate keys only from: ${list(autopilot.allowedProviders)}.`);
   if (autopilot.maxServicesPerWave !== undefined) lines.push(`Autopilot changes at most ${autopilot.maxServicesPerWave} service${autopilot.maxServicesPerWave === 1 ? '' : 's'} per wave.`);
   if (autopilot.approvalTiers?.length) lines.push(`Keys in these risk tiers always need an approval: ${list(autopilot.approvalTiers)}.`);
+  lines.push(autopilot.allowMonitorAutomation === true
+    ? 'The monitor may rotate or contain keys automatically where keysentry.yaml turns that on, within the autopilot limits above.'
+    : 'The monitor never rotates or contains keys automatically; every monitor action waits for approval.');
   const byTier = Object.entries(approvals.requiredByTier ?? {}).filter(([, count]) => count !== undefined).map(([tier, count]) => `${tier}: ${count}`);
   lines.push(`Approvals: ${approvals.required} operator${approvals.required === 1 ? '' : 's'} or admin${approvals.required === 1 ? '' : 's'}${byTier.length ? ` (${byTier.join(', ')})` : ''}; policy-widening changes: ${approvals.wideningAdmins} admin${approvals.wideningAdmins === 1 ? '' : 's'}.`);
   if (network.offline) lines.push('Offline: no breach feeds or news are fetched.');

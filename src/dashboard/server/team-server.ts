@@ -8,8 +8,9 @@ import { ASSETS } from '../generated/assets.js';
 import type { OidcClient } from '../oidc/client.js';
 import { OIDC_MESSAGES, OidcError, type OidcFailure } from '../oidc/errors.js';
 import { isTeamRole, memberForIdentity, normalizeEmail, pinnedTo } from '../oidc/members.js';
+import { candidateFingerprint } from '../../team/enrollment.js';
 import { createLoginTransactions } from '../oidc/transactions.js';
-import { apiRoute, bodyDigest, validateApi } from './api.js';
+import { apiRoute, bodyDigest, DashboardAccepted, needsTeamPasskey, validateApi } from './api.js';
 import { createPasskeyGate, PasskeyGateError, type PasskeyStore } from './passkey-gate.js';
 import { CSP, DashboardError, json, operationalError, readJson, securityHeaders } from './security.js';
 import type { DashboardOptions } from './server.js';
@@ -168,7 +169,10 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
   }
   function enrollToken(input: unknown): string {
     const token = (input as { token?: unknown } | null)?.token;
-    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new DashboardError(400, 'This enrollment link is not valid. Ask a team admin for a new one (keysentry team invite).');
+    // A signed invitation: base64url payload, a dot, and the admin's base64url signature (src/team/enrollment.ts).
+    if (typeof token !== 'string' || token.length > 2200 || !/^[A-Za-z0-9_-]{16,2048}\.[A-Za-z0-9_-]{86}$/.test(token)) {
+      throw new DashboardError(400, 'This enrollment link is not valid. Ask a team admin for a new one (keysentry team invite).');
+    }
     return token;
   }
   function decodeField(value: unknown, maxBytes: number): Buffer {
@@ -252,7 +256,8 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
       await hooks.complete({ token, memberId: ceremony.memberId, credential, aaguid });
       enrollEvent({ kind: 'passkey-enrolled', memberId: ceremony.memberId });
       json(res, 200, { enrolled: true, member: ceremony.memberId, credentialId: credential.id,
-        next: `Ask a team admin to run: keysentry team add-passkey ${ceremony.memberId} ${credential.id}` });
+        fingerprint: candidateFingerprint({ credential }),
+        next: `Ask a team admin to add it: keysentry team passkeys pending -o <file> on the dashboard host, then keysentry team add-passkey ${ceremony.memberId} --card <file> on the admin's computer.` });
     } catch (error) {
       enrollEvent({ kind: 'enrollment-refused' });
       throw error;
@@ -422,7 +427,8 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
       // The identity provider only says who someone is; the roster says what they may do.
       const needed = builtIn ? 'operator' : requiredRole(name, route!, team.routeRoles);
       if (!allows(member.role, needed)) throw new DashboardError(403, member.role === 'viewer' ? VIEWER : ROLE);
-      if (opts.readOnly && (builtIn || route!.mutating)) throw new DashboardError(403, READ_ONLY);
+      // Disarm (a passkey-confirmed, non-mutating route) stays available on a read-only team dashboard.
+      if (opts.readOnly && (builtIn ? false : route!.mutating)) throw new DashboardError(403, READ_ONLY);
       const body = req.method === 'POST' ? await readJson(req) : undefined;
       const proof = req.headers['x-passkey-assertion'];
       if (Array.isArray(proof)) throw new DashboardError(403, 'Confirm this action with your passkey.');
@@ -432,14 +438,18 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
           throw new DashboardError(400, 'Choose an action and its JSON body digest.');
         }
         const action = apiRoute(opts.api, input.route);
-        if (!action || action.method !== 'POST' || !action.mutating) throw new DashboardError(400, 'Choose an action that requires a passkey.');
+        if (!action || action.method !== 'POST' || !needsTeamPasskey(action)) throw new DashboardError(400, 'Choose an action that requires a passkey.');
+        if (opts.readOnly && action.mutating) throw new DashboardError(403, READ_ONLY);
         if (!allows(member.role, requiredRole(input.route, action, team.routeRoles))) throw new DashboardError(403, ROLE);
         json(res, 200, await gate.challenge(session.id, input.route, input.bodyDigest, scoped)); return;
       }
-      // Every change needs this member's own passkey over this exact request; nobody else's credential is offered or accepted.
-      const passkey = route!.mutating ? await gate.verify(session.id, name, bodyDigest(body), proof, scoped) : undefined;
+      // Every change, and disarm, needs this member's own passkey over this exact request; nobody else's credential is
+      // offered or accepted. The identity provider session alone can only read (review M3).
+      const passkey = needsTeamPasskey(route!) ? await gate.verify(session.id, name, bodyDigest(body), proof, scoped) : undefined;
       const result = await route!.handler(body, { session: session.id, member: { id: member.id, role: member.role }, ...(passkey ? { passkey } : {}) });
-      json(res, 200, result);
+      // A team change still collecting approvals is accepted, not done (review C1).
+      if (result instanceof DashboardAccepted) json(res, 202, result.body);
+      else json(res, 200, result);
     } catch (error) {
       if (res.headersSent || res.destroyed) { res.destroy(); return; }
       if (error instanceof DashboardError || error instanceof PasskeyGateError) json(res, error.status, { error: error.message });

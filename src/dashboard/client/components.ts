@@ -1,5 +1,13 @@
 import { postWithPasskey } from './api.js';
 
+/**
+ * Team dashboard: true when a change was recorded as a team request that still needs other members' approvals (the
+ * api's TeamRequestRecorded). Matched by name, so screens need not import the class.
+ */
+export function isTeamRequestRecorded(error: unknown): error is Error {
+  return error instanceof Error && error.name === 'TeamRequestRecorded';
+}
+
 export function button(label: string, onClick?: () => void, variant: 'primary' | 'secondary' | 'danger' = 'primary'): HTMLButtonElement {
   const control = document.createElement('button'); control.type = 'button'; control.className = `button ${variant}`; control.textContent = label;
   if (onClick) control.addEventListener('click', onClick);
@@ -142,7 +150,11 @@ export function maskedValue(input: { route?: string; body?: unknown; label?: str
         if (disposed || generation !== revealGeneration) { result.value = ''; return; }
         if (typeof result.value !== 'string') throw new Error();
         value = result.value; output.textContent = value; status.textContent = 'Value shown'; actions.replaceChildren(copy, button('Hide', hide, 'secondary'));
-      } catch { if (!disposed && generation === revealGeneration) status.textContent = 'The value could not be revealed. Try again.'; }
+      } catch (error) {
+        if (disposed || generation !== revealGeneration) return;
+        // Team dashboard: other admins approve the reveal first; then Reveal again shows the value here.
+        status.textContent = isTeamRequestRecorded(error) ? error.message : 'The value could not be revealed. Try again.';
+      }
       finally { if (!disposed && generation === revealGeneration) reveal.disabled = false; }
     })();
   }, 'secondary');

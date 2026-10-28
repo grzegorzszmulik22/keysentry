@@ -54,6 +54,11 @@ export interface RotateOptions {
   nextDeployAcceptance?: ArmedPlan['nextDeployAcceptance'];
   /** Supervised adoption supplies the previous provider reference for write-only clusters. */
   adoptedKeyRefs?: Record<string, string>;
+  /**
+   * A team policy's minimum grace period (`rotation.minGraceSeconds`): an interactive "revoke now" and `finish --now`
+   * do not revoke an old key that has been kept for less than this, counted from its first grace-start.
+   */
+  minGraceMs?: number;
 }
 
 interface ServiceWork {
@@ -1660,7 +1665,20 @@ export async function runRotation(
             } });
           }
           let decision: GraceDecision;
-          if (deps.grace) decision = await deps.grace(sanitize(info, true));
+          if (deps.grace) {
+            decision = await deps.grace(sanitize(info, true));
+            if (decision === 'revoke' && (opts.minGraceMs ?? 0) > 0) {
+              // Review M1: the team policy's minimum grace counts from each old key's first grace-start.
+              const started = Math.min(...eligible.map(work => {
+                const at = Date.parse(clusterHistory(work.step.clusterId).find(entry => entry.event === 'grace-start')?.at ?? '');
+                return Number.isFinite(at) ? at : now().getTime();
+              }));
+              if (now().getTime() < started + opts.minGraceMs!) {
+                decision = 'defer';
+                for (const work of eligible) warn(work, 'The team policy keeps old keys for a minimum grace period. Finish this rotation after it has passed.');
+              }
+            }
+          }
           else if (group.nextDeploy.length > 0) decision = 'defer';
           else {
             await sleep(Math.max(0, Date.parse(deadline) - now().getTime()));

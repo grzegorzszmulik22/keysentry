@@ -1,11 +1,11 @@
 export {
   PolicyError, policyHash, policyFingerprint, preparePolicyDraft, signPolicy, verifyPolicy, loadPolicyHead, applyPolicy, readTeamFile,
-  loadPolicy, requirePolicyForChanges, policyStatePath, checkPolicyProposal,
+  loadPolicy, requirePolicyForChanges, policyStatePath, checkPolicyProposal, policyAdminsNeeded,
 } from './policy.js';
 export type { PolicyHead, PolicyVerification, PolicyStatus, LoadPolicyOptions } from './policy.js';
 export { parseSignedPolicy, PROVIDER_IDS, NOTIFY_KINDS } from './schema.js';
 export {
-  effectiveSettings, narrowRotationOptions, policyBlockers, restrictUserEgress, autopilotRefusal, alwaysNeedsApproval, checkArmedPlan, approvalsRequired,
+  effectiveSettings, narrowRotationOptions, narrowMonitorPolicy, monitorAutomationAllowed, policyBlockers, restrictUserEgress, autopilotRefusal, alwaysNeedsApproval, checkArmedPlan, approvalsRequired,
   tiersForClusters,
 } from './effective.js';
 export type { PlanCheck } from './effective.js';

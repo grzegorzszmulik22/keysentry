@@ -4,7 +4,8 @@ import { confirmAction, emptyState } from '../components.js';
 import { actions, dateTime, el, lifetime, message, paragraph, section, status, taskButton } from './components-b.js';
 
 interface Pending {
-  id: string; kind: string; summary: string; changes: string[]; reviewHash: string; createdAt: string; expiresAt?: string; source: 'monitor' | 'autopilot';
+  /** `team`: a change a team member asked for on the team dashboard; it runs once enough members approve it. */
+  id: string; kind: string; summary: string; changes: string[]; reviewHash: string; createdAt: string; expiresAt?: string; source: 'monitor' | 'autopilot' | 'team';
   /** Team mode: distinct team approvals so far and how many the team policy needs. */
   quorum?: { approvals: number; required: number };
 }
@@ -24,7 +25,8 @@ export async function renderApprovals(session: DashboardSession): Promise<HTMLEl
     const expired = () => !Number.isFinite(deadline) && deadline !== Infinity || Date.now() >= deadline;
     const state = paragraph(expired() ? 'Expired' : 'Pending');
     const identity = `${item.summary} (${item.id})`;
-    const block = section(identity, paragraph(`${item.kind} · From ${item.source} · Created ${dateTime(item.createdAt)}.${item.expiresAt ? ` Expires ${dateTime(item.expiresAt)}.` : ''}`), state);
+    const source = item.source === 'team' ? 'a team member' : item.source;
+    const block = section(identity, paragraph(`${item.kind} · From ${source} · Created ${dateTime(item.createdAt)}.${item.expiresAt ? ` Expires ${dateTime(item.expiresAt)}.` : ''}`), state);
     const count = item.quorum ? paragraph(progress(item.quorum)) : undefined;
     if (count) block.append(count);
     const decide = async (decision: 'approve' | 'dismiss') => {
@@ -44,7 +46,7 @@ export async function renderApprovals(session: DashboardSession): Promise<HTMLEl
         return;
       }
       completed = true; state.textContent = decision === 'approve' ? 'Approved' : 'Dismissed'; controls.remove();
-      message(feedback, state.textContent, decision === 'approve' ? result.result ?? 'This action was approved.' : 'This request was dismissed.', 'ok');
+      message(feedback, state.textContent, decision === 'approve' ? result.text ?? result.result ?? 'This action was approved.' : 'This request was dismissed.', 'ok');
     };
     const approve = taskButton('Approve', feedback, async () => { approve.disabled = true; dismiss.disabled = true; try { await decide('approve'); } finally { if (controls.isConnected) dismiss.disabled = session.readOnly || expired(); } }, () => session.readOnly || expired() || completed);
     const dismiss = taskButton('Dismiss', feedback, async () => { approve.disabled = true; dismiss.disabled = true; try { await decide('dismiss'); } finally { if (controls.isConnected) approve.disabled = session.readOnly || expired(); } }, () => session.readOnly || expired() || completed);

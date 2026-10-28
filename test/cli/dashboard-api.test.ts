@@ -32,13 +32,16 @@ async function setup() {
 describe('dashboard runtime routes', () => {
   it('declares exactly the documented routes and passkey requirements', async () => {
     const { api } = await setup();
-    const get = ['overview', 'keys', 'platforms', 'access', 'network', 'rotations', 'autopilot', 'autopilot/eligibility', 'activity', 'notifications', 'approvals', 'settings', 'hygiene'];
+    const get = ['overview', 'keys', 'platforms', 'access', 'network', 'rotations', 'autopilot', 'autopilot/eligibility', 'activity', 'notifications', 'approvals', 'settings', 'hygiene',
+      'team/candidates'];
     const readPost = ['rotate/preview', 'drill', 'timeline', 'card', 'notifications/verify', 'autopilot/disarm'];
     const writePost = ['vault/store', 'vault/remove', 'rotate/execute', 'rotation/finish', 'rotation/undo', 'autopilot/arm', 'notifications/add', 'notifications/remove', 'notifications/test', 'approvals/approve', 'approvals/dismiss', 'settings/update', 'spend-limits/apply', 'reveal'];
     expect(Object.keys(api).sort()).toEqual([...get, ...readPost, ...writePost].sort());
     for (const route of get) expect(api[route]).toMatchObject({ method: 'GET', mutating: false });
     for (const route of readPost) expect(api[route]).toMatchObject({ method: 'POST', mutating: false });
     for (const route of writePost) expect(api[route]).toMatchObject({ method: 'POST', mutating: true });
+    // Disarm stays passkey-free on the local dashboard; the team dashboard asks for the member's passkey (review M3).
+    expect(Object.entries(api).filter(([, route]) => route.teamPasskey).map(([name]) => name)).toEqual(['autopilot/disarm']);
   });
 
   it.each([

@@ -85,14 +85,16 @@ export const TEAM_ROUTE_ROLES: Readonly<Record<string, TeamRole>> = Object.freez
   'vault/store': 'admin',
   'vault/remove': 'admin',
   reveal: 'admin',
+  // Pending passkey candidates (public data) for an admin to export as a card (review H3).
+  'team/candidates': 'admin',
 });
 
 const RANK: Readonly<Record<TeamRole, number>> = { viewer: 0, operator: 1, admin: 2 };
 
-export function requiredRole(name: string, route: { method: 'GET' | 'POST'; mutating: boolean }, overrides: Readonly<Record<string, TeamRole>> = {}): TeamRole {
+export function requiredRole(name: string, route: { method: 'GET' | 'POST'; mutating: boolean; teamPasskey?: boolean }, overrides: Readonly<Record<string, TeamRole>> = {}): TeamRole {
   const table: Record<string, TeamRole> = { ...TEAM_ROUTE_ROLES, ...overrides };
   const role = Object.hasOwn(table, name) && Object.hasOwn(RANK, table[name]!) ? table[name]! : route.method === 'GET' ? 'viewer' : 'operator';
-  return route.mutating && role === 'viewer' ? 'operator' : role;
+  return (route.mutating || route.teamPasskey === true) && role === 'viewer' ? 'operator' : role;
 }
 
 export function allows(role: TeamRole, required: TeamRole): boolean {

@@ -6,7 +6,7 @@ import { approvalsRequired } from '../policy/effective.js';
 import { hasRole, memberForDeviceKey, memberForPasskey } from '../team/roster.js';
 import { verifyAssertion } from './webauthn/index.js';
 import { transactApprovals } from './store.js';
-import type { ApprovalAction, ApprovalCluster, ApprovalState, ApprovalStatus, StoredApproval } from './store.js';
+import type { ApprovalAction, ApprovalCluster, ApprovalQuorumState, ApprovalState, ApprovalStatus, StoredApproval } from './store.js';
 
 export type { ApprovalAction, ApprovalCluster } from './store.js';
 export interface ApprovalRequestDetails extends ApprovalRequest { clusters: ApprovalCluster[] }
@@ -41,8 +41,16 @@ export interface ApprovalDescription { kind: string; keyCount: number; digest: s
   /** Team quorum progress; absent without a team. */
   quorum?: { approvals: number; required: number } }
 export interface ApprovalChallenge { challenge: string; rpId: string; allowCredentials: { type: 'public-key'; id: string }[] }
+export interface ApprovalRequestOptions {
+  /**
+   * Team mode: the request needs the admins a policy-widening action needs (`approvals.wideningAdmins`, or the roster's
+   * threshold without a policy), but unlike a widening action each admin may approve it with a passkey. Used for team
+   * dashboard changes that handle secrets or change settings (reveal, vault, channels, settings, arming).
+   */
+  admins?: boolean;
+}
 export interface ApprovalService {
-  request(action: ApprovalAction, widening: boolean): Promise<ApprovalRequestDetails>;
+  request(action: ApprovalAction, widening: boolean, options?: ApprovalRequestOptions): Promise<ApprovalRequestDetails>;
   approveWithPasskey(actionId: string, assertion: PasskeyAssertion, expectedDigest?: string): Promise<ApprovalGrant>;
   approveWithDevice(actionId: string, signed: DeviceApproval): Promise<ApprovalGrant>;
   /**
@@ -56,7 +64,25 @@ export interface ApprovalService {
   recordDisarm(clientHash: string): Promise<void>;
   /** Approved current versions remain available until their executor records completion. */
   approved(): Promise<ApprovedAction[]>;
+  /**
+   * Run-time check of an approved request before its action runs: it must still be approved and not executed, and in
+   * team mode its approvers must still meet the current roster's and policy's quorum (removed or demoted members stop
+   * counting, a raised requirement applies). Returns the grant, or refuses.
+   */
+  checkGrant(actionId: string, expectedDigest?: string): Promise<ApprovalGrant>;
   markExecuted(actionId: string, expectedDigest?: string): Promise<void>;
+}
+
+/** Distinct members among a request's approvers who still qualify under `roster` (the "n" of "n of m"). */
+export function qualifyingApprovals(quorum: Pick<ApprovalQuorumState, 'admins' | 'approvers'>, roster: TeamRoster): number {
+  return new Set(quorum.approvers.filter(approver => approverQualifies(roster, approver, quorum.admins)).map(approver => approver.memberId)).size;
+}
+
+function approverQualifies(roster: TeamRoster, approver: ApprovalApprover, admins: boolean): boolean {
+  const member = approver.memberId === undefined ? undefined : roster.members.find(candidate => candidate.id === approver.memberId);
+  if (!member || !hasRole(member, admins ? 'admin' : 'operator')) return false;
+  return approver.kind === 'passkey' ? member.passkeys.some(passkey => passkey.id === approver.credentialId)
+    : member.deviceKeys.some(key => key.keyId === approver.keyId);
 }
 export class ApprovalError extends Error {
   readonly code = 'APPROVAL_REJECTED';
@@ -83,6 +109,8 @@ const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
 const WIDENING = 'This change can only be approved on your own computer with `keysentry approve`.';
 const REJECTED = 'This approval could not be verified.';
 const PAUSED = 'The team roster or policy could not be verified, so approvals are paused.';
+/** A request created under a team quorum is never satisfied by a single approval because the team stopped being visible. */
+const TEAM_GONE = 'This request needs team approvals, but the team roster is not available here, so approvals are paused. Restore the roster with keysentry team apply.';
 type Team = { roster: TeamRoster; policy: TeamPolicy | null };
 const APPROVAL_PREFIX = 'keysentry-approval:v1\n';
 function reject(message = REJECTED): never { throw new ApprovalError(message); }
@@ -200,16 +228,14 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     if (request.action && opts.quorum?.tiers) {
       try { tiers = (await opts.quorum.tiers(actionCopy(request.action))) ?? null; } catch { tiers = null; }
     }
-    const rule = approvalsRequired({ widening: request.widening, tiers }, team.policy, team.roster);
+    // An admin-quorum request (created with `admins`) keeps the widening rule's count and role.
+    const rule = approvalsRequired({ widening: request.widening || request.quorum?.admins === true, tiers }, team.policy, team.roster);
     // A rule that changes while a request is pending can only make it stricter.
     return { required: Math.max(rule.count, request.quorum?.required ?? 0), admins: rule.role === 'admin' || request.quorum?.admins === true };
   }
   /** An earlier approver still counts only while the same credential belongs to a member with the needed role. */
   function stillEligible(team: Team, approver: ApprovalApprover, admins: boolean): boolean {
-    const member = approver.memberId === undefined ? undefined : team.roster.members.find(candidate => candidate.id === approver.memberId);
-    if (!member || !hasRole(member, admins ? 'admin' : 'operator')) return false;
-    return approver.kind === 'passkey' ? member.passkeys.some(passkey => passkey.id === approver.credentialId)
-      : member.deviceKeys.some(key => key.keyId === approver.keyId);
+    return approverQualifies(team.roster, approver, admins);
   }
   function sameCredential(approver: ApprovalApprover, by: ApprovalGrant['by']): boolean {
     return approver.kind === 'passkey' ? by.kind === 'passkey' && approver.credentialId === by.credentialId : by.kind === 'device' && approver.keyId === by.keyId;
@@ -254,15 +280,16 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
   }
 
   return {
-    request(input, widening) {
+    request(input, widening, options = {}) {
       return transaction(async (state, events, at) => {
         let action: ApprovalAction;
         try { action = actionCopy(input); if (typeof widening !== 'boolean') reject(); }
         catch { events.push(event('rejected')); return reject('This action description is not valid.'); }
         const digest = actionDigest(action);
         const team = await teamNow();
+        const admins = options?.admins === true;
         const existing = currentRequest(state, action.id);
-        if (existing?.digest === digest && existing.widening !== widening) {
+        if (existing?.digest === digest && (existing.widening !== widening || existing.quorum !== undefined && admins && existing.quorum.admins !== true)) {
           events.push(event('rejected', action.id)); return reject('This approval request has different authorization requirements.');
         }
         if (existing?.digest === digest && existing.status === 'pending') {
@@ -283,6 +310,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           kind: action.kind, keyCount: action.clusterIds.length, status: 'pending', attempts: 0, action,
           clusters: action.clusters ?? action.clusterIds.map(clusterId => ({ clusterId, hint: null })) };
         if (team) {
+          if (admins) request.quorum = { required: 1, admins: true, approvers: [] };
           const need = await requirement(team, request);
           request.quorum = { required: need.required, admins: need.admins, approvers: [] };
         }
@@ -311,6 +339,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           } catch { return attemptFailed(request, events); }
           return recordApprover(state, request, team, { kind: 'passkey', credentialId: credential.id }, memberForPasskey(team.roster, credential), at, events);
         }
+        if (request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
         try {
           const credential = (await registered(state)).find((c) => c.id === input?.credentialId);
           if (!credential) reject();
@@ -328,6 +357,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       return transaction(async (state, events, at) => {
         const request = pending(state, actionId, events);
         const team = await teamNow();
+        if (!team && request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
         let verified: { keyId: string; member: TeamMember | undefined } | undefined;
         try {
           if (!signed || typeof signed.keyId !== 'string' || signed.digest !== request.digest || typeof signed.at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(signed.at) || !Number.isFinite(Date.parse(signed.at)) || Math.abs(at.getTime() - Date.parse(signed.at)) > TEN_MINUTES || typeof signed.sig !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(signed.sig)) reject();
@@ -377,8 +407,15 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     describe(actionId) {
       return transaction(async (state) => {
         const request = currentRequest(state, actionId);
-        return request ? { kind: request.kind, keyCount: request.keyCount, digest: request.digest, expiresAt: request.expiresAt, status: request.status,
-          ...(request.quorum ? { quorum: { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required } } : {}) } : null;
+        if (!request) return null;
+        let quorum: ApprovalDescription['quorum'];
+        if (request.quorum) {
+          // "n of m" counts only approvers who still qualify under the current roster; an unreadable team counts none.
+          let team: Team | null = null;
+          try { team = await teamNow(); } catch { team = null; }
+          quorum = { approvals: team ? qualifyingApprovals(request.quorum, team.roster) : 0, required: request.quorum.required };
+        }
+        return { kind: request.kind, keyCount: request.keyCount, digest: request.digest, expiresAt: request.expiresAt, status: request.status, ...(quorum ? { quorum } : {}) };
       });
     },
     challenge(actionId, expectedDigest) {
@@ -400,6 +437,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           }
           return { challenge: request.challenge, rpId: opts.rpId, allowCredentials: [...ids].map(id => ({ type: 'public-key' as const, id })) };
         }
+        if (request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
         const credentials = await registered(state);
         return { challenge: request.challenge, rpId: opts.rpId, allowCredentials: credentials.map((c) => ({ type: 'public-key' as const, id: c.id })) };
       });
@@ -422,6 +460,27 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           approved.push({ action, request: requestCopy(request), grant: structuredClone(request.grant) });
         }
         return approved;
+      });
+    },
+    checkGrant(actionId, expectedDigest) {
+      return transaction(async (state, events) => {
+        const request = currentRequest(state, actionId);
+        if (!request || request.status !== 'approved' || !request.grant || (expectedDigest !== undefined && request.digest !== expectedDigest)) {
+          events.push(event('rejected', request?.actionId)); return reject('This action has no approval to run. Request it again.');
+        }
+        const team = await teamNow();
+        if (!team) {
+          if (request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
+          return structuredClone(request.grant);
+        }
+        const need = await requirement(team, request);
+        const approvers = request.grant.approvers ?? request.quorum?.approvers ?? [];
+        const counted = new Set(approvers.filter(approver => stillEligible(team, approver, need.admins)).map(approver => approver.memberId));
+        if (counted.size < need.required) {
+          events.push(event('quorum-lapsed', actionId));
+          return reject(`The approvals for this action no longer meet the team policy (${counted.size} of ${need.required} still count). Ask team members to approve it again.`);
+        }
+        return structuredClone(request.grant);
       });
     },
     markExecuted(actionId, expectedDigest) {

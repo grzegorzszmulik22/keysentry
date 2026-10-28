@@ -1,3 +1,4 @@
+import { asciiEmail, foldEmail } from '../../team/schema.js';
 import type { TeamMember, TeamRole } from '../../types.js';
 import { fail } from './errors.js';
 import type { VerifiedIdentity } from './id-token.js';
@@ -12,8 +13,12 @@ export function isTeamRole(value: unknown): value is TeamRole {
   return typeof value === 'string' && (ROLES as readonly string[]).includes(value);
 }
 
+/**
+ * ASCII case folding only (review L4): Unicode lower-casing maps different addresses onto one (KELVIN SIGN becomes
+ * "k"). Roster emails are ASCII, and a non-ASCII identity never matches one.
+ */
 export function normalizeEmail(value: string): string {
-  return value.toLowerCase();
+  return foldEmail(value);
 }
 
 /** True when the member's pinned single sign-on identity is exactly this issuer and subject. */
@@ -38,6 +43,7 @@ export function memberForIdentity(identity: VerifiedIdentity, members: readonly 
   if (pinned.length === 1) return pinned[0]!;
   if (identity.email === undefined) return fail('email-missing');
   if (identity.emailVerified !== true) return fail('email-unverified');
+  if (typeof identity.email !== 'string' || !asciiEmail(identity.email)) return fail('not-member');
   const email = normalizeEmail(identity.email);
   const matches = valid.filter(member => typeof member.email === 'string' && normalizeEmail(member.email) === email);
   if (matches.length !== 1) return fail('not-member');

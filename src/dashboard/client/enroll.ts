@@ -1,5 +1,6 @@
-// The team dashboard's passkey enrollment page (/enroll). The invitation token arrives in the URL fragment, so the
-// browser never sends it with the page request; this script removes it from the address bar and posts it.
+// The team dashboard's passkey enrollment page (/enroll). The invitation (signed by a team admin's device key) arrives in
+// the URL fragment, so the browser never sends it with the page request; this script removes it from the address bar
+// and posts it.
 // The passkey created here is only a candidate until team admins sign it into the roster.
 
 const failure = 'The passkey could not be added. Ask a team admin for a new enrollment link.';
@@ -47,7 +48,7 @@ export async function startEnrollment(doc: Document = document): Promise<void> {
   const token = location.hash.replace(/^#/, '');
   // Keep the token out of the address bar, history and any later navigation.
   history.replaceState(null, '', '/enroll');
-  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) { status.textContent = 'This enrollment link is not complete. Open the full link a team admin sent you.'; return; }
+  if (token.length > 2200 || !/^[A-Za-z0-9_-]{16,2048}\.[A-Za-z0-9_-]{86}$/.test(token)) { status.textContent = 'This enrollment link is not complete. Open the full link a team admin sent you.'; return; }
   const begin = async (): Promise<{ options: CreationOptions; memberName: string }> => {
     const result = await send('/enroll/options', { token });
     const member = result.member as { name?: unknown } | undefined;
@@ -79,7 +80,8 @@ export async function startEnrollment(doc: Document = document): Promise<void> {
       const response = credential.response as AuthenticatorAttestationResponse;
       const result = await send('/enroll/finish', { token, clientDataJSON: base64url(response.clientDataJSON), attestationObject: base64url(response.attestationObject) });
       const id = typeof result.credentialId === 'string' ? result.credentialId : '';
-      status.textContent = `Passkey created. It works after a team admin adds it to the roster. Give them this credential id: ${id}`;
+      const fingerprint = typeof result.fingerprint === 'string' ? result.fingerprint : '';
+      status.textContent = `Passkey created. It works after a team admin adds it to the roster. Give them this credential id: ${id}${fingerprint ? ` (fingerprint ${fingerprint})` : ''}`;
       done = true;
     } catch (error) {
       status.textContent = error instanceof Error && error.message ? error.message : failure;

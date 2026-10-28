@@ -40,6 +40,25 @@ function routeName(route: string): string {
   return name;
 }
 
+/**
+ * Team dashboard: the change was recorded as a team request that still needs other members' approvals, so it did not
+ * run yet. Screens show its message as progress, not as a failure.
+ */
+export class TeamRequestRecorded extends Error {
+  constructor(message: string, readonly approvals: number, readonly required: number) { super(message); this.name = 'TeamRequestRecorded'; }
+}
+
+function recorded(status: number, value: unknown): TeamRequestRecorded | null {
+  if (status !== 202 || !value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  if (record.teamRequest !== 'recorded') return null;
+  const approvals = Number.isInteger(record.approvals) ? record.approvals as number : 0;
+  const required = Number.isInteger(record.required) ? record.required as number : 0;
+  const text = typeof record.text === 'string' && record.text.length <= 1000 ? record.text
+    : `Your approval was recorded: ${approvals} of ${required} team approvals so far.`;
+  return new TeamRequestRecorded(text, approvals, required);
+}
+
 async function request<T>(route: string, method: 'GET' | 'POST', body?: string, assertion?: string): Promise<T> {
   const name = routeName(route);
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -49,11 +68,17 @@ async function request<T>(route: string, method: 'GET' | 'POST', body?: string, 
     headers['X-CSRF-Token'] = session.csrf;
   }
   if (assertion) headers['X-Passkey-Assertion'] = assertion;
+  let status: number;
+  let value: unknown;
   try {
     const response = await fetch(`/api/${name}`, { method, credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers, ...(body === undefined ? {} : { body }) });
     if (!response.ok) throw new Error();
-    return await response.json() as T;
+    status = response.status;
+    value = await response.json();
   } catch { throw new Error(requestError); }
+  const pending = recorded(status, value);
+  if (pending) throw pending;
+  return value as T;
 }
 
 export async function get<T = unknown>(route: string): Promise<T> { return request<T>(route, 'GET'); }

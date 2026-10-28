@@ -249,6 +249,19 @@ describe('Task 6a dashboard screens', () => {
     expect(receipt.querySelector('tbody tr')!.textContent).toContain('7'); expect(receipt.textContent).toContain('2026-10-27T10:00:00Z');
   });
 
+  it('shows the proxy, certificate and offline lines keysentry network prints, and offline feeds', async () => {
+    data.network = { ...data.network as object, status: ['Requests go through the proxy at https://proxy.example.test (from keysentry.yaml).',
+      '1 extra certificate is trusted in addition to Node\'s default roots.'], feeds: 'offline' };
+    const page = await open('network');
+    expect(page.textContent).toContain('Requests go through the proxy at https://proxy.example.test (from keysentry.yaml).');
+    expect(page.textContent).toContain('1 extra certificate is trusted in addition to Node\'s default roots.');
+    expect(page.textContent).toContain('Offline mode: keysentry fetches no breach feeds or news.');
+    // The status line already says so: not twice.
+    data.network = { ...data.network as object, status: ['Offline mode is on (set in keysentry.yaml): breach feeds and security news are not contacted.'], feeds: 'offline' };
+    const again = await open('network');
+    expect(again.textContent).not.toContain('Offline mode: keysentry fetches no breach feeds or news.');
+  });
+
   it.each(['home', 'keys', 'connect', 'access', 'network'])('%s ignores unexpected value fields in fixture responses', async path => {
     const page = await open(path); expect(api.get).toHaveBeenCalledWith(path === 'home' ? 'overview' : path === 'connect' ? 'platforms' : path);
     expect(page.textContent).not.toContain('This page could not be opened.'); expect(page.outerHTML).not.toContain(secret); expect(api.postWithPasskey).not.toHaveBeenCalled();

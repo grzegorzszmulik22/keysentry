@@ -34,6 +34,8 @@ const sections = {
     allowedProviders: z.array(z.enum(PROVIDER_IDS)).max(PROVIDER_IDS.length).refine(unique).optional(),
     maxServicesPerWave: z.number().int().min(1).max(1000).optional(),
     approvalTiers: z.array(z.enum(TIER_ORDER as unknown as [RiskTier, ...RiskTier[]])).max(TIER_ORDER.length).refine(unique).optional(),
+    /** Off unless stated: the monitor's automatic rotation and containment do not run under a policy. */
+    allowMonitorAutomation: z.boolean().optional(),
   }).strict(),
   approvals: z.object({ required: count, requiredByTier: tierCounts.optional(), wideningAdmins: count }).strict(),
   network: z.object({

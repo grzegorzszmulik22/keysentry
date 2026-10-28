@@ -208,7 +208,10 @@ describe('saved roster', () => {
     const v2 = signRoster(nextRoster(v1, { kind: 'role', memberId: 'dee', role: 'viewer' }, NOW), 'ana', ana.key);
     await expect(applyRoster(store, v2)).rejects.toThrow('Only version 1 of a roster can start a team.');
     await expect(applyRoster(store, v2, { trust: { fingerprint: 'ffffffffffffffff' } })).rejects.toThrow(/fingerprint/);
-    expect(await applyRoster(store, v2, { trust: { fingerprint: rosterHash(v2).slice(0, 16) } })).toMatchObject({ status: 'applied' });
+    // Review L5: a fingerprint is 128 bits; a 64-bit prefix (second-preimage cost 2^64) is no longer accepted.
+    await expect(applyRoster(store, v2, { trust: { fingerprint: rosterHash(v2).slice(0, 16) } })).rejects.toThrow(/fingerprint does not match/);
+    expect(fingerprint(rosterHash(v2))).toMatch(/^(?:[a-f0-9]{4}-){7}[a-f0-9]{4}$/);
+    expect(await applyRoster(store, v2, { trust: { fingerprint: fingerprint(rosterHash(v2)) } })).toMatchObject({ status: 'applied' });
   });
 
   test('restoring an older encrypted roster file is caught by the vault checkpoint', async () => {

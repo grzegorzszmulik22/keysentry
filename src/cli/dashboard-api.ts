@@ -18,13 +18,16 @@ import { executeLocalApprovedAction } from './phase2.js';
 import { CREDENTIAL_NAMES } from '../vault/index.js';
 import { HOST_CREDENTIALS } from '../hosts/credentials.js';
 import { PROVIDER_IDS } from '../core/provider-ids.js';
-import type { DashboardApi, DashboardRequestContext } from '../dashboard/server/api.js';
+import { DashboardAccepted, type DashboardApi, type DashboardRequestContext } from '../dashboard/server/api.js';
+import { candidateCard, candidateFingerprint, listCandidates, loadTeam } from '../team/index.js';
 import { approveMonitorAsTeam } from './team-approvals.js';
+import { createTeamChanges, isTeamQuorumRoute } from './team-dashboard.js';
+import { notifyTeam } from './team-notify.js';
 import { CliError } from './errors.js';
 import type { PasskeyStore } from '../dashboard/server/passkey-gate.js';
 import { DashboardError } from '../dashboard/server/security.js';
 import type { ApprovalRequest, HostId, RotationPlan, Vault } from '../types.js';
-import type { KeysentryRuntime } from './runtime.js';
+import type { KeysentryRuntime, TeamGrantRef } from './runtime.js';
 import { createPhase3Runtime } from './phase3-runtime.js';
 import { planIdSchema } from './schemas.js';
 import { serviceLabel } from './display.js';
@@ -70,22 +73,52 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
   const passkeys = createDashboardPasskeyStore(runtime.store, runtime.vault);
   let armingEpoch = 0;
   const api: DashboardApi = {};
-  const read = (name: string, handler: () => Promise<unknown>) => { api[name] = { method: 'GET', mutating: false, handler: async () => runtime.safe(await handler()) }; };
-  function post<S extends z.ZodType>(name: string, schema: S, mutating: boolean, handler: (body: z.output<S>, ctx: DashboardRequestContext) => Promise<unknown>) {
-    api[name] = { method: 'POST', mutating, handler: async (body, ctx) => {
+  // Team dashboard: every audit event a member's request causes names the member (review M4).
+  const attributed = <T>(ctx: DashboardRequestContext | undefined, operation: () => Promise<T>): Promise<T> =>
+    ctx?.member ? runtime.asMember(ctx.member.id, operation) : operation();
+  const read = (name: string, handler: (ctx: DashboardRequestContext) => Promise<unknown>) => {
+    api[name] = { method: 'GET', mutating: false, handler: async (_body, ctx) => attributed(ctx, async () => runtime.safe(await handler(ctx))) };
+  };
+  const handlers: Record<string, { schema: z.ZodType; handler: (body: never, ctx: DashboardRequestContext) => Promise<unknown> }> = {};
+  /**
+   * Run a change's handler inside the dashboard authorization; on the team dashboard also with the signed-in member and,
+   * for quorum routes, the approved team request it runs under (each runtime entry point re-checks it).
+   */
+  function runChange(name: string, input: unknown, ctx: DashboardRequestContext, grant?: TeamGrantRef): Promise<unknown> {
+    const entry = handlers[name];
+    if (!entry) throw new DashboardError(404, 'This action is not available.');
+    return runtime.dashboardAction(async () => {
+      try { const result = await entry.handler(input as never, ctx); return name === 'reveal' ? result : runtime.safe(result); }
+      finally { await runtime.checkpoint(); }
+    }, { ...(ctx.member ? { memberId: ctx.member.id } : {}), ...(grant ? { grant } : {}) });
+  }
+  // Review C1: on the team dashboard, changes that rotate, finish, undo, revoke, cap, arm, or change settings, channels or
+  // vault entries are request-then-run under the team's quorum. The approvals screen may run a change it completes.
+  const teamChanges = createTeamChanges(runtime, { run: (route, body, ctx, grant) => {
+    const entry = handlers[route];
+    if (!entry) throw new DashboardError(404, 'This action is not available.');
+    return runChange(route, parse(entry.schema, body), ctx, grant);
+  } });
+  function post<S extends z.ZodType>(name: string, schema: S, mutating: boolean, handler: (body: z.output<S>, ctx: DashboardRequestContext) => Promise<unknown>,
+    options: { teamPasskey?: boolean } = {}) {
+    handlers[name] = { schema, handler: handler as (body: never, ctx: DashboardRequestContext) => Promise<unknown> };
+    api[name] = { method: 'POST', mutating, ...(options.teamPasskey ? { teamPasskey: true } : {}), handler: async (body, ctx) => {
       const input = parse(schema, body);
-      if (!mutating) return runtime.safe(await handler(input, ctx));
+      if (!mutating) return attributed(ctx, async () => runtime.safe(await handler(input, ctx)));
       // Team governance: an untrusted roster, an invalid policy or an unmet policy requirement pauses every change.
       await runtime.assertGovernance();
-      return runtime.dashboardAction(async () => { try { const result = await handler(input, ctx); return name === 'reveal' ? result : runtime.safe(result); } finally { await runtime.checkpoint(); } });
+      if (ctx.member && isTeamQuorumRoute(name)) {
+        const result = await attributed(ctx, () => teamChanges.submit(name, input, ctx, grant => runChange(name, input, ctx, grant)));
+        return result instanceof DashboardAccepted ? new DashboardAccepted(runtime.safe(result.body)) : result;
+      }
+      return runChange(name, input, ctx);
     } };
   }
-  /** Team quorum progress of a pending approval request, when there is one. */
+  /** Team quorum progress of a pending approval request, when there is one ("n" counts only approvers who still qualify). */
   async function quorumOf(actionId: string): Promise<{ approvals: number; required: number } | undefined> {
     const request = await transactApprovals(runtime.store, async state => state.requests.find(item => item.actionId === actionId && item.status === 'pending'
       && Date.parse(item.expiresAt) > runtime.now().getTime()));
-    if (!request?.quorum) return undefined;
-    return { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required };
+    return request ? teamChanges.progress(request) : undefined;
   }
   async function autopilot() {
     const manager = createCliAutopilotManager(runtime);
@@ -201,8 +234,9 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     }));
     // Monitor actions' team approval requests are listed above with their action, not as separate requests.
     const requests = await transactApprovals(runtime.store, async state => state.requests.filter(request => request.status === 'pending' && request.kind !== 'monitor'
-      && Date.parse(request.expiresAt) > runtime.now().getTime()));
-    return { pending: [...pending, ...await Promise.all(requests.map(autopilotReview))] };
+      && !request.kind.startsWith('dashboard:') && Date.parse(request.expiresAt) > runtime.now().getTime()));
+    // Team dashboard changes waiting for the team's quorum (review C1).
+    return { pending: [...pending, ...await Promise.all(requests.map(autopilotReview)), ...await teamChanges.pending()] };
   });
   async function autopilotReview(request: StoredApproval) {
     const saved = await runtime.store.readJson<{ actions: { action: ApprovalAction; request: ApprovalRequest }[] }>('pending', join(runtime.paths.dir, 'watcher-approvals.json'));
@@ -217,8 +251,18 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     return { id: request.actionId, kind: request.kind, summary: `Rotate ${request.keyCount} selected ${request.keyCount === 1 ? 'key' : 'keys'} with autopilot.`, changes,
       reviewHash: createHash('sha256').update(canonicalJson({ action, digest: request.digest, expiresAt: request.expiresAt, changes })).digest('hex'),
       createdAt: request.createdAt, expiresAt: request.expiresAt, source: 'autopilot' as const,
-      ...(request.quorum ? { quorum: { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required } } : {}) };
+      ...(request.quorum ? { quorum: await teamChanges.progress(request) } : {}) };
   }
+  // Review H3: passkeys created on the team dashboard wait here as public candidates. An admin downloads them as a
+  // card (`keysentry team add-passkey <member> --card <file>` on the admin's own computer signs the roster change).
+  read('team/candidates', async () => {
+    const team = await loadTeam(runtime.store, { anchor: runtime.teamAnchors.roster });
+    const listed = new Set(team?.roster.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.id)) ?? []);
+    const pending = (await listCandidates(runtime.store)).filter(candidate => !listed.has(candidate.credential.id));
+    return { pending: pending.map(candidate => ({ memberId: candidate.memberId, credentialId: candidate.credential.id, createdAt: candidate.createdAt,
+      fingerprint: candidateFingerprint(candidate), ...(candidate.aaguid ? { reportedAuthenticator: candidate.aaguid } : {}) })),
+    card: pending.length ? candidateCard(pending) : null };
+  });
   read('settings', () => phase3.settings());
   read('hygiene', async () => ({ keys: await phase3.hygiene() }));
   post('rotate/preview', z.object({ clusterIds: ids }).strict(), false, async body => {
@@ -236,7 +280,17 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     try { await verifyNotification(await notificationContext(), { code: body.code }); return { valid: true, message: 'Notification signature verified.' }; }
     catch { return { valid: false, message: 'This code could not be verified with a trusted local key.' }; }
   });
-  post('autopilot/disarm', empty, false, async () => { armingEpoch++; await runtime.dashboardDisarm(); return { state: 'disarmed' }; });
+  // Disarm never waits for governance or a quorum (it only reduces automation). On the team dashboard it needs the
+  // member's own passkey, so an identity provider session alone cannot turn autopilot off, and the team is told (M3).
+  post('autopilot/disarm', empty, false, async (_body, ctx) => {
+    if (ctx.member && !ctx.passkey) throw new DashboardError(403, 'Confirm disarming with your passkey.');
+    armingEpoch++; await runtime.dashboardDisarm();
+    if (ctx.member) {
+      await notifyTeam(runtime, { kind: 'team-disarm', severity: 'urgent', title: 'keysentry: autopilot disarmed',
+        lines: [`${ctx.member.id} disarmed autopilot on the team dashboard. Automatic rotations stop until an admin arms it again.`] });
+    }
+    return { state: 'disarmed' };
+  }, { teamPasskey: true });
   post('vault/store', credential.extend({ value: z.string().min(1).max(1_048_576).refine(value => !/[\x00\r\n]/.test(value)) }).strict(), true, async body => { await runtime.vaultSet(body.name, body.value, body.role); await runtime.scan(); return { stored: true }; });
   post('vault/remove', credential, true, async body => ({ removed: (await runtime.vaultRemove(body.name, body.role)).removed }));
   post('rotate/execute', planInput.extend({ planHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(), true, async body => {
@@ -261,10 +315,12 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     } catch (error) { if (generation !== armingEpoch) await runtime.dashboardDisarm(); throw error; }
   });
   post('notifications/add', channelInput, true, async body => {
+    await runtime.requireTeamGrant('dashboard:notifications/add');
     const channel = await addNotification(body);
     return { id: channel.id };
   });
   post('notifications/remove', z.object({ id }).strict(), true, async body => {
+    await runtime.requireTeamGrant('dashboard:notifications/remove');
     return { removed: await removeNotificationChannel(await notificationContext(), body.id) };
   });
   post('notifications/test', empty, true, async () => {
@@ -286,6 +342,12 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     const member = ctx.member && ctx.passkey ? { memberId: ctx.member.id, credentialId: ctx.passkey } : undefined;
     const pending = await transactApprovals(runtime.store, async state => state.requests.find(request => request.actionId === body.id && request.status === 'pending'
       && request.kind !== 'monitor' && Date.parse(request.expiresAt) > runtime.now().getTime()));
+    // A team dashboard change (review C1): approved by members; it may run as soon as the quorum is met.
+    if (pending?.kind.startsWith('dashboard:')) {
+      if (!ctx.member) throw new DashboardError(409, 'Team requests are approved on the team dashboard.');
+      const outcome = await teamChanges.approve(body.id, body.reviewHash, ctx);
+      return outcome.result === 'recorded' ? outcome : { result: outcome.result, text: outcome.text };
+    }
     if (pending) {
       const review = await autopilotReview(pending);
       if (review.reviewHash !== body.reviewHash) throw new DashboardError(409, 'The action changed. Review it again before approving.');
@@ -309,6 +371,8 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     return { result: approved?.status ?? action?.status ?? 'not-available' };
   }
   post('approvals/dismiss', z.object({ id }).strict(), true, async body => {
+    // Team dashboard: dismissing runs only under the team's quorum (review L5); the terminal and local dashboard are unchanged.
+    await runtime.requireTeamGrant('dashboard:approvals/dismiss');
     const dismissed = await transactApprovals(runtime.store, async (state, commit) => { const request = state.requests.find(request => request.actionId === body.id && request.status === 'pending'); if (!request) return false; request.status = 'rejected'; await commit(); return true; });
     if (!dismissed) await runtime.dismiss(body.id);
     else await runtime.audit.append({ kind: 'approval-dismiss', summary: 'Pending action dismissed.' });
@@ -316,7 +380,9 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
   });
   post('settings/update', settingsInput, true, body => phase3.updateSettings(body));
   post('spend-limits/apply', z.object({ clusterIds: ids }).strict(), true, async body => { const result = await phase3.spendLimits(true, body.clusterIds); return { applied: result.applied, skipped: result.skipped }; });
-  post('reveal', z.object({ clusterId: id }).strict(), true, async body => {
+  post('reveal', z.object({ clusterId: id }).strict(), true, async (body, ctx) => {
+    // Team dashboard (review M2): only after approvals.wideningAdmins admins approved this reveal, and the team is told.
+    await runtime.requireTeamGrant('dashboard:reveal');
     const inv = await runtime.inventory(); const cluster = inv.clusters.find(cluster => cluster.id === body.clusterId);
     if (cluster?.fingerprint) for (const consumer of cluster.consumers) {
       if (consumer.sealed) continue;
@@ -327,6 +393,10 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
       if (variable?.value !== undefined && fingerprint(variable.value, runtime.fingerprintKey) === cluster.fingerprint) {
         runtime.redactor.register(variable.value);
         await runtime.audit.append({ kind: 'reveal', summary: 'A readable value was revealed.', data: { name: consumer.varName, clusterId: cluster.id } });
+        if (ctx.member) {
+          await notifyTeam(runtime, { kind: 'team-reveal', severity: 'warning', title: 'keysentry: a key value was revealed',
+            lines: [`${ctx.member.id} revealed the value of a ${providerName(cluster.provider)} key (${cluster.hint ?? cluster.id}) on the team dashboard after the team approved it.`] });
+        }
         return { value: variable.value };
       }
     }

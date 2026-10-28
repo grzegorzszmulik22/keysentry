@@ -1,5 +1,6 @@
 // Per-member notification routing. Channels assigned to members receive only messages at or above the lowest
-// minSeverity among those members; channels assigned to nobody receive everything (the single-user behaviour).
+// minSeverity among those members; channels assigned to nobody receive everything (the single-user behaviour), except
+// retired channels: a member's channel stays member-owned after the member leaves and receives nothing.
 import { createDispatcher, type DispatcherOptions } from '../notify/dispatch.js';
 import type { NotifyChannel, NotifyMessage, NotifySeverity, SignedNotifyMessage, TeamRoster } from '../types.js';
 
@@ -22,7 +23,8 @@ export function routeChannels(roster: TeamRoster | null | undefined, channelIds:
     }
   }
   const severity = rank(message.severity);
-  return channelIds.filter(id => !lowest.has(id) || severity >= lowest.get(id)!);
+  const retired = new Set(Array.isArray(roster.retiredChannels) ? roster.retiredChannels : []);
+  return channelIds.filter(id => lowest.has(id) ? severity >= lowest.get(id)! : !retired.has(id));
 }
 
 export interface RoutedSendResult {

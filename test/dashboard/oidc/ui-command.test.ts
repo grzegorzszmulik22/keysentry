@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { registerPhase3Commands, type Phase3CommandsOptions } from '../../../src/cli/phase3.js';
 import { createRuntime } from '../../../src/cli/runtime.js';
 import type { DashboardOptions } from '../../../src/dashboard/server/index.js';
+import { devicePublicKey } from '../../../src/team/index.js';
 import type { TeamMember } from '../../../src/types.js';
 import { createFakeVault } from '../../helpers/fake-vault.js';
 import { FakeHttp, json, silentLogger } from '../../helpers/fake-http.js';
@@ -94,4 +95,20 @@ test('ui --team keeps single sign-on inside the team policy and offers passkey e
   Object.assign(s.runtime, { teamPolicy: { ...structuredClone(policy), network: { allowHosts: ['idp.example.test'] } } });
   await s.run(...team);
   expect(started.options.at(-1)!.team!.enrollment).toMatchObject({ check: expect.any(Function), complete: expect.any(Function) });
+});
+
+test('ui --team refuses to start where the device key belongs to a team admin, and warns for another member (review H3)', async () => {
+  const roster = (role: TeamMember['role']) => async (rt: Awaited<ReturnType<typeof createRuntime>>) => {
+    const key = await rt.signingKey();
+    try { return [...structuredClone(members), { id: 'srv', name: 'Server', role, passkeys: [], deviceKeys: [devicePublicKey(key)] }]; }
+    finally { key.privateKeyDer.fill(0); }
+  };
+  const admin = await setup({ teamMembers: roster('admin') });
+  await expect(admin.run(...team)).rejects.toThrow(/This computer's device key belongs to team admin srv, so the team dashboard will not start here/);
+  expect(started.options).toHaveLength(0);
+  expect(admin.http.calls).toHaveLength(0);
+  const operator = await setup({ teamMembers: roster('operator') });
+  await operator.run(...team);
+  expect(started.options).toHaveLength(1);
+  expect(operator.diagnostics.join('\n')).toContain('This computer\'s device key belongs to team member srv (operator): anyone with a terminal here can approve as srv.');
 });

@@ -54,6 +54,8 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
 
   async function updateSettings(patch: Partial<DashboardSettings>): Promise<DashboardSettings> {
     rt.assertHuman('change settings');
+    // Team dashboard: only under the team's approved request (review C1).
+    await rt.requireTeamGrant('dashboard:settings/update');
     const input = settingsSchema.partial().safeParse(patch);
     if (!input.success) throw new CliError('Choose valid settings before saving.');
     const updated = settingsSchema.parse({ ...await settings(), ...input.data });
@@ -150,7 +152,7 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
 
   async function spendLimits(apply: boolean, clusterIds?: string[]) {
     if (typeof apply !== 'boolean' || clusterIds && (!Array.isArray(clusterIds) || clusterIds.some(id => typeof id !== 'string' || !id))) throw new CliError('Choose valid keys for spending limits.');
-    if (apply) rt.assertHuman('apply spending limits');
+    if (apply) { rt.assertHuman('apply spending limits'); await rt.requireTeamGrant('dashboard:spend-limits/apply'); }
     await settings();
     const inventory = await rt.inventory();
     if (clusterIds?.some(id => !inventory.clusters.some(cluster => cluster.id === id))) throw new CliError('A selected key is no longer in the inventory. Scan and try again.');

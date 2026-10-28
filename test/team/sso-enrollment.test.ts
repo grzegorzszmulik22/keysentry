@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStateCipher, createStateStore, type StateStore } from '../../src/core/store.js';
 import {
-  checkInvite, completeEnrollment, createInvite, describeRosterChange, enrollmentPath, INVITE_TTL_MS, listCandidates, memberForEmail, memberForSso,
-  nextRoster, parseSignedRoster, removeCandidates, signRoster, verifyRoster,
+  candidateCard, candidateFingerprint, checkInvite, completeEnrollment, describeRosterChange, enrollmentPath, INVITE_TTL_MS, listCandidates, memberForEmail,
+  memberForSso, nextRoster, parseCandidateCard, parseSignedRoster, removeCandidates, signInvite, signRoster, verifyRoster,
 } from '../../src/team/index.js';
+import { generateDeviceKey } from '../../src/security/index.js';
 import type { PasskeyCredential, SignedTeamRoster } from '../../src/types.js';
 import { NOW, rosterOf, testMember } from './helpers.js';
 
@@ -81,57 +82,99 @@ describe('pinned single sign-on identity in the signed roster', () => {
   });
 });
 
-describe('passkey enrollment invitations', () => {
+describe('passkey enrollment invitations, signed on an admin\'s computer (review H3)', () => {
   const ORIGIN = 'https://keysentry.example.test';
   const credential: PasskeyCredential = { ...ben.credential, id: 'ZW5yb2xsZWQtY3JlZGVudGlhbA', rpId: 'keysentry.example.test', origins: [ORIGIN] };
+  const roster = (members = [ana, ben]) => signed(members).roster;
+  const context = (now = NOW, members = [ana, ben]) => ({ roster: roster(members), origin: ORIGIN, now });
+  const payload = (token: string) => JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString('utf8')) as Record<string, unknown>;
 
-  test('a valid invitation is checked, used once, and produces a pending candidate; the token is stored only as a hash', async () => {
-    const invite = await createInvite(store, { memberId: 'ben', origin: ORIGIN, now: NOW });
-    expect(invite.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  test('an admin-signed invitation is checked against the roster, used once, and produces a pending candidate; the server keeps only a nonce hash', async () => {
+    const invite = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key });
+    expect(invite.token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86}$/);
     expect(invite.expiresAt).toBe(new Date(NOW.getTime() + INVITE_TTL_MS).toISOString());
-    const saved = JSON.stringify(await store.readJson('passkeys', enrollmentPath(store)));
-    expect(saved).not.toContain(invite.token);
-    expect(await readFile(enrollmentPath(store), 'utf8')).not.toContain(invite.token);
-    expect(await checkInvite(store, invite.token, ORIGIN, NOW)).toEqual({ memberId: 'ben', expiresAt: invite.expiresAt });
-    const candidate = await completeEnrollment(store, { token: invite.token, origin: ORIGIN, memberId: 'ben', credential, aaguid: '00000000000000000000000000000000', now: NOW });
+    expect(payload(invite.token)).toEqual({ v: 1, member: 'ben', origin: ORIGIN, exp: invite.expiresAt, nonce: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/), keyId: ana.key.keyId });
+    // Nothing is stored where the invitation is signed or checked.
+    expect(await checkInvite(store, invite.token, context())).toEqual({ memberId: 'ben', expiresAt: invite.expiresAt });
+    expect(await store.readJson('passkeys', enrollmentPath(store))).toBeNull();
+    const candidate = await completeEnrollment(store, { token: invite.token, roster: roster(), origin: ORIGIN, memberId: 'ben', credential,
+      aaguid: '00000000000000000000000000000000', now: NOW });
     expect(candidate).toMatchObject({ memberId: 'ben', aaguid: null, credential: { id: credential.id } });
     expect(await listCandidates(store)).toHaveLength(1);
+    const saved = await readFile(enrollmentPath(store), 'utf8');
+    expect(saved).not.toContain(invite.token);
+    expect(JSON.stringify(await store.readJson('passkeys', enrollmentPath(store)))).not.toContain(payload(invite.token).nonce as string);
     // Reuse is refused, both at the check and at the completion.
-    await expect(checkInvite(store, invite.token, ORIGIN, NOW)).rejects.toMatchObject({ reason: 'used', message: expect.stringMatching(/already been used/) });
-    await expect(completeEnrollment(store, { token: invite.token, origin: ORIGIN, memberId: 'ben', credential: { ...credential, id: 'b3RoZXI' }, aaguid: null, now: NOW }))
-      .rejects.toMatchObject({ reason: 'used' });
+    await expect(checkInvite(store, invite.token, context())).rejects.toMatchObject({ reason: 'used', message: expect.stringMatching(/already been used/) });
+    await expect(completeEnrollment(store, { token: invite.token, roster: roster(), origin: ORIGIN, memberId: 'ben', credential: { ...credential, id: 'b3RoZXI' },
+      aaguid: null, now: NOW })).rejects.toMatchObject({ reason: 'used' });
     expect(await removeCandidates(store, [credential.id])).toBe(1);
     expect(await listCandidates(store)).toEqual([]);
   });
 
-  test('expired, unknown, malformed, other-origin and other-member invitations are refused', async () => {
-    const invite = await createInvite(store, { memberId: 'ben', origin: ORIGIN, now: NOW });
-    const later = new Date(NOW.getTime() + INVITE_TTL_MS);
-    await expect(checkInvite(store, invite.token, ORIGIN, later)).rejects.toMatchObject({ reason: 'expired', message: expect.stringMatching(/expired/) });
-    await expect(checkInvite(store, 'A'.repeat(43), ORIGIN, NOW)).rejects.toMatchObject({ reason: 'invalid' });
-    await expect(checkInvite(store, 'short', ORIGIN, NOW)).rejects.toMatchObject({ reason: 'invalid' });
-    await expect(checkInvite(store, invite.token, 'https://other.example.test', NOW)).rejects.toMatchObject({ reason: 'origin' });
-    await expect(completeEnrollment(store, { token: invite.token, origin: ORIGIN, memberId: 'ana', credential, aaguid: null, now: NOW }))
+  test('refuses links not signed by a current admin, altered, re-encoded, expired, too far ahead, for another origin or member, or for someone who left', async () => {
+    const invite = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key });
+    const notAdmin = /not signed by a current team admin/;
+    await expect(checkInvite(store, signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ben.key }).token, context()))
+      .rejects.toMatchObject({ reason: 'invalid', message: expect.stringMatching(notAdmin) });
+    await expect(checkInvite(store, signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: generateDeviceKey() }).token, context()))
+      .rejects.toMatchObject({ reason: 'invalid', message: expect.stringMatching(notAdmin) });
+    // Ana demoted to operator: her old links stop working.
+    const demoted = structuredClone(signed()); demoted.roster.members[0]!.role = 'operator'; demoted.roster.members[1]!.role = 'admin';
+    await expect(checkInvite(store, invite.token, { roster: demoted.roster, origin: ORIGIN, now: NOW })).rejects.toMatchObject({ reason: 'invalid' });
+    const [body, sig] = invite.token.split('.') as [string, string];
+    const altered = Buffer.from(JSON.stringify({ ...payload(invite.token), member: 'ana' })).toString('base64url');
+    await expect(checkInvite(store, `${altered}.${sig}`, context())).rejects.toMatchObject({ reason: 'invalid' });
+    const respaced = Buffer.from(JSON.stringify(payload(invite.token), null, 1)).toString('base64url');
+    await expect(checkInvite(store, `${respaced}.${sig}`, context())).rejects.toMatchObject({ reason: 'invalid' });
+    for (const bad of ['A'.repeat(43), 'short', `${body}.${'A'.repeat(86)}`, `${body}.${sig}=`, `${body}..${sig}`]) {
+      await expect(checkInvite(store, bad, context())).rejects.toMatchObject({ reason: 'invalid' });
+    }
+    await expect(checkInvite(store, invite.token, context(new Date(NOW.getTime() + INVITE_TTL_MS)))).rejects.toMatchObject({ reason: 'expired', message: expect.stringMatching(/expired/) });
+    const ahead = signInvite({ memberId: 'ben', origin: ORIGIN, now: new Date(NOW.getTime() + 60 * 60_000), signer: ana.key });
+    await expect(checkInvite(store, ahead.token, context())).rejects.toMatchObject({ reason: 'invalid' });
+    await expect(checkInvite(store, invite.token, { ...context(), origin: 'https://other.example.test' })).rejects.toMatchObject({ reason: 'origin' });
+    await expect(checkInvite(store, invite.token, context(NOW, [ana]))).rejects.toMatchObject({ reason: 'member' });
+    await expect(completeEnrollment(store, { token: invite.token, roster: roster(), origin: ORIGIN, memberId: 'ana', credential, aaguid: null, now: NOW }))
       .rejects.toMatchObject({ reason: 'member', message: 'This enrollment link was made for another team member.' });
     // The refused attempts did not use the invitation up.
-    expect(await checkInvite(store, invite.token, ORIGIN, NOW)).toMatchObject({ memberId: 'ben' });
+    expect(await checkInvite(store, invite.token, context())).toMatchObject({ memberId: 'ben' });
     expect(await listCandidates(store)).toEqual([]);
   });
 
-  test('a duplicate candidate and an invalid credential are refused; a real AAGUID is kept', async () => {
-    const first = await createInvite(store, { memberId: 'ben', origin: ORIGIN, now: NOW });
-    await completeEnrollment(store, { token: first.token, origin: ORIGIN, memberId: 'ben', credential, aaguid: 'ad'.repeat(16), now: NOW });
+  test('a duplicate candidate (same id or same public key) and an invalid credential are refused; a reported AAGUID is kept as a hint', async () => {
+    const first = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key });
+    await completeEnrollment(store, { token: first.token, roster: roster(), origin: ORIGIN, memberId: 'ben', credential, aaguid: 'ad'.repeat(16), now: NOW });
     expect((await listCandidates(store))[0]!.aaguid).toBe('ad'.repeat(16));
-    const second = await createInvite(store, { memberId: 'ben', origin: ORIGIN, now: NOW });
-    await expect(completeEnrollment(store, { token: second.token, origin: ORIGIN, memberId: 'ben', credential, aaguid: null, now: NOW })).rejects.toMatchObject({ reason: 'duplicate' });
-    await expect(completeEnrollment(store, { token: second.token, origin: ORIGIN, memberId: 'ben', credential: { ...credential, id: 'not base64url!' }, aaguid: null, now: NOW }))
-      .rejects.toMatchObject({ reason: 'invalid' });
+    const second = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key });
+    const again = (input: PasskeyCredential) => completeEnrollment(store, { token: second.token, roster: roster(), origin: ORIGIN, memberId: 'ben', credential: input, aaguid: null, now: NOW });
+    await expect(again(credential)).rejects.toMatchObject({ reason: 'duplicate' });
+    await expect(again({ ...credential, id: 'c2FtZS1rZXk' })).rejects.toMatchObject({ reason: 'duplicate' });
+    await expect(again({ ...credential, id: 'not base64url!' })).rejects.toMatchObject({ reason: 'invalid' });
   });
 
-  test('a token the output would mask is drawn again', async () => {
+  test('a link the output would mask is signed again', async () => {
     let calls = 0;
-    const invite = await createInvite(store, { memberId: 'ben', origin: ORIGIN, now: NOW, printable: () => ++calls > 2 });
+    const invite = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key, printable: () => ++calls > 2 });
     expect(calls).toBe(3);
-    expect(await checkInvite(store, invite.token, ORIGIN, NOW)).toMatchObject({ memberId: 'ben' });
+    expect(await checkInvite(store, invite.token, context())).toMatchObject({ memberId: 'ben' });
+  });
+
+  test('candidate cards carry public data only, parse strictly, and show a comparable fingerprint', async () => {
+    const invite = signInvite({ memberId: 'ben', origin: ORIGIN, now: NOW, signer: ana.key });
+    await completeEnrollment(store, { token: invite.token, roster: roster(), origin: ORIGIN, memberId: 'ben', credential, aaguid: null, now: NOW });
+    const card = candidateCard(await listCandidates(store));
+    expect(card).toMatchObject({ v: 1, kind: 'keysentry-passkey-candidates', candidates: [{ memberId: 'ben', credential: { id: credential.id, origins: [ORIGIN] } }] });
+    expect(parseCandidateCard(JSON.parse(JSON.stringify(card)))).toEqual(card.candidates);
+    expect(candidateFingerprint(card.candidates[0]!)).toMatch(/^(?:[a-f0-9]{4}-){7}[a-f0-9]{4}$/);
+    expect(() => parseCandidateCard({ ...card, extra: true })).toThrow(/passkey card is not valid/);
+    expect(() => parseCandidateCard({ ...card, candidates: [] })).toThrow(/passkey card is not valid/);
+    expect(() => parseCandidateCard({ ...card, candidates: [card.candidates[0], card.candidates[0]] })).toThrow(/same passkey twice/);
+  });
+
+  test('a saved state from before signed invitations keeps its candidates and drops its stored invitations', async () => {
+    const candidate = { memberId: 'ben', credential, createdAt: NOW.toISOString(), aaguid: null };
+    await store.writeJson('passkeys', enrollmentPath(store), { v: 1, invites: [{ tokenHash: 'a'.repeat(64) }], candidates: [candidate] });
+    expect(await listCandidates(store)).toEqual([candidate]);
   });
 });

@@ -9,8 +9,8 @@ import { enrollmentHooks } from '../../../src/cli/phase3.js';
 import { createStateCipher, createStateStore } from '../../../src/core/store.js';
 import { createOidcClient, memberForIdentity } from '../../../src/dashboard/oidc/index.js';
 import { createMemoryPasskeyCounters, startDashboard, type DashboardApi } from '../../../src/dashboard/server/index.js';
-import { canonicalJson } from '../../../src/security/index.js';
-import { createInvite, INVITE_TTL_MS, listCandidates } from '../../../src/team/index.js';
+import { canonicalJson, generateDeviceKey } from '../../../src/security/index.js';
+import { candidateFingerprint, devicePublicKey, INVITE_TTL_MS, listCandidates, signInvite } from '../../../src/team/index.js';
 import type { AuditEvent, TeamMember } from '../../../src/types.js';
 import { CLIENT_ID, CLIENT_SECRET, createFakeIdp, ISSUER, PUBLIC_HOST, PUBLIC_ORIGIN, REDIRECT_URI, type FakeUser } from './fake-idp.js';
 import { createEnrollingAuthenticator } from './enrolling-authenticator.js';
@@ -25,10 +25,15 @@ afterEach(async () => {
 
 const T0 = Date.parse('2026-10-28T12:00:00Z');
 const digest = (body: unknown) => createHash('sha256').update(canonicalJson(body)).digest('hex');
+// Ana's device key signs invitations on her own computer; the team server only holds the roster (review H3).
+const anaKey = generateDeviceKey();
+const invite = (memberId: string, at: number, origin = PUBLIC_ORIGIN) => signInvite({ memberId, origin, now: new Date(at), signer: anaKey });
+/** Well-formed (payload.signature) but not a valid invitation. */
+const FORGED = `${'A'.repeat(43)}.${'A'.repeat(86)}`;
 
 function roster(): TeamMember[] {
   return [
-    { id: 'ana', name: 'Ana', role: 'admin', email: 'ana@example.test', sso: { issuer: ISSUER, subject: 'sub-ana' }, deviceKeys: [], passkeys: [] },
+    { id: 'ana', name: 'Ana', role: 'admin', email: 'ana@example.test', sso: { issuer: ISSUER, subject: 'sub-ana' }, deviceKeys: [devicePublicKey(anaKey)], passkeys: [] },
     { id: 'ben', name: 'Ben', role: 'operator', email: 'ben@example.test', deviceKeys: [], passkeys: [] },
     { id: 'vic', name: 'Vic', role: 'viewer', email: 'vic@example.test', deviceKeys: [], passkeys: [] },
   ];
@@ -48,7 +53,7 @@ async function startTeam(extra: { enrollment?: boolean } = {}) {
   const dashboard = await startDashboard({ api, readOnly: false, now: () => now, team: {
     publicOrigin: PUBLIC_ORIGIN, listen: { host: '127.0.0.1', port: 0 }, oidc,
     members: async () => structuredClone(members), passkeyCounters: createMemoryPasskeyCounters(),
-    ...(extra.enrollment === false ? {} : { enrollment: enrollmentHooks(rt, PUBLIC_ORIGIN, { diagnostic: () => {} }) }),
+    ...(extra.enrollment === false ? {} : { enrollment: enrollmentHooks(rt, PUBLIC_ORIGIN, { diagnostic: () => {} }, async () => structuredClone(members)) }),
   } });
   running.push(dashboard);
   const replies: Reply[] = [];
@@ -133,7 +138,7 @@ describe('passkey enrollment for the team dashboard host', () => {
     // Every other page still blocks credential creation.
     expect((await t.req('/')).headers['permissions-policy']).toBe('publickey-credentials-get=(self), publickey-credentials-create=()');
 
-    const { token } = await createInvite(t.store, { memberId: 'ben', origin: PUBLIC_ORIGIN, now: new Date(t.now()) });
+    const { token } = invite('ben', t.now());
     const options = await t.post('/enroll/options', { token });
     expect(options.status).toBe(200);
     expect(options.json.member).toEqual({ id: 'ben', name: 'Ben' });
@@ -141,8 +146,9 @@ describe('passkey enrollment for the team dashboard host', () => {
     const authenticator = createEnrollingAuthenticator(PUBLIC_HOST, { aaguid: Buffer.alloc(16, 0xab) });
     const finished = await t.post('/enroll/finish', { token, ...authenticator.register(options.json.publicKey.challenge, PUBLIC_ORIGIN) });
     expect(finished.status).toBe(200);
-    expect(finished.json).toEqual({ enrolled: true, member: 'ben', credentialId: authenticator.id, next: `Ask a team admin to run: keysentry team add-passkey ben ${authenticator.id}` });
     const [candidate] = await listCandidates(t.store);
+    expect(finished.json).toEqual({ enrolled: true, member: 'ben', credentialId: authenticator.id, fingerprint: candidateFingerprint(candidate!),
+      next: "Ask a team admin to add it: keysentry team passkeys pending -o <file> on the dashboard host, then keysentry team add-passkey ben --card <file> on the admin's computer." });
     expect(candidate).toMatchObject({ memberId: 'ben', aaguid: 'ab'.repeat(16), credential: { id: authenticator.id, rpId: PUBLIC_HOST, origins: [PUBLIC_ORIGIN] } });
     expect(t.audit.map(event => event.kind)).toContain('team:passkey-enrolled');
     // The token never comes back in any response.
@@ -170,16 +176,20 @@ describe('passkey enrollment for the team dashboard host', () => {
 
   it('refuses expired, unknown, other-origin and other-member links, a failed ceremony and a wrong RP ID', async () => {
     const t = await startTeam();
-    const expired = await createInvite(t.store, { memberId: 'ben', origin: PUBLIC_ORIGIN, now: new Date(t.now() - INVITE_TTL_MS - 1) });
+    const expired = invite('ben', t.now() - INVITE_TTL_MS - 1);
     expect(await t.post('/enroll/options', { token: expired.token })).toMatchObject({ status: 410, json: { error: expect.stringMatching(/expired/) } });
-    expect((await t.post('/enroll/options', { token: 'A'.repeat(43) })).status).toBe(403);
+    expect((await t.post('/enroll/options', { token: FORGED })).status).toBe(403);
+    expect((await t.post('/enroll/options', { token: 'A'.repeat(43) })).status).toBe(400);
+    // Signed by someone who is not an admin of the roster the dashboard serves.
+    expect(await t.post('/enroll/options', { token: signInvite({ memberId: 'ben', origin: PUBLIC_ORIGIN, now: new Date(t.now()), signer: generateDeviceKey() }).token }))
+      .toMatchObject({ status: 403, json: { error: expect.stringMatching(/not signed by a current team admin/) } });
     expect((await t.post('/enroll/options', { token: 'not-a-token' })).status).toBe(400);
-    const elsewhere = await createInvite(t.store, { memberId: 'ben', origin: 'https://other.example.test', now: new Date(t.now()) });
+    const elsewhere = invite('ben', t.now(), 'https://other.example.test');
     expect((await t.post('/enroll/options', { token: elsewhere.token })).status).toBe(403);
-    const gone = await createInvite(t.store, { memberId: 'zed', origin: PUBLIC_ORIGIN, now: new Date(t.now()) });
+    const gone = invite('zed', t.now());
     expect(await t.post('/enroll/options', { token: gone.token })).toMatchObject({ status: 403, json: { error: expect.stringMatching(/no longer on the team roster/) } });
 
-    const valid = await createInvite(t.store, { memberId: 'ben', origin: PUBLIC_ORIGIN, now: new Date(t.now()) });
+    const valid = invite('ben', t.now());
     // Finishing without a started ceremony is refused, and does not use the link.
     const authenticator = createEnrollingAuthenticator(PUBLIC_HOST);
     expect((await t.post('/enroll/finish', { token: valid.token, ...authenticator.register('AAAA', PUBLIC_ORIGIN) })).status).toBe(409);
@@ -201,11 +211,11 @@ describe('passkey enrollment for the team dashboard host', () => {
   it('rate-limits enrollment requests', async () => {
     const t = await startTeam();
     const statuses: number[] = [];
-    for (let i = 0; i < 31; i++) statuses.push((await t.post('/enroll/options', { token: 'B'.repeat(43) })).status);
+    for (let i = 0; i < 31; i++) statuses.push((await t.post('/enroll/options', { token: FORGED })).status);
     expect(statuses.slice(0, 30).every(status => status === 403)).toBe(true);
     expect(statuses[30]).toBe(429);
     t.advance(60_000);
-    expect((await t.post('/enroll/options', { token: 'B'.repeat(43) })).status).toBe(403);
+    expect((await t.post('/enroll/options', { token: FORGED })).status).toBe(403);
   });
 
   it('does not exist without enrollment hooks, nor on the local dashboard', async () => {

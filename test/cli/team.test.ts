@@ -186,11 +186,15 @@ describe('a team across three computers', () => {
 
     const invite = await run(ana, ['team', 'invite', 'ben', '--origin', 'https://keysentry.example.com']);
     expect(invite.exit).toBe(0);
-    const link = /https:\/\/keysentry\.example\.com\/enroll#([A-Za-z0-9_-]{43})/.exec(invite.output);
+    // An invitation signed by Ana's device key: base64url payload, a dot, and the signature (review H3).
+    const link = /https:\/\/keysentry\.example\.com\/enroll#([A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86})\n/.exec(invite.output);
     expect(link).not.toBeNull();
+    expect(JSON.parse(Buffer.from(link![1]!.split('.')[0]!, 'base64url').toString())).toMatchObject({ v: 1, member: 'ben', origin: 'https://keysentry.example.com',
+      exp: '2026-10-28T10:15:00.000Z' });
     expect(invite.output).toMatch(/works once, until 2026-10-28T10:15:00\.000Z/);
-    // The audit event names the member, never the token.
-    expect(ana.events.at(-1)).toEqual({ kind: 'team:invite', summary: 'A passkey enrollment link was created.', data: { memberId: 'ben' } });
+    expect(invite.output).toContain('keysentry team add-passkey ben --card <file>');
+    // The audit event names the member, never the link.
+    expect(ana.events.at(-1)).toEqual({ kind: 'team:invite', summary: 'A passkey enrollment link was signed.', data: { memberId: 'ben' } });
     expect(JSON.stringify(ana.events)).not.toContain(link![1]);
     expect((await run(ana, ['team', 'invite', 'zed', '--origin', 'https://keysentry.example.com'])).message).toBe('There is no member zed on this team.');
     expect((await run(ana, ['team', 'invite', 'ben', '--origin', 'http://keysentry.example.com'])).message).toMatch(/^Use --origin with the team dashboard/);

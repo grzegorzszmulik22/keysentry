@@ -268,8 +268,9 @@ must correctly terminate TLS and configure proxy trust.
 
 Local registration binds to loopback, uses a one-time token, opens as localhost, checks Host/Origin, serves only a
 static script and closes after success or timeout. A localhost passkey is not a public-origin passkey. The server
-does not provide public `/register`; the dashboard never enrolls passkeys, so public-origin enrollment
-remains unavailable here. Notifications carry an approval-page URL only when a passkey for the watcher's public
+does not provide public `/register`; the local dashboard never enrolls passkeys, so public-origin enrollment for the
+watcher remains unavailable here (the team dashboard's `/enroll` creates inert candidates only, see
+[Teams, policy and single sign-on](#teams-policy-and-single-sign-on)). Notifications carry an approval-page URL only when a passkey for the watcher's public
 origin is registered; otherwise they direct the user to the local approval command. Browser/authenticator
 implementation, the selected origin and the local supervised enrollment remain trust boundaries.
 
@@ -315,49 +316,90 @@ operations still need maintainer validation before a release.
 ## Teams, policy and single sign-on
 
 **The roster is the only source of team trust.** Members, roles, device keys, passkeys and pinned single sign-on
-identities live in one signed roster. Each version links to the previous one by hash and needs the previous version's
-admin threshold of distinct admin signatures (Ed25519 device keys). A removed admin cannot sign the next version; a new
-admin cannot vote for their own addition; lowering the threshold still needs the old threshold. The applied version is
-kept in encrypted state and its version and hash in the vault, so an older state file copied back, a forked version or
-a deleted state file is refused rather than accepted ("rollback protection").
+identities live in one signed roster. Each version links to the previous one by hash and needs distinct admin
+signatures (Ed25519 device keys) from admins of the previous version: the previous version's admin threshold, or the
+applied policy's `approvals.wideningAdmins` when that is higher. A removed admin cannot sign the next version; a new
+admin cannot vote for their own addition; lowering the threshold still needs the old threshold; a change that would
+leave fewer admins with device keys than `wideningAdmins` is refused. Signatures must use the canonical base64
+spelling, so one document has one hash, and two members cannot list the same passkey public key. The applied version
+is kept in encrypted state and its version and hash in the vault, so an older state file copied back, a forked version
+or a deleted state file is refused rather than accepted ("rollback protection"). An environment-variable vault (CI)
+cannot hold that copy: there the encrypted state file is the only record of the applied roster and policy, and
+deleting it loses rollback protection on that computer.
 
 **Trust on first use and fingerprints.** A computer with no roster cannot check a roster's signatures meaningfully:
-whoever writes a roster chooses its admins. `team apply --fingerprint` makes the person compare a 64-bit prefix of the
+whoever writes a roster chooses its admins. `team apply --fingerprint` makes the person compare a 128-bit prefix of the
 roster hash with an admin over another channel; that comparison is the trust anchor. An attacker who controls both the
 roster file and the channel used for the fingerprint can make a new computer join their own team. After the first
 roster, every later version is verified against the one in use.
 
-**Admin threshold and policy.** The signed policy (policy-as-code) needs the roster's admin threshold of signatures
-from current admins and only narrows local configuration. If the policy file, the roster or a policy requirement
-cannot be verified, every change pauses with a specific message; nothing falls back to a weaker mode, and turning
-team mode off under an applied roster pauses changes too. Narrowing that keysentry applies before it can read state
-(the KMS unwrap of the state key at start-up) uses `keysentry.yaml` only. Inspection commands that open no state
+**Admin threshold and policy.** The first signed policy (policy-as-code) needs the roster's admin threshold of
+signatures from current admins; every later version also needs the policy in force's `approvals.wideningAdmins`
+admins, so the rules cannot be relaxed with fewer signatures than they require. A policy only narrows local
+configuration. Under a policy the monitor's automatic actions (and their environment overrides) are off unless the
+policy allows them, and then stay inside its hosts, providers and approval tiers; a minimum grace period also binds
+"revoke immediately", "revoke now" at the grace prompt and `finish --now`. If the policy file, the roster or a policy
+requirement cannot be verified, every change pauses with a specific message; nothing falls back to a weaker mode, and
+turning team mode off under an applied roster pauses changes too. Narrowing that keysentry applies before it can read
+state (the KMS unwrap of the state key at start-up) uses `keysentry.yaml` only. Inspection commands that open no state
 (`keysentry network`, `keysentry verify`) apply the policy file's narrowing without checking its signatures, which can
 only make them stricter.
 
 **Quorum.** With a policy that needs N approvals, an action runs only after N distinct roster members with the needed
 role approved it, each with their own roster passkey or device key, within the request's lifetime. The same credential
-or member counts once; members removed or demoted before the quorum is met stop counting; the requirement can only grow
-while a request is pending. Arming is signed by one admin's device, so a policy that wants more than one admin for
-policy-widening changes pauses arming instead of accepting fewer approvals. Members' own computers each hold their own
+or member counts once; members removed or demoted before the action runs stop counting (approvals are checked again
+when it runs); the requirement can only grow while a request is pending; a request that recorded a quorum is never
+approved by a single approval because the roster stopped being visible. Members' own computers each hold their own
 approval state: a quorum is collected where the request lives (the watcher, through the relay or its approval page, or
 the team dashboard), not across separate computers.
 
-**Single sign-on is limited to reading and signing in.** The identity provider says who someone is; the roster says
-what they may do. A provider session opens the team dashboard at the member's role (reading, and for operators the
-non-mutating disarm). Every change needs that member's own passkey for the dashboard's host, listed in the signed
-roster; roster and policy changes need admins' device keys. A pinned member (`sso` in the roster) maps only from the
-exact issuer and subject, so a reassigned email address cannot sign in as them; unpinned members map by verified email
-(OIDC Core §5.7 warns that email is not a stable identifier, which is why pinning exists).
+**Team dashboard changes.** On the team dashboard every change that rotates, finishes, undoes, revokes, caps, arms,
+dismisses, reveals, or changes settings, channels or vault entries is a team request bound to that exact change and
+requester. The requester's passkey confirmation is their approval; the change runs only when the approval service
+reports the quorum met (operators: `approvals.required` by risk tier; admin changes: `approvals.wideningAdmins`
+admins, or the roster's threshold without a policy), and every runtime entry point it calls re-checks that approved
+request against the current roster and policy before acting, so no route can skip it. Each approved request runs
+once. Request bodies that carry a secret are never stored; the requester submits them again after approval. Reveals
+and disarms are announced on the team's notification channels with the member's id, and every audit event a dashboard
+request causes records that member (exports carry it as `actor`). Disarm needs the member's passkey but never a quorum
+or governance check: it only reduces automation.
 
-**Passkey enrollment for the public host.** A member's passkey for the team dashboard is created on `/enroll` from an
-admin's single-use, 15-minute link bound to that member and that origin; the token travels in the URL fragment and is
-stored only as a hash. The result is a pending public credential that grants nothing until admins sign it into the
-roster with `team add-passkey`, which refuses a candidate for any member other than the invited one. Someone who
-intercepts a link before the member uses it can enroll their own authenticator as a candidate; the admin's review of
-the credential id with the member (`team passkeys pending`) is what stops it from reaching the roster. Enrollment is
+**The team dashboard's host.** `ui --team` refuses to start where the device key belongs to an admin, so the
+internet-facing host never holds a key that signs roster or policy changes. It still holds the platform and provider
+tokens the dashboard acts with, and anyone with a terminal on it can use them directly (the CLI there is outside the
+dashboard's roles and quorum, like any member's own computer). A device key on the host that belongs to a non-admin
+member lets such a person approve as that member; `ui --team` warns about it.
+
+**Single sign-on is limited to reading and signing in.** The identity provider says who someone is; the roster says
+what they may do. A provider session opens the team dashboard at the member's role for reading. Every change, and
+disarm, needs that member's own passkey for the dashboard's host, listed in the signed roster; changes also need the
+quorum; roster and policy changes need admins' device keys. A pinned member (`sso` in the roster) maps only from the
+exact issuer and subject, so a reassigned email address cannot sign in as them; unpinned members map by verified
+email compared in ASCII only (a non-ASCII address never matches), and OIDC Core §5.7 warns that email is not a stable
+identifier, which is why pinning exists.
+
+**Passkey enrollment for the public host.** A member's passkey for the team dashboard is created on `/enroll` from a
+link an admin signs on their own computer with their device key: `{ member, origin, expiry, nonce }`, valid 15
+minutes. The dashboard host checks the signature against the current roster's admins, the expiry and its own origin,
+and keeps only a hash of each used nonce (single use); it needs no admin key. The link travels in the URL fragment. The
+result is a pending public credential that grants nothing until an admin signs it into the roster on their own
+computer (`team add-passkey <member> --card <file>`, from the card the host exports with `team passkeys pending -o`),
+which refuses a candidate for any member other than the invited one; the host then applies the new roster like any
+computer. Someone who intercepts a link before the member uses it can enroll their own authenticator as a candidate;
+the admin's comparison of the candidate's fingerprint with the member is what stops it from reaching the roster. The
+authenticator model a `none` attestation reports is the authenticator's own claim, not verified. Enrollment is
 rate-limited, refuses reuse, does not exist on the local dashboard, and is the only page whose permissions policy
 allows credential creation.
+
+**Notification routing.** A channel a member received stays member-owned when no member receives it any more (the
+roster lists it as retired), so removing a member never turns their personal channel into one that receives every
+team message, approval links included. `team remove` and `team notify --clear` refuse while the member has such
+channels unless `--drop-channels` removes them locally.
+
+**Deployed watchers keep the sealed roster.** `watcher setup` seals the verified roster and policy into the watcher's
+config. A deployed watcher or cloud box does not read later roster versions: a removed or demoted member keeps the
+approvals and disarms they had there until `watcher setup` (or `box send-tokens`) runs again. `team remove` and
+`team role` say so when a watcher or box is known.
 
 ## Cloud box
 
@@ -437,9 +479,10 @@ messages, but a substituted key or an old attestation fails a named check and no
 | AI coding agent or agent-driven browser | Invoke mutation commands, click dashboard controls or obtain keys indirectly through local tools. | No product MCP/agent interface, interactive CLI mutation checks, marker-triggered read-only dashboard, terminal-only local passkey enrollment (team passkeys reach the roster only through admins' signed changes), exact-action user-verified passkeys, and value-free normal output. An agent with unrestricted same-user file/process access can bypass keysentry and its markers; OS and tool permissions must enforce that separate boundary. |
 | Foreign web page or local process | Rebind a hostname, make cross-origin requests, steal a sign-in link or replay a dashboard action. | Loopback binding, exact Host/Origin, single-use expiring link, strict session cookie/CSRF checks, CSP and fresh route/body-bound passkey proofs constrain access. A stolen unused link can establish a session; same-user process/browser compromise is outside those controls. |
 | Recipient of a share card or timeline | Infer infrastructure, counts or incident timing from an export. | Card platform/counts are opt-in and names/hints/values never enter it; timelines escape and redact recorded events. Chosen metadata can still identify a deployment or event, and publication is irreversible from keysentry. |
-| Identity provider (team dashboard) | Sign someone in as a member, reassign an email address, or deny sign-in. | The provider can grant reading at a member's role and the non-mutating disarm. Changes need the member's roster passkey; roster and policy changes need admins' device keys. Pinned members accept only their exact issuer and subject. It can deny service to every member. |
-| Team member | Approve alone, approve twice, act above their role, or keep acting after removal. | Quorum counts distinct members once each, viewers cannot approve, operators cannot sign roster or policy changes, widening approvals need admins, and every request and session re-checks the current roster. A member's own host tokens on their own computer stay outside roles; the policy still narrows them there. |
-| Admin, or admins up to the threshold | Change the roster or policy, add an authenticator, lower the threshold. | That is their authority by design; changes are signed, versioned and audited, and joining computers check fingerprints. Fewer admins than the threshold cannot make a valid change. |
+| Identity provider (team dashboard) | Sign someone in as a member, reassign an email address, or deny sign-in. | The provider can grant reading at a member's role. Changes and disarm need the member's roster passkey, and changes also the team's quorum; roster and policy changes need admins' device keys. Pinned members accept only their exact issuer and subject; email matching folds ASCII case only. It can deny service to every member. |
+| Team member | Approve alone, approve twice, act above their role, or keep acting after removal. | Quorum counts distinct members once each, team dashboard changes are requests that run only under the quorum, viewers cannot approve, operators cannot sign roster or policy changes, widening approvals need admins, and team dashboard sessions, requests and approvals re-check the current roster (approvals again when the action runs). A deployed watcher or cloud box keeps the roster sealed at setup until setup runs again. A member's own host tokens on their own computer stay outside roles; the policy still narrows them there. |
+| Admin, or admins up to the threshold | Change the roster or policy, add an authenticator, lower the threshold. | That is their authority by design; changes are signed, versioned and audited, and joining computers check fingerprints. Fewer admins than the threshold, or than the policy's `wideningAdmins`, cannot make a valid roster or policy change. With one required signature, one admin can add a member whose key they hold; `team add` warns when the policy needs more approvers than that. |
+| Team dashboard host | Use the platform tokens in its vault, or approve as a member whose device key it holds. | It never holds an admin's key (`ui --team` refuses), so it cannot sign roster or policy changes. Anyone with a terminal there can use its tokens outside the dashboard's roles and quorum; protect it like the tokens. |
 | keysentry maintainers | Ship an unsafe implementation or change the release trust list. | Open source, readable release code, explicit trust roots, release signatures, checksums, provenance workflows, and independent rebuilding enable review. Maintainers still control releases; a valid signature identifies the signer, not the safety of the code. There is no external audit yet. |
 
 ## What keysentry does not protect against

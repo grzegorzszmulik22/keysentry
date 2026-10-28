@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { ASSETS } from '../generated/assets.js';
-import { apiRoute, bodyDigest, validateApi } from './api.js';
+import { apiRoute, bodyDigest, DashboardAccepted, validateApi } from './api.js';
 import type { DashboardApi } from './api.js';
 import { createPasskeyGate, PasskeyGateError, REGISTER_IN_TERMINAL } from './passkey-gate.js';
 import type { PasskeyStore } from './passkey-gate.js';
@@ -128,7 +128,8 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
       }
       if (route!.mutating) await gate.verify(session.id, name, bodyDigest(body), proof);
       const result = await route!.handler(body, { session: session.id });
-      json(res, 200, result);
+      if (result instanceof DashboardAccepted) json(res, 202, result.body);
+      else json(res, 200, result);
     } catch (error) {
       if (res.headersSent || res.destroyed) { res.destroy(); return; }
       if (error instanceof DashboardError || error instanceof PasskeyGateError) json(res, error.status, { error: error.message });

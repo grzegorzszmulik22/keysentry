@@ -59,8 +59,11 @@ function expandScope(signal: Signal, inv: Inventory, scope: PolicyRule['scope'])
     .map(cluster => cluster.id);
 }
 
-/** Pure policy evaluation. The action executor reserves cooldown/capacity before any rotation call. */
-export function decide(signal: Signal, inv: Inventory, policy: Policy, state: MonitorState): Decision[] {
+/**
+ * Pure policy evaluation. The action executor reserves cooldown/capacity before any rotation call. `allowAutomatic`
+ * (a team policy's host, provider and tier limits) keeps other clusters out of automatic action: they wait for approval.
+ */
+export function decide(signal: Signal, inv: Inventory, policy: Policy, state: MonitorState, allowAutomatic?: (clusterId: string) => boolean): Decision[] {
   const rule = policy.rules[signal.kind];
   let clusterIds = expandScope(signal, inv, rule.scope);
   const decision = (ids: string[], automatic: boolean, reason?: string, action: ActionKind = rule.action): Decision => ({
@@ -95,6 +98,12 @@ export function decide(signal: Signal, inv: Inventory, policy: Policy, state: Mo
   if (!clusterIds.length) return decisions;
   const enabled = containment ? policy.autoContain : policy.autoExecute;
   if (!enabled) return [...decisions, decision(clusterIds, false, containment ? 'auto-contain-disabled' : 'auto-execute-disabled')];
+  if (allowAutomatic) {
+    const outside = clusterIds.filter(id => !allowAutomatic(id));
+    if (outside.length) decisions.push(decision(outside, false, 'team-policy'));
+    clusterIds = clusterIds.filter(id => !outside.includes(id));
+    if (!clusterIds.length) return decisions;
+  }
 
   const timestamp = Date.parse(signal.at);
   if (!Number.isFinite(timestamp)) return [...decisions, decision(clusterIds, false, 'invalid-time')];

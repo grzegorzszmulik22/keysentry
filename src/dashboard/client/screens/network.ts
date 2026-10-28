@@ -8,7 +8,8 @@ interface AllowedHost {
 }
 
 interface ReceiptRow { host: string; purpose: string; count: number; blocked: number; lastAt: string }
-interface NetworkResponse { allowed: AllowedHost[]; receipt: ReceiptRow[] }
+/** `status`: the proxy, extra CA and offline lines `keysentry network` prints; `feeds`: whether breach feeds are polled. */
+interface NetworkResponse { allowed: AllowedHost[]; receipt: ReceiptRow[]; status?: string[]; feeds?: 'offline' | 'polled' }
 
 function scrollTable(content: HTMLTableElement): HTMLElement {
   const wrapper = document.createElement('div'); wrapper.className = 'table-scroll';
@@ -18,11 +19,19 @@ function scrollTable(content: HTMLTableElement): HTMLElement {
 
 /** Hosts and aggregate request metadata only; paths and request bodies are never rendered. */
 export async function renderNetwork(): Promise<HTMLElement> {
-  const { allowed, receipt } = await get<NetworkResponse>('network');
+  const { allowed, receipt, status, feeds } = await get<NetworkResponse>('network');
   const page = document.createElement('div'); page.className = 'screen-a-network';
   const introduction = document.createElement('p');
   introduction.textContent = 'These are the hosts keysentry is allowed to contact and the requests recorded in your network receipt.';
   page.append(introduction);
+  // Proxy, extra certificates and offline mode, as `keysentry network` reports them (plain text, no values).
+  for (const line of Array.isArray(status) ? status : []) {
+    if (typeof line !== 'string') continue;
+    const item = document.createElement('p'); item.textContent = line; page.append(item);
+  }
+  if (feeds === 'offline' && !(Array.isArray(status) && status.some(line => typeof line === 'string' && line.startsWith('Offline mode')))) {
+    const offline = document.createElement('p'); offline.textContent = 'Offline mode: keysentry fetches no breach feeds or news.'; page.append(offline);
+  }
 
   if (allowed.length === 0) page.append(emptyState('No hosts are allowed in this configuration. Review keysentry.yaml to configure network access.'));
   const groups = new Map<string, AllowedHost[]>();

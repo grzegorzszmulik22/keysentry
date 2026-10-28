@@ -14,6 +14,8 @@ export interface ActionContext extends DetectorContext {
   interactive?: boolean;
   /** Called before irreversible actions and after state changes. A failed save stops execution. */
   saveState?: () => Promise<void>;
+  /** Team policy limits for automatic actions (hosts, providers, tiers); clusters outside them wait for approval. */
+  automaticAllowed?: (clusterId: string) => boolean;
 }
 
 async function save(ctx: ActionContext): Promise<void> {
@@ -153,7 +155,7 @@ async function containClusters(ids: string[], ctx: ActionContext, automatic: boo
     // Resolution may discover that another cluster is the same provider key.
     // Recheck after that await and reserve synchronously before the provider call.
     if(automatic && signal) {
-      const eligible=decide({...signal,at:now(ctx).toISOString()},ctx.inventory,ctx.policy,ctx.state)
+      const eligible=decide({...signal,at:now(ctx).toISOString()},ctx.inventory,ctx.policy,ctx.state,ctx.automaticAllowed)
         .some(decision=>decision.automatic && decision.action==='cap' && decision.clusterIds.includes(id));
       if(!eligible) { incomplete.push(id);continue; }
     }
@@ -205,7 +207,7 @@ async function executeCurrent(decision: Decision, ctx: ActionContext): Promise<v
 export async function executeDecisions(decisions: readonly Decision[], ctx: ActionContext): Promise<void> {
   for(const decision of decisions) {
     if(!decision.automatic) { await executeCurrent(decision,ctx);continue; }
-    const current=decide({...decision.signal,at:now(ctx).toISOString()},ctx.inventory,ctx.policy,ctx.state);
+    const current=decide({...decision.signal,at:now(ctx).toISOString()},ctx.inventory,ctx.policy,ctx.state,ctx.automaticAllowed);
     for(const next of current) {
       const ids=next.clusterIds.filter(id=>decision.clusterIds.includes(id));
       if(ids.length) await executeCurrent({...next,clusterIds:ids},ctx);

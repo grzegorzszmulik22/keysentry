@@ -171,3 +171,19 @@ describe('monitor policy', () => {
     expect(decisions.filter(d => !d.automatic).flatMap(d => d.clusterIds)).toEqual(['b', 'c']);
   });
 });
+
+describe('team policy limits on automatic monitor actions (review H2)', () => {
+  it('keeps clusters outside the limits out of automatic action: they wait for approval', () => {
+    const policy = { ...defaultPolicy(), autoExecute: true };
+    const inv = inventory([cluster('a', [svc('railway', 'one')]), cluster('b', [svc('vercel', 'two')])]);
+    const decisions = decide(signal({ clusterIds: ['a', 'b'] }), inv, policy, createMonitorState(), id => id === 'a');
+    expect(decisions.map(item => ({ ids: item.clusterIds, automatic: item.automatic, reason: item.reason }))).toEqual([
+      { ids: ['b'], automatic: false, reason: 'team-policy' },
+      { ids: ['a'], automatic: true, reason: undefined },
+    ]);
+    // Nothing allowed: no automatic decision at all.
+    expect(decide(signal({ clusterIds: ['a', 'b'] }), inv, policy, createMonitorState(), () => false).every(item => !item.automatic)).toBe(true);
+    // Without limits the old behaviour is unchanged.
+    expect(decide(signal({ clusterIds: ['a', 'b'] }), inv, policy, createMonitorState())).toMatchObject([{ clusterIds: ['a', 'b'], automatic: true }]);
+  });
+});

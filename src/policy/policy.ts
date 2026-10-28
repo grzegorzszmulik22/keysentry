@@ -67,26 +67,36 @@ export function signPolicy(input: SignedTeamPolicy, memberId: string, key: Devic
 }
 
 export type PolicyVerification =
-  | { ok: true; policy: SignedTeamPolicy; hash: string; signers: string[]; relation: 'same' | 'first' | 'newer' }
+  | { ok: true; policy: SignedTeamPolicy; hash: string; signers: string[]; relation: 'same' | 'first' | 'newer'; required: number }
   | { ok: false; reason: string };
 
 /**
- * A policy is valid when `roster.adminThreshold` distinct admins of the current roster signed it (a policy signed by
- * an admin who has since been removed must be signed again). Against the applied head it must be the same document,
- * or a newer version: the next version must link to the head by hash; a later version may skip versions only because
- * each version is independently signed by the current admins. Older versions and different documents with the same
- * version are refused.
+ * Distinct admins of the current roster a policy needs. A newer version needs the roster's threshold or the applied
+ * policy's `approvals.wideningAdmins`, whichever is higher, so a policy cannot lower its own rules with fewer signatures
+ * than they require (review H1). The first policy, and the applied policy itself when it is checked again, need the
+ * roster's threshold (the applied one passed the stricter check when it was accepted).
+ */
+export function policyAdminsNeeded(roster: TeamRoster, head: PolicyHead | null, relation: 'same' | 'first' | 'newer'): number {
+  return relation === 'newer' && head ? Math.max(roster.adminThreshold, head.policy.policy.approvals.wideningAdmins) : roster.adminThreshold;
+}
+
+/**
+ * A policy is valid when enough distinct admins of the current roster signed it (`policyAdminsNeeded`; a policy
+ * signed by an admin who has since been removed must be signed again). Against the applied head it must be the same
+ * document, or a newer version: the next version must link to the head by hash; a later version may skip versions
+ * only because each version is independently signed by the current admins. Older versions and different documents
+ * with the same version are refused.
  */
 export function verifyPolicy(input: unknown, roster: TeamRoster, head: PolicyHead | null): PolicyVerification {
-  return checkPolicy(input, roster, head, roster.adminThreshold);
+  return checkPolicy(input, roster, head, true);
 }
 
 /** A policy still collecting signatures: everything `verifyPolicy` checks except the number of signatures. */
 export function checkPolicyProposal(input: unknown, roster: TeamRoster, head: PolicyHead | null): PolicyVerification {
-  return checkPolicy(input, roster, head, 0);
+  return checkPolicy(input, roster, head, false);
 }
 
-function checkPolicy(input: unknown, roster: TeamRoster, head: PolicyHead | null, threshold: number): PolicyVerification {
+function checkPolicy(input: unknown, roster: TeamRoster, head: PolicyHead | null, complete: boolean): PolicyVerification {
   const parsed = parseSignedPolicy(input);
   if (!parsed.ok) return parsed;
   const signed = parsed.value;
@@ -94,7 +104,7 @@ function checkPolicy(input: unknown, roster: TeamRoster, head: PolicyHead | null
   if (policy.teamId !== roster.teamId) return { ok: false, reason: 'This policy belongs to a different team.' };
   const hash = policyHash(signed);
   // Signatures first: a document changed after signing is reported as such, not as a version conflict.
-  const check = verifyTeamSignatures(policy, signed.signatures, roster, threshold);
+  const check = verifyTeamSignatures(policy, signed.signatures, roster, 0);
   if (!check.ok) return { ok: false, reason: check.reason };
   let relation: 'same' | 'first' | 'newer' = 'first';
   if (head) {
@@ -104,7 +114,17 @@ function checkPolicy(input: unknown, roster: TeamRoster, head: PolicyHead | null
     if (policy.version === applied + 1 && policy.prev !== head.hash) return { ok: false, reason: 'This policy does not extend the one in use (fork protection).' };
     relation = hash === head.hash ? 'same' : 'newer';
   }
-  return { ok: true, policy: signed, hash, signers: check.signers, relation };
+  // A widening rule no admin group could meet would freeze every later roster and policy change.
+  const signing = roster.members.filter(member => member.role === 'admin' && member.deviceKeys.length > 0).length;
+  if (relation !== 'same' && policy.approvals.wideningAdmins > signing) {
+    return { ok: false, reason: `This policy asks for ${policy.approvals.wideningAdmins} admins for policy-widening changes, but only ${signing} admin${signing === 1 ? ' has' : 's have'} a device key, so no later change could be signed. Add admins first, or lower approvals.wideningAdmins.` };
+  }
+  const required = policyAdminsNeeded(roster, head, relation);
+  if (complete && check.signers.length < required) {
+    return { ok: false, reason: `This change has ${check.signers.length} of the ${required} admin signatures it needs.${required > roster.adminThreshold
+      ? ' The policy in force asks for that many admins (approvals.wideningAdmins) before its rules can change.' : ''}` };
+  }
+  return { ok: true, policy: signed, hash, signers: check.signers, relation, required };
 }
 
 // ------------------------------------------------------------------------------------------------ storage

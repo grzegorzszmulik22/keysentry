@@ -40,6 +40,11 @@ export interface AutopilotManagerOptions {
   teamPolicy?: () => TeamPolicy | null;
   /** Refuses while team governance blocks changes (untrusted roster, invalid policy, unmet requirement). */
   assertChanges?: () => Promise<void>;
+  /**
+   * True when this arming already runs under a met team quorum of `approvals.wideningAdmins` admins (the team
+   * dashboard's admin quorum, checked by `assertChanges`). Then a policy that asks for more than one admin can be met.
+   */
+  wideningApproved?: () => boolean;
 }
 
 export async function recordDrill(store: StateStore, result: { passed: boolean; at: Date }): Promise<void> {
@@ -184,10 +189,11 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     await opts.assertChanges?.();
     const policy = opts.teamPolicy?.() ?? null;
     // Arming more keys widens what may happen unattended. One device signs the plan, so a policy that wants more than
-    // one admin for widening changes cannot be met here: refuse rather than arm with fewer approvals than it asks for.
+    // one admin for widening changes cannot be met at a terminal: refuse rather than arm with fewer approvals than it
+    // asks for. On the team dashboard the arm request collects that many admins' passkey approvals first.
     const widening = policy?.approvals.wideningAdmins ?? 1;
-    if (widening > 1) {
-      throw new CliError(`The team policy says policy-widening changes such as arming need ${widening} admins, and arming is signed by one admin's device. Arming is paused until a policy with approvals.wideningAdmins: 1 is signed and applied.`);
+    if (widening > 1 && opts.wideningApproved?.() !== true) {
+      throw new CliError(`The team policy says policy-widening changes such as arming need ${widening} admins, and arming at a terminal is signed by one admin's device. Arm on the team dashboard, where ${widening} admins approve it, or sign and apply a policy with approvals.wideningAdmins: 1.`);
     }
     const policyReason = (cluster: Cluster): string | null =>
       autopilotRefusal({ provider: cluster.provider, hosts: [...new Set(cluster.consumers.map(consumer => consumer.service.host))] }, policy);

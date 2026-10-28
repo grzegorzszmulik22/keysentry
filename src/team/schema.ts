@@ -7,6 +7,8 @@ export const MAX_MEMBERS = 200;
 export const MAX_PASSKEYS_PER_MEMBER = 10;
 export const MAX_DEVICE_KEYS_PER_MEMBER = 10;
 export const MAX_SIGNATURES = 400;
+/** Channel ids kept as retired (member-owned, routed nothing) in one roster. */
+export const MAX_RETIRED_CHANNELS = 1000;
 /** Roster and policy files are small; anything larger is refused before parsing. */
 export const MAX_TEAM_FILE_BYTES = 1024 * 1024;
 
@@ -20,6 +22,18 @@ const base64url = z.string().min(1).max(65536).regex(/^[A-Za-z0-9_-]+$/)
   .refine(value => Buffer.from(value, 'base64url').toString('base64url') === value);
 export const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/).refine(value => Number.isFinite(Date.parse(value)));
 export const sha256Hex = z.string().regex(/^[a-f0-9]{64}$/);
+/**
+ * Email addresses are compared after lower-casing ASCII letters only. Unicode case folding would map different
+ * addresses onto one (KELVIN SIGN lower-cases to "k"), and roster emails are ASCII-only.
+ */
+export function foldEmail(value: string): string {
+  return value.replace(/[A-Z]/g, letter => letter.toLowerCase());
+}
+/** True for an address made only of printable ASCII (the only kind a roster can hold). */
+export function asciiEmail(value: string): boolean {
+  return /^[\x21-\x7e]{1,254}$/.test(value);
+}
+
 export const emailSchema = z.string().max(254)
   .regex(/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/);
 
@@ -87,12 +101,20 @@ export const rosterSchema = z.object({
   updatedAt: isoDate,
   members: z.array(memberSchema).min(1).max(MAX_MEMBERS),
   adminThreshold: z.number().int().min(1).max(MAX_MEMBERS),
+  /** Sorted and unique, so one roster has one spelling. */
+  retiredChannels: z.array(z.string().regex(channelIdPattern)).min(1).max(MAX_RETIRED_CHANNELS)
+    .refine(values => values.every((value, index) => index === 0 || values[index - 1]! < value)).optional(),
 }).strict();
+
+/** Exactly one spelling per signature: the canonical base64 of 64 bytes (the unused low bits must be zero). */
+export function canonicalSignature(value: string): boolean {
+  return /^[A-Za-z0-9+/]{86}==$/.test(value) && Buffer.from(value, 'base64').toString('base64') === value;
+}
 
 export const signatureSchema = z.object({
   memberId: z.string().regex(memberIdPattern),
   keyId: z.string().regex(/^[a-f0-9]{16}$/),
-  sig: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
+  sig: z.string().refine(canonicalSignature),
 }).strict();
 
 export const signedRosterSchema = z.object({
@@ -121,6 +143,10 @@ export function rosterProblem(roster: z.infer<typeof rosterSchema>): string | nu
   if (new Set(emails).size !== emails.length) return 'Two members share the same email.';
   const identities = roster.members.flatMap(member => member.sso === undefined ? [] : [`${member.sso.issuer}\n${member.sso.subject}`]);
   if (new Set(identities).size !== identities.length) return 'Two members share the same single sign-on identity.';
+  if (roster.retiredChannels) {
+    const assigned = new Set(roster.members.flatMap(member => member.notify?.channels ?? []));
+    if (roster.retiredChannels.some(channel => assigned.has(channel))) return 'A retired notification channel is still assigned to a member.';
+  }
   const admins = roster.members.filter(member => member.role === 'admin');
   if (!admins.length) return 'A team needs at least one admin.';
   if (roster.adminThreshold > admins.length) return 'The admin threshold is higher than the number of admins.';
@@ -138,6 +164,11 @@ export function parseSignedRoster(input: unknown): { ok: true; value: SignedTeam
   if (!parsed.success) return { ok: false, reason: 'The roster is not a valid signed team roster (wrong type, unknown field, or invalid value).' };
   const problem = rosterProblem(parsed.data.roster);
   if (problem) return { ok: false, reason: problem };
+  // Review L3: one authenticator key under two credential ids (for example another member's public key, copied from a
+  // roster export) would let a single assertion verify as two credentials or two members. Every signed roster that is
+  // verified, proposed, applied or loaded passes here.
+  const passkeyKeys = parsed.data.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.publicKeyCose));
+  if (new Set(passkeyKeys).size !== passkeyKeys.length) return { ok: false, reason: 'The same passkey public key is listed more than once.' };
   const seen = new Set<string>();
   for (const signature of parsed.data.signatures) {
     const key = `${signature.memberId}:${signature.keyId}`;

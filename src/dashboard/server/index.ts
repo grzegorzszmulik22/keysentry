@@ -1,6 +1,7 @@
 export { startDashboard } from './server.js';
 export type { DashboardOptions } from './server.js';
 export type { DashboardApi, DashboardRequestContext } from './api.js';
+export { DashboardAccepted } from './api.js';
 export type { PasskeyStore } from './passkey-gate.js';
 export type { TeamAuthEvent, TeamDashboardOptions, TeamEnrollmentHooks } from './team-server.js';
 export {

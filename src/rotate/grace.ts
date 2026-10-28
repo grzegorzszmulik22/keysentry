@@ -55,6 +55,16 @@ function graceDeadline(entries: JournalEntry[], clusterId: string): string | und
   return undefined;
 }
 
+/** Review M1: has the old key been kept for the team policy's minimum grace period, counted from its first grace-start? */
+function minimumGracePassed(entries: JournalEntry[], clusterId: string, minGraceMs: number | undefined, at: Date): boolean {
+  if (!minGraceMs || minGraceMs <= 0) return true;
+  const first = entries.find(entry => entry.event === 'grace-start' && (entry.clusterId === clusterId || entry.clusterId === undefined
+    && (!Array.isArray(entry.data?.clusters) || entry.data.clusters.some(cluster => cluster === clusterId
+      || (cluster !== null && typeof cluster === 'object' && cluster.clusterId === clusterId)))));
+  const started = first ? Date.parse(first.at) : Number.NaN;
+  return Number.isFinite(started) && at.getTime() >= started + minGraceMs;
+}
+
 function nextDeployRules(entries: JournalEntry[], clusterId: string): { host: string; revokeAfterMax: boolean }[] | undefined {
   const entry = [...entries].reverse().find(candidate => candidate.clusterId === clusterId && candidate.event === 'grace-start');
   if (entry?.data?.reason !== 'next-deploy') return undefined;
@@ -183,7 +193,7 @@ export async function finishRotation(
     if (unfinishedUndo(entries, step)) return false;
     const deadline = graceDeadline(entries, step.clusterId)!;
     return Number.isFinite(Date.parse(deadline)) && (now().getTime() >= Date.parse(deadline)
-      || opts.early === true && nextDeployRules(entries, step.clusterId) === undefined);
+      || opts.early === true && nextDeployRules(entries, step.clusterId) === undefined && minimumGracePassed(entries, step.clusterId, opts.minGraceMs, now()));
   }).flatMap(step => step.consumers.map(consumer => serviceKey(consumer.service))));
   const currentVariables = new Map<string, RawVariable[] | null>();
   let railwayNamespace: ServiceRef[] | null | undefined;
@@ -352,6 +362,8 @@ export async function finishRotation(
       blocked = true;
     }
     else if (!Number.isFinite(Date.parse(deadline))) { warning = 'The saved grace deadline is unavailable; the old key is retained.'; blocked = true; }
+    else if (now().getTime() < Date.parse(deadline) && opts.early === true && acceptedNextDeploy === undefined
+      && !minimumGracePassed(entries, clusterId, opts.minGraceMs, now())) warning = 'The team policy keeps old keys for a minimum grace period, which has not passed; the old key is retained.';
     else if (now().getTime() < Date.parse(deadline) && (opts.early !== true || acceptedNextDeploy !== undefined)) warning = 'The grace period deadline has not passed; the old key is retained.';
     else expired = true;
     if (expired && acceptedNextDeploy !== undefined && (acceptedNextDeploy.length === 0 || acceptedNextDeploy.some(rule => !rule.revokeAfterMax))) {

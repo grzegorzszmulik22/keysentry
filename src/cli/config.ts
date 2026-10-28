@@ -172,7 +172,7 @@ export const configSchema = z.object({
   network: z.object({
     allowHosts: z.array(exactHostname).default([]),
     /** Phase 5: an HTTP(S) proxy for every outbound request (HTTPS_PROXY is also honoured), hosts that bypass it, and
-     * a PEM bundle trusted in addition to the system roots. */
+     * a PEM bundle trusted in addition to Node's default roots. */
     proxy: safeUrl.refine(value => { const url = new URL(value); return !url.pathname.replace(/^\/$/, '') && !url.search && !url.hash; }).optional(),
     noProxy: z.array(exactHostname).default([]),
     caFile: nonempty.optional(),

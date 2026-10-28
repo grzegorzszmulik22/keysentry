@@ -188,7 +188,7 @@ network:
 - **Fail closed.** A proxy, CA file or team policy setting that cannot be used refuses every request with a fixed message; keysentry never silently connects directly. `keysentry doctor` explains the problem, and `keysentry network` shows the current proxy, CA and offline state above the allowed hosts.
 - **Deployed watcher.** `watcher setup` puts the certificates from `network.caFile` (the certificates, not the path) into the encrypted deployment vault, and with `network.proxy` also the proxy credential: `KEYSENTRY_PROXY_AUTH` from the vault, or the one in `HTTPS_PROXY` after you confirm. A file that cannot be read stops setup. The watcher uses `network.proxy` and `network.noProxy` as configured, so it must be able to reach that proxy; for a hosted platform outside your network, remove `network.proxy` before setup. `HTTPS_PROXY` from your terminal is not carried; set it in the watcher's environment if it needs one. A watcher whose proxy or CA settings cannot be used answers `/healthz` with HTTP 503, and `keysentry watcher status` reports it unhealthy.
 - **Offline mode.** keysentry stops polling breach feeds and security news, and removes their hosts from the allowed list as a backstop. Autopilot waves start only from feed incidents, so they never start; alerts and automatic actions come only from your own signals (GitHub secret-scanning alerts, canaries, keys revoked upstream and usage anomalies). Provider and host APIs, notifications and health checks keep working, and you can still rotate any key yourself. `watcher setup` carries offline mode into the deployed watcher. `doctor`, `network`, `watch`, `monitor` and `watcher status` say when it is on.
-- **Not proxied:** syslog audit export and the cloud box, which has its own egress. Syslog cannot be tunnelled, so it refuses a host that HTTPS requests would send through the proxy (the same proxy and no-proxy decision); add the host to `noProxy` (exactly, or as `.suffix`) to allow a direct TLS connection. A team policy that requires the proxy refuses syslog export entirely.
+- **Not proxied:** syslog audit export and the cloud box, which has its own egress. `keysentry box send-tokens` leaves `network.proxy` and `network.noProxy` out of the box's deployment (the box reaches provider APIs from Google's network and cannot reach your proxy) and says so; the certificates from `network.caFile` are kept. A team policy with `requireProxy` refuses to send tokens to a cloud box. Syslog cannot be tunnelled, so it refuses a host that HTTPS requests would send through the proxy (the same proxy and no-proxy decision); add the host to `noProxy` (exactly, or as `.suffix`) to allow a direct TLS connection. A team policy that requires the proxy refuses syslog export entirely.
 
 ## Verify and audit
 
@@ -514,7 +514,7 @@ keysentry disarm
 keysentry disarm --relay
 ```
 
-Local disarm sets the saved off-state. With `--relay`, it also publishes a device-signed disarm bound to that watcher. A successful command confirms publication; the watcher applies it on its next check and polls again between automatic engine steps. Authenticated disarms have no age deadline, but transport can still delay or suppress them, so check the watcher's status. Disarming needs no passkey. The approval server also has a Disarm page. Disarm stops new automatic effects and grace settlement; old keys that have not yet been revoked stay valid. It does not restore a key already revoked.
+Local disarm sets the saved off-state. With `--relay`, it also publishes a device-signed disarm bound to that watcher. A successful command confirms publication; the watcher applies it on its next check and polls again between automatic engine steps. Authenticated disarms have no age deadline, but transport can still delay or suppress them, so check the watcher's status. Disarming at a terminal or on the local dashboard needs no passkey; on the team dashboard it needs the member's own passkey (a sign-in session alone cannot turn autopilot off) and the team's channels are told who disarmed. Disarming never waits for a quorum. The approval server also has a Disarm page. Disarm stops new automatic effects and grace settlement; old keys that have not yet been revoked stay valid. It does not restore a key already revoked.
 
 Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-arming requires the local human CLI or a passkey-gated local dashboard action and a new signed plan. When the watcher's own host has an incident, it still rotates or requests approval for the other covered keys and names operating credentials that need local rotation. It does not automatically replace its own operating credentials.
 
@@ -523,20 +523,20 @@ Set `KEYSENTRY_ALERT_ONLY=1` on the watcher to force alert-only operation. Re-ar
 Team mode is part of the open core (Apache-2.0, no licence checks). A team shares one signed **roster** (who is on the
 team, their roles, device keys and passkeys) and, optionally, one signed **policy file** (rules that only narrow what
 keysentry may do). Both live beside your project: the roster in encrypted state, the policy as a JSON file you can
-commit. Admins sign changes with their computer's device key; a change needs the roster's admin threshold of
-signatures.
+commit. Admins sign changes with their own computer's device key.
 
 **Roles.**
 
 | Role | Can |
 |------|-----|
 | viewer | read the team dashboard and approval requests |
-| operator | also approve rotations (with their own passkey or device key) and disarm autopilot |
-| admin | also sign roster and policy changes, arm autopilot, and change settings, notification channels and vault entries on the team dashboard |
+| operator | also ask for and approve rotations, finishes, undos, spending limits and dismissals (each with their own passkey or device key), and disarm autopilot with their own passkey |
+| admin | also sign roster and policy changes on their own computer, and ask for and approve arming, settings, notification channels, vault entries and reveals on the team dashboard |
 
 Roles decide who may approve, what the team dashboard allows, and whose signatures count. Someone running keysentry on
 their own computer with their own host tokens is still governed by the team policy there, but not by roles: the roster
-cannot take tokens away from a person who holds them.
+cannot take tokens away from a person who holds them. The same holds for the team dashboard's host: anyone with a
+terminal there can use the tokens in its vault, so protect that host like the tokens themselves.
 
 **Joining a team.**
 
@@ -545,29 +545,35 @@ keysentry team init --id ana --name Ana --email ana@example.com    # this comput
 keysentry team card -o ben.json                                    # on Ben's computer: public keys only
 keysentry team add ben --role operator --card ben.json --email ben@example.com
 keysentry team export -o roster.json                               # send roster.json to Ben, then on his computer:
-keysentry team apply roster.json --fingerprint 3f9a-12c4-77d0-ab18 # read the fingerprint (team list) to Ben by phone or chat
+keysentry team apply roster.json --fingerprint 3f9a-12c4-77d0-ab18-0c2e-9d41-5b7a-e630   # read it out by phone or chat
 keysentry team list                                                # members, roles and the fingerprint
 keysentry team verify                                              # roster, team mode and policy; exit 1 when changes are paused
 ```
 
-A computer with no roster trusts the first one it applies only when you give it the fingerprint an admin read to you:
-signatures alone cannot protect a first use, because whoever writes a roster also chooses its admin keys. After that,
-each new version must extend the one in use (rollback and fork protection) and is checked against a copy of the
-applied version in your vault, so an older state file copied back is refused.
+A computer with no roster trusts the first one it applies only when you give it the fingerprint an admin read to you
+(the first 128 bits of the roster's hash): signatures alone cannot protect a first use, because whoever writes a roster
+also chooses its admin keys. After that, each new version must extend the one in use (rollback and fork protection)
+and is checked against a copy of the applied version in your vault, so an older state file copied back is refused. An
+environment-variable vault (CI) cannot keep that copy, so there the encrypted state file is the only record.
 
-**Signing changes.** With an admin threshold of 1, `team add`, `remove`, `role`, `notify`, `sso`, `add-passkey` and
-`threshold` sign and apply at once. Above 1, they write a proposal with your signature; other admins review it and run
-`keysentry team sign <file>` on their own computers, and anyone applies it with `keysentry team apply <file>` once it
-has enough signatures. The signatures that count are those of the admins of the version being replaced: a removed admin
-cannot sign the next version, a new admin cannot vote for their own addition, and lowering the threshold still needs the
-old number of signatures.
+**Signing changes.** A roster change needs the signatures of as many admins of the version being replaced as the
+roster's admin threshold, or as the applied policy's `approvals.wideningAdmins` when that is higher (adding or promoting
+a member widens who can approve). When one signature is enough, `team add`, `remove`, `role`, `notify`, `sso`,
+`add-passkey` and `threshold` sign and apply at once. Otherwise they write a proposal with your signature; other admins
+review it and run `keysentry team sign <file>` on their own computers, and anyone applies it with `keysentry team apply
+<file>` once it has enough signatures. A removed admin cannot sign the next version, a new admin cannot vote for their
+own addition, lowering the threshold still needs the old number of signatures, and a change that would leave fewer
+admins with device keys than the policy's `wideningAdmins` is refused (nothing could be signed after it). When one
+admin's signature can add an operator while the policy needs more than one approver, `team add` and `team role` warn
+that this admin could add a member whose key they hold and then meet the quorum alone.
 
 **Policy file.** Write a draft, sign it, apply it:
 
 ```json
 {
-  "approvals": { "required": 2, "requiredByTier": { "crypto": 3 }, "wideningAdmins": 1 },
-  "autopilot": { "allowedHosts": ["railway", "vercel"], "allowedProviders": ["openai", "openrouter"], "maxServicesPerWave": 5 },
+  "approvals": { "required": 2, "requiredByTier": { "crypto": 3 }, "wideningAdmins": 2 },
+  "autopilot": { "allowedHosts": ["railway", "vercel"], "allowedProviders": ["openai", "openrouter"], "maxServicesPerWave": 5,
+    "allowMonitorAutomation": false },
   "network": { "offline": true, "allowHosts": ["hooks.example.com", "idp.example.com"], "requireProxy": true },
   "notify": { "allowedKinds": ["slack", "smtp"] },
   "rotation": { "revoke": "after-deploy", "minGraceSeconds": 900 },
@@ -583,64 +589,105 @@ keysentry policy show                      # the rules in plain English
 
 Every rule only narrows: approvals need that many different operators or admins (the strictest tier of the keys
 involved); autopilot arms only the listed hosts and providers, with at most that many services per wave and at least
-that grace period; `network.offline` turns on offline mode; `network.allowHosts` drops destinations you added
-(webhooks, health checks, feeds, the relay, ntfy and SMTP servers, audit export targets, single sign-on hosts) that it
-does not list; `requireProxy` sends every request through your proxy and ignores no-proxy lists; `notify.allowedKinds`
-drops other channels; `rotation` lowers revocation and raises grace; `audit.exportRequired` pauses changes until an
-audit export is configured. A policy needs the roster's admin threshold of signatures from current admins, so after
-removing an admin who signed it, sign it again as a new version. While the roster, the policy file or a policy
-requirement cannot be verified, keysentry pauses every change ("Changes are paused. …"), including approvals, arming
-and watcher setup; disarming always works. Turning `team.enabled` off under an applied roster also pauses changes: it
-never falls back to single-user mode. Arming is signed by one admin's device, so a policy with `wideningAdmins` above 1
-pauses arming.
+that grace period; the monitor's automatic rotation and containment (`monitor.autoExecute`, `monitor.autoContain`,
+their `KEYSENTRY_AUTO_*` overrides, and revoking unconfirmed keys on high-confidence signals) are turned off unless the
+policy sets `autopilot.allowMonitorAutomation: true`, and even then they stay inside the listed hosts, providers and
+`approvalTiers` (other keys wait for an approval); `network.offline` turns on offline mode; `network.allowHosts` drops
+destinations you added (webhooks, health checks, feeds, the relay, ntfy and SMTP servers, audit export targets, single
+sign-on hosts) that it does not list; `requireProxy` sends every request through your proxy and ignores no-proxy lists;
+`notify.allowedKinds` drops other channels; `rotation` lowers revocation and raises grace, and with `minGraceSeconds`
+neither `rotate --revoke immediately`, the "revoke now" answer at the grace prompt, nor `keysentry finish --now` (the
+dashboard's early revoke) revokes an old key before it has been kept that long; `audit.exportRequired` pauses changes
+until an audit export is configured.
 
-**Approvals with a quorum.** When the policy needs two approvals, the first operator's approval is recorded, not run:
+The first policy needs the roster's admin threshold of signatures from current admins. A new version needs the
+policy in force's `approvals.wideningAdmins` admins too, so a policy cannot relax its own rules with fewer signatures
+than they require. After removing an admin who signed the policy in force, sign it again as a new version. While the
+roster, the policy file or a policy requirement cannot be verified, keysentry pauses every change ("Changes are paused.
+…"), including approvals, arming and watcher setup; disarming always works. Turning `team.enabled` off under an applied
+roster also pauses changes: it never falls back to single-user mode. Arming at a terminal is signed by one admin's
+device, so there a policy with `wideningAdmins` above 1 pauses arming; on the team dashboard the arm request collects
+that many admins' approvals first.
+
+**Approvals with a quorum.** When the policy needs two approvals, the first approval is recorded, not run:
 `keysentry approve <id>` prints "Your approval was recorded: 1 of 2 team approvals so far… 1 more approval from a team
-operator or admin who has not approved yet." and exits 0; the dashboard and the watcher's approval page show the count.
-The action runs when a different member approves. The same member or the same passkey cannot count twice, viewers and
-people outside the roster are refused, and a member removed or demoted before the quorum is met stops counting. Monitor
-actions use the same quorum in team mode.
+operator or admin who has not approved yet." and exits 0; the dashboard and the watcher's approval page show the count,
+which includes only approvers who still qualify under the current roster. The action runs when a different member
+approves. The same member or the same passkey cannot count twice, viewers and people outside the roster are refused,
+and a member removed or demoted before the action runs stops counting. Monitor actions use the same quorum in team
+mode. A request that recorded a quorum is never approved by a single approval because the roster stopped being
+visible on that computer; approvals pause instead.
+
+**Team dashboard changes run under the quorum.** On the team dashboard nothing changes because one member pressed a
+button. A rotation, finish, undo, spending limit or dismissal (operators), or an arm, settings, notification channel,
+vault or reveal change (admins), confirmed with the member's own passkey, becomes a team request bound to exactly that
+change and counts as that member's approval; the dashboard answers "recorded: 1 of 2" and nothing runs yet. Other
+members approve it on the Approvals screen with their own passkeys. Operator changes need `approvals.required`
+operators or admins (by the risk tier of the keys involved); admin changes need `approvals.wideningAdmins` admins (the
+roster's threshold without a policy). The change runs when the last approval arrives, as that member, after
+keysentry checks the approvals again against the current roster and policy. Changes that carry a secret (storing a
+token, adding a channel) and reveals are not kept with the request: after the approval, the member who asked makes the
+same change again and it runs then; a revealed value only ever reaches that member's browser. Each approved request
+runs once. A reveal and a disarm are announced on the team's notification channels with the member's name.
 
 **Team dashboard with single sign-on.** `keysentry ui --team --public-origin https://keysentry.example.com
 --oidc-issuer https://idp.example.com --oidc-client-id keysentry` serves the dashboard behind your TLS proxy (keep the
-`Host` header unchanged and rate-limit `/auth/*` and `/enroll/*` there). Register `https://keysentry.example.com/auth/callback`
-as the redirect URI (scopes `openid email`) and store a confidential client's secret with `keysentry vault set
-KEYSENTRY_OIDC_CLIENT_SECRET`, or use `--oidc-public-client`. Members sign in by verified email until an admin pins
-their identity provider identity: the dashboard's Account page shows the issuer and subject, and
+`Host` header unchanged and rate-limit `/auth/*` and `/enroll/*` there). It refuses to start on a computer whose device
+key belongs to a team admin: the dashboard faces the internet, and an admin key there would let anyone with a terminal
+on that host sign roster and policy changes and approve as that admin. Run it on a computer that joined with `team
+apply` and keep admin keys on admins' own computers. Register `https://keysentry.example.com/auth/callback` as the
+redirect URI (scopes `openid email`) and store a confidential client's secret with `keysentry vault set
+KEYSENTRY_OIDC_CLIENT_SECRET`, or use `--oidc-public-client`. Members sign in by verified email (ASCII addresses only,
+compared without case) until an admin pins their identity provider identity: the dashboard's Account page shows the
+issuer and subject, and
 
 ```sh
 keysentry team sso ben --issuer https://idp.example.com --subject 00u1abcd2EFGH3ijk4l5
 ```
 
 signs it into the roster. From then on only that exact issuer and subject sign in as Ben; a reassigned email address is
-refused. Every change on the team dashboard still needs the member's own passkey for the dashboard's host:
+refused. Every change on the team dashboard needs the member's own passkey for the dashboard's host:
 
 ```sh
-keysentry team invite ben --origin https://keysentry.example.com   # prints a single-use link, valid 15 minutes
-keysentry team passkeys pending                                    # after Ben opens it: member, credential id, time, authenticator
-keysentry team add-passkey ben <credential-id>                     # a signed roster change, like any other
+# On an admin's computer: a link signed with the admin's device key, valid 15 minutes, for one member and one address.
+keysentry team invite ben --origin https://keysentry.example.com
+# On the dashboard host, after Ben opened it (or download the card from the dashboard's Account page as an admin):
+keysentry team passkeys pending -o passkeys.json
+# Back on the admin's computer: compare the fingerprint with Ben, then sign the roster change; apply it on the host.
+keysentry team add-passkey ben --card passkeys.json
 ```
 
-The link's token is in the URL fragment, so browsers never send it in a request line or log it; the page posts it. The
-passkey Ben creates there is only a candidate: it grants nothing until the signed roster lists it, and it can only go
-on the card of the member whose link created it. Links work once, expire after 15 minutes, are bound to one member and
-one dashboard address, and are stored only as hashes. Enrollment is rate-limited, exists only on the team dashboard,
-and is the only page that may create a credential; the local dashboard never registers passkeys.
+The dashboard host never needs an admin's key: it checks the link's signature against the roster's current admins,
+its expiry and its own address, and remembers each link once used (as a hash). The link is in the URL fragment, so
+browsers never send it in a request line or log it; the page posts it. The passkey Ben creates there is only a
+candidate: it grants nothing until the signed roster lists it, and it can only go on the card of the member whose link
+created it. The authenticator model a candidate shows is reported by the authenticator itself and not verified.
+Enrollment is rate-limited, exists only on the team dashboard, and is the only page that may create a credential; the
+local dashboard never registers passkeys.
 
 **What the identity provider can and cannot do.** It decides who can open the team dashboard and read it at their
-role. It cannot approve, arm, change settings or reveal values: those need the member's own passkey from the signed
-roster. It cannot add members, change roles or add passkeys: those are roster changes signed by admins' device keys.
-An operator's identity-provider session alone allows disarm and the read-only checks, as intended. A compromised
-provider can therefore read what a member can read and disarm autopilot, but not change keys.
+role. It cannot approve, ask for changes, arm, disarm, change settings or reveal values: those need the member's own
+passkey from the signed roster, and changes also need the team's quorum. It cannot add members, change roles or add
+passkeys: those are roster changes signed by admins' device keys. A compromised provider can therefore read what a
+member can read, but not change keys or turn autopilot off.
 
 **Notifications per member.** `keysentry team notify ben --channels ops --min-severity urgent` sends a channel that
 members are assigned to only messages at or above the lowest severity among them; channels assigned to nobody receive
-everything. The watcher applies the routing and the policy's channel kinds.
+everything. A channel that a member received stays member-owned when nobody receives it any more: the roster lists it
+as retired and no computer sends it team messages, so a removed member's own chat never becomes a team-wide channel.
+`team remove` and `team notify --clear` refuse while the member has channels no other member receives, unless
+`--drop-channels` also removes them from `keysentry.yaml` on that computer. The watcher applies the routing and the
+policy's channel kinds.
+
+**Who did it.** Every audit event a team dashboard request causes records the signed-in member (`memberId`), and audit
+exports carry it as the record's `actor`. Sign-ins, approvals and quorum progress name members too.
 
 **Watchers.** `keysentry watcher setup` seals the verified roster and policy into the watcher's config, so a deployed
 watcher counts members' roster passkeys and device keys toward the quorum, accepts disarms from operators' device keys,
-routes notifications, and stops acting on an armed plan that falls outside the policy. Run `watcher setup` again after
-a roster or policy change.
+routes notifications, and stops acting on an armed plan that falls outside the policy. A deployed watcher or cloud box
+keeps the roster and policy it was set up with: a member you remove can still approve and disarm there until you run
+`keysentry watcher setup` again (and `keysentry box send-tokens` for a cloud box). `team remove` and `team role` remind
+you when a watcher or box is known.
 
 ## Safety model and limitations
 

@@ -239,3 +239,64 @@ describe('team quorum', () => {
     }
   });
 });
+
+describe('review fixes: stored quorums, admin quorums, run-time checks and honest counts', () => {
+  test('L1: a request that recorded a quorum is never approved alone once the team stops being visible', async () => {
+    const approvals = service();
+    const request = await approvals.request(action, false);
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(cat, request.challenge))).rejects.toBeInstanceOf(ApprovalPendingError);
+    roster = null;
+    local = [cat.credential, dan.credential];
+    const gone = /team roster is not available here, so approvals are paused/;
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(dan, request.challenge, 1))).rejects.toThrow(gone);
+    await expect(approvals.approveWithDevice(action.id, device(request, dan.key))).rejects.toThrow(gone);
+    await expect(approvals.challenge(action.id)).rejects.toThrow(gone);
+    expect(await approvals.status(action.id)).toBe('pending');
+  });
+
+  test('an admin quorum takes wideningAdmins admins, each with a passkey; operators are refused', async () => {
+    const approvals = service();
+    const reveal = { ...action, id: 'reveal-one', kind: 'dashboard:reveal' };
+    const request = await approvals.request(reveal, false, { admins: true });
+    expect(await approvals.describe('reveal-one')).toMatchObject({ quorum: { approvals: 0, required: 2 } });
+    // The same pending action cannot be requested again with the weaker operator rule.
+    await expect(approvals.request(reveal, false)).resolves.toMatchObject({ digest: request.digest });
+    expect(await approvals.describe('reveal-one')).toMatchObject({ quorum: { required: 2 } });
+    await expect(approvals.approveWithPasskey('reveal-one', assertionFor(cat, request.challenge))).rejects.toThrow('This change needs approval from team admins.');
+    await expect(approvals.approveAsMember('reveal-one', { memberId: 'ana', credentialId: ana.credential.id }, request.digest)).rejects.toBeInstanceOf(ApprovalPendingError);
+    const grant = await approvals.approveAsMember('reveal-one', { memberId: 'ben', credentialId: ben.credential.id }, request.digest);
+    expect(grant.approvers?.map(approver => approver.memberId)).toEqual(['ana', 'ben']);
+  });
+
+  test('checkGrant re-checks approvers against the current roster and policy when the action runs', async () => {
+    const approvals = service();
+    const request = await approvals.request(action, false);
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(cat, request.challenge))).rejects.toBeInstanceOf(ApprovalPendingError);
+    await approvals.approveWithPasskey(action.id, assertionFor(dan, request.challenge));
+    expect((await approvals.checkGrant(action.id, request.digest)).approvers).toHaveLength(2);
+    await expect(approvals.checkGrant(action.id, 'f'.repeat(64))).rejects.toThrow('This action has no approval to run. Request it again.');
+    // A raised requirement applies to a grant that has not run yet.
+    policy = policyWith({ required: 3, wideningAdmins: 2 });
+    await expect(approvals.checkGrant(action.id, request.digest)).rejects.toThrow('The approvals for this action no longer meet the team policy (2 of 3 still count). Ask team members to approve it again.');
+    policy = policyWith({ required: 2, wideningAdmins: 2 });
+    // Dan is demoted to viewer: his approval stops counting.
+    roster = rosterOf([ana, ben, cat, { ...dan, member: { ...dan.member, role: 'viewer' } }, vic]);
+    await expect(approvals.checkGrant(action.id, request.digest)).rejects.toThrow(/\(1 of 2 still count\)/);
+    roster = null;
+    await expect(approvals.checkGrant(action.id, request.digest)).rejects.toThrow(/team roster is not available here/);
+    roster = rosterOf([ana, ben, cat, dan, vic]);
+    await approvals.markExecuted(action.id, request.digest);
+    await expect(approvals.checkGrant(action.id, request.digest)).rejects.toThrow('This action has no approval to run. Request it again.');
+  });
+
+  test('L5: "n of m" counts only approvers who still qualify', async () => {
+    const approvals = service();
+    const request = await approvals.request(action, false);
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(cat, request.challenge))).rejects.toBeInstanceOf(ApprovalPendingError);
+    expect(await approvals.describe(action.id)).toMatchObject({ quorum: { approvals: 1, required: 2 } });
+    roster = rosterOf([ana, ben, dan, vic]);
+    expect(await approvals.describe(action.id)).toMatchObject({ quorum: { approvals: 0, required: 2 } });
+    teamFails = true;
+    expect(await approvals.describe(action.id)).toMatchObject({ quorum: { approvals: 0, required: 2 } });
+  });
+});

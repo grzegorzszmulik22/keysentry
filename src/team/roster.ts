@@ -6,7 +6,9 @@ import { CliError } from '../cli/errors.js';
 import type { StateStore } from '../core/store.js';
 import type { DeviceKey } from '../security/index.js';
 import type { NotifySeverity, PasskeyCredential, SignedTeamRoster, TeamMember, TeamRole, TeamRoster, Vault } from '../types.js';
-import { keyIdFor, parseSignedRoster, ROLE_RANK, rosterProblem, rosterSchema, MAX_MEMBERS, memberIdPattern, teamIdPattern } from './schema.js';
+import {
+  asciiEmail, foldEmail, keyIdFor, parseSignedRoster, ROLE_RANK, rosterProblem, rosterSchema, MAX_MEMBERS, MAX_RETIRED_CHANNELS, memberIdPattern, teamIdPattern,
+} from './schema.js';
 import { documentHash, fingerprint, fingerprintMatches, signTeamDocument, verifyTeamSignatures } from './signature.js';
 
 /** A refused team operation. Messages are fixed text (member ids are validated identifiers, never secrets). */
@@ -48,7 +50,7 @@ function member(input: NewMember): TeamMember {
   if (!memberIdPattern.test(input.id)) throw new TeamError('Member ids use lowercase letters, digits, - and _, start with a letter, and have at most 32 characters.');
   return {
     id: input.id, name: input.name, role: input.role,
-    ...(input.email === undefined ? {} : { email: input.email.toLowerCase() }),
+    ...(input.email === undefined ? {} : { email: foldEmail(input.email) }),
     ...(input.sso === undefined ? {} : { sso: { issuer: input.sso.issuer, subject: input.sso.subject } }),
     passkeys: clone(input.passkeys ?? []), deviceKeys: clone(input.deviceKeys ?? []),
     ...(input.notify ? { notify: { channels: [...input.notify.channels], minSeverity: input.notify.minSeverity } } : {}),
@@ -119,7 +121,39 @@ export function nextRoster(current: SignedTeamRoster, change: RosterChange, now:
     }
   }
   if (!Number.isSafeInteger(base.version + 1)) throw new TeamError('The roster version cannot be increased.');
-  return checked({ ...base, version: base.version + 1, prev: rosterHash(current), updatedAt: now.toISOString(), members, adminThreshold });
+  // A channel a member received stays member-owned once nobody is assigned to it: it is retired and routed nothing,
+  // rather than becoming a channel that receives every team message (review M5).
+  const assigned = new Set(members.flatMap(entry => entry.notify?.channels ?? []));
+  const retired = [...new Set([...base.retiredChannels ?? [], ...assignedChannels(base)])].filter(channel => !assigned.has(channel)).sort();
+  if (retired.length > MAX_RETIRED_CHANNELS) throw new TeamError(`A roster can keep at most ${MAX_RETIRED_CHANNELS} retired notification channels.`);
+  const { retiredChannels: _previous, ...rest } = base;
+  return checked({ ...rest, version: base.version + 1, prev: rosterHash(current), updatedAt: now.toISOString(), members, adminThreshold,
+    ...(retired.length ? { retiredChannels: retired } : {}) });
+}
+
+function assignedChannels(roster: TeamRoster): string[] {
+  return roster.members.flatMap(entry => entry.notify?.channels ?? []);
+}
+
+/** Channels routed to `memberId` that no other member receives (they would be retired if the member left). */
+export function exclusiveChannels(roster: TeamRoster, memberId: string): string[] {
+  const target = roster.members.find(entry => entry.id === memberId);
+  if (!target?.notify) return [];
+  const others = new Set(roster.members.filter(entry => entry.id !== memberId).flatMap(entry => entry.notify?.channels ?? []));
+  return target.notify.channels.filter(channel => !others.has(channel));
+}
+
+/**
+ * Distinct admins of the roster in force that a roster or policy change needs: the roster's threshold, or the policy
+ * in force's `approvals.wideningAdmins` when that is higher (review H1).
+ */
+export function adminsNeeded(roster: Pick<TeamRoster, 'adminThreshold'>, wideningAdmins?: number): number {
+  return Math.max(roster.adminThreshold, wideningAdmins ?? 0);
+}
+
+/** Admins of `roster` who hold a device key, i.e. who could sign a later change. */
+function signingAdmins(roster: TeamRoster): number {
+  return roster.members.filter(entry => entry.role === 'admin' && entry.deviceKeys.length > 0).length;
 }
 
 /** Add this admin's signature. Signing never changes the document; a second signature by the same key is refused. */
@@ -135,12 +169,17 @@ export function signRoster(input: SignedTeamRoster | TeamRoster, memberId: strin
 
 export type RosterVerification = { ok: true; roster: SignedTeamRoster; hash: string; signers: string[] } | { ok: false; reason: string };
 
+/** The policy in force where a roster change is checked: its `approvals.wideningAdmins`, when a policy is applied. */
+export interface RosterRules { wideningAdmins?: number }
+
 /**
  * Version 1 must carry `adminThreshold` signatures by its own admins. Every later version must extend `previous`
- * (same team, version + 1, `prev` = hash of `previous`) and carry signatures from `previous.adminThreshold` admins of
- * `previous`: a removed admin cannot sign the next version, and a new admin cannot vote for their own addition.
+ * (same team, version + 1, `prev` = hash of `previous`) and carry signatures from `adminsNeeded(previous, wideningAdmins)`
+ * admins of `previous`: a removed admin cannot sign the next version, a new admin cannot vote for their own addition,
+ * and the policy's widening rule binds roster changes too (adding or promoting members widens who can approve).
+ * Under a policy, the new version must keep enough admins with device keys to sign the next change.
  */
-export function verifyRoster(input: unknown, previous: SignedTeamRoster | null): RosterVerification {
+export function verifyRoster(input: unknown, previous: SignedTeamRoster | null, rules: RosterRules = {}): RosterVerification {
   const parsed = parseSignedRoster(input);
   if (!parsed.ok) return parsed;
   const signed = parsed.value;
@@ -150,25 +189,33 @@ export function verifyRoster(input: unknown, previous: SignedTeamRoster | null):
     const check = verifyTeamSignatures(roster, signed.signatures, roster, roster.adminThreshold);
     return check.ok ? { ok: true, roster: signed, hash: rosterHash(signed), signers: check.signers } : { ok: false, reason: check.reason };
   }
-  const problem = linkProblem(roster, previous);
+  const problem = linkProblem(roster, previous) ?? deadlockProblem(roster, rules);
   if (problem) return { ok: false, reason: problem };
-  const check = verifyTeamSignatures(roster, signed.signatures, previous.roster, previous.roster.adminThreshold);
+  const check = verifyTeamSignatures(roster, signed.signatures, previous.roster, adminsNeeded(previous.roster, rules.wideningAdmins));
   return check.ok ? { ok: true, roster: signed, hash: rosterHash(signed), signers: check.signers } : { ok: false, reason: check.reason };
+}
+
+function deadlockProblem(roster: TeamRoster, rules: RosterRules): string | null {
+  const widening = rules.wideningAdmins ?? 0;
+  if (widening > 1 && signingAdmins(roster) < widening) {
+    return `After this change fewer admins with a device key would remain than the team policy's approvals.wideningAdmins (${widening}), so no later roster or policy change could be signed. Lower approvals.wideningAdmins in the policy first.`;
+  }
+  return null;
 }
 
 /**
  * A proposal that is still collecting signatures: it must already link to `previous`, and every signature it carries
- * must be valid and from an admin of `previous`. Only the threshold is not required yet.
+ * must be valid and from an admin of `previous`. Only the number of signatures is not required yet.
  */
-export function checkProposal(input: unknown, previous: SignedTeamRoster):
+export function checkProposal(input: unknown, previous: SignedTeamRoster, rules: RosterRules = {}):
   { ok: true; roster: SignedTeamRoster; signers: string[]; required: number } | { ok: false; reason: string } {
   const parsed = parseSignedRoster(input);
   if (!parsed.ok) return parsed;
-  const problem = linkProblem(parsed.value.roster, previous);
+  const problem = linkProblem(parsed.value.roster, previous) ?? deadlockProblem(parsed.value.roster, rules);
   if (problem) return { ok: false, reason: problem };
   const check = verifyTeamSignatures(parsed.value.roster, parsed.value.signatures, previous.roster, 0);
   if (!check.ok) return { ok: false, reason: check.reason };
-  return { ok: true, roster: parsed.value, signers: check.signers, required: previous.roster.adminThreshold };
+  return { ok: true, roster: parsed.value, signers: check.signers, required: adminsNeeded(previous.roster, rules.wideningAdmins) };
 }
 
 function linkProblem(roster: TeamRoster, previous: SignedTeamRoster): string | null {
@@ -233,7 +280,9 @@ export function teamDeviceKeys(roster: TeamRoster, minRole: TeamRole = 'viewer')
  * by email; their subject decides (`memberForSso`).
  */
 export function memberForEmail(roster: TeamRoster, email: string): TeamMember | undefined {
-  const wanted = email.toLowerCase();
+  // ASCII case only: a non-ASCII address never matches (it is a different mailbox, whatever it lower-cases to).
+  if (!asciiEmail(email)) return undefined;
+  const wanted = foldEmail(email);
   return roster.members.find(candidate => candidate.email === wanted && candidate.sso === undefined);
 }
 
@@ -304,6 +353,8 @@ export interface ApplyRosterOptions {
   anchor?: TeamAnchor;
   /** Required to accept a first roster other than one this computer created (`team init`). */
   trust?: { fingerprint: string };
+  /** The applied policy's `approvals.wideningAdmins`: a roster change needs that many admins when it is above the threshold. */
+  wideningAdmins?: number;
 }
 
 /** Replace the saved roster only with a verified extension of it; the same roster again is a no-op. */
@@ -323,7 +374,7 @@ export function applyRoster(store: StateStore, input: unknown, options: ApplyRos
     if (current) {
       const parsed = parseSignedRoster(input);
       if (parsed.ok && rosterHash(parsed.value) === current.hash) return { status: 'unchanged', roster: current.roster, hash: current.hash, previous: null, signers: [] };
-      result = verifyRoster(input, current.roster);
+      result = verifyRoster(input, current.roster, { wideningAdmins: options.wideningAdmins });
     } else result = options.trust ? verifyFirstUse(input, options.trust.fingerprint) : verifyRoster(input, null);
     if (!result.ok) throw new TeamError(result.reason);
     if (head && (result.roster.roster.version < head.version || (result.roster.roster.version === head.version && result.hash !== head.hash))) {
@@ -356,5 +407,7 @@ export function describeRosterChange(previous: TeamRoster | null, next: TeamRost
   }
   for (const entry of previous.members) if (!next.members.some(candidate => candidate.id === entry.id)) lines.push(`Remove ${entry.id} (${entry.role}).`);
   if (previous.adminThreshold !== next.adminThreshold) lines.push(`Admin signatures needed for changes: ${previous.adminThreshold} → ${next.adminThreshold}.`);
+  const newlyRetired = (next.retiredChannels ?? []).filter(channel => !(previous.retiredChannels ?? []).includes(channel));
+  if (newlyRetired.length) lines.push(`Stop sending team messages to ${newlyRetired.join(', ')} (no member receives ${newlyRetired.length === 1 ? 'it' : 'them'} any more).`);
   return lines.length ? lines : ['No membership changes.'];
 }

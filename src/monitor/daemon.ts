@@ -20,6 +20,8 @@ export interface MonitorContext extends Omit<DetectorContext,'state'> {
   breachFeedOptions?: BreachFeedOptions;
   github?: GithubOptions;
   usageOptions?: UsageOptions;
+  /** Team policy limits for automatic actions (hosts, providers, tiers); clusters outside them wait for approval. */
+  automaticAllowed?: (clusterId: string) => boolean;
 }
 
 function isStore(state: MonitorState|MonitorStateStore): state is MonitorStateStore { return 'load' in state; }
@@ -34,7 +36,7 @@ async function poll(ctx: MonitorContext): Promise<{signals:Signal[];decisions:De
     canaries:new Map(state.canaries.map(canary=>[canary.id,canary.triggeredAt])),
     feeds:{...state.seenFeedItems},github:{...state.seenGithubAlerts},verify:{...state.lastVerify},
   };
-  const actions:ActionContext={...detector,policy:ctx.policy,notifier:ctx.notifier,rotate:ctx.rotate,
+  const actions:ActionContext={...detector,policy:ctx.policy,notifier:ctx.notifier,rotate:ctx.rotate,automaticAllowed:ctx.automaticAllowed,
     ...(store ? {saveState:()=>store.save(state)}:{})};
   const signals:Signal[]=[];
   const decisions:Decision[]=[];
@@ -90,7 +92,7 @@ async function poll(ctx: MonitorContext): Promise<{signals:Signal[];decisions:De
     }
     for(const signal of signals) {
       try {
-        const selected=decide(signal,ctx.inventory,ctx.policy,state);
+        const selected=decide(signal,ctx.inventory,ctx.policy,state,ctx.automaticAllowed);
         decisions.push(...selected);
         await executeDecisions(selected,actions);
         acknowledgments.get(signal)?.();

@@ -1,4 +1,4 @@
-import { button, notice } from '../components.js';
+import { button, isTeamRequestRecorded, notice } from '../components.js';
 
 export function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, className?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -44,7 +44,11 @@ export function taskButton(label: string, feedback: HTMLElement, run: () => Prom
   const control = button(label, () => {
     if (control.disabled || disabledNow()) return;
     control.disabled = true; control.setAttribute('aria-busy', 'true');
-    void run().catch(() => { message(feedback, 'Request not completed', 'The request could not be completed. Try again.', 'attention'); })
+    void run().catch(error => {
+      // Team dashboard: a change waiting for other members' approvals is progress, not a failure.
+      if (isTeamRequestRecorded(error)) message(feedback, 'Request recorded', error.message, 'info');
+      else message(feedback, 'Request not completed', 'The request could not be completed. Try again.', 'attention');
+    })
       .finally(() => { control.disabled = disabledNow(); control.removeAttribute('aria-busy'); });
   });
   control.disabled = disabledNow(); return control;

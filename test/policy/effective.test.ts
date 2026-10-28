@@ -199,5 +199,9 @@ test('describePolicy summarises every rule in plain English', () => {
     notify: { allowedKinds: ['slack'] }, rotation: { revoke: 'never', minGraceSeconds: 600 }, audit: { exportRequired: true } }));
   expect(lines).toContain('Approvals: 2 operators or admins (crypto: 3); policy-widening changes: 2 admins.');
   expect(lines).toContain('Autopilot changes at most 1 service per wave.');
-  expect(lines).toHaveLength(12);
+  // Review H2: monitor automation is off unless the policy allows it.
+  expect(lines).toContain('The monitor never rotates or contains keys automatically; every monitor action waits for approval.');
+  expect(lines).toHaveLength(13);
+  expect(describePolicy(policy({ autopilot: { allowMonitorAutomation: true } }))).toContain(
+    'The monitor may rotate or contain keys automatically where keysentry.yaml turns that on, within the autopilot limits above.');
 });

@@ -112,14 +112,16 @@ export async function renderAutopilot(session: DashboardSession): Promise<HTMLEl
   const disarm = taskButton('Turn off autopilot', feedback, async () => {
     if (!await confirmAction({ title: 'Turn off autopilot', changes: ['keysentry will stop starting automatic rotations. Rotations already in progress keep their current status.'], button: 'Turn off autopilot', signal: scope.signal }) || scope.signal.aborted) return;
     ++coordination.offGeneration; coordination.turningOff = true; notify(); const pending = coordination.arming;
+    // The team dashboard asks for the member's own passkey, so a sign-in session alone cannot turn autopilot off.
+    const send = () => session.team ? postWithPasskey<{ state: 'disarmed' }>('autopilot/disarm', {}) : post<{ state: 'disarmed' }>('autopilot/disarm', {});
     try {
-      let result = await post<{ state: 'disarmed' }>('autopilot/disarm', {});
+      let result = await send();
       if (pending) {
         if (!scope.signal.aborted) { stateText.textContent = 'Autopilot is turning off while an earlier arming request finishes.'; message(feedback, 'Turning off autopilot', 'The current plan is disarmed. keysentry will turn it off again when the earlier arming request finishes.'); }
         // The passkey helper cannot cancel an assertion already in flight. Disarm immediately,
         // then repeat after that exact request settles so an earlier arm cannot be the last write.
         await pending.catch(() => {});
-        result = await post<{ state: 'disarmed' }>('autopilot/disarm', {});
+        result = await send();
       }
       state = { ...state, state: result.state, reasons: [], needsRefresh: false }; notify(state);
       if (!scope.signal.aborted) message(feedback, 'Autopilot disarmed', 'Automatic rotations are turned off.', 'ok');

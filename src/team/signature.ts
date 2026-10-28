@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson, signDetached, verifyDetached, type DeviceKey } from '../security/index.js';
 import type { TeamRoster, TeamSignature } from '../types.js';
-import { keyIdFor } from './schema.js';
+import { canonicalSignature, keyIdFor } from './schema.js';
 
 export const TEAM_SIGNATURE_PREFIX = 'keysentry-team:v1\n';
 
@@ -16,15 +16,18 @@ export function documentHash(signed: unknown): string {
   return createHash('sha256').update(canonicalJson(signed), 'utf8').digest('hex');
 }
 
-/** Short, human-comparable form of a document hash, e.g. "3f9a-12c4-77d0-ab18". */
+/**
+ * Human-comparable form of a document hash: its first 128 bits, e.g. "3f9a-12c4-77d0-ab18-0c2e-9d41-5b7a-e630".
+ * 128 bits keep a second preimage (a different roster with the same fingerprint) out of reach.
+ */
 export function fingerprint(hash: string): string {
-  return hash.slice(0, 16).match(/.{4}/g)!.join('-');
+  return hash.slice(0, 32).match(/.{4}/g)!.join('-');
 }
 
-/** True when `value` (dashes and case ignored, at least 16 hex characters) is a prefix of `hash`. */
+/** True when `value` (dashes and case ignored, at least 32 hex characters, i.e. 128 bits) is a prefix of `hash`. */
 export function fingerprintMatches(hash: string, value: string): boolean {
   const clean = value.replaceAll('-', '').toLowerCase();
-  return /^[a-f0-9]{16,64}$/.test(clean) && hash.startsWith(clean);
+  return /^[a-f0-9]{32,64}$/.test(clean) && hash.startsWith(clean);
 }
 
 export function signTeamDocument(document: unknown, memberId: string, key: DeviceKey): TeamSignature {
@@ -48,6 +51,10 @@ export function verifyTeamSignatures(document: unknown, signatures: readonly Tea
     }
     const key = member.deviceKeys.find(candidate => candidate.keyId === signature.keyId);
     if (!key) return { ok: false, reason: 'A signature uses a device key that is not listed for that admin.' };
+    // Canonical base64 only: another spelling of the same bytes would give the same document a different hash.
+    if (typeof signature.sig !== 'string' || !canonicalSignature(signature.sig)) {
+      return { ok: false, reason: 'A signature is not in the canonical encoding.' };
+    }
     const sig = Buffer.from(signature.sig, 'base64');
     if (sig.length !== 64 || !verifyDetached(Buffer.from(key.publicKeyDer, 'base64'), bytes, sig)) {
       return { ok: false, reason: 'A signature does not match the document. It may have been changed after signing.' };

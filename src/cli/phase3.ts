@@ -12,7 +12,7 @@ import { guardStaged, formatGuardStaged, installHook, uninstallHook } from '../g
 import { detectAgentEnvironment } from '../safety/index.js';
 import { createStatePasskeyCounters, startDashboard, type TeamEnrollmentHooks } from '../dashboard/server/index.js';
 import { DashboardError } from '../dashboard/server/security.js';
-import { checkInvite, completeEnrollment, EnrollmentError } from '../team/index.js';
+import { checkInvite, completeEnrollment, EnrollmentError, loadTeam } from '../team/index.js';
 import { createOidcClient, OIDC_CLIENT_SECRET_NAME, OidcError, parseTeamUiOptions, teamAuditEvent } from '../dashboard/oidc/index.js';
 import type { TeamMember } from '../types.js';
 import { credentialVaultName } from '../vault/index.js';
@@ -98,17 +98,30 @@ function enrollmentRefusal(error: unknown): unknown {
 }
 
 /**
- * `/enroll` on the team dashboard: invitations from `keysentry team invite` (encrypted state, hashed tokens) become
- * pending candidates. Nothing here touches the roster; admins add a candidate with `keysentry team add-passkey`.
+ * `/enroll` on the team dashboard: invitations signed on an admin's own computer (`keysentry team invite`) are checked
+ * against the current roster's admins and become pending candidates; the server keeps only used nonce hashes. Nothing
+ * here touches the roster; admins add a candidate on their own computers with `keysentry team add-passkey --card`.
  */
-export function enrollmentHooks(rt: Pick<KeysentryRuntime, 'store' | 'audit' | 'now'>, origin: string, opts: Pick<Phase3CommandsOptions, 'diagnostic'>): TeamEnrollmentHooks {
+export function enrollmentHooks(rt: Pick<KeysentryRuntime, 'store' | 'audit' | 'now'> & Partial<Pick<KeysentryRuntime, 'teamAnchors'>>, origin: string,
+  opts: Pick<Phase3CommandsOptions, 'diagnostic'>, members?: () => Promise<TeamMember[]>): TeamEnrollmentHooks {
   const refusals = { start: Number.NEGATIVE_INFINITY, count: 0 };
+  // The verified roster the team dashboard serves (the same members() it re-reads per request), or the saved roster.
+  const roster = async () => {
+    try {
+      if (members) return { members: await members() };
+      const team = await loadTeam(rt.store, { anchor: rt.teamAnchors?.roster });
+      if (team) return team.roster.roster;
+    } catch { /* fixed text below */ }
+    throw new DashboardError(503, 'The team roster could not be read. Try again in a moment.');
+  };
   return {
     async check(token) {
-      try { return await checkInvite(rt.store, token, origin, rt.now()); } catch (error) { throw enrollmentRefusal(error); }
+      const current = await roster();
+      try { return await checkInvite(rt.store, token, { roster: current, origin, now: rt.now() }); } catch (error) { throw enrollmentRefusal(error); }
     },
     async complete(input) {
-      try { await completeEnrollment(rt.store, { ...input, origin, now: rt.now() }); } catch (error) { throw enrollmentRefusal(error); }
+      const current = await roster();
+      try { await completeEnrollment(rt.store, { ...input, roster: current, origin, now: rt.now() }); } catch (error) { throw enrollmentRefusal(error); }
     },
     async onEvent(event) {
       if (event.kind === 'enrollment-refused') {
@@ -197,6 +210,16 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
     if (!opts.teamMembers) throw new CliError('Team mode needs a team roster. Run keysentry team init first.');
     const rt = await opts.getRuntime();
     const members = () => opts.teamMembers!(rt);
+    // Review H3: the team dashboard faces the internet. Its vault must never hold an admin's device key, or anyone with
+    // a terminal there could sign roster and policy changes and approve as that admin.
+    const local = await rt.signingKey();
+    let holder: TeamMember | undefined;
+    try { holder = (await members()).find(member => member.deviceKeys.some(key => key.keyId === local.keyId)); }
+    finally { local.privateKeyDer.fill(0); }
+    if (holder?.role === 'admin') {
+      throw new CliError(`This computer's device key belongs to team admin ${holder.id}, so the team dashboard will not start here. It faces the internet: anyone with a terminal on its host could sign roster and policy changes and approve as ${holder.id}. Run it on a computer whose device key is not an admin's (join that computer with keysentry team apply <roster> --fingerprint <fingerprint>), and keep admin keys on admins' own computers.`);
+    }
+    if (holder) opts.diagnostic(`This computer's device key belongs to team member ${holder.id} (${holder.role}): anyone with a terminal here can approve as ${holder.id}. A dedicated computer whose key is on no member is safer.`);
     // A team policy's network.allowHosts also limits which identity provider hosts the dashboard may reach. (A forced
     // offline mode only stops feeds, so it does not affect sign-in.)
     const allowHosts = rt.teamPolicy?.network.allowHosts;
@@ -231,7 +254,7 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
       onError: (name: string) => { opts.diagnostic(`Dashboard request failed: ${/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name) ? name : 'Error'}`); },
       team: { publicOrigin: settings.publicOrigin, listen: settings.listen, oidc, members, passkeyCounters: createStatePasskeyCounters(rt.store),
         onAuthEvent: async event => { await rt.audit.append(teamAuditEvent(event)).catch(() => opts.diagnostic('A dashboard sign-in event could not be added to the audit log.')); },
-        enrollment: enrollmentHooks(rt, settings.publicOrigin, opts) },
+        enrollment: enrollmentHooks(rt, settings.publicOrigin, opts, members) },
     });
     opts.emit({ url: dashboard.url, listen: `${settings.listen.host}:${dashboard.port}` },
       `Team dashboard: ${dashboard.url}\nListening on ${settings.listen.host}:${dashboard.port}. Serve it through your TLS proxy and keep the Host header unchanged.`);

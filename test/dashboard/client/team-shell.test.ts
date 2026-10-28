@@ -59,3 +59,22 @@ describe('team dashboard shell', () => {
     expect(renderAccount({ csrf: 'x', readOnly: false, passkeys: 1 }).textContent).toContain('Local dashboard');
   });
 });
+
+describe('team dashboard review fixes', () => {
+  it('shows an admin the passkeys waiting for the roster and offers their card for download (H3)', async () => {
+    const card = { v: 1, kind: 'keysentry-passkey-candidates', candidates: [{ memberId: 'ben', credential: { id: 'Y3JlZA' } }] };
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => reply(url === '/api/team/candidates'
+      ? { pending: [{ memberId: 'ben', credentialId: 'Y3JlZA', createdAt: '2026-10-28T10:00:00.000Z', fingerprint: '0123-4567-89ab-cdef-0123-4567-89ab-cdef' }], card } : {})));
+    configureSession({ ...team, member: { ...team.member, role: 'admin' } });
+    const page = renderAccount({ ...team, member: { ...team.member, role: 'admin' } });
+    document.body.append(page);
+    await vi.waitFor(() => expect(page.textContent).toContain('0123-4567-89ab-cdef-0123-4567-89ab-cdef'));
+    expect(page.textContent).toContain('keysentry team add-passkey <member> --card <file>');
+    const created = vi.fn(() => 'blob:card'); const revoked = vi.fn();
+    vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: created, revokeObjectURL: revoked }));
+    [...page.querySelectorAll('button')].find(item => item.textContent === 'Download passkey card')!.click();
+    expect(created).toHaveBeenCalledTimes(1);
+    // Operators do not see the list.
+    expect(renderAccount({ ...team }).textContent).not.toContain('Passkeys waiting for an admin');
+  });
+});

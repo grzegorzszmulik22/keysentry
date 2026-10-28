@@ -1,6 +1,6 @@
 import { get, postWithPasskey } from '../api.js';
 import type { DashboardSession } from '../api.js';
-import { button, emptyState } from '../components.js';
+import { button, emptyState, isTeamRequestRecorded } from '../components.js';
 import { documentationLink, element, section } from './components-a.js';
 import type { PlatformView } from './components-a.js';
 import { clearFieldError, fieldError } from './components-b.js';
@@ -51,7 +51,10 @@ function tokenForm(platform: PlatformView, readOnly: boolean): HTMLFormElement {
         finally { body.value = ''; }
         await request;
         status.textContent = 'Stored token.';
-      } catch { status.textContent = 'Token was not stored. Enter it again and try Store token.'; }
+      } catch (error) {
+        // Team dashboard: other admins approve first; the token is not kept, so it is entered again afterwards.
+        status.textContent = isTeamRequestRecorded(error) ? error.message : 'Token was not stored. Enter it again and try Store token.';
+      }
       finally { body.value = ''; value.value = ''; pending = false; store.disabled = readOnly; }
     })();
   });

@@ -839,6 +839,12 @@ export interface TeamRoster {
   members: TeamMember[];
   /** Distinct admins whose signatures a roster or policy change needs (1 for a team of one). */
   adminThreshold: number;
+  /**
+   * Channel ids that a member received in an earlier version and that no member receives now (sorted, unique). They
+   * stay member-owned: routing sends them no team message, so a removed member's own chat never becomes a team-wide
+   * channel. Maintained by `nextRoster`; absent when empty.
+   */
+  retiredChannels?: string[];
 }
 
 /** Signature by an admin's device key over `keysentry-team:v1\n` + canonical JSON of the document. */
@@ -858,6 +864,12 @@ export interface TeamPolicy {
     maxServicesPerWave?: number;
     /** Tiers whose rotations always need an approval, even inside an armed plan. */
     approvalTiers?: RiskTier[];
+    /**
+     * Lets the monitor's automatic actions (`monitor.autoExecute`, `monitor.autoContain` and their environment
+     * overrides) run under this policy. Default false: they are turned off. Even when true, automatic actions stay
+     * inside `allowedHosts`, `allowedProviders` and `approvalTiers`.
+     */
+    allowMonitorAutomation?: boolean;
   };
   approvals: {
     /** Distinct operators or admins per approval (default 1). */

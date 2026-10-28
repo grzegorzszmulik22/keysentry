@@ -4,24 +4,26 @@ import type { Command } from 'commander';
 import { randomBytes } from 'node:crypto';
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { parseDocument } from 'yaml';
+import { isMap, isSeq, parseDocument } from 'yaml';
 import type { DeviceKey } from '../security/index.js';
 import type { NotifySeverity, SignedTeamPolicy, SignedTeamRoster, TeamRole, TeamRoster } from '../types.js';
 import {
-  applyRoster, checkProposal, createInvite, createRoster, describeRosterChange, devicePublicKey, INVITE_TTL_MS, listCandidates, loadTeam, memberCardSchema,
-  nextRoster, parseSignedRoster, removeCandidates, rosterFingerprint, rosterHash, signRoster, TeamError, vaultTeamAnchor, verifyFirstUse, verifyRoster,
-  type LoadedTeam, type RosterChange, type TeamAnchor,
+  adminsNeeded, applyRoster, asciiEmail, candidateCard, candidateFingerprint, checkProposal, createRoster, describeRosterChange, devicePublicKey, exclusiveChannels,
+  foldEmail, INVITE_TTL_MS, listCandidates, loadTeam, memberCardSchema, nextRoster, parseCandidateCard, parseSignedRoster, removeCandidates, rosterFingerprint,
+  rosterHash, signInvite, signRoster, TeamError, vaultTeamAnchor, verifyFirstUse, verifyRoster,
+  type EnrollmentCandidate, type LoadedTeam, type RosterChange, type TeamAnchor,
 } from '../team/index.js';
 import { ssoSchema } from '../team/schema.js';
 import {
   applyPolicy, checkPolicyProposal, describePolicy, loadGovernance, loadPolicyHead, policyFingerprint, preparePolicyDraft, readTeamFile, signPolicy,
-  verifyPolicy, type Governance,
+  verifyPolicy, type Governance, type PolicyHead,
 } from '../policy/index.js';
 import { configSchema, type ConfigSettings } from './config.js';
 import { CliError } from './errors.js';
 import { listPasskeys } from './passkeys.js';
 import { confirmAction, type PromptIO } from './prompts.js';
 import type { KeysentryRuntime } from './runtime.js';
+import { knownWatcherKeys } from './watcher-keys.js';
 
 /** The parts of the runtime the team commands use (the full runtime satisfies it). */
 export type TeamRuntime = Pick<KeysentryRuntime, 'store' | 'vault' | 'audit' | 'projectId' | 'signingKey'> & {
@@ -69,8 +71,10 @@ function displayName(value: string | undefined, fallback: string): string {
 }
 function email(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const lower = value.trim().toLowerCase();
-  if (lower.length > 254 || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(lower)) {
+  // ASCII case folding only (review L4): a non-ASCII address is refused, not lower-cased onto an ASCII one.
+  const trimmed = value.trim();
+  const lower = foldEmail(trimmed);
+  if (!asciiEmail(trimmed) || lower.length > 254 || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(lower)) {
     throw new CliError('Use a valid email address.');
   }
   return lower;
@@ -88,6 +92,43 @@ async function requireTeam(rt: TeamRuntime): Promise<LoadedTeam> {
   const team = await loadTeam(rt.store, { anchor: anchors(rt).roster });
   if (!team) throw new TeamError('This project has no team yet. Run keysentry team init, or keysentry team apply with your team\'s roster.');
   return team;
+}
+
+/**
+ * The policy applied on this computer, whose `approvals.wideningAdmins` also binds roster changes (review H1). A
+ * checkpoint without saved state refuses (fail closed) rather than falling back to the roster's threshold.
+ */
+async function appliedPolicy(rt: TeamRuntime): Promise<PolicyHead | null> {
+  return loadPolicyHead(rt.store, { anchor: anchors(rt).policy });
+}
+
+/** Remove notification channels from keysentry.yaml (comments kept) and their vault entries; returns the ids removed. */
+async function dropChannels(rt: TeamRuntime, ids: readonly string[]): Promise<string[]> {
+  if (!ids.length) return [];
+  let source = '';
+  try { source = await readFile(rt.config.configPath, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new CliError('Unable to read configuration file.'); }
+  const document = parseDocument(source, { prettyErrors: false });
+  if (document.errors.length) throw new CliError('Invalid YAML configuration. Check the file syntax.');
+  const channels = document.getIn(['notify', 'channels'], true);
+  const removed: string[] = [];
+  if (isSeq(channels)) {
+    channels.items = channels.items.filter(item => {
+      const id = isMap(item) ? item.get('id') : undefined;
+      if (typeof id === 'string' && ids.includes(id)) { removed.push(id); return false; }
+      return true;
+    });
+  }
+  if (removed.length) {
+    let value: unknown;
+    try { value = document.toJS({ maxAliasCount: 100 }) ?? {}; } catch { throw new CliError('Invalid YAML configuration: too many aliases or invalid structure.'); }
+    if (!configSchema.safeParse(value).success) throw new CliError('keysentry.yaml would not be valid after this change, so it was not changed.');
+    try { await writeFile(rt.config.configPath, document.toString(), { mode: 0o600 }); }
+    catch { throw new CliError('Unable to write the configuration file.'); }
+    rt.config.settings.notify.channels = rt.config.settings.notify.channels.filter(channel => !removed.includes(channel.id));
+  }
+  for (const id of removed) for (const name of await rt.vault.list(`notify/${id}/`)) await rt.vault.delete(name);
+  return removed;
 }
 
 /** This computer's device key, as an admin of `roster`. The caller clears the private key. */
@@ -158,12 +199,14 @@ function rosterSummary(team: { roster: SignedTeamRoster; hash: string }) {
   };
 }
 
-function rosterTable(summary: ReturnType<typeof rosterSummary>): string {
+function rosterTable(summary: ReturnType<typeof rosterSummary>, wideningAdmins?: number): string {
   const rows = summary.members.map(member => `${member.id.padEnd(14)} ${member.role.padEnd(9)} ${String(member.deviceKeys.length).padEnd(5)} ${String(member.passkeys.length).padEnd(9)} ${
     member.notify ? `${member.notify.channels.join(',') || '(none)'} (${member.notify.minSeverity}+)` : 'all channels'}  ${member.name}`);
   return [
     `Team ${summary.teamId} · roster version ${summary.version} · fingerprint ${summary.fingerprint}`,
-    `Admin signatures needed for roster and policy changes: ${summary.adminThreshold}`,
+    wideningAdmins !== undefined && wideningAdmins > summary.adminThreshold
+      ? `Admin signatures needed for roster and policy changes: ${wideningAdmins} (the team policy's approvals.wideningAdmins; the roster's threshold is ${summary.adminThreshold})`
+      : `Admin signatures needed for roster and policy changes: ${summary.adminThreshold}`,
     'Member         Role      Keys  Passkeys  Notifications  Name',
     ...rows,
   ].join('\n');
@@ -188,29 +231,63 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
   const governance = (rt: TeamRuntime) => loadGovernance({ store: rt.store, settings: rt.config.settings, cwd: rt.config.cwd,
     env: options.env, anchors: anchors(rt) });
 
-  /** Sign and apply a roster change, or save a proposal when more than one admin must sign. The caller passed the human gate. */
-  async function change(rt: TeamRuntime, change: RosterChange, output: string | undefined): Promise<void> {
+  /**
+   * Sign and apply a roster change, or save a proposal when more than one admin must sign. The caller passed the human
+   * gate. A change needs `max(adminThreshold, policy approvals.wideningAdmins)` admins of the current roster (review H1).
+   */
+  async function change(rt: TeamRuntime, change: RosterChange, output: string | undefined): Promise<SignedTeamRoster> {
     const team = await requireTeam(rt);
+    const policy = (await appliedPolicy(rt))?.policy.policy ?? null;
+    const wideningAdmins = policy?.approvals.wideningAdmins;
     const next = nextRoster(team.roster, change, now(rt));
     const signer = await localAdmin(rt, team.roster.roster);
     let signed: SignedTeamRoster;
     try { signed = signRoster(next, signer.memberId, signer.key); }
     finally { signer.key.privateKeyDer.fill(0); }
+    const proposal = checkProposal(signed, team.roster, { wideningAdmins });
+    if (!proposal.ok) throw new TeamError(proposal.reason);
     for (const line of describeRosterChange(team.roster.roster, next)) options.diagnostic(line);
-    const required = team.roster.roster.adminThreshold;
+    const required = adminsNeeded(team.roster.roster, wideningAdmins);
+    const widens = (change.kind === 'add' && change.member.role !== 'viewer') || (change.kind === 'role' && change.role !== 'viewer');
+    if (widens && required <= 1 && policy && Math.max(policy.approvals.required, ...Object.values(policy.approvals.requiredByTier ?? {}).filter((value): value is number => value !== undefined)) > 1) {
+      options.diagnostic('Warning: this change needs one admin signature, but the team policy needs more than one approver for some actions. One admin can add or promote a member whose key they hold and then meet that quorum alone. Set approvals.wideningAdmins to 2 or more in the policy so member changes need more than one admin.');
+    }
     if (required <= 1) {
-      const result = await applyRoster(rt.store, signed, { anchor: anchors(rt).roster });
+      const result = await applyRoster(rt.store, signed, { anchor: anchors(rt).roster, wideningAdmins });
       await settleCandidates(rt, result.roster);
       await rt.audit.append({ kind: 'team:roster-applied', summary: 'Team roster change applied.', data: { version: next.version } });
       options.emit({ status: 'applied', version: next.version, fingerprint: rosterFingerprint(result.roster) },
         `Roster version ${next.version} applied (fingerprint ${rosterFingerprint(result.roster)}). Share the roster with other members' computers: keysentry team apply.`);
-      return;
+      return signed;
     }
     const path = target(rt, output ?? `keysentry-team-v${next.version}.json`);
     await writeNew(path, signed);
     await rt.audit.append({ kind: 'team:roster-proposed', summary: 'Team roster change proposed.', data: { version: next.version } });
+    const why = required > team.roster.roster.adminThreshold ? ' The team policy asks for that many admins (approvals.wideningAdmins) for roster changes.' : '';
     options.emit({ status: 'proposed', version: next.version, path, signatures: 1, required },
-      `Proposed roster version ${next.version} saved to ${path} with your signature (1 of ${required}). Each other admin runs keysentry team sign <file> on their own computer; then run keysentry team apply <file>.`);
+      `Proposed roster version ${next.version} saved to ${path} with your signature (1 of ${required}).${why} Each other admin runs keysentry team sign <file> on their own computer; then run keysentry team apply <file>.`);
+    return signed;
+  }
+
+  /**
+   * Review M6: deployed watchers and cloud boxes keep the roster sealed at setup, so a removed or demoted member keeps
+   * the rights they had there until setup runs again.
+   */
+  async function watcherReminder(rt: TeamRuntime, memberId: string): Promise<void> {
+    let deployed: { signer: string }[] = [];
+    try { deployed = await knownWatcherKeys(rt.vault); } catch { deployed = []; }
+    if (!deployed.length) return;
+    options.diagnostic(`Deployed watchers and cloud boxes keep the roster sealed when they were set up: until you run keysentry watcher setup again (and keysentry box send-tokens for a cloud box), they still accept approvals and disarms from ${memberId} as before.`);
+  }
+
+  /** Review M5: a member's channels that nobody else receives. Refuse unless the caller drops them from this computer. */
+  async function memberChannels(rt: TeamRuntime, memberId: string, drop: boolean | undefined): Promise<string[]> {
+    const team = await requireTeam(rt);
+    const own = exclusiveChannels(team.roster.roster, memberId);
+    if (own.length && !drop) {
+      throw new TeamError(`${memberId} receives notifications on channels no other member receives (${own.join(', ')}). Run again with --drop-channels to remove them from keysentry.yaml on this computer; after the change the roster keeps them member-owned, so other computers send them no team messages.`);
+    }
+    return own;
   }
 
   const team = program.command('team').description('Team roster: members, roles and the admins who sign changes');
@@ -273,15 +350,23 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
         opts.output);
     });
   team.command('remove <id>').description('Remove a member').option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
-    .action(async (id: string, opts: { output?: string }) => {
+    .option('--drop-channels', 'Also remove the member\'s own notification channels (ones no other member receives) from keysentry.yaml')
+    .action(async (id: string, opts: { output?: string; dropChannels?: boolean }) => {
       options.human('remove a team member');
-      await change(await options.getRuntime(), { kind: 'remove', memberId: id }, opts.output);
+      const rt = await options.getRuntime();
+      const own = await memberChannels(rt, id, opts.dropChannels);
+      await change(rt, { kind: 'remove', memberId: id }, opts.output);
+      const dropped = await dropChannels(rt, own);
+      if (dropped.length) options.diagnostic(`Removed ${dropped.join(', ')} from keysentry.yaml on this computer.`);
+      await watcherReminder(rt, id);
     });
   team.command('role <id> <role>').description('Change a member\'s role').option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
     .action(async (id: string, value: string, opts: { output?: string }) => {
       options.human('change a team role');
       const memberRole = role(value);
-      await change(await options.getRuntime(), { kind: 'role', memberId: id, role: memberRole }, opts.output);
+      const rt = await options.getRuntime();
+      await change(rt, { kind: 'role', memberId: id, role: memberRole }, opts.output);
+      await watcherReminder(rt, id);
     });
   team.command('threshold <n>').description('How many admins must sign roster and policy changes').option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
     .action(async (value: string, opts: { output?: string }) => {
@@ -291,21 +376,30 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
     });
   team.command('notify <id>').description('Route notification channels to a member')
     .option('--channels <ids>', 'Channel ids this member receives', collect).option('--min-severity <severity>', 'info, warning or urgent')
-    .option('--clear', 'Stop routing; the member\'s channels go back to receiving everything').option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
-    .action(async (id: string, opts: { channels?: string[]; minSeverity?: string; clear?: boolean; output?: string }) => {
+    .option('--clear', 'Stop routing to this member; channels nobody else receives stop receiving team messages')
+    .option('--drop-channels', 'With --clear: also remove the member\'s own channels (ones no other member receives) from keysentry.yaml')
+    .option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
+    .action(async (id: string, opts: { channels?: string[]; minSeverity?: string; clear?: boolean; dropChannels?: boolean; output?: string }) => {
       options.human('change team notification routing');
       if (!!opts.clear === (opts.channels !== undefined)) throw new CliError('Use either --channels (with --min-severity) or --clear.');
+      if (opts.dropChannels && !opts.clear) throw new CliError('Use --drop-channels together with --clear.');
       const rt = await options.getRuntime();
       const notify = opts.channels ? { channels: opts.channels, minSeverity: severity(opts.minSeverity) } : null;
       warnUnknownChannels(rt, notify?.channels);
+      const own = opts.clear ? await memberChannels(rt, id, opts.dropChannels) : [];
       await change(rt, { kind: 'notify', memberId: id, notify }, opts.output);
+      const dropped = await dropChannels(rt, own);
+      if (dropped.length) options.diagnostic(`Removed ${dropped.join(', ')} from keysentry.yaml on this computer.`);
     });
   team.command('list').description('Show the team roster').action(async () => {
     const rt = await options.getRuntime();
     const loaded = await loadTeam(rt.store, { anchor: anchors(rt).roster });
     if (!loaded) { options.emit({ team: null }, 'This project has no team. Run keysentry team init to start one.'); return; }
     const summary = rosterSummary(loaded);
-    options.emit(summary, rosterTable(summary));
+    // The applied policy can raise what roster and policy changes need (review H1); an unreadable one is reported by team verify.
+    let wideningAdmins: number | undefined;
+    try { wideningAdmins = (await appliedPolicy(rt))?.policy.policy.approvals.wideningAdmins; } catch { wideningAdmins = undefined; }
+    options.emit({ ...summary, adminsNeeded: adminsNeeded(loaded.roster.roster, wideningAdmins) }, rosterTable(summary, wideningAdmins));
   });
   team.command('export').description('Write the signed roster in use, for other members\' computers (keysentry team apply)')
     .option('-o, --output <file>', 'Write to a new file instead of printing')
@@ -336,7 +430,8 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       const rt = await options.getRuntime();
       const current = await requireTeam(rt);
       const path = target(rt, file);
-      const proposal = checkProposal(await readTeamFile(path, 'roster proposal'), current.roster);
+      const wideningAdmins = (await appliedPolicy(rt))?.policy.policy.approvals.wideningAdmins;
+      const proposal = checkProposal(await readTeamFile(path, 'roster proposal'), current.roster, { wideningAdmins });
       if (!proposal.ok) throw new TeamError(proposal.reason);
       for (const line of describeRosterChange(current.roster.roster, proposal.roster.roster)) options.diagnostic(line);
       if (!await confirmed(`roster-v${proposal.roster.roster.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not signed. Nothing changed.'); return; }
@@ -371,11 +466,13 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       if (current && rosterHash(parsed.value) === current.hash) {
         options.emit({ status: 'unchanged', version: current.roster.roster.version }, `Roster version ${current.roster.roster.version} is already in use.`); return;
       }
-      const check = current ? verifyRoster(input, current.roster) : verifyFirstUse(input, opts.fingerprint!);
+      // The policy applied here binds roster changes too: wideningAdmins admins of the current roster (review H1).
+      const wideningAdmins = current ? (await appliedPolicy(rt))?.policy.policy.approvals.wideningAdmins : undefined;
+      const check = current ? verifyRoster(input, current.roster, { wideningAdmins }) : verifyFirstUse(input, opts.fingerprint!);
       if (!check.ok) throw new TeamError(check.reason);
       for (const line of describeRosterChange(current?.roster.roster ?? null, check.roster.roster)) options.diagnostic(line);
       if (!await confirmed(`roster-v${check.roster.roster.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not applied. Nothing changed.'); return; }
-      const result = await applyRoster(rt.store, input, { anchor, ...(current ? {} : { trust: { fingerprint: opts.fingerprint! } }) });
+      const result = await applyRoster(rt.store, input, { anchor, wideningAdmins, ...(current ? {} : { trust: { fingerprint: opts.fingerprint! } }) });
       if (result.status === 'unchanged') { options.emit({ status: 'unchanged', version: result.roster.roster.version }, `Roster version ${result.roster.roster.version} is already in use.`); return; }
       await rt.audit.append({ kind: 'team:roster-applied', summary: 'Team roster change applied.', data: { version: result.roster.roster.version } });
       await settleCandidates(rt, result.roster);
@@ -406,48 +503,78 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       }
       await change(await options.getRuntime(), { kind: 'sso', memberId: id, sso }, opts.output);
     });
-  team.command('invite <id>').description('Print a single-use link that lets a member add a passkey on the team dashboard (15 minutes)')
+  team.command('invite <id>').description('Print a single-use link, signed by your admin device key, that lets a member add a passkey on the team dashboard (15 minutes)')
     .requiredOption('--origin <url>', 'The team dashboard’s https address (its public origin)')
     .action(async (id: string, opts: { origin: string }) => {
       options.human('invite a team member to add a passkey');
       const origin = dashboardOrigin(opts.origin);
       const rt = await options.getRuntime();
       const current = await requireTeam(rt);
-      const signer = await localAdmin(rt, current.roster.roster);
-      signer.key.privateKeyDer.fill(0);
       const member = current.roster.roster.members.find(candidate => candidate.id === id);
       if (!member) throw new TeamError(`There is no member ${/^[a-z][a-z0-9_-]{0,31}$/.test(id) ? id : 'with that id'} on this team.`);
-      const invite = await createInvite(rt.store, { memberId: member.id, origin, now: now(rt), ttlMs: INVITE_TTL_MS,
-        ...(options.printable ? { printable: (token: string) => options.printable!(`${origin}/enroll#${token}`) } : {}) });
-      await rt.audit.append({ kind: 'team:invite', summary: 'A passkey enrollment link was created.', data: { memberId: member.id } });
-      // The token is in the fragment, so browsers never send it with the page request or put it in a request log.
+      // Review H3: the invitation is signed here, on an admin's own computer. The team server only checks the signature
+      // against the roster's admins and remembers the link once used; it never needs an admin's private key.
+      const signer = await localAdmin(rt, current.roster.roster);
+      let invite: { token: string; expiresAt: string };
+      try {
+        invite = signInvite({ memberId: member.id, origin, now: now(rt), ttlMs: INVITE_TTL_MS, signer: signer.key,
+          ...(options.printable ? { printable: (token: string) => options.printable!(`${origin}/enroll#${token}`) } : {}) });
+      } finally { signer.key.privateKeyDer.fill(0); }
+      await rt.audit.append({ kind: 'team:invite', summary: 'A passkey enrollment link was signed.', data: { memberId: member.id } });
+      // The link is in the fragment, so browsers never send it with the page request or put it in a request log.
       const link = `${origin}/enroll#${invite.token}`;
       options.emit({ memberId: member.id, origin, expiresAt: invite.expiresAt, link },
         [`Enrollment link for ${member.id} (works once, until ${invite.expiresAt}):`, link,
-          `Send it to ${member.id} privately. The passkey they create works only after admins add it to the roster: keysentry team passkeys pending, then keysentry team add-passkey ${member.id} <credential-id>.`].join('\n'));
+          `Send it to ${member.id} privately. The passkey they create works only after admins add it to the roster: on the team dashboard host run keysentry team passkeys pending -o <file> (or download the card from the dashboard's Account page), then on your computer keysentry team add-passkey ${member.id} --card <file>.`].join('\n'));
     });
   const passkeys = team.command('passkeys').description('Passkeys members created on the team dashboard');
-  passkeys.command('pending').description('List passkeys waiting for an admin to add them to the roster').action(async () => {
-    const rt = await options.getRuntime();
-    const loaded = await loadTeam(rt.store, { anchor: anchors(rt).roster });
-    const onRoster = new Set(loaded?.roster.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.id)) ?? []);
-    const pending = (await listCandidates(rt.store)).filter(candidate => !onRoster.has(candidate.credential.id))
-      .map(candidate => ({ memberId: candidate.memberId, credentialId: candidate.credential.id, createdAt: candidate.createdAt,
-        rpId: candidate.credential.rpId, ...(candidate.aaguid ? { aaguid: candidate.aaguid } : {}) }));
-    options.emit({ pending }, pending.length ? ['Member         Created at                Credential id', ...pending.map(item =>
-      `${item.memberId.padEnd(14)} ${item.createdAt.padEnd(25)} ${item.credentialId}${item.aaguid ? `  (authenticator ${item.aaguid})` : ''}`),
-    'Compare the credential id with the member before you add it: keysentry team add-passkey <member> <credential-id>.'].join('\n') : 'No passkeys are waiting.');
-  });
-  team.command('add-passkey <id> <credentialId>').description('Add a passkey from team passkeys pending to its member (a signed roster change)')
+  passkeys.command('pending').description('List passkeys waiting for an admin to add them to the roster; -o writes them as a card for an admin')
+    .option('-o, --output <file>', 'Write the waiting passkeys (public keys only) to a new card file for keysentry team add-passkey --card')
+    .action(async (opts: { output?: string }) => {
+      // Read-only and public: the team server (no admin key) lists and exports candidates for an admin's computer.
+      const rt = await options.getRuntime();
+      const loaded = await loadTeam(rt.store, { anchor: anchors(rt).roster });
+      const onRoster = new Set(loaded?.roster.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.id)) ?? []);
+      const candidates = (await listCandidates(rt.store)).filter(candidate => !onRoster.has(candidate.credential.id));
+      const pending = candidates.map(candidate => ({ memberId: candidate.memberId, credentialId: candidate.credential.id, createdAt: candidate.createdAt,
+        rpId: candidate.credential.rpId, origin: candidate.credential.origins[0] ?? null, fingerprint: candidateFingerprint(candidate),
+        ...(candidate.aaguid ? { reportedAuthenticator: candidate.aaguid } : {}) }));
+      if (opts.output) {
+        if (!candidates.length) { options.emit({ pending, path: null }, 'No passkeys are waiting, so no card was written.'); return; }
+        const path = target(rt, opts.output);
+        await writeNew(path, candidateCard(candidates));
+        options.emit({ pending, path }, [`Wrote ${candidates.length} waiting passkey${candidates.length === 1 ? '' : 's'} to ${path}. The card holds public keys only.`,
+          'On an admin\'s computer: keysentry team add-passkey <member> --card <file>. Compare each fingerprint with the member first.'].join('\n'));
+        return;
+      }
+      options.emit({ pending }, pending.length ? ['Member         Created at                Fingerprint                              Credential id', ...pending.map(item =>
+        `${item.memberId.padEnd(14)} ${item.createdAt.padEnd(25)} ${item.fingerprint}  ${item.credentialId}${item.reportedAuthenticator
+          ? `  (authenticator model ${item.reportedAuthenticator}, reported by the authenticator, not verified)` : ''}`),
+      'Compare the fingerprint with the member, then export a card for an admin: keysentry team passkeys pending -o <file>.'].join('\n') : 'No passkeys are waiting.');
+    });
+  team.command('add-passkey <id> [credentialId]').description('Add a passkey a member created on the team dashboard (a signed roster change on an admin\'s computer)')
+    .option('--card <file>', 'The card from keysentry team passkeys pending -o on the team dashboard host')
     .option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
-    .action(async (id: string, credentialId: string, opts: { output?: string }) => {
+    .action(async (id: string, credentialId: string | undefined, opts: { card?: string; output?: string }) => {
       options.human('add a passkey to the team roster');
       const rt = await options.getRuntime();
-      const candidate = (await listCandidates(rt.store)).find(item => item.credential.id === credentialId);
-      if (!candidate) throw new TeamError('No pending passkey has that credential id. Run keysentry team passkeys pending.');
-      // A candidate is bound to the member whose invitation created it; it never goes on anyone else's card.
-      if (candidate.memberId !== id) throw new TeamError('That passkey was enrolled from another member’s link. Add it only to that member.');
-      await change(rt, { kind: 'passkey', memberId: id, passkey: candidate.credential }, opts.output);
+      const available: EnrollmentCandidate[] = opts.card ? parseCandidateCard(await readTeamFile(target(rt, opts.card), 'passkey card')) : await listCandidates(rt.store);
+      const forMember = available.filter(item => item.memberId === id);
+      let candidate: EnrollmentCandidate | undefined;
+      if (credentialId !== undefined) {
+        candidate = available.find(item => item.credential.id === credentialId);
+        if (!candidate) throw new TeamError(opts.card ? 'The card has no passkey with that credential id.' : 'No pending passkey has that credential id. Run keysentry team passkeys pending.');
+        // A candidate is bound to the member whose invitation created it; it never goes on anyone else's card.
+        if (candidate.memberId !== id) throw new TeamError('That passkey was enrolled from another member’s link. Add it only to that member.');
+      } else {
+        if (!opts.card) throw new CliError('Name the credential id, or pass the card from the team dashboard host with --card <file>.');
+        if (forMember.length !== 1) {
+          throw new TeamError(forMember.length ? `The card has ${forMember.length} passkeys for ${id}. Name the one to add by its credential id.` : `The card has no passkey for ${id}.`);
+        }
+        candidate = forMember[0];
+      }
+      options.diagnostic(`Passkey ${candidate!.credential.id} for ${id}, created ${candidate!.createdAt} at ${candidate!.credential.origins.join(', ')}; fingerprint ${candidateFingerprint(candidate!)}. Compare the fingerprint with ${id} before you sign.`);
+      await change(rt, { kind: 'passkey', memberId: id, passkey: candidate!.credential }, opts.output);
     });
 
   const policy = program.command('policy').description('Team policy-as-code: rules that only narrow what this project may do');
@@ -487,10 +614,12 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       finally { signer.key.privateKeyDer.fill(0); }
       await replace(path, signed);
       const count = new Set([...check.signers, signer.memberId]).size;
-      const required = current.roster.roster.adminThreshold;
+      // A newer version needs the policy in force's approvals.wideningAdmins admins too (review H1).
+      const required = check.required;
+      const why = required > current.roster.roster.adminThreshold ? ' The policy in force asks for that many admins (approvals.wideningAdmins) before its rules can change.' : '';
       await rt.audit.append({ kind: 'policy:signed', summary: 'Team policy signed.', data: { version: prepared.policy.version } });
       options.emit({ status: 'signed', path, version: prepared.policy.version, signatures: count, required },
-        `Signed policy version ${prepared.policy.version} (${count} of ${required} admin signatures). ${count >= required
+        `Signed policy version ${prepared.policy.version} (${count} of ${required} admin signatures).${why} ${count >= required
           ? `It has enough signatures: run keysentry policy apply ${file}.` : 'Send it to another admin to sign.'}`);
     });
   policy.command('apply <file>').description('Apply a fully signed policy and make it the project\'s policy file')

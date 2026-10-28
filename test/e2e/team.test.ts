@@ -94,13 +94,16 @@ async function teamDashboard(rt: Awaited<ReturnType<Awaited<ReturnType<typeof fi
     return { callback, auth };
   }
   const get = (path: string, auth: { cookie: string }) => req(path, { headers: { Cookie: auth.cookie } });
-  async function approve(auth: { cookie: string; csrf: string }, authenticator: ReturnType<typeof createEnrollingAuthenticator>, body: { id: string; reviewHash: string }) {
+  /** A change confirmed with the member's own passkey, as the dashboard client sends it. */
+  async function change(auth: { cookie: string; csrf: string }, authenticator: ReturnType<typeof createEnrollingAuthenticator>, route: string, body: unknown) {
     const headers = { Cookie: auth.cookie, 'X-CSRF-Token': auth.csrf };
-    const challenge = await post('/api/passkey/challenge', { route: 'approvals/approve', bodyDigest: digest(body) }, headers);
+    const challenge = await post('/api/passkey/challenge', { route, bodyDigest: digest(body) }, headers);
     if (challenge.status !== 200) return challenge;
-    return post('/api/approvals/approve', body, { ...headers, 'X-Passkey-Assertion': authenticator.assertionHeader(challenge.json.challenge, PUBLIC_ORIGIN) });
+    return post(`/api/${route}`, body, { ...headers, 'X-Passkey-Assertion': authenticator.assertionHeader(challenge.json.challenge, PUBLIC_ORIGIN) });
   }
-  return { req, post, signIn, get, approve };
+  const approve = (auth: { cookie: string; csrf: string }, authenticator: ReturnType<typeof createEnrollingAuthenticator>, body: { id: string; reviewHash: string }) =>
+    change(auth, authenticator, 'approvals/approve', body);
+  return { req, post, signIn, get, approve, change };
 }
 
 describe('team mode end to end', () => {
@@ -166,7 +169,7 @@ describe('team mode end to end', () => {
     const dashboard = await teamDashboard(rt);
     const invite = await f.cli(rt, ['team', 'invite', 'ben', '--origin', PUBLIC_ORIGIN]);
     expect(invite).toMatchObject({ code: 0, output: expect.stringContaining(`${PUBLIC_ORIGIN}/enroll#`) });
-    const token = /\/enroll#([A-Za-z0-9_-]{43})/.exec(invite.output)![1]!;
+    const token = /\/enroll#([A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86})/.exec(invite.output)![1]!;
     const options = await dashboard.post('/enroll/options', { token });
     expect(options.json.member).toEqual({ id: 'ben', name: 'ben' });
     expect((await dashboard.post('/enroll/finish', { token, ...ben.passkey.register(options.json.publicKey.challenge, PUBLIC_ORIGIN) })).status).toBe(200);
@@ -222,6 +225,75 @@ describe('team mode end to end', () => {
     await expect(service.approveWithDevice('arm-more-keys', sign(ben.key))).rejects.toThrow('This change needs approval from team admins.');
     const grant = await service.approveWithDevice('arm-more-keys', sign(await deviceKey(f.vault)));
     expect(grant.approvers?.map(approver => approver.memberId)).toEqual(['ana']);
+  });
+
+  it('a team server with no admin key: signed invitations, passkey cards, and dashboard changes that run only under the quorum (review C1, H3)', async () => {
+    // ---- Ana's laptop holds the only admin key. Ben and Cy are operators; their dashboard passkeys come later.
+    const laptop = await fixture();
+    const ana = await laptop.runtime();
+    const ben = { key: generateDeviceKey(), passkey: createEnrollingAuthenticator(PUBLIC_HOST) };
+    const cy = { key: generateDeviceKey(), passkey: createEnrollingAuthenticator(PUBLIC_HOST) };
+    expect((await laptop.cli(ana, ['team', 'init', '--id', 'ana', '--email', 'ana@example.test'])).code).toBe(0);
+    for (const [id, person] of [['ben', ben], ['cy', cy]] as const) {
+      await writeFile(laptop.path(`${id}.json`), card(person.key));
+      expect((await laptop.cli(ana, ['team', 'add', id, '--role', 'operator', '--card', `${id}.json`, '--email', `${id}@example.test`])).code).toBe(0);
+    }
+    await writeFile(laptop.path('team-policy.json'), JSON.stringify({ approvals: { required: 2, wideningAdmins: 1 } }));
+    expect((await laptop.cli(ana, ['policy', 'sign', 'team-policy.json', '--yes'])).code).toBe(0);
+    expect((await laptop.cli(ana, ['policy', 'apply', 'team-policy.json', '--yes'])).code).toBe(0);
+
+    // ---- The team server (its own vault, the platform tokens and keys) joins by fingerprint and takes the signed policy.
+    const server = await fixture();
+    let rt = await server.runtime();
+    expect((await laptop.cli(ana, ['team', 'export', '-o', 'roster-v3.json'])).code).toBe(0);
+    await writeFile(server.path('roster-v3.json'), await readFile(laptop.path('roster-v3.json')));
+    const fingerprint = /fingerprint ((?:[a-f0-9]{4}-){7}[a-f0-9]{4})/.exec((await laptop.cli(ana, ['team', 'list'])).output)![1]!;
+    expect((await server.cli(rt, ['team', 'apply', 'roster-v3.json', '--fingerprint', fingerprint, '--yes'])).code).toBe(0);
+    await writeFile(server.path('team-policy.json'), await readFile(laptop.path('team-policy.json')));
+    expect((await server.cli(rt, ['policy', 'apply', 'team-policy.json', '--yes'])).code).toBe(0);
+    rt = await server.runtime();
+    expect(rt.teamPolicy?.approvals.required).toBe(2);
+    // The server's own device key is on no member, and it cannot sign anything for the team.
+    expect((await server.cli(rt, ['team', 'invite', 'ben', '--origin', PUBLIC_ORIGIN])).errors).toMatch(/does not belong to an admin/);
+    const dashboard = await teamDashboard(rt);
+
+    // ---- Ana signs enrollment links on her laptop; the server checks them against the roster and keeps candidates.
+    for (const [id, person] of [['ben', ben], ['cy', cy]] as const) {
+      const invite = await laptop.cli(ana, ['team', 'invite', id, '--origin', PUBLIC_ORIGIN]);
+      const token = /\/enroll#([A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86})/.exec(invite.output)![1]!;
+      const options = await dashboard.post('/enroll/options', { token });
+      expect(options.status).toBe(200);
+      expect((await dashboard.post('/enroll/finish', { token, ...person.passkey.register(options.json.publicKey.challenge, PUBLIC_ORIGIN) })).status).toBe(200);
+    }
+    expect((await server.cli(rt, ['team', 'passkeys', 'pending', '-o', 'card.json'])).code).toBe(0);
+    await writeFile(laptop.path('card.json'), await readFile(server.path('card.json')));
+    // Each signed version goes to the server in order, like to any other member's computer.
+    for (const [id, version] of [['ben', 4], ['cy', 5]] as const) {
+      expect(await laptop.cli(ana, ['team', 'add-passkey', id, '--card', 'card.json'])).toMatchObject({ code: 0, output: expect.stringMatching(new RegExp(`^Roster version ${version} applied`)) });
+      expect((await laptop.cli(ana, ['team', 'export', '-o', `roster-v${version}.json`])).code).toBe(0);
+      await writeFile(server.path(`roster-v${version}.json`), await readFile(laptop.path(`roster-v${version}.json`)));
+      expect((await server.cli(rt, ['team', 'apply', `roster-v${version}.json`, '--yes'])).code).toBe(0);
+    }
+    expect((await server.cli(rt, ['team', 'passkeys', 'pending'])).output).toBe('No passkeys are waiting.');
+
+    // ---- Ben rotates on the team dashboard: recorded as a team request, nothing changes yet.
+    const benSession = (await dashboard.signIn({ sub: 'sub-ben', email: 'ben@example.test', email_verified: true })).auth!;
+    expect((await dashboard.get('/api/session', benSession)).json.passkeys).toBe(1);
+    const preview = await dashboard.post('/api/rotate/preview', { clusterIds: (await rt.inventory()).clusters.map(cluster => cluster.id) },
+      { Cookie: benSession.cookie, 'X-CSRF-Token': benSession.csrf });
+    const execute = await dashboard.change(benSession, ben.passkey, 'rotate/execute', { planId: preview.json.planId, planHash: preview.json.planHash });
+    expect(execute).toMatchObject({ status: 202, json: { teamRequest: 'recorded', approvals: 1, required: 2 } });
+    expect({ keys: server.provider.keys.size, writes: server.host.writes.length }).toEqual({ keys: 1, writes: 0 });
+
+    // ---- Cy approves it on the Approvals screen: the quorum is met and the rotation runs on the server.
+    const cySession = (await dashboard.signIn({ sub: 'sub-cy', email: 'cy@example.test', email_verified: true })).auth!;
+    const item = (await dashboard.get('/api/approvals', cySession)).json.pending.find((entry: { source: string }) => entry.source === 'team');
+    expect(item).toMatchObject({ kind: 'rotate/execute', quorum: { approvals: 1, required: 2 } });
+    expect(await dashboard.approve(cySession, cy.passkey, { id: item.id, reviewHash: item.reviewHash })).toMatchObject({ status: 200, json: { result: 'executed' } });
+    expect({ keys: server.provider.keys.size, writes: server.host.writes.length }).toEqual({ keys: 2, writes: 1 });
+    // Disarm needs a passkey here, never just the sign-in session.
+    expect((await dashboard.post('/api/autopilot/disarm', {}, { Cookie: benSession.cookie, 'X-CSRF-Token': benSession.csrf })).status).toBe(403);
+    expect((await dashboard.change(benSession, ben.passkey, 'autopilot/disarm', {})).status).toBe(200);
   });
 
   it('pauses changes when the policy file is changed after signing, and when team mode is turned off under a roster', async () => {
