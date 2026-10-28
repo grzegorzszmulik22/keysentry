@@ -1,4 +1,4 @@
-import { classify, fingerprint, serviceKey } from '../core/index.js';
+import { classify, fingerprint, isPublicGoogleKeyStep, serviceKey } from '../core/index.js';
 import { RotationAbortedError } from '../types.js';
 import { crash, isCrash, unresolvedOrphans } from './recovery.js';
 import { undoRotation } from './undo.js';
@@ -6,6 +6,9 @@ import { StopRequestedError, withStopChecks } from './stop.js';
 import { activationMode, needsManualActivation } from '../hosts/activation.js';
 import { hasPublicKeyIds, isPublicKeyId } from './public-refs.js';
 import { secretCredentialValues } from '../providers/credential-kinds.js';
+import { twilioKeySidFor } from '../providers/twilio.js';
+import { publicGoogleKeyGuidance } from '../providers/google.js';
+import { PLANNED_FORM_PREFIX } from '../providers/shared.js';
 import type {
   ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
@@ -91,28 +94,33 @@ interface StepWork {
   oldCompanions?: Record<string, string>;
   unusedCleanupAttempted?: boolean;
   unusedCleanupSucceeded?: boolean;
+  /** The old key lives in shipped clients (a public Google API key): never revoke it automatically. */
+  retainOldKey?: boolean;
+  /** Grouped atomic roll: the step whose provider call rolls the shared credential for this step too. */
+  groupPrimary?: StepWork;
+  /** Grouped atomic roll: other planned forms of the credential this step's provider call rolls. */
+  groupMembers?: StepWork[];
+  /** Grouped atomic roll (primary only): each member's new value, by cluster id, as the provider returned it. */
+  groupForms?: Map<string, string>;
+  /** The provider call may have changed something without a known result (see uncertainMutation). */
+  uncertain?: boolean;
 }
 
-const TWILIO_KEY_SID = /^SK[0-9a-fA-F]{32}$/;
+/** Variables that may hold a form of an Upstash credential (REST token, password, Redis URL, QStash token). */
+const UPSTASH_FORM_NAME = /UPSTASH|QSTASH|REDIS|^KV_/i;
+
+/** A provider call that may have changed something, with an unknown outcome (see ProviderMutationUncertainError). */
+function mutationUncertain(error: unknown): error is { code: 'MUTATION_UNCERTAIN'; atomic?: unknown; keyRef?: unknown } {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'MUTATION_UNCERTAIN';
+}
 
 /**
  * The Twilio API key SID paired with a secret held under `holders` in one service, and every variable holding it.
- * Same naming rules as src/providers/twilio.ts (X_API_SECRET → X_API_KEY, X_API_KEY_SECRET → X_API_KEY_SID, ...), else
- * the only distinct SK… value in the service.
+ * The adapter's own pairing rule (src/providers/twilio.ts), so the engine and the adapter always agree: a
+ * conventionally named SID, else the only SK… value unless it is the conventional partner of another secret.
  */
 function twilioKeySid(holders: string[], siblings: Record<string, string>): { sid: string | null; names: string[] } {
-  const candidates: string[] = [];
-  for (const holder of holders) {
-    let match: RegExpExecArray | null;
-    if ((match = /^(.*)API_KEY_SECRET$/.exec(holder))) candidates.push(`${match[1]}API_KEY_SID`, `${match[1]}API_KEY`);
-    else if ((match = /^(.*)API_SECRET$/.exec(holder))) candidates.push(`${match[1]}API_KEY`, `${match[1]}API_KEY_SID`, `${match[1]}API_SID`);
-    else if ((match = /^(.*)SECRET$/.exec(holder))) candidates.push(`${match[1]}SID`, `${match[1]}KEY_SID`);
-  }
-  let sid = candidates.map(name => siblings[name]).find((value): value is string => typeof value === 'string' && TWILIO_KEY_SID.test(value)) ?? null;
-  if (sid === null) {
-    const values = new Set(Object.values(siblings).filter(value => typeof value === 'string' && TWILIO_KEY_SID.test(value)));
-    sid = values.size === 1 ? [...values][0]! : null;
-  }
+  const sid = twilioKeySidFor(holders, siblings);
   return { sid, names: sid === null ? [] : Object.keys(siblings).filter(name => siblings[name] === sid).sort() };
 }
 
@@ -203,7 +211,8 @@ export async function runRotation(
   const works: StepWork[] = plan.steps.map(step => {
     const stepReport: StepReport = { clusterId: step.clusterId, status: 'pending', warnings: [] };
     report.steps.push(stepReport);
-    return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false };
+    return { step, report: stepReport, services: new Set(step.consumers.map(c => serviceKey(c.service))), ready: false,
+      retainOldKey: isPublicGoogleKeyStep(step) || clusterHistory(step.clusterId).some(entry => entry.data?.retainOldKey === true) };
   });
   function adoptedRef(work: StepWork): string | undefined {
     const refs = opts?.adoptedKeyRefs;
@@ -378,6 +387,190 @@ export async function runRotation(
       if (error instanceof JournalFailure) throw error;
       warn(work, 'Unused replacement cleanup failed; revoke the new key manually.');
     }
+  }
+  /**
+   * A provider call may have changed something (created a key, reset or rolled a credential) without a known result.
+   * Record a possible stray key with the orphan-suspect mechanism, keep the in-flight data, and say what to check:
+   * for an atomic roll the old credential may already be invalid while every consumer still uses it.
+   */
+  async function uncertainMutation(work: StepWork, error: { atomic?: unknown; keyRef?: unknown }): Promise<void> {
+    const atomic = work.atomicRoll === true || error.atomic === true;
+    work.uncertain = true;
+    unusedReplacementMayBeLive = true;
+    const keyRef = typeof error.keyRef === 'string' && error.keyRef.length > 0 ? error.keyRef : null;
+    if (keyRef && hasPublicKeyIds(work.step.provider) && isPublicKeyId(keyRef, work.step.provider) && !sensitiveValues.has(keyRef)) publicKeyRefs.add(keyRef);
+    const suspect = { clusterId: work.step.clusterId, provider: work.step.provider, keyRef };
+    if (keyRef) (report.orphanSuspects ??= []).push({ ...suspect, keyRef });
+    await journal('orphan-suspected', { clusterId: work.step.clusterId, data: { ...suspect, reason: 'mutation-uncertain', atomic } });
+    let where = `the ${work.step.provider} console`;
+    try { const url = work.provider?.guidance().url; if (url) where = url; }
+    catch (failure) { if (isCrash(failure)) throw failure; /* keep the generic location */ }
+    if (atomic) {
+      await fail(work, `URGENT: the ${work.step.provider} reset may already have happened, but keysentry could not confirm it. If it did, the old credential is already invalid while every consumer of this step still uses it. Check it at ${where} now; if it changed, copy the new value to every consumer and redeploy, then scan again. keysentry changed no consumer.`);
+    } else {
+      await fail(work, `${work.step.provider} may already have created a replacement key, but keysentry could not confirm it. Check ${where} for an unused keysentry key and delete it if you do not use it. Every consumer still uses the old key, which stays active.`);
+    }
+  }
+  /**
+   * An Upstash reset changes every form of the credential at once: the password, the REST token, every Redis URL and
+   * possibly the read-only token. Each form has a different value, so each is its own inventory cluster. Before any
+   * reset, find every place that holds a form of the same database (or QStash user):
+   * - forms in this plan become one group, rolled by one provider call that returns each form's new value;
+   * - forms the plan does not update (and that the primary's companions will not rewrite) stop that reset;
+   * - places keysentry cannot read (sealed, unreadable, an incomplete scan) make every Upstash reset guided.
+   */
+  async function groupUpstashForms(): Promise<void> {
+    const rolls = works.filter(work => work.ready && work.atomicRoll && !work.guided && work.step.provider === 'upstash'
+      && !work.recovered && work.oldValue !== undefined && work.provider !== undefined && work.ctx !== undefined);
+    if (rolls.length === 0) return;
+    const provider = rolls[0]!.provider!;
+    const ctx = rolls[0]!.ctx!;
+    async function resolve(value: string): Promise<string | null | undefined> {
+      if (typeof provider.resolveKeyRef !== 'function') return undefined;
+      try { return await provider.resolveKeyRef(value, ctx); }
+      catch (error) { if (isCrash(error) || error instanceof RotationAbortedError) throw error; return undefined; }
+    }
+    const refs = new Map<StepWork, string>();
+    // A value the adapter cannot identify is refused by rotate() before any reset, so it needs no grouping.
+    for (const work of rolls) { const ref = await resolve(work.oldValue!); if (typeof ref === 'string') refs.set(work, ref); }
+    if (refs.size === 0) return;
+    const groups = new Map<string, StepWork[]>();
+    for (const [work, ref] of refs) groups.set(ref, [...(groups.get(ref) ?? []), work]);
+    // A read-only form cannot drive the reset (the adapter refuses it), so a writable form goes first.
+    const readOnly = (work: StepWork) => work.step.consumers.some(consumer => /READ_?ONLY/i.test(consumer.varName));
+    const primaries = new Map([...groups].map(([ref, group]) => [ref, [...group].sort((a, b) => Number(readOnly(a)) - Number(readOnly(b)))[0]!]));
+    const label = (service: ServiceRef, name: string) => `${service.host}/${service.serviceName || service.serviceId || 'shared'}:${name}`;
+    const unseen = new Set<string>();
+    const outside = new Map<string, Set<string>>();
+    // The primary's companions rewrite a form only where companionsFor delivers them: a consumer service of the
+    // primary that holds the same value under the same name as the primary's context service.
+    function covered(primary: StepWork, value: string, locations: { service: ServiceRef; varName: string; reference?: boolean }[]): boolean {
+      const context = primary.contextService ? services.get(primary.contextService) : undefined;
+      return context !== undefined && locations.every(location => {
+        const key = serviceKey(location.service);
+        const holder = services.get(key);
+        return !location.reference && primary.services.has(key) && holder !== undefined
+          && siblingValues(context)[location.varName] === value && siblingValues(holder)[location.varName] === value;
+      });
+    }
+    async function check(value: string, locations: { service: ServiceRef; varName: string; reference?: boolean }[], name: string): Promise<void> {
+      const ref = await resolve(value);
+      if (ref === undefined) { for (const location of locations) unseen.add(label(location.service, location.varName)); return; }
+      const primary = ref === null ? undefined : primaries.get(ref);
+      if (!primary || covered(primary, value, locations)) return;
+      const places = outside.get(ref!) ?? new Set<string>();
+      for (const location of locations) places.add(`${label(location.service, location.varName)}${name}`);
+      outside.set(ref!, places);
+    }
+    for (const error of inv.errors) unseen.add(`services on ${error.host} (its last scan was incomplete)`);
+    const grouped = new Set([...refs.keys()].map(work => work.step.clusterId));
+    const inventoried = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
+      .map(consumer => `${serviceKey(consumer.service)}\0${consumer.varName}`));
+    // Every other inventoried form: a cluster with an Upstash classification or an Upstash/Redis-like name.
+    for (const cluster of inv.clusters) {
+      if (grouped.has(cluster.id)) continue;
+      if (cluster.provider !== 'upstash' && !cluster.consumers.some(consumer => UPSTASH_FORM_NAME.test(consumer.varName))) continue;
+      let value: string | undefined;
+      for (const consumer of cluster.consumers.filter(candidate => !candidate.reference && !candidate.sealed)) {
+        const service = await readService(consumer.service);
+        const variable = service.readFailed ? undefined : service.variables.find(candidate => candidate.name === consumer.varName);
+        if (variable && !variable.sealed && variable.value !== undefined
+          && (cluster.fingerprint === null || fingerprint(variable.value, deps.fingerprintKey) === cluster.fingerprint)) { value = variable.value; break; }
+      }
+      if (value === undefined) { for (const consumer of cluster.consumers) unseen.add(label(consumer.service, consumer.varName)); continue; }
+      await check(value, cluster.consumers, ` (cluster ${cluster.id})`);
+    }
+    // Values keysentry did not inventory (for example a password under REDIS_PW) in the services this reset touches.
+    for (const work of refs.keys()) for (const key of work.services) {
+      const service = services.get(key);
+      if (!service || service.readFailed) continue;
+      for (const variable of service.variables) {
+        if (!UPSTASH_FORM_NAME.test(variable.name) || inventoried.has(`${key}\0${variable.name}`)) continue;
+        if (variable.sealed || variable.value === undefined) { unseen.add(label(service.service, variable.name)); continue; }
+        const text = variable.value.trim();
+        if (text.length < 16 || /^https?:\/\//i.test(text)) continue;
+        await check(variable.value, [{ service: service.service, varName: variable.name }], '');
+      }
+    }
+    if (unseen.size > 0) {
+      const places = [...unseen].sort().join(', ');
+      for (const work of refs.keys()) {
+        work.guided = true;
+        work.atomicRoll = false;
+        warn(work, `Guided reset: an Upstash reset changes every form of this credential (password, REST token, Redis URLs), and keysentry cannot read every place that may hold one: ${places}. Reset it in the Upstash console and update every form yourself.`);
+      }
+      return;
+    }
+    for (const [ref, group] of groups) {
+      const places = outside.get(ref);
+      if (places) {
+        const list = [...places].sort().join(', ');
+        for (const work of group) {
+          work.ready = false;
+          work.report.status = 'skipped';
+          warn(work, `Not reset: an Upstash reset also changes the same credential at ${list}, which this plan does not update. Plan those clusters together with this one (keysentry rotate --cluster for each) so one reset updates every form.`);
+        }
+        continue;
+      }
+      const primary = primaries.get(ref)!;
+      if (group.length < 2) continue;
+      primary.groupMembers = group.filter(work => work !== primary);
+      for (const member of primary.groupMembers) member.groupPrimary = primary;
+    }
+  }
+  /** The primary of a grouped roll returns each member's form under PLANNED_FORM_PREFIX names: keep them apart. */
+  function takeGroupForms(work: StepWork, result: RotationResult): RotationResult {
+    const forms = new Map<string, string>();
+    const companions: Record<string, string> = Object.create(null);
+    for (const [name, value] of Object.entries(result.companions ?? {})) {
+      if (!name.startsWith(PLANNED_FORM_PREFIX)) { companions[name] = value; continue; }
+      register(value);
+      forms.set(name.slice(PLANNED_FORM_PREFIX.length), value);
+    }
+    work.groupForms = forms;
+    // Members are rolled by this call: their results exist from now on, so recovery delivers them too.
+    for (const member of work.groupMembers ?? []) {
+      const value = forms.get(member.step.clusterId);
+      if (value === undefined || value === member.oldValue) continue;
+      member.result = { newValue: value, oldKeyRef: result.oldKeyRef, newKeyRef: result.newKeyRef, oldRevoked: true };
+      member.atomicRoll = true;
+      member.oldRevoked = true;
+    }
+    const { companions: _all, ...rest } = result;
+    return Object.keys(companions).length > 0 ? { ...rest, companions } : rest;
+  }
+  /** A member of a grouped roll: its form of the primary's result, or a clear account of why there is none. */
+  async function groupMemberResult(work: StepWork, guidedReplacement: (work: StepWork) => Promise<RotationResult | null>): Promise<RotationResult | null> {
+    const primary = work.groupPrimary!;
+    const named = `cluster ${primary.step.clusterId}`;
+    if (work.result) { register(work.result.newValue); return work.result; }
+    let where = 'the Upstash console';
+    try { const url = work.provider?.guidance().url; if (url) where = url; }
+    catch (failure) { if (isCrash(failure)) throw failure; /* keep the generic location */ }
+    if (primary.result && !primary.guided) {
+      if (primary.groupForms?.get(work.step.clusterId) === work.oldValue) {
+        work.report.status = 'skipped';
+        warn(work, `The reset (${named}) left this form of the credential unchanged; nothing to update.`);
+        return null;
+      }
+      work.atomicRoll = true;
+      work.oldRevoked = true;
+      await fail(work, `URGENT: the reset (${named}) also changed this form of the credential, but the provider did not return its new value. Copy it from ${where} and update every consumer of this step now.`);
+      return null;
+    }
+    if (primary.guided && primary.result) {
+      // A person reset the credential by hand: this form changed too, so ask for it as well.
+      work.guided = true;
+      work.atomicRoll = false;
+      return guidedReplacement(work);
+    }
+    if (primary.uncertain) {
+      await fail(work, `URGENT: the reset of this credential (${named}) may already have happened, but keysentry could not confirm it. If it did, this form is already invalid too. Check it at ${where} and update every consumer of this step.`);
+      return null;
+    }
+    work.report.status = 'skipped';
+    warn(work, `Not reset: the reset of this credential (${named}) did not run, so this form did not change.`);
+    return null;
   }
   async function readService(ref: ServiceRef): Promise<ServiceWork> {
     const key = serviceKey(ref);
@@ -811,6 +1004,7 @@ export async function runRotation(
           work.provider = provider;
           work.byRef = work.oldValue === undefined && canPrepareByRef(work, provider);
           work.guided = work.step.provider === 'encryption-key' || work.step.method === 'guided' || provider.method === 'guided' || !provider.rotate && !work.byRef
+            || isPublicGoogleKeyStep(work.step)
             || (work.oldValue === undefined && (work.step.method === 'auto' || work.step.method === 'atomic-roll') && !work.byRef);
           work.atomicRoll = !work.guided && (work.step.method === 'atomic-roll' || provider.method === 'atomic-roll');
           if (work.atomicRoll) {
@@ -832,10 +1026,13 @@ export async function runRotation(
           }
         } catch (error) { if (isCrash(error)) throw error; work.ready = false; await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.'); }
       }
+      await groupUpstashForms();
       const preparation = [
         ...works.filter(work => work.ready && work.guided),
         ...works.filter(work => work.ready && !work.guided && !work.atomicRoll),
-        ...works.filter(work => work.ready && work.atomicRoll),
+        // Members of a grouped roll follow their primary, whose single provider call rolls them too.
+        ...works.filter(work => work.ready && work.atomicRoll && !work.groupPrimary)
+          .flatMap(work => [work, ...(work.groupMembers ?? []).filter(member => member.ready)]),
       ];
       function invalidGuidedValue(work: StepWork, value: string): boolean {
         if (work.step.provider !== 'unknown' && work.step.consumers.some(c => !c.reference && classify(c.varName, value).provider !== work.step.provider)) return true;
@@ -859,7 +1056,7 @@ export async function runRotation(
         if (work.oldValue === undefined) warn(work, 'Old value is sealed; guided rotation is required and automatic old-key revocation may be unavailable.');
         const value = await deps.prompt({
           clusterId: work.step.clusterId, provider: work.step.provider, hint: work.step.hint,
-          guidance: provider.guidance(), consumers: work.step.consumers,
+          guidance: isPublicGoogleKeyStep(work.step) ? publicGoogleKeyGuidance() : provider.guidance(), consumers: work.step.consumers,
         });
         if (value === null) {
           work.report.status = 'skipped';
@@ -877,14 +1074,16 @@ export async function runRotation(
           crash(deps, 'after-store', { clusterId: work.step.clusterId });
           await journal('value-stored', { clusterId: work.step.clusterId, data: { newFingerprint: fingerprint(value, deps.fingerprintKey) } });
         }
-        // A pasted replacement must never become the OLD ref.
-        const oldKeyRef = work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, work.ctx!) : null;
+        // A pasted replacement must never become the OLD ref. A retained old key gets no ref, so nothing revokes it.
+        const oldKeyRef = !work.retainOldKey && work.oldValue !== undefined && provider.resolveKeyRef ? await provider.resolveKeyRef(work.oldValue, work.ctx!) : null;
         return { newValue: value, oldKeyRef, newKeyRef: null, oldRevoked: false };
       }
       for (const work of preparation) {
         work.ready = false;
-        if (waveStopped) { stopped(work); continue; }
-        if (aborted) {
+        // A member already rolled by its primary must still be delivered, like any rolled credential.
+        const rolledByPrimary = work.groupPrimary !== undefined && work.result !== undefined;
+        if (waveStopped && !rolledByPrimary) { stopped(work); continue; }
+        if (aborted && !rolledByPrimary) {
           work.report.status = 'skipped';
           warn(work, 'Rotation interrupted by the operator; no new provider mutation or replacement prompt was started.');
           continue;
@@ -897,7 +1096,7 @@ export async function runRotation(
             result = work.result!;
             // The store can be durable even when the following metadata entry
             // was never appended. Recover references without creating another key.
-            if (!result.oldKeyRef && work.oldValue !== undefined && provider.resolveKeyRef) result.oldKeyRef = await provider.resolveKeyRef(work.oldValue, ctx);
+            if (!result.oldKeyRef && !work.retainOldKey && work.oldValue !== undefined && provider.resolveKeyRef) result.oldKeyRef = await provider.resolveKeyRef(work.oldValue, ctx);
             if (!result.oldKeyRef && work.byRef) result.oldKeyRef = adoptedRef(work) ?? null;
           } else if (work.guided) {
             const replacement = await guidedReplacement(work);
@@ -906,10 +1105,18 @@ export async function runRotation(
               continue;
             }
             result = replacement;
+          } else if (work.groupPrimary) {
+            const derived = await groupMemberResult(work, guidedReplacement);
+            if (!derived) continue;
+            result = derived;
           } else {
             try {
+              // A grouped roll passes the other planned forms so the adapter returns each one's new value.
+              const rollCtx: ProviderContext = work.groupMembers?.length ? { ...ctx, siblingVars: { ...ctx.siblingVars,
+                ...Object.fromEntries(work.groupMembers.map(member => [`${PLANNED_FORM_PREFIX}${member.step.clusterId}`, member.oldValue!])) } } : ctx;
               result = work.byRef ? await provider.rotateByRef!(adoptedRef(work)!, ctx)
-                : await provider.rotate!(work.oldValue ?? '', ctx);
+                : await provider.rotate!(work.oldValue ?? '', rollCtx);
+              if (work.groupMembers?.length) result = takeGroupForms(work, result);
               providerProducedResult = true;
               work.result = result;
               work.atomicRoll ||= result.oldRevoked;
@@ -919,6 +1126,7 @@ export async function runRotation(
                 await deps.inflight.put(plan.id, `new:${work.step.clusterId}`, result.newValue);
                 crash(deps, 'after-store', { clusterId: work.step.clusterId });
                 for (const [name, value] of Object.entries(result.companions ?? {})) await deps.inflight.put(plan.id, `companion:${work.step.clusterId}:${name}`, value);
+                for (const member of work.groupMembers ?? []) if (member.result) await deps.inflight.put(plan.id, `new:${member.step.clusterId}`, member.result.newValue);
               }
             }
             catch (error) {
@@ -931,10 +1139,15 @@ export async function runRotation(
               // an adapter or stale plan that advertised an atomic roll.
               work.guided = true;
               work.atomicRoll = false;
+              if ('retainOldKey' in error && error.retainOldKey === true) {
+                work.retainOldKey = true;
+                warn(work, 'This key ships inside web pages or mobile apps that keysentry cannot redeploy. keysentry will not delete the old key: delete it yourself once those clients have updated.');
+              }
               const atomicRollsAlreadyRan = works.some(previous => previous.atomicRoll && previous.result);
               if (atomicRollsAlreadyRan) await preserveRolledValues('guided-fallback');
               await journal('created', { clusterId: work.step.clusterId, data: {
                 phase: 'guided-fallback', code: 'GUIDED_ROTATION_REQUIRED', atomicRollsAlreadyRan,
+                ...(work.retainOldKey ? { retainOldKey: true } : {}),
               } });
               const replacement = await guidedReplacement(work, true);
               if (!replacement) {
@@ -1072,6 +1285,10 @@ export async function runRotation(
               await journal('orphan-suspected', { clusterId: work.step.clusterId, data: { ...suspect, reason: 'unused-key-cleanup' } });
             }
             if (preparationJournalFailure) throw preparationJournalFailure;
+          }
+          if (mutationUncertain(error) && !work.result) {
+            await uncertainMutation(work, error);
+            continue;
           }
           await fail(work, 'Unable to prepare the replacement credential; no consumer was changed.');
         }
@@ -1241,6 +1458,11 @@ export async function runRotation(
           return;
         }
         if (blockedBySealed(work)) return;
+        if (work.retainOldKey) {
+          const message = 'The old key was kept because it ships inside web pages or mobile apps: delete it yourself in the provider console once every shipped client uses the replacement.';
+          if (!work.report.warnings.includes(message)) warn(work, message);
+          return;
+        }
         if (localGeneration(work)) {
           if ([...work.services].every(key => activationFor(work, key) === 'success')) {
             work.oldRevoked = true;

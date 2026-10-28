@@ -17,7 +17,8 @@ const CONFIGS: readonly DeployTarget[] = [
   { host: 'netlify', evidence: 'netlify.toml' },
   { host: 'netlify', evidence: '.netlify/state.json' }, // written by `netlify link` (holds the site id)
   { host: 'heroku', evidence: 'heroku.yml' },
-  { host: 'heroku', evidence: 'app.json' }, // Heroku app manifest (also read by Dokku)
+  // Heroku's app manifest, but also Expo's standard config file: it only corroborates another Heroku file (below).
+  { host: 'heroku', evidence: 'app.json' },
   { host: 'heroku', evidence: 'Procfile' }, // weak: Railway/Nixpacks, Dokku and Scalingo read it too
   { host: 'digitalocean', evidence: '.do/app.yaml' },
   { host: 'digitalocean', evidence: '.do/deploy.template.yaml' }, // "Deploy to DigitalOcean" button template
@@ -84,6 +85,12 @@ export async function detectDeployTargets(root: string): Promise<DeployTarget[]>
   const targets: DeployTarget[] = [];
   for (const config of CONFIGS) {
     if (await inspectPath(absoluteRoot, config.evidence)) targets.push({ ...config });
+  }
+  // app.json alone is usually a React Native/Expo project, not a Heroku app: keep it only beside heroku.yml or a Procfile.
+  const herokuFiles = targets.filter(target => target.host === 'heroku' && target.evidence !== 'app.json');
+  if (herokuFiles.length === 0) {
+    const manifest = targets.findIndex(target => target.host === 'heroku' && target.evidence === 'app.json');
+    if (manifest >= 0) targets.splice(manifest, 1);
   }
 
   const workflows = await inspectPath(absoluteRoot, '.github/workflows', true);

@@ -226,7 +226,8 @@ describe('Google provider: API key rotation', () => {
     const oldValue = apiKey();
     const newValue = apiKey();
     const token = accessToken();
-    const bound = oldMetadata({ restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://example.com/*'] } },
+    // Server (IP) restrictions are copied; browser, Android and iOS keys ship in clients and stay guided (below).
+    const bound = oldMetadata({ restrictions: { serverKeyRestrictions: { allowedIps: ['203.0.113.7'] } },
       annotations: undefined, serviceAccountEmail: 'gemini@demo-project.iam.gserviceaccount.com' });
     const http = new FakeHttp()
       .on('GET', /\/projects\/my-project\/locations\/global\/keys$/, (req) => { bearer(req, token); return json(200, { keys: [{ name: OLD }] }); })
@@ -234,7 +235,7 @@ describe('Google provider: API key rotation', () => {
       .on('GET', /\/keys\/old-key$/, () => json(200, bound))
       .on('POST', /\/projects\/123456789012\/locations\/global\/keys$/, (req) => {
         expect(JSON.parse(req.body!)).toEqual({ displayName: 'Production Gemini', serviceAccountEmail: 'gemini@demo-project.iam.gserviceaccount.com',
-          restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://example.com/*'] } } });
+          restrictions: { serverKeyRestrictions: { allowedIps: ['203.0.113.7'] } } });
         return json(200, { name: 'operations/akmf.p7-2', done: true, response: { name: NEW } });
       })
       .on('GET', /\/keys\/new-key\/keyString$/, (req) => { bearer(req, token); return json(200, { keyString: newValue }); });
@@ -325,7 +326,8 @@ describe('Google provider: API key rotation', () => {
         .on('GET', /\/operations\/s$/, () => json(200, { name: 'operations/s', done: false })), /still running/],
       ['bad key string', http => http.on('POST', /\/locations\/global\/keys$/, () => json(200, { name: 'operations/k', done: true, response: { name: NEW, keyString: 'short' } })), /invalid replacement/],
       ['reused value', http => http.on('POST', /\/locations\/global\/keys$/, () => json(200, { name: 'operations/k', done: true, response: { name: OLD, keyString: apiKey() } })), /invalid replacement/],
-      ['bad operation name', http => http.on('POST', /\/locations\/global\/keys$/, () => json(200, { name: '../../x', done: false })), /invalid operation/],
+      // The create call was accepted, so an operation may be running: the outcome is unknown.
+      ['bad operation name', http => http.on('POST', /\/locations\/global\/keys$/, () => json(200, { name: '../../x', done: false })), /unused replacement may appear/],
     ];
     for (const [, extend, message] of cases) {
       const oldValue = apiKey();

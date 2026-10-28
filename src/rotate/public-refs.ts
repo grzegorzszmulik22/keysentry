@@ -1,4 +1,5 @@
 import type { ProviderId } from '../types.js';
+import { isPublicKeyIdentifier } from '../core/redact.js';
 
 const AWS_ACCESS_KEY_ID = /^(?:AKIA|ASIA)[A-Z0-9]{16}$/;
 const TWILIO_KEY_SID = /^SK[0-9a-fA-F]{32}$/;
@@ -12,7 +13,7 @@ export function isPublicKeyId(value: string, provider?: ProviderId): boolean {
   if (provider === 'aws') return AWS_ACCESS_KEY_ID.test(value);
   if (provider === 'twilio') return TWILIO_KEY_SID.test(value);
   if (provider !== undefined) return false;
-  return AWS_ACCESS_KEY_ID.test(value) || TWILIO_KEY_SID.test(value);
+  return isPublicKeyIdentifier(value);
 }
 
 /** Providers whose key references are public identifiers (see isPublicKeyId). */

@@ -202,9 +202,10 @@ describe('twilioProvider rotate', () => {
     expect(result.newKeyRef === newSid).toBe(true);
     expect(result.oldRevoked).toBe(false);
     expect(result.companions).toEqual({ TWILIO_API_KEY: newSid });
+    // The pair is proven (the secret authenticates as the SID) before the key's policy is read.
     expect(s.http.calls.map(call => `${call.method} ${new URL(call.url).host}${new URL(call.url).pathname}`)).toEqual([
-      `GET iam.twilio.com/v1/Keys/${s.oldSid}`,
       `GET api.twilio.com/2010-04-01/Accounts/${s.account}/Applications.json`,
+      `GET iam.twilio.com/v1/Keys/${s.oldSid}`,
       'GET iam.twilio.com/v1/Keys',
       'POST iam.twilio.com/v1/Keys',
     ]);
@@ -220,7 +221,7 @@ describe('twilioProvider rotate', () => {
     expect(result.companions).toEqual({ TWILIO_API_KEY: newSid, TWILIO_KEY_SID_COPY: newSid });
   });
 
-  it('copies a Restricted key policy without probing for Main access', async () => {
+  it('copies a Restricted key policy after proving the pair, without probing for Main access', async () => {
     const s = setup();
     const policy = { allow: ['/twilio/messaging/messages/read', '/twilio/messaging/messages/create'] };
     const { newSid } = standardRoutes(s, { policy });
@@ -231,7 +232,10 @@ describe('twilioProvider rotate', () => {
     expect([...body.keys()].sort()).toEqual(['AccountSid', 'FriendlyName', 'KeyType', 'Policy']);
     expect(body.get('KeyType')).toBe('restricted');
     expect(JSON.parse(body.get('Policy')!)).toEqual(policy);
-    expect(s.http.callsTo('GET', /Applications\.json/)).toHaveLength(0);
+    // One authentication as the old key proves the pair; a Restricted key is never probed for Main access.
+    const proofs = s.http.callsTo('GET', /Applications\.json/);
+    expect(proofs).toHaveLength(1);
+    expect(proofs[0]!.headers?.Authorization === basic(s.oldSid, s.oldSecret)).toBe(true);
     expect(s.http.callsTo('GET', /\/v1\/Keys\?/)).toHaveLength(0);
   });
 

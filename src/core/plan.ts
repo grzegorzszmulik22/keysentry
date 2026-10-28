@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { TIER_ORDER } from '../types.js';
 import type { Cluster, Consumer, HostId, Inventory, PlanStep, ProviderId, Redactor, RiskTier, RotationPlan, ServiceRef } from '../types.js';
 import { createRedactor } from './redact.js';
+import { isPublicGoogleKeyName, PUBLIC_GOOGLE_KEY_EXPLANATION } from './classify.js';
 import { serviceKey } from './service-key.js';
 
 interface PlanOptions {
@@ -104,7 +105,21 @@ function renderConsumers(consumers: Consumer[], redactor: Redactor): string[] {
   return consumers.map(consumer => `- ${code(`${serviceLabel(consumer.service)}:${consumer.varName}`, redactor)} (${serviceContext(consumer.service, redactor)})${consumer.sealed ? ' — sealed' : ''}${consumer.reference ? ' — reference — redeploy only; do not overwrite' : ''}`);
 }
 
+/** A Google API key that some consumer ships to web or mobile clients (see isPublicGoogleKeyName). */
+export function isPublicGoogleKeyStep(step: Pick<PlanStep, 'provider' | 'consumers'>): boolean {
+  return step.provider === 'google' && step.consumers.some(consumer => isPublicGoogleKeyName(consumer.varName));
+}
+
 function instructions(step: PlanStep): string[] {
+  if (isPublicGoogleKeyStep(step)) {
+    return [
+      PUBLIC_GOOGLE_KEY_EXPLANATION,
+      `First check its restrictions at ${DASHBOARD_HINTS.google}: limit it to your websites or app IDs and to the APIs it needs. That is usually the right fix.`,
+      'If it must be replaced, create a new key with the same restrictions and provide it through the hidden prompt; never put its value in this runbook.',
+      'Update every consumer listed above and publish new web and app builds.',
+      'Delete the old key yourself, only after the shipped apps and pages that used it have updated. keysentry does not delete it.',
+    ];
+  }
   const stage = step.consumers.some(consumer => consumer.reference)
     ? 'Stage the replacement in directly stored variables, suppressing deployments until all plan steps are staged. Leave reference variables unchanged and include their services in the shared redeploy pass.'
     : 'Stage the replacement in every consumer listed above, suppressing deployments until all plan steps are staged.';
@@ -215,6 +230,7 @@ export function renderBlastRadius(inv: Inventory): string {
       `${cluster.tier} · ${cluster.provider} · ${code(cluster.method, redactor)}`,
       `Hint: ${cluster.hint === null ? 'unavailable' : code(cluster.hint, redactor)}`,
       cluster.consumers.length > 1 ? `Shared secret: this key lives in ${cluster.consumers.length} places. Rotate every copy together.` : `This key lives in ${cluster.consumers.length} place.`,
+      ...(isPublicGoogleKeyStep(cluster) ? [PUBLIC_GOOGLE_KEY_EXPLANATION] : []),
       '', ...renderConsumers(cluster.consumers, redactor), '',
     );
   }

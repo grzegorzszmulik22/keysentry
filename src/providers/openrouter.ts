@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult } from '../types.js';
-import { credential, ensureOk, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, mutationRequest, ProviderMutationUncertainError, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 const BASE = 'https://openrouter.ai/api/v1';
 const PROVIDER = 'OpenRouter';
@@ -116,10 +116,17 @@ async function createKey(ctx: ProviderContext, name: string, limit: number | nul
   restrictions: KeyRestrictions = {}): Promise<{ value: string; keyRef: string }> {
   const body: { name: string; limit?: number | null } & KeyRestrictions = { name, ...restrictions };
   if (limit !== undefined) body.limit = limit;
-  const response = await request(ctx, { method: 'POST', url: `${BASE}/keys`, headers: headers(ctx), body: JSON.stringify(body) }, PROVIDER);
+  const response = await mutationRequest(ctx, { method: 'POST', url: `${BASE}/keys`, headers: headers(ctx), body: JSON.stringify(body) }, PROVIDER);
   ensureOk(response, PROVIDER);
-  const payload = record(readJson<unknown>(response, PROVIDER));
-  if (typeof payload?.key !== 'string' || payload.key.length === 0) throw new Error(`${PROVIDER} returned an invalid new key`);
+  let payload: Row | undefined;
+  try {
+    payload = record(response.json<unknown>());
+  } catch {
+    payload = undefined;
+  }
+  if (typeof payload?.key !== 'string' || payload.key.length === 0) {
+    throw new ProviderMutationUncertainError(`${PROVIDER} returned an invalid new key; check the provider console for an unused keysentry key.`);
+  }
   return { value: payload.key, keyRef: keyRef(record(payload.data)?.hash, ctx, [payload.key]) };
 }
 

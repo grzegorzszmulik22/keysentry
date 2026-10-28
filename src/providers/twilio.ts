@@ -1,5 +1,5 @@
 import type { HttpRequest, ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult } from '../types.js';
-import { credential, ensureOk, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, mutationRequest, ProviderMutationUncertainError, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 // Docs (accessed 2026-10-28): https://www.twilio.com/docs/iam/api-keys/key-resource-v1,
 // https://www.twilio.com/docs/usage/requests-to-twilio, https://www.twilio.com/docs/api/errors/20003,
@@ -83,13 +83,39 @@ function adminAccountSid(ctx: ProviderContext): string | null {
 }
 
 /** Choose one sibling value: a conventionally named variable first, else the only distinct value of that shape. */
-function pick(siblings: Record<string, string>, candidates: string[], shape: RegExp): string | null {
+function pick(siblings: Record<string, string>, candidates: string[], shape: RegExp, claimed: ReadonlySet<string> = new Set()): string | null {
   for (const name of candidates) {
     const value = siblings[name];
     if (typeof value === 'string' && shape.test(value)) return value;
   }
   const values = new Set(Object.values(siblings).filter((value) => typeof value === 'string' && shape.test(value)));
-  return values.size === 1 ? [...values][0]! : null;
+  if (values.size !== 1) return null;
+  const only = [...values][0]!;
+  // The fallback never takes a SID that sits under the conventional name of another secret's SID: that SID belongs to
+  // the other secret (TWILIO_API_KEY to TWILIO_API_SECRET), not to the value being rotated.
+  return Object.keys(siblings).some((name) => siblings[name] === only && claimed.has(name)) ? null : only;
+}
+
+/** Conventional names of the API key SID paired with a secret held under `holder` (TWILIO_API_SECRET -> TWILIO_API_KEY). */
+export function twilioSidNames(holder: string): string[] {
+  let match: RegExpExecArray | null;
+  if ((match = /^(.*)API_KEY_SECRET$/.exec(holder))) return [`${match[1]}API_KEY_SID`, `${match[1]}API_KEY`];
+  if ((match = /^(.*)API_SECRET$/.exec(holder))) return [`${match[1]}API_KEY`, `${match[1]}API_KEY_SID`, `${match[1]}API_SID`];
+  if ((match = /^(.*)SECRET$/.exec(holder))) return [`${match[1]}SID`, `${match[1]}KEY_SID`];
+  return [];
+}
+
+/**
+ * The API key SID paired with a secret held under `holders` in one service: a conventionally named SID first, else the
+ * only SK… value in the service, unless that SID is the conventional partner of another secret in the service.
+ * Shared with the rotation engine's consistency check so both always agree.
+ */
+export function twilioKeySidFor(holders: string[], siblings: Record<string, string>): string | null {
+  const own = holders.flatMap(twilioSidNames);
+  const claimed = new Set(Object.keys(siblings)
+    .filter((name) => !holders.includes(name) && /SECRET$/.test(name) && typeof siblings[name] === 'string' && siblings[name]!.length > 0)
+    .flatMap(twilioSidNames));
+  return pick(siblings, own, KEY_SID, claimed);
 }
 
 /**
@@ -102,26 +128,18 @@ function findPair(value: string, ctx: ProviderContext): Pair {
   const kind: Kind = holders.some((name) => /AUTH_TOKEN$/.test(name)) ? 'auth-token'
     : holders.some((name) => /SECRET$/.test(name)) ? 'api-key'
       : AUTH_TOKEN_SHAPE.test(value) ? 'auth-token' : 'api-key';
-  const sidNames: string[] = [];
   const accountNames: string[] = [];
   for (const holder of holders) {
     let match: RegExpExecArray | null;
     if ((match = /^(.*)AUTH_TOKEN$/.exec(holder))) {
       accountNames.push(`${match[1]}ACCOUNT_SID`);
-    } else if ((match = /^(.*)API_KEY_SECRET$/.exec(holder))) {
-      sidNames.push(`${match[1]}API_KEY_SID`, `${match[1]}API_KEY`);
-      accountNames.push(`${match[1]}ACCOUNT_SID`);
-    } else if ((match = /^(.*)API_SECRET$/.exec(holder))) {
-      sidNames.push(`${match[1]}API_KEY`, `${match[1]}API_KEY_SID`, `${match[1]}API_SID`);
-      accountNames.push(`${match[1]}ACCOUNT_SID`);
-    } else if ((match = /^(.*)SECRET$/.exec(holder))) {
-      sidNames.push(`${match[1]}SID`, `${match[1]}KEY_SID`);
+    } else if ((match = /^(.*?)(?:API_KEY_SECRET|API_SECRET|SECRET)$/.exec(holder))) {
       accountNames.push(`${match[1]}ACCOUNT_SID`);
     }
   }
   accountNames.push('TWILIO_ACCOUNT_SID');
   const accountSid = pick(siblings, accountNames, ACCOUNT_SID);
-  const keySid = kind === 'api-key' ? pick(siblings, sidNames, KEY_SID) : null;
+  const keySid = kind === 'api-key' ? twilioKeySidFor(holders, siblings) : null;
   const keySidVars = keySid === null ? [] : Object.keys(siblings).filter((name) => siblings[name] === keySid).sort();
   return { kind, keySid, keySidVars, accountSid };
 }
@@ -158,6 +176,12 @@ function samePolicy(requested: Policy | null, returned: unknown): boolean {
 async function keyPolicy(pair: Pair & { keySid: string; accountSid: string }, oldValue: string, admin: Admin,
   ctx: ProviderContext): Promise<Policy | null> {
   try {
+    // Prove the pair first: the secret must authenticate as the SID it was paired with. 2xx, or 403 for a Restricted
+    // key without access to this list, proves it; 401 (or anything else) means the SID belongs to another secret.
+    const proof = await request(ctx, applicationsRequest(pair.accountSid, pair.keySid, oldValue), PROVIDER);
+    if (!(proof.status >= 200 && proof.status < 300) && proof.status !== 403) {
+      throw new TwilioGuidedRotationRequiredError('the secret does not authenticate as the API key SID paired with it');
+    }
     const response = await request(ctx, {
       method: 'GET', url: `${IAM}/Keys/${pair.keySid}`, headers: { Authorization: basic(admin.username, admin.password) },
     }, PROVIDER);
@@ -171,10 +195,9 @@ async function keyPolicy(pair: Pair & { keySid: string; accountSid: string }, ol
     const policy = parsePolicy(data.policy);
     if (policy !== null) return policy;
     // A null policy is a Standard key or a Main key. Main keys can only be created in the Console, and the docs say
-    // Standard keys are refused (error 20003) by the Keys endpoints that Main keys may call. Prove the old secret
-    // authenticates first, so a refusal cannot simply mean a wrong secret.
-    const check = await request(ctx, applicationsRequest(pair.accountSid, pair.keySid, oldValue), PROVIDER);
-    if (check.status < 200 || check.status >= 300) {
+    // Standard keys are refused (error 20003) by the Keys endpoints that Main keys may call. A Standard key reads the
+    // account's resources, so the proof above must have been a 2xx: a refusal cannot simply mean a wrong secret.
+    if (proof.status < 200 || proof.status >= 300) {
       throw new TwilioGuidedRotationRequiredError('the old Twilio API key did not authenticate');
     }
     const probe = await request(ctx, {
@@ -200,9 +223,10 @@ async function removeUnusable(sid: string, admin: Admin, ctx: ProviderContext): 
   } catch {
     removed = false;
   }
-  throw new Error(removed
-    ? 'Twilio returned an unusable or differently scoped replacement key; it was deleted and no consumer was changed.'
-    : 'Twilio returned an unusable or differently scoped replacement key and it could not be deleted; delete the newest keysentry API key in the Twilio Console.');
+  if (removed) throw new Error('Twilio returned an unusable or differently scoped replacement key; it was deleted and no consumer was changed.');
+  throw new ProviderMutationUncertainError(
+    'Twilio returned an unusable or differently scoped replacement key and it could not be deleted; delete the unused keysentry API key in the Twilio Console.',
+    false, sid);
 }
 
 export const twilioProvider: ProviderAdapter = {
@@ -254,16 +278,21 @@ export const twilioProvider: ProviderAdapter = {
       body.set('KeyType', 'restricted');
       body.set('Policy', JSON.stringify(policy));
     }
-    const response = await request(rctx, {
+    const response = await mutationRequest(rctx, {
       method: 'POST', url: `${IAM}/Keys`,
       headers: { Authorization: basic(admin.username, admin.password), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     }, PROVIDER);
     ensureOk(response, PROVIDER);
-    const data = record(readJson<unknown>(response, PROVIDER));
+    let data: Row | undefined;
+    try {
+      data = record(response.json<unknown>());
+    } catch {
+      data = undefined;
+    }
     const newSid = data?.sid;
     if (typeof newSid !== 'string' || !KEY_SID.test(newSid) || newSid === pair.keySid) {
-      throw new Error('Twilio returned an invalid API key creation response; check the Twilio Console for an unused keysentry API key.');
+      throw new ProviderMutationUncertainError('Twilio returned an invalid API key creation response; check the Twilio Console for an unused keysentry API key.');
     }
     const secret = data?.secret;
     if (typeof secret !== 'string' || secret.trim().length === 0 || secret === oldValue || isIdentifier(secret)

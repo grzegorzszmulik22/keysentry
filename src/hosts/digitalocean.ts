@@ -38,6 +38,26 @@ interface EnvEntry {
   sealed: boolean;
 }
 
+// Credentials kept in the spec outside `envs`: log destination keys (Datadog api_key, Better Stack/Logtail token,
+// OpenSearch basic_auth password) and image registry_credentials.
+const SPEC_SECRET_FIELDS = new Set(['api_key', 'token', 'password', 'registry_credentials']);
+
+/**
+ * The whole spec is sent back on every write, so a credential outside `envs` must round-trip exactly. App Platform
+ * returns encrypted values as `EV[...]` ciphertext, which it accepts back unchanged. A value in any other form (plain,
+ * empty or masked) might be a placeholder that would overwrite the real credential, so the write is refused. Whether
+ * these fields always come back as ciphertext is not documented (notes/fix-phase6.md).
+ */
+function specCredentialsRoundTrip(value: unknown, key = ''): boolean {
+  if (key === 'envs') return true;
+  if (Array.isArray(value)) return value.every((item) => specCredentialsRoundTrip(item));
+  if (value !== null && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).every(([name, item]) => specCredentialsRoundTrip(item, name));
+  }
+  if (!SPEC_SECRET_FIELDS.has(key)) return true;
+  return value === undefined || value === null || (typeof value === 'string' && CIPHERTEXT.test(value));
+}
+
 function invalidResponse(): never {
   // App specs hold secrets (variables, log destination keys); never include them in errors.
   throw new Error('DigitalOcean returned an invalid response');
@@ -233,6 +253,9 @@ export function createDigitalOceanHost({ token, apps, http, log }: DigitalOceanH
         throw new Error('DigitalOcean app is pinned to a rollback; commit or revert the rollback first');
       }
       const spec = record(app.spec);
+      if (!specCredentialsRoundTrip(spec)) {
+        throw new Error('DigitalOcean app spec holds a log destination or registry credential that is not encrypted, so a full spec update could overwrite it; update this variable in the DigitalOcean control panel instead');
+      }
       const holder = holderFor(spec, service);
       const entries = entriesOf(holder);
       // Validate every key before changing anything.

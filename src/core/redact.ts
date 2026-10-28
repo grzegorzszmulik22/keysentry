@@ -3,11 +3,24 @@ import { secretPatternRanges } from './classify.js';
 
 const MASK = '«redacted»';
 
+const AWS_ACCESS_KEY_ID = /^(?:AKIA|ASIA)[A-Z0-9]{16}$/;
+const TWILIO_KEY_SID = /^SK[0-9a-fA-F]{32}$/;
+
+/**
+ * Public key identifiers: AWS access key ids and Twilio API key SIDs. They name a key, they do not grant access
+ * (classify marks them non-secret), and rotation journals and reports must keep them so finish, undo and resume can
+ * revoke the right key. The redactor therefore never registers them, even when a caller registers every value it
+ * writes. The secrets paired with them stay masked, and the rotation engine still masks them in freeform text.
+ */
+export function isPublicKeyIdentifier(value: string): boolean {
+  return AWS_ACCESS_KEY_ID.test(value) || TWILIO_KEY_SID.test(value);
+}
+
 export function createRedactor(): Redactor {
   const secrets = new Set<string>();
   return {
     register(secret) {
-      if (secret.length < 6 || secrets.has(secret)) return;
+      if (secret.length < 6 || secrets.has(secret) || isPublicKeyIdentifier(secret)) return;
       secrets.add(secret);
     },
     redact(text) {

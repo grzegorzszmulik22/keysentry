@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { ArmedCluster, ArmedPlan, AutopilotMethod, Cluster, HostId, Inventory, ProviderId } from '../types.js';
 import { classify } from '../core/classify.js';
 import { serviceKey } from '../core/service-key.js';
-import { getProvider, PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { getProvider, PROVIDER_CREDENTIALS, rotationIdentifiesOldKey } from '../providers/index.js';
 import { canonicalJson, signDetached, verifyDetached, type DeviceKey } from '../security/index.js';
 import { HOST_IDS } from '../types.js';
 
@@ -108,9 +108,9 @@ export function autopilotEligibility(cluster: Cluster): Eligibility {
   if (cluster.tier === 'crypto' || cluster.provider === 'crypto-wallet') return refuse('Wallet keys are never rotated automatically.');
   if (cluster.provider === 'private-key') return refuse('Private keys are never rotated automatically.');
   if (cluster.consumers.length === 0) return refuse('The cluster has no consumers.');
-  // Inventory plans Google service-account JSON keys as guided (methodForValue); a person rotates them.
+  // Inventory plans Google service-account JSON keys and public (client-side) API keys as guided (methodForValue).
   if (cluster.provider === 'google' && cluster.method === 'guided') {
-    return refuse('Google service-account keys are always rotated by a person, so they cannot be armed.');
+    return refuse('Google service-account keys and public (client-side) Google API keys are always rotated by a person, so they cannot be armed.');
   }
 
   let adapter;
@@ -133,6 +133,9 @@ export function autopilotEligibility(cluster: Cluster): Eligibility {
   } else if (adapter.method !== 'auto' || typeof adapter.rotate !== 'function'
     || typeof adapter.revoke !== 'function' || typeof adapter.verify !== 'function') {
     return refuse('This provider cannot create, verify and revoke keys automatically.');
+  } else if (!rotationIdentifiesOldKey(cluster.provider)) {
+    // An armed wave would leave the possibly compromised old key valid (rotate returns no old key reference).
+    return refuse('This provider cannot identify the old key, so an unattended rotation would leave it valid. Rotate it with supervision and delete the old key yourself.');
   }
   if (adoptionNeeded(cluster)) return refuse('Write-only consumers need adoption before automatic rotation.');
   if ((cluster as AdoptableCluster).adopted && !adoptedSchema.safeParse((cluster as AdoptableCluster).adopted).success) {

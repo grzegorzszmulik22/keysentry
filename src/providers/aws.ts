@@ -1,6 +1,7 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import type { HttpResponse, ProviderAdapter, ProviderContext } from '../types.js';
 import { signAwsRequest, type AwsCredentials } from './aws-sigv4.js';
+import { ProviderMutationUncertainError } from './shared.js';
 
 interface CredentialPair {
   accessIdVar: string;
@@ -117,13 +118,27 @@ export const awsProvider: ProviderAdapter = {
     if (credentials.sessionToken) {
       throw new Error('AWS automatic rotation does not support session credentials; renew the temporary credentials through their issuer.');
     }
-    const response = await query(ctx, 'iam', credentials, { Action: 'CreateAccessKey', Version: '2010-05-08' });
+    const uncertain = (detail: string) => new ProviderMutationUncertainError(
+      `AWS ${detail}; a new access key may already exist for this IAM user. Check it in the IAM console.`);
+    let response: HttpResponse;
+    try {
+      response = await query(ctx, 'iam', credentials, { Action: 'CreateAccessKey', Version: '2010-05-08' });
+    } catch {
+      throw uncertain('did not answer the CreateAccessKey request');
+    }
+    if (response.status >= 500) throw uncertain(`request failed (HTTP ${response.status})`);
     ensureOk(response);
-    const result = child(parseResponse(response, 'CreateAccessKeyResponse'), 'CreateAccessKeyResult');
-    const key = child(result, 'AccessKey');
-    const newId = stringField(key, 'AccessKeyId');
-    const newValue = stringField(key, 'SecretAccessKey');
-    if (!validAccessId(newId, [oldValue, newValue, credentials.sessionToken])) throw new Error('AWS returned an invalid response.');
+    let newId: string;
+    let newValue: string;
+    try {
+      const result = child(parseResponse(response, 'CreateAccessKeyResponse'), 'CreateAccessKeyResult');
+      const key = child(result, 'AccessKey');
+      newId = stringField(key, 'AccessKeyId');
+      newValue = stringField(key, 'SecretAccessKey');
+    } catch {
+      throw uncertain('returned an invalid response');
+    }
+    if (!validAccessId(newId, [oldValue, newValue, credentials.sessionToken])) throw uncertain('returned an invalid response');
     return {
       newValue,
       oldKeyRef: credentials.accessKeyId,

@@ -79,7 +79,8 @@ describe('Kubernetes host', () => {
       }))
       .on('GET', /\/namespaces\/apps\/secrets\?limit=100&labelSelector=team%3Dpay&continue=next%2Ftoken$/, () => json(200, {
         metadata: { continue: '' },
-        items: [{ ...secret(), type: 'kubernetes.io/tls', metadata: { name: 'tls-cert' } }],
+        // A TLS pair is renewed by its issuer (skipped since fix-phase6); an ordinary Secret on this page is listed.
+        items: [{ ...secret(), type: 'kubernetes.io/tls', metadata: { name: 'tls-cert' } }, { ...secret(), metadata: { name: 'billing' } }],
       }))
       .on('GET', /\/namespaces\/jobs\/secrets\?limit=100&labelSelector=team%3Dpay$/, () => json(200, {
         metadata: {}, items: [{ metadata: { name: 'worker' }, data: {} }],
@@ -88,7 +89,7 @@ describe('Kubernetes host', () => {
     const refs = await hostFor(http, { namespaces: ['apps', 'jobs'], labelSelector: 'team=pay', cluster: 'prod-eu' }).listServices();
     expect(refs).toEqual([
       { ...service, environmentId: 'prod-eu', environmentName: 'prod-eu' },
-      { ...service, serviceId: 'tls-cert', serviceName: 'tls-cert', environmentId: 'prod-eu', environmentName: 'prod-eu' },
+      { ...service, serviceId: 'billing', serviceName: 'billing', environmentId: 'prod-eu', environmentName: 'prod-eu' },
       { ...service, projectId: 'jobs', projectName: 'jobs', serviceId: 'worker', serviceName: 'worker', environmentId: 'prod-eu', environmentName: 'prod-eu' },
     ]);
     expect(http.calls).toEqual([

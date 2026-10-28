@@ -109,8 +109,9 @@ describe('Doppler host', () => {
       body: JSON.stringify({
         project: 'backend', config: 'prd',
         change_requests: [
-          { name: 'API_KEY', originalName: 'API_KEY', value: 'test-new-api', originalValue: 'test-old-api' },
-          { name: 'SEALED', originalName: 'SEALED', value: 'test-new-sealed' },
+          // fix-phase6: the current visibility is sent back so an update never resets it.
+          { name: 'API_KEY', originalName: 'API_KEY', value: 'test-new-api', originalValue: 'test-old-api', visibility: 'masked' },
+          { name: 'SEALED', originalName: 'SEALED', value: 'test-new-sealed', visibility: 'restricted' },
           { name: 'ADDED', originalName: null, value: 'test-added' },
         ],
       }),

@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult } from '../types.js';
-import { credential, ensureOk, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, mutationRequest, ProviderMutationUncertainError, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 // Docs (accessed 2026-10-28): https://neon.com/docs/manage/api-keys,
 // https://neon.com/docs/reference/api/api-keys/create-api-key, .../api-keys/list-api-keys, .../api-keys/revoke-api-key,
@@ -61,17 +61,24 @@ async function personalKeys(admin: string, ctx: ProviderContext): Promise<Row[]>
 }
 
 async function createKey(admin: string, ctx: ProviderContext, previous: string[]): Promise<{ value: string; id: string }> {
-  const response = await request(ctx, {
+  const response = await mutationRequest(ctx, {
     method: 'POST', url: `${API}/api_keys`,
     headers: { ...auth(admin), 'Content-Type': 'application/json' },
     body: JSON.stringify({ key_name: `keysentry-${new Date().toISOString()}` }),
   }, PROVIDER);
   ensureOk(response, PROVIDER);
-  const data = record(readJson<unknown>(response, PROVIDER));
+  let data: Row | undefined;
+  try {
+    data = record(response.json<unknown>());
+  } catch {
+    data = undefined;
+  }
   const id = keyId(data?.id);
   const value = data?.key;
   if (id === null || typeof value !== 'string' || value.trim().length === 0 || previous.includes(value) || value === admin) {
-    throw new Error('Neon returned an invalid API key creation response; check the Neon Console for an unused keysentry API key.');
+    // Name the possible stray key only when the response cannot be describing an existing key.
+    const stray = typeof value === 'string' && (previous.includes(value) || value === admin) ? null : id;
+    throw new ProviderMutationUncertainError('Neon returned an invalid API key creation response; check the Neon Console for an unused keysentry API key.', false, stray);
   }
   return { value, id };
 }

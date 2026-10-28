@@ -47,17 +47,44 @@ function identifier(value: string, what: string): string {
   return value;
 }
 
-interface DopplerSecret { raw?: string; readable: boolean }
+interface DopplerSecret {
+  raw?: string;
+  readable: boolean;
+  /** The secret's current visibility and value type, sent back with every change so an update never resets them. */
+  visibility?: 'masked' | 'unmasked' | 'restricted';
+  valueType?: string;
+}
+
+const VISIBILITIES = new Set(['masked', 'unmasked', 'restricted']);
+const VALUE_TYPE = /^[a-z0-9]{1,32}$/;
 
 function secretEntry(value: unknown): DopplerSecret {
   const entry = object(value);
   const visibility = entry.rawVisibility === undefined || entry.rawVisibility === null ? {} : object(entry.rawVisibility);
   const restricted = visibility.type === 'restricted';
-  if (entry.raw === undefined || entry.raw === null) return { readable: false };
+  const kept: Pick<DopplerSecret, 'visibility' | 'valueType'> = {};
+  if (typeof visibility.type === 'string' && VISIBILITIES.has(visibility.type)) kept.visibility = visibility.type as DopplerSecret['visibility'];
+  const valueType = entry.rawValueType ?? entry.valueType;
+  if (valueType !== undefined && valueType !== null) {
+    const type = object(valueType).type;
+    if (typeof type === 'string' && VALUE_TYPE.test(type)) kept.valueType = type;
+  }
+  if (entry.raw === undefined || entry.raw === null) return { readable: false, ...kept };
   if (typeof entry.raw !== 'string') invalidResponse();
   // Older behaviour returned an empty string for a restricted value hidden from a user-bound token.
-  if (restricted && entry.raw === '') return { readable: false };
-  return { raw: entry.raw, readable: true };
+  if (restricted && entry.raw === '') return { readable: false, ...kept };
+  return { raw: entry.raw, readable: true, ...kept };
+}
+
+/**
+ * Doppler documents no default `visibility` for a change request, so an update without one might reset a restricted
+ * secret to masked. Send the current visibility (and value type, when the listing shows it) back unchanged.
+ */
+function keepSettings(existing: DopplerSecret): Record<string, unknown> {
+  return {
+    ...(existing.visibility ? { visibility: existing.visibility } : {}),
+    ...(existing.valueType ? { valueType: { type: existing.valueType } } : {}),
+  };
 }
 
 export function createDopplerHost(opts: DopplerHostOptions): HostAdapter {
@@ -168,9 +195,9 @@ export function createDopplerHost(opts: DopplerHostOptions): HostAdapter {
           changes.push({ name, originalName: null, value });
         } else if (!existing.readable) {
           // A write-only value cannot be compared; Doppler gets no precondition for it.
-          changes.push({ name, originalName: name, value });
+          changes.push({ name, originalName: name, value, ...keepSettings(existing) });
         } else if (existing.raw !== value) {
-          changes.push({ name, originalName: name, value, originalValue: existing.raw });
+          changes.push({ name, originalName: name, value, originalValue: existing.raw, ...keepSettings(existing) });
         }
       }
       if (changes.length === 0) return;

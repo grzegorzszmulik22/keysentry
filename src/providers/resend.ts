@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderContext } from '../types.js';
-import { credential, ensureOk, matchHint, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, matchHint, mutationRequest, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 const API_URL = 'https://api.resend.com';
 
@@ -89,7 +89,7 @@ export const resendProvider: ProviderAdapter = {
   async rotate(oldValue, ctx) {
     const admin = credential(ctx, 'RESEND_ADMIN_KEY');
     const scope = await keyScope(oldValue, admin, ctx);
-    const response = await request(ctx, {
+    const response = await mutationRequest(ctx, {
       method: 'POST',
       url: `${API_URL}/api-keys`,
       headers: { Authorization: `Bearer ${admin}`, 'Content-Type': 'application/json' },

@@ -1,5 +1,5 @@
 import type { HttpResponse, ProviderAdapter, ProviderContext, RotationResult, VerifyResult } from '../types.js';
-import { credential, ensureOk, readJson, request, verifyRead } from './shared.js';
+import { credential, ensureOk, PLANNED_FORM_PREFIX, ProviderMutationUncertainError, readJson, request, verifyRead } from './shared.js';
 
 // Docs (accessed 2026-10-28): https://upstash.com/docs/devops/developer-api/authentication.md,
 // .../developer-api/redis/list_databases.md, .../developer-api/redis/reset_password.md,
@@ -146,15 +146,18 @@ async function identify(value: string, ctx: ProviderContext): Promise<Target | n
 const ROLLED_UNKNOWN = 'Upstash completed the reset but did not return usable new credentials; the old credentials may already be invalid. Copy the new values from the Upstash console and update every consumer now.';
 const UNCONFIRMED = 'the reset may already have happened. Check the credential in the Upstash console before retrying.';
 
-/** A reset whose outcome is unknown (transport failure, 5xx) must not read as "nothing changed". */
+/**
+ * A reset whose outcome is unknown (transport failure, 5xx) must not read as "nothing changed": it raises the coded
+ * ProviderMutationUncertainError, which the engine reports as a possibly rolled credential.
+ */
 async function mutate(ctx: ProviderContext, url: string): Promise<HttpResponse> {
   let response: HttpResponse;
   try {
     response = await request(ctx, { method: 'POST', url, headers: mgmtHeaders(ctx) }, PROVIDER);
   } catch {
-    throw new Error(`${PROVIDER} did not answer the reset request; ${UNCONFIRMED}`);
+    throw new ProviderMutationUncertainError(`${PROVIDER} did not answer the reset request; ${UNCONFIRMED}`, true);
   }
-  if (response.status >= 500) throw new Error(`${PROVIDER} request failed (HTTP ${response.status}); ${UNCONFIRMED}`);
+  if (response.status >= 500) throw new ProviderMutationUncertainError(`${PROVIDER} request failed (HTTP ${response.status}); ${UNCONFIRMED}`, true);
   ensureOk(response, PROVIDER);
   return response;
 }
@@ -170,7 +173,8 @@ function redisCompanions(siblings: Record<string, string>, primary: string, befo
     else if (value === before.password) companions[name] = after.password;
     else if (before.readOnlyToken !== undefined && value === before.readOnlyToken) {
       if (after.readOnlyToken === undefined) readOnlyUnknown = true;
-      else if (after.readOnlyToken !== before.readOnlyToken) companions[name] = after.readOnlyToken;
+      // A planned form is answered even when unchanged, so the engine can tell "unchanged" from "unknown".
+      else if (after.readOnlyToken !== before.readOnlyToken || name.startsWith(PLANNED_FORM_PREFIX)) companions[name] = after.readOnlyToken;
     } else {
       const url = parseRedisUrl(value);
       if (url && url.host === before.host && url.password === before.password) companions[name] = withPassword(url, after.password);
@@ -190,12 +194,12 @@ async function rollDatabase(target: Extract<Target, { db: Database }>, oldValue:
   }
   const password = optionalString(fresh?.password);
   const restToken = optionalString(fresh?.rest_token);
-  if (!password || !restToken || password === db.password || restToken === db.restToken) throw new Error(ROLLED_UNKNOWN);
+  if (!password || !restToken || password === db.password || restToken === db.restToken) throw new ProviderMutationUncertainError(ROLLED_UNKNOWN, true);
   const readOnlyToken = optionalString(fresh?.read_only_rest_token);
   const newValue = target.kind === 'rest' ? restToken : target.kind === 'password' ? password : withPassword((target as { url: RedisUrl }).url, password);
   const { companions, readOnlyUnknown } = redisCompanions(ctx.siblingVars ?? {}, oldValue, db,
     { password, restToken, ...(readOnlyToken ? { readOnlyToken } : {}) });
-  const notes = ['Upstash reset the database password atomically: the previous password and REST token stopped working. Update and redeploy every consumer immediately; other services that hold a different form of this credential (Redis URL, password or REST token) must be updated by hand.'];
+  const notes = ['Upstash reset the database password atomically: the previous password, REST token and Redis URLs stopped working. keysentry updates every form of this credential it planned; redeploy every consumer immediately.'];
   if (readOnlyUnknown) notes.push('A read-only REST token in this service may also have changed; check it in the Upstash console.');
   return {
     newValue, oldKeyRef: db.id, newKeyRef: db.id, oldRevoked: true,
@@ -213,11 +217,14 @@ async function rollQStash(user: QStashUser, ctx: ProviderContext): Promise<Rotat
     fresh = undefined;
   }
   const token = optionalString(fresh?.token);
-  if (!token || token === user.token) throw new Error(ROLLED_UNKNOWN);
+  if (!token || token === user.token) throw new ProviderMutationUncertainError(ROLLED_UNKNOWN, true);
   const readOnlyToken = optionalString(fresh?.read_only_token);
   const companions: Record<string, string> = {};
-  if (user.readOnlyToken !== undefined && readOnlyToken !== undefined && readOnlyToken !== user.readOnlyToken) {
-    for (const [name, value] of Object.entries(ctx.siblingVars ?? {})) if (value === user.readOnlyToken) companions[name] = readOnlyToken;
+  if (user.readOnlyToken !== undefined && readOnlyToken !== undefined) {
+    for (const [name, value] of Object.entries(ctx.siblingVars ?? {})) {
+      // A planned form is answered even when unchanged, so the engine can tell "unchanged" from "unknown".
+      if (value === user.readOnlyToken && (readOnlyToken !== user.readOnlyToken || name.startsWith(PLANNED_FORM_PREFIX))) companions[name] = readOnlyToken;
+    }
   }
   return {
     newValue: token, oldKeyRef: user.id, newKeyRef: user.id, oldRevoked: true,

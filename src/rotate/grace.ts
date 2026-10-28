@@ -1,4 +1,4 @@
-import { buildInventory, fingerprint, serviceKey } from '../core/index.js';
+import { buildInventory, fingerprint, isPublicGoogleKeyStep, serviceKey } from '../core/index.js';
 import type { EngineDeps, RotateOptions } from './engine.js';
 import { crash, createRecoverySafety, isCrash, unresolvedOrphans } from './recovery.js';
 import { withStopChecks } from './stop.js';
@@ -431,7 +431,13 @@ export async function finishRotation(
             try { const result = await provider.verify(oldValue, oldCtx); alreadyRevoked = !result.ok && result.status === 401; }
             catch (error) { if (isCrash(error)) throw error; }
           }
-          if (!alreadyRevoked && (!oldKeyRef || !provider.revoke)) {
+          // A key that ships inside web pages or mobile apps is never deleted by keysentry (fix-phase6 H1).
+          const retained = isPublicGoogleKeyStep(step)
+            || entries.some(entry => entry.clusterId === clusterId && entry.data?.retainOldKey === true);
+          if (!alreadyRevoked && retained) {
+            warning = 'The old key was kept because it ships inside web pages or mobile apps: delete it yourself in the provider console once every shipped client uses the replacement.';
+            blocked = true;
+          } else if (!alreadyRevoked && (!oldKeyRef || !provider.revoke)) {
             warning = 'The old key cannot be identified or revoked automatically; it is retained.';
             blocked = true;
           } else {

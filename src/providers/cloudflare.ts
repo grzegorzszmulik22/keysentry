@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderContext, VerifyResult } from '../types.js';
-import { credential, ensureOk, readJson, request } from './shared.js';
+import { credential, ensureOk, mutationRequest, ProviderMutationUncertainError, readJson, request } from './shared.js';
 
 const API = 'https://api.cloudflare.com/client/v4';
 const PROVIDER = 'cloudflare';
@@ -55,15 +55,20 @@ export const cloudflareProvider: ProviderAdapter = {
     const { id } = await inspectToken(oldValue, ctx);
     if (!id) throw new Error('cloudflare cannot roll a token without an active verified identity');
 
-    const response = await request(ctx, {
+    const response = await mutationRequest(ctx, {
       method: 'PUT',
       url: `${API}/user/tokens/${encodeURIComponent(id)}/value`,
       headers: { Authorization: `Bearer ${admin}` },
-    }, PROVIDER);
+    }, PROVIDER, { atomic: true });
     ensureOk(response, PROVIDER);
-    const data = readJson<unknown>(response, PROVIDER);
+    let data: unknown;
+    try {
+      data = response.json<unknown>();
+    } catch {
+      data = undefined;
+    }
     if (!isRecord(data) || data.success !== true || typeof data.result !== 'string' || data.result.trim().length === 0) {
-      throw new Error('cloudflare returned an invalid token-roll response; the old token may already be invalid');
+      throw new ProviderMutationUncertainError('cloudflare returned an invalid token-roll response; the old token may already be invalid', true);
     }
     return {
       newValue: data.result,

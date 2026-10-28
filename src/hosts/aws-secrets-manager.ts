@@ -101,6 +101,50 @@ function canonicalText(text: string): string | undefined {
   return out;
 }
 
+/**
+ * Replace the string values of existing top-level keys in place, keeping every other byte of the original text
+ * (indentation, key order, line endings). Returns undefined when a key is new or the text cannot be walked; the
+ * caller then writes the minified form, which parsers read identically.
+ */
+export function replaceJsonStringValues(text: string, updates: ReadonlyMap<string, string>): string | undefined {
+  let out = '';
+  let depth = 0;
+  let afterColon = false;
+  let key: string | undefined;
+  const replaced = new Set<string>();
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (ch === '"') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+      if (end >= text.length) return undefined;
+      const token = text.slice(i, end + 1);
+      let decoded: string;
+      try { decoded = JSON.parse(token) as string; } catch { return undefined; }
+      if (depth === 1 && afterColon) {
+        if (key !== undefined && updates.has(key) && !replaced.has(key)) {
+          out += JSON.stringify(updates.get(key));
+          replaced.add(key);
+        } else out += token;
+        afterColon = false;
+      } else {
+        if (depth === 1) key = decoded;
+        out += token;
+      }
+      i = end;
+      continue;
+    }
+    if (ch === ':' && depth === 1) afterColon = true;
+    else if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') {
+      afterColon = false;
+      if (ch === '{' || ch === '[') depth += 1;
+      else if (ch === '}' || ch === ']') depth -= 1;
+    }
+    out += ch;
+  }
+  return replaced.size === updates.size ? out : undefined;
+}
+
 export function createAwsSecretsManagerHost(opts: AwsSecretsManagerHostOptions): HostAdapter {
   if (!REGION.test(opts.region)) throw new Error('AWS Secrets Manager region is invalid');
   const endpoint = `https://secretsmanager.${opts.region}.amazonaws.com/`;
@@ -244,7 +288,10 @@ export function createAwsSecretsManagerHost(opts: AwsSecretsManagerHostOptions):
             throw new Error('AWS Secrets Manager secret key holds a non-string value; keysentry only replaces string values');
           }
         }
-        next = JSON.stringify(Object.fromEntries([...Object.entries(map), ...entries]));
+        const merged = JSON.stringify(Object.fromEntries([...Object.entries(map), ...entries]));
+        // Keep the secret's own formatting when only existing values change; check the result parses to the same map.
+        const inPlace = replaceJsonStringValues(value.text, new Map(entries));
+        next = inPlace !== undefined && JSON.stringify(jsonObject(inPlace)) === merged ? inPlace : merged;
       } else {
         const plainName = plainVariableName(value.name);
         if (entries.length !== 1 || entries[0]![0] !== plainName) {

@@ -10,7 +10,7 @@ import type {
   SecretFinding,
   ServiceRef,
 } from '../types.js';
-import { classify, methodForValue } from './classify.js';
+import { classify, isPublicGoogleKeyName, methodForValue } from './classify.js';
 import { fingerprint, makeHint } from './fingerprint.js';
 import { serviceKey } from './service-key.js';
 
@@ -140,7 +140,7 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
               fingerprint: consumer.fingerprint,
               provider: classification.provider,
               tier: classification.tier,
-              method: methodForValue(classification.provider, value),
+              method: methodForValue(classification.provider, value, variable.name),
               hint: consumer.hint,
               consumers: [consumer],
             },
@@ -158,7 +158,7 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
         if (safetyDifference > 0 || (safetyDifference === 0 && confidenceDifference > 0)) {
           existing.cluster.provider = classification.provider;
           existing.cluster.tier = classification.tier;
-          existing.cluster.method = methodForValue(classification.provider, value);
+          existing.cluster.method = methodForValue(classification.provider, value, variable.name);
           existing.confidence = classification.confidence;
         }
       }
@@ -209,6 +209,11 @@ export function buildInventory(scans: HostScan[], key: Buffer, now = new Date())
       cluster.consumers.push(consumer);
       findings.push({ ...consumer, provider: cluster.provider, tier: cluster.tier, isSecret: true, confidence });
     }
+  }
+
+  // One public copy makes the whole key public: a Google API key that any consumer ships to clients stays guided.
+  for (const { cluster } of clusters.values()) {
+    if (cluster.provider === 'google' && cluster.consumers.some(consumer => isPublicGoogleKeyName(consumer.varName))) cluster.method = 'guided';
   }
 
   return {

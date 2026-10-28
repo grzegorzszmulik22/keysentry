@@ -37,7 +37,7 @@ export { databaseProvider } from './database.js';
 export {
   createGuidedAdapter, slackProvider, privateKeyProvider, cryptoWalletProvider, unknownProvider, type GuidedProviderId,
 } from './guided.js';
-export { googleProvider, createGoogleProvider, GoogleGuidedRotationRequiredError, GOOGLE_CREDENTIALS, GOOGLE_PROJECT } from './google.js';
+export { googleProvider, createGoogleProvider, GoogleGuidedRotationRequiredError, GOOGLE_CREDENTIALS, GOOGLE_PROJECT, publicGoogleKeyGuidance } from './google.js';
 export { twilioProvider, TwilioGuidedRotationRequiredError } from './twilio.js';
 export { sendgridProvider, SendGridGuidedRotationRequiredError } from './sendgrid.js';
 export { appSecretProvider } from './app-secret.js';
@@ -112,6 +112,32 @@ export const PROVIDER_CREDENTIALS: Record<ProviderId, string[]> = {
 };
 
 export { NON_SECRET_CREDENTIALS, secretCredentialValues } from './credential-kinds.js';
+
+/**
+ * The credential sets that let a provider rotate automatically: any one set, with every name in it present. Most
+ * providers have one set, PROVIDER_CREDENTIALS itself. Google takes a service-account key (its project_id names the
+ * project) or an OAuth access token with GOOGLE_API_KEYS_PROJECT. Twilio needs the management SID and secret;
+ * TWILIO_ADMIN_ACCOUNT_SID is needed only when that SID is a Main key SID, which a list of names cannot show.
+ */
+export function automaticCredentialSets(provider: ProviderId): readonly (readonly string[])[] {
+  if (provider === 'google') return [['GOOGLE_API_KEYS_ADMIN_KEY'], ['GOOGLE_OAUTH_ACCESS_TOKEN', 'GOOGLE_API_KEYS_PROJECT']];
+  if (provider === 'twilio') return [['TWILIO_ADMIN_KEY_SID', 'TWILIO_ADMIN_KEY']];
+  return [PROVIDER_CREDENTIALS[provider]];
+}
+
+/**
+ * False for providers whose automatic rotation cannot name the old key (rotate returns oldKeyRef null): Neon and
+ * Resend do not expose any part of existing key values. The replacement is created, but the possibly compromised old
+ * key stays valid until a person deletes it, so an unattended (armed) rotation must not be offered for them.
+ */
+export function rotationIdentifiesOldKey(provider: ProviderId): boolean {
+  return provider !== 'neon' && provider !== 'resend';
+}
+
+/** True when the configured credential names (never values) satisfy one of the provider's automatic sets. */
+export function automaticCredentialsConfigured(provider: ProviderId, configured: ReadonlySet<string>): boolean {
+  return automaticCredentialSets(provider).some(set => set.every(name => configured.has(name)));
+}
 
 export function getProvider(id: ProviderId): ProviderAdapter {
   if (!Object.hasOwn(providers, id)) throw new Error('Unsupported provider');

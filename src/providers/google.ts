@@ -1,8 +1,8 @@
 import { createPrivateKey, sign, timingSafeEqual, type KeyObject } from 'node:crypto';
 import type {
-  HttpRequest, HttpResponse, ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult, VerifyResult,
+  Guidance, HttpRequest, HttpResponse, ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult, VerifyResult,
 } from '../types.js';
-import { ensureOk, readJson, safeIdentity } from './shared.js';
+import { ensureOk, ProviderMutationUncertainError, readJson, safeIdentity } from './shared.js';
 
 // Google Cloud API keys (AIza…, used by Gemini, Maps and other Google APIs) are managed through the API Keys API
 // (https://docs.cloud.google.com/api-keys/docs/reference/rest). Service-account JSON keys share this provider id
@@ -41,6 +41,8 @@ const POLL_DELAYS_MS = [500, 1_000, 2_000, 3_000, 5_000, 5_000, 5_000, 5_000, 5_
 const KEY_FIELDS = new Set(['name', 'uid', 'displayName', 'keyString', 'createTime', 'updateTime', 'deleteTime',
   'annotations', 'restrictions', 'etag', 'serviceAccountEmail']);
 const CLIENT_RESTRICTIONS = ['browserKeyRestrictions', 'serverKeyRestrictions', 'androidKeyRestrictions', 'iosKeyRestrictions'] as const;
+/** Application restrictions of keys that ship inside web pages or mobile apps. */
+const SHIPPED_CLIENT_RESTRICTIONS = ['browserKeyRestrictions', 'androidKeyRestrictions', 'iosKeyRestrictions'] as const;
 /** google.api.ErrorReason values meaning the key itself is valid but may not call the Gemini API from here. */
 const LIMITED_REASONS = new Set(['API_KEY_SERVICE_BLOCKED', 'API_KEY_HTTP_REFERRER_BLOCKED', 'API_KEY_IP_ADDRESS_BLOCKED',
   'API_KEY_ANDROID_APP_BLOCKED', 'API_KEY_IOS_APP_BLOCKED', 'SERVICE_DISABLED']);
@@ -53,16 +55,45 @@ const MESSAGES = {
   notFound: 'The Google API key was not found in the configured project; use guided rotation.',
   reference: 'Google API key reference is not valid; use guided rotation.',
   createRejected: 'Google rejected the replacement API key request; no key was created. Use guided rotation.',
+  clientKey: 'This Google API key is restricted to websites or mobile apps, so it ships inside clients keysentry cannot redeploy. Use guided rotation and delete the old key only after those clients have updated.',
+  createUnanswered: 'Google did not answer the API key creation request; an unused replacement may appear in the project. Check the Google Cloud console.',
+  createUnknown: 'Google API key creation did not finish with a usable result; an unused replacement may appear in the project. Check the Google Cloud console.',
+  createRunning: 'Google API key creation is still running; an unused replacement may appear in the project without keysentry recording it.',
 } as const;
 
 export class GoogleGuidedRotationRequiredError extends Error {
   readonly code = 'GUIDED_ROTATION_REQUIRED';
   readonly provider = 'google';
+  /**
+   * True when the old key lives in shipped clients (browser, Android or iOS restrictions): after a guided replacement
+   * the engine keeps the old key instead of deleting it, and the person deletes it once those clients have updated.
+   */
+  readonly retainOldKey: boolean;
 
-  constructor(message: string = MESSAGES.restrictions) {
+  constructor(message: string = MESSAGES.restrictions, options: { retainOldKey?: boolean } = {}) {
     super(message);
     this.name = 'GoogleGuidedRotationRequiredError';
+    this.retainOldKey = options.retainOldKey === true;
   }
+}
+
+class OperationFailedError extends Error {}
+class OperationRunningError extends Error {}
+
+/**
+ * Guided steps for a public Google API key (Firebase web config, Maps keys for browsers and apps, keys in variables a
+ * build tool ships to clients). Such a key is restricted, not secret, and rotating it breaks shipped clients.
+ */
+export function publicGoogleKeyGuidance(): Guidance {
+  return {
+    url: 'https://console.cloud.google.com/apis/credentials',
+    steps: [
+      'This key is public by design: it ships inside web pages or mobile apps, so its restrictions protect it, not secrecy. Rotating it breaks every installed app and cached page that still uses the old key.',
+      'Usually the right fix is to tighten its restrictions: allow only your websites or app IDs, and only the APIs it needs.',
+      'If it must be replaced, create a new key with the same restrictions, paste it here, and publish new web and app builds.',
+      'Delete the old key yourself, only after the shipped apps and pages that used it have updated. keysentry does not delete it.',
+    ],
+  };
 }
 
 type Row = Record<string, unknown>;
@@ -392,38 +423,67 @@ export function createGoogleProvider(options: GoogleProviderOptions = {}): Provi
     const name = op.name;
     for (let attempt = 0; !op.done; attempt++) {
       if (attempt >= POLL_DELAYS_MS.length) {
-        throw new Error(action === 'creation'
-          ? `${PROVIDER} API key creation is still running; an unused replacement may appear in the project without keysentry recording it.`
+        throw new OperationRunningError(action === 'creation'
+          ? MESSAGES.createRunning
           : `${PROVIDER} API key deletion is still running; check the key in the Google Cloud console.`);
       }
       await sleep(POLL_DELAYS_MS[attempt]!);
       op = operation(await api(ctx, s, 'GET', `${API_KEYS}/${name}`));
       if (op.name !== undefined && op.name !== name) throw new Error(`${PROVIDER} returned an invalid operation`);
     }
-    if (op.failed) throw new Error(`${PROVIDER} API key ${action} failed`);
+    if (op.failed) throw new OperationFailedError(`${PROVIDER} API key ${action} failed`);
     return op.response;
   }
 
   async function replace(ctx: ProviderContext, s: Session, oldName: string, oldValue?: string): Promise<RotationResult> {
     const key = record(await api(ctx, s, 'GET', `${API_KEYS}/${oldName}`));
     if (!key) throw new Error(`${PROVIDER} returned an invalid key`);
+    // Keys restricted to websites or apps live in shipped clients: replacing and later deleting them breaks those
+    // clients, which keysentry cannot redeploy.
+    const restrictions = record(key.restrictions);
+    if (restrictions && SHIPPED_CLIENT_RESTRICTIONS.some(field => restrictions[field] !== undefined && restrictions[field] !== null)) {
+      throw new GoogleGuidedRotationRequiredError(MESSAGES.clientKey, { retainOldKey: true });
+    }
     const body = replacementSpec(key, oldName, now());
     const project = KEY_NAME.exec(oldName)![1]!;
-    const response = await call(ctx, {
-      method: 'POST',
-      url: `${API_KEYS}/projects/${project}/locations/global/keys`,
-      headers: { Authorization: `Bearer ${s.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }, s.secrets);
+    let response: HttpResponse;
+    try {
+      response = await call(ctx, {
+        method: 'POST',
+        url: `${API_KEYS}/projects/${project}/locations/global/keys`,
+        headers: { Authorization: `Bearer ${s.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, s.secrets);
+    } catch {
+      throw new ProviderMutationUncertainError(MESSAGES.createUnanswered);
+    }
     // A synchronous client error means no long-running operation started, so nothing was created.
     if ([400, 401, 403, 404].includes(response.status)) throw new GoogleGuidedRotationRequiredError(MESSAGES.createRejected);
+    if (response.status >= 500) {
+      throw new ProviderMutationUncertainError(`${PROVIDER} request failed (HTTP ${response.status}); an unused replacement may appear in the project. Check the Google Cloud console.`);
+    }
     ensureOk(response, PROVIDER);
-    const created = record(await settle(ctx, s, readJson<unknown>(response, PROVIDER), 'creation'));
-    const invalid = () => new Error(`${PROVIDER} returned an invalid replacement key response; check the project for an unused key created just now.`);
+    let created: Row | undefined;
+    try {
+      created = record(await settle(ctx, s, readJson<unknown>(response, PROVIDER), 'creation'));
+    } catch (error) {
+      // A failed operation created nothing. Anything else (still running, unreadable, a failed poll) may leave a key.
+      if (error instanceof OperationFailedError) throw error;
+      throw new ProviderMutationUncertainError(error instanceof OperationRunningError ? MESSAGES.createRunning : MESSAGES.createUnknown);
+    }
     const newName = keyName(created?.name, s.secrets);
+    const invalid = () => new ProviderMutationUncertainError(
+      `${PROVIDER} returned an invalid replacement key response; check the project for an unused key created just now.`,
+      false, newName !== undefined && newName !== oldName ? newName : null);
     if (!created || !newName || newName === oldName || KEY_NAME.exec(newName)![1] !== project) throw invalid();
     let keyString = created.keyString;
-    if (keyString === undefined) keyString = record(await api(ctx, s, 'GET', `${API_KEYS}/${newName}/keyString`))?.keyString;
+    if (keyString === undefined) {
+      try {
+        keyString = record(await api(ctx, s, 'GET', `${API_KEYS}/${newName}/keyString`))?.keyString;
+      } catch {
+        throw invalid();
+      }
+    }
     if (typeof keyString !== 'string' || !KEY_STRING.test(keyString) || (oldValue !== undefined && sameSecret(keyString, oldValue))
       || s.secrets.includes(keyString)) {
       throw invalid();

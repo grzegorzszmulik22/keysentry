@@ -1,5 +1,5 @@
 import type { HostId, Inventory, ServiceRef } from '../types.js';
-import { PROVIDER_CREDENTIALS } from '../providers/index.js';
+import { automaticCredentialsConfigured } from '../providers/index.js';
 import { builtInActivation, canConfirmActivation } from '../hosts/activation.js';
 
 /** Runtime facts needed for the drill score. Pass credential names, never their values. */
@@ -29,11 +29,13 @@ export function readinessScore(input: ReadinessInput): { score: number; reasons:
   const { inventory: inv, redeploy, canaries } = input;
   const credentials = new Set(input.configuredCredentials);
   const total = inv.clusters.length;
+  // Credential lists may be alternatives (Google) or partly conditional (Twilio): the provider decides what suffices.
+  const configured = (cluster: Inventory['clusters'][number]) => automaticCredentialsConfigured(cluster.provider, credentials);
   const automatic = inv.clusters.filter(cluster => cluster.method === 'generate' ||
-    cluster.method !== 'guided' && cluster.fingerprint !== null && PROVIDER_CREDENTIALS[cluster.provider].every(name => credentials.has(name))).length;
+    cluster.method !== 'guided' && cluster.fingerprint !== null && configured(cluster)).length;
   const sealed = inv.clusters.filter(cluster => cluster.fingerprint === null).length;
   const duplicate = inv.clusters.filter(cluster => cluster.consumers.length > 1).length;
-  const missing = inv.clusters.filter(cluster => PROVIDER_CREDENTIALS[cluster.provider].some(name => !credentials.has(name))).length;
+  const missing = inv.clusters.filter(cluster => !configured(cluster)).length;
   const manual = input.manualActivation ?? ((service: ServiceRef) => builtInManual(service, redeploy));
   const manualDeploys = inv.services.filter(service => manual(service)).length;
   const ratio = (count: number, denominator = total) => denominator ? count / denominator : 0;

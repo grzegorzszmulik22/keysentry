@@ -33,7 +33,8 @@ function spec() {
         { key: 'STRIPE_KEY', scope: 'RUN_TIME', type: 'SECRET', value: ciphertext },
         { key: 'DB_PASSWORD', scope: 'RUN_TIME', type: 'GENERAL', value: '${db.PASSWORD}' },
       ],
-      log_destinations: [{ name: 'dd', datadog: { api_key: 'test-datadog-key' } }],
+      // App Platform returns spec credentials outside envs as EV[...] ciphertext (fix-phase6 refuses any other form).
+      log_destinations: [{ name: 'dd', datadog: { api_key: ciphertext } }],
     }],
     workers: [{ name: 'queue', image: { registry_type: 'DOCR', repository: 'queue', tag: 'stable' } }],
     databases: [{ name: 'db', engine: 'PG' }],

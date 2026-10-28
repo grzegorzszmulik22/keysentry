@@ -32,12 +32,44 @@ export interface KubernetesHostOptions {
   now?: () => Date;
 }
 
-/** Controller-managed or tool-state Secrets: rotating them by editing data would break their owner. */
+/**
+ * Controller-managed or tool-state Secrets: rotating them by editing data would break their owner. A TLS Secret holds a
+ * certificate and its private key as a pair: replacing one of them breaks it, so it is renewed by its issuer.
+ */
 export const DEFAULT_EXCLUDED_SECRET_TYPES: readonly string[] = [
   'kubernetes.io/service-account-token',
   'bootstrap.kubernetes.io/token',
   'helm.sh/release.v1',
+  'kubernetes.io/tls',
 ];
+
+/**
+ * Annotation and label key prefixes set by controllers that write a Secret from another source. Such a controller
+ * restores its source value at the next reconcile, so a keysentry write would silently revert (possibly after the old
+ * key was revoked). Sources (accessed 2026-10-28): External Secrets Operator labels/annotations
+ * `reconcile.external-secrets.io/*`; Sealed Secrets README (`sealedsecrets.bitnami.com/managed`, `/patch`,
+ * `/skip-set-owner-references`); Vault Secrets Operator helpers/secrets.go (`app.kubernetes.io/managed-by:
+ * hashicorp-vso`, `secrets.hashicorp.com/vso-ownerRefUID`); cert-manager `cert-manager.io/*` annotations; legacy
+ * service account token annotations `kubernetes.io/service-account.*`; Secrets Store CSI driver sync label
+ * `secrets-store.csi.k8s.io/managed` (unverified).
+ */
+const CONTROLLER_KEY_PREFIXES: readonly [string, string][] = [
+  ['reconcile.external-secrets.io/', 'External Secrets'],
+  ['external-secrets.io/', 'External Secrets'],
+  ['sealedsecrets.bitnami.com/', 'Sealed Secrets'],
+  ['secrets.hashicorp.com/', 'the Vault Secrets Operator'],
+  ['cert-manager.io/', 'cert-manager'],
+  ['kubernetes.io/service-account.', 'a service account token'],
+  ['secrets-store.csi.k8s.io/', 'the Secrets Store CSI driver'],
+];
+/** Owner kinds named in the skip reason; any other owner reference is described generically. */
+const OWNER_KINDS: Record<string, string> = {
+  ExternalSecret: 'External Secrets', ClusterExternalSecret: 'External Secrets', PushSecret: 'External Secrets',
+  SealedSecret: 'Sealed Secrets', Certificate: 'cert-manager', CertificateRequest: 'cert-manager',
+  VaultStaticSecret: 'the Vault Secrets Operator', VaultDynamicSecret: 'the Vault Secrets Operator',
+  VaultPKISecret: 'the Vault Secrets Operator', HCPVaultSecretsApp: 'the Vault Secrets Operator',
+  SecretProviderClassPodStatus: 'the Secrets Store CSI driver',
+};
 
 const RESTART_ANNOTATION = 'kubectl.kubernetes.io/restartedAt';
 const RESTART_ID_PREFIX = 'k8s-restart:v1:';
@@ -59,6 +91,28 @@ function object(value: unknown): Record<string, unknown> {
 
 function optionalObject(value: unknown): Record<string, unknown> {
   return value === undefined || value === null ? {} : object(value);
+}
+
+/**
+ * Who manages this Secret instead of keysentry, as fixed text (never text from the response), or null: any owner
+ * reference, or the annotations or labels of a known secret controller.
+ */
+export function kubernetesSecretManager(secret: Record<string, unknown>): string | null {
+  const metadata = optionalObject(secret.metadata);
+  const keys = [...Object.keys(optionalObject(metadata.annotations)), ...Object.keys(optionalObject(metadata.labels))];
+  for (const [prefix, manager] of CONTROLLER_KEY_PREFIXES) if (keys.some(key => key.startsWith(prefix))) return manager;
+  if (optionalObject(metadata.labels)['app.kubernetes.io/managed-by'] === 'hashicorp-vso') return 'the Vault Secrets Operator';
+  const owners = metadata.ownerReferences;
+  if (owners !== undefined && owners !== null) {
+    if (!Array.isArray(owners)) invalidResponse();
+    if (owners.length > 0) {
+      const kinds = owners.map(owner => optionalObject(owner).kind);
+      const known = kinds.map(kind => typeof kind === 'string' && Object.hasOwn(OWNER_KINDS, kind) ? OWNER_KINDS[kind] : undefined)
+        .find((manager): manager is string => manager !== undefined);
+      return known ?? 'the resource that owns it';
+    }
+  }
+  return null;
 }
 
 function nonempty(value: unknown): string {
@@ -223,6 +277,12 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
         const type = secret.type ?? 'Opaque';
         if (typeof type !== 'string') invalidResponse();
         if (excluded.has(type)) continue;
+        const manager = kubernetesSecretManager(secret);
+        if (manager !== null) {
+          opts.log.info(`Kubernetes Secret skipped: ${manager} manages it and would restore its value. Rotate the key in its source store.`,
+            { namespace, secret: name });
+          continue;
+        }
         refs.push(ref(namespace, name));
       }
       const next = optionalObject(list.metadata).continue;
@@ -248,7 +308,7 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
 
     async readVariables(service): Promise<RawVariable[]> {
       const secret = await readSecret(service);
-      if (excluded.has((secret.type as string | undefined) ?? 'Opaque')) return [];
+      if (excluded.has((secret.type as string | undefined) ?? 'Opaque') || kubernetesSecretManager(secret) !== null) return [];
       const data = optionalObject(secret.data);
       const variables: RawVariable[] = [];
       let binary = 0;
@@ -273,6 +333,10 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
       }
       const secret = await readSecret(service);
       if (excluded.has((secret.type as string | undefined) ?? 'Opaque')) throw new Error('Kubernetes Secret type is managed by its owner and is not written by keysentry');
+      const manager = kubernetesSecretManager(secret);
+      if (manager !== null) {
+        throw new Error(`Kubernetes Secret is managed by ${manager}, which would restore the old value; keysentry does not write it. Rotate the key in its source store.`);
+      }
       if (secret.immutable === true) throw new Error('Kubernetes Secret is immutable; create a replacement Secret instead');
       nonempty(object(secret.metadata).resourceVersion);
       const existing = optionalObject(secret.data);

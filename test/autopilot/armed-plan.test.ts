@@ -37,8 +37,13 @@ function signedMutation(edit: (plan: ArmedPlan) => void): ArmedPlan {
 
 describe('eligibility and adoption', () => {
   test('only provider-API and allow-listed generate clusters are eligible', () => {
-    for (const provider of ['openai', 'openrouter', 'resend', 'aws'] as const) {
+    for (const provider of ['openai', 'openrouter', 'aws'] as const) {
       expect(autopilotEligibility(cluster({ provider, tier: provider === 'aws' ? 'cloud' : 'ai' }))).toEqual({ eligible: true, method: 'auto' });
+    }
+    // fix-phase6 L3: rotate cannot name the old key, so an armed wave would leave it valid.
+    for (const provider of ['resend', 'neon'] as const) {
+      expect(autopilotEligibility(cluster({ provider, tier: provider === 'neon' ? 'database' : 'comms' }))).toMatchObject({ eligible: false });
+      expect(autopilotEligibility(cluster({ provider, tier: 'comms' }))).toMatchObject({ eligible: false, reason: expect.stringMatching(/cannot identify the old key/) });
     }
     const app = cluster({ provider: 'app-secret', tier: 'app', method: 'generate' });
     for (const varName of ['JWT_SECRET', 'JWT_SIGNING_SECRET', 'SESSION_SECRET', 'COOKIE_SECRET', 'NEXTAUTH_SECRET', 'AUTH_SECRET', 'BETTER_AUTH_SECRET', 'SECRET_KEY_BASE', 'CSRF_SECRET']) {

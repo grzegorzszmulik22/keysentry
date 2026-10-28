@@ -1,7 +1,7 @@
 import type {
   HttpRequest, ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult, UsageSample,
 } from '../types.js';
-import { credential, ensureOk, matchHint, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, matchHint, mutationRequest, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 const BASE = 'https://api.openai.com/v1';
 const PROVIDER = 'OpenAI';
@@ -220,7 +220,7 @@ async function createReplacement(oldKeyRef: string, scopes: unknown, expiresAt: 
     }
   }
   const accountPath = `${BASE}/organization/projects/${encodeURIComponent(projectId)}/service_accounts`;
-  const response = await request(ctx, {
+  const response = await mutationRequest(ctx, {
     method: 'POST', url: `${accountPath}/${encodeURIComponent(serviceAccountId)}/api_keys`,
     headers: { ...headers(ctx), 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}`, scopes,

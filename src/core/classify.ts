@@ -22,12 +22,47 @@ export function methodFor(provider: ProviderId): RotationMethod {
 
 /**
  * The rotation method for one readable value. Google service-account JSON keys share the `google` provider with API
- * keys, but their rotation is always guided, so they are never planned (or armed) as automatic.
+ * keys, but their rotation is always guided, so they are never planned (or armed) as automatic. So are Google API keys
+ * held in a variable whose name marks them public or client-side (pass the variable name): see isPublicGoogleKeyName.
  */
-export function methodForValue(provider: ProviderId, value: string | undefined): RotationMethod {
+export function methodForValue(provider: ProviderId, value: string | undefined, name?: string): RotationMethod {
   if (provider === 'google' && value !== undefined && isGoogleAccount(value.trim())) return 'guided';
+  if (provider === 'google' && name !== undefined && isPublicGoogleKeyName(name)) return 'guided';
+  // The Twilio adapter rotates an account Auth Token only by hand (promoting a secondary token ends the old one for
+  // every consumer). It treats a value as an Auth Token by its name, else by its 32-lowercase-hex shape.
+  if (provider === 'twilio' && name !== undefined && (/AUTH_TOKEN$/i.test(name)
+    || !/SECRET$/i.test(name) && value !== undefined && /^[0-9a-f]{32}$/.test(value.trim()))) return 'guided';
+  // Neon organization and project API keys are created per organization or project; the adapter rotates only
+  // personal keys. A name that says organization or project is planned as guided up front.
+  if (provider === 'neon' && name !== undefined && /(?:^|_)(?:ORG|ORGANIZATION|PROJECT)(?:_|$)/i.test(name)) return 'guided';
   return methodFor(provider);
 }
+
+// Build tools put these variables into browser bundles or app binaries (Next.js, Vite, Expo, Create React App,
+// SvelteKit/Astro, Nuxt, Gatsby, Vue CLI).
+const CLIENT_PREFIX = /^(?:NEXT_PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|PUBLIC_|NUXT_PUBLIC_|NUXT_ENV_|GATSBY_|VUE_APP_)/;
+const CLIENT_WORDS = new Set(['BROWSER', 'CLIENT', 'FRONTEND', 'ANDROID', 'IOS', 'MOBILE']);
+const MAPS_CLIENT_WORDS = new Set(['WEB', 'JS', 'JAVASCRIPT', 'EMBED', 'PUBLIC']);
+
+/**
+ * Google API keys that are public by design: Firebase web config keys, Maps keys for browsers and apps, and any key in
+ * a variable that a build tool ships to clients. Such a key is protected by its restrictions, not by secrecy, and it
+ * lives in shipped web bundles and app builds that keysentry cannot redeploy. It is never rotated automatically.
+ */
+export function isPublicGoogleKeyName(name: string): boolean {
+  const upper = name.toUpperCase();
+  // Whatever a client-prefixed variable holds is shipped to clients.
+  if (CLIENT_PREFIX.test(upper)) return true;
+  // Service-account keys, admin keys and CI tokens (FIREBASE_TOKEN) are real secrets, never public config.
+  if (/SERVICE_?ACCOUNT|ADMIN|PRIVATE|CREDENTIAL|SECRET|PASSWORD/.test(upper)) return false;
+  if (/FIREBASE/.test(upper)) return /API_?KEY|(?:^|_)KEY$/.test(upper);
+  const words = upper.split(/[^A-Z0-9]+/);
+  if (words.some(word => CLIENT_WORDS.has(word))) return true;
+  return words.some(word => word === 'MAPS' || word === 'MAP') && words.some(word => MAPS_CLIENT_WORDS.has(word));
+}
+
+/** Plain explanation shown wherever a public Google API key is listed or planned. */
+export const PUBLIC_GOOGLE_KEY_EXPLANATION = 'This Google API key is public by design: it ships inside web pages or mobile apps, so its restrictions (allowed websites, apps and APIs) protect it, not secrecy. Rotating it breaks every installed app and cached page that still uses the old key, so keysentry never rotates it automatically.';
 
 function result(provider: ProviderId, isSecret: boolean, confidence: Classification['confidence']): Classification {
   return { provider, tier: tierFor(provider), isSecret, confidence };

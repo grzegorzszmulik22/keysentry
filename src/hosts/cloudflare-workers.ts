@@ -277,6 +277,12 @@ export function createCloudflareWorkersHost(opts: CloudflareWorkersHostOptions):
     await request('PATCH', projectPath(project), { deployment_configs: { [environment]: { env_vars: envVars } } });
     // Verify the documented merge behavior instead of trusting it: every other variable must survive unchanged.
     const after = await getProject(project);
+    // So must every other deployment setting (bindings, compatibility date and flags, usage model, ...).
+    for (const checked of PAGES_ENVIRONMENTS) {
+      if (pagesSettings(before, checked) !== pagesSettings(after, checked)) {
+        throw new Error('Cloudflare Pages settings changed beyond this update; check the project settings (bindings, compatibility) in Cloudflare');
+      }
+    }
     for (const checked of PAGES_ENVIRONMENTS) {
       const was = pagesVars(before, checked);
       const now = pagesVars(after, checked);
@@ -373,6 +379,19 @@ export function createCloudflareWorkersHost(opts: CloudflareWorkersHostOptions):
       return state.latestServesSome ? 'pending' : 'failed';
     },
   };
+}
+
+/** One environment's deployment settings other than env_vars, in a canonical form for comparison only. */
+function pagesSettings(project: Data, environment: CloudflarePagesEnvironment): string {
+  const configs = project.deployment_configs;
+  const config = configs === undefined || configs === null ? undefined : (record(configs) as Data)[environment];
+  if (config === undefined || config === null) return 'null';
+  const { env_vars: _vars, ...rest } = record(config) as Data;
+  const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+    : value !== null && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value as Data).sort().map(key => [key, canonical((value as Data)[key])]))
+      : value;
+  return JSON.stringify(canonical(rest));
 }
 
 /** Secret values are never compared: they are not returned. Plain-text values must match exactly. */

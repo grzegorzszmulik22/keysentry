@@ -15,6 +15,8 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // API owners stay on one host, including within a provider's wildcard rule.
 const CROSS_HOST_REDIRECT_OWNERS = new Set(['feed', 'release', 'notify', 'user']);
 const hostOf = (url: URL): string => url.hostname.toLowerCase().replace(/\.$/, '');
+/** Scheme, normalized host and effective port: another port of the same host is another server. */
+const originOf = (url: URL): string => `${url.protocol}//${hostOf(url)}:${url.port || (url.protocol === 'http:' ? '80' : '443')}`;
 
 function isCredentialHeader(name: string): boolean {
   return /token|secret|key|auth/i.test(name)
@@ -75,6 +77,7 @@ export function createGuardedHttp(inner: HttpClient, opts: {
       let owner: string | undefined;
       let firstHost: string | undefined;
       let redirects = 0;
+      let bodyToOtherOrigin = false;
 
       for (;;) {
         let url: URL;
@@ -86,6 +89,13 @@ export function createGuardedHttp(inner: HttpClient, opts: {
           || (owner !== undefined && rule.owner !== owner)
           || (firstHost !== undefined && host !== firstHost && !CROSS_HOST_REDIRECT_OWNERS.has(rule.owner))) {
           return blocked(host, current.method);
+        }
+        // A 307/308 resends the body, and bodies carry secret values (a Vault PATCH, a whole Kubernetes Secret, a
+        // client secret): they never follow a redirect to another origin, even one the rules allow.
+        if (bodyToOtherOrigin) {
+          const safeHost = redactor.redact(host);
+          await record({ host: safeHost, method: current.method, purpose: 'redirect that would resend a request body to another server', allowed: false });
+          throw new EgressBlockedError(safeHost);
         }
         // Classify forbidden targets before the hop limit so their blocked attempt is still recorded.
         if (redirects > 0 && redirects > maxRedirects) throw new Error(`Too many redirects from ${firstHost}`);
@@ -114,7 +124,8 @@ export function createGuardedHttp(inner: HttpClient, opts: {
 
         let target: URL;
         try { target = new URL(location, url); } catch { return blocked('(unparseable)', next.method); }
-        if (hostOf(target) !== host) {
+        if (originOf(target) !== originOf(url)) {
+          bodyToOtherOrigin = next.body !== undefined && !['GET', 'HEAD'].includes(next.method);
           for (const name of Object.keys(next.headers ?? {})) {
             if (isCredentialHeader(name)) delete next.headers![name];
           }

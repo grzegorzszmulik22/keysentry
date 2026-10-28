@@ -1,5 +1,5 @@
 import type { HttpResponse, ProviderAdapter, ProviderContext, ProviderKeyInfo, RotationResult } from '../types.js';
-import { credential, ensureOk, readJson, request, safeIdentity, verifyRead } from './shared.js';
+import { credential, ensureOk, mutationRequest, ProviderMutationUncertainError, readJson, request, safeIdentity, verifyRead } from './shared.js';
 
 // Docs (accessed 2026-10-28): https://www.twilio.com/docs/sendgrid/api-reference/api-keys/create-api-keys,
 // .../api-keys/retrieve-an-existing-api-key, .../api-keys/retrieve-all-api-keys-belonging-to-the-authenticated-user,
@@ -105,25 +105,31 @@ async function removeUnusable(id: string, admin: string, ctx: ProviderContext): 
   } catch {
     removed = false;
   }
-  throw new Error(removed
-    ? 'SendGrid returned an unusable or differently scoped replacement key; it was deleted and no consumer was changed.'
-    : 'SendGrid returned an unusable or differently scoped replacement key and it could not be deleted; delete the newest keysentry API key in the SendGrid dashboard.');
+  if (removed) throw new Error('SendGrid returned an unusable or differently scoped replacement key; it was deleted and no consumer was changed.');
+  throw new ProviderMutationUncertainError(
+    'SendGrid returned an unusable or differently scoped replacement key and it could not be deleted; delete the unused keysentry API key in the SendGrid dashboard.',
+    false, id);
 }
 
 async function createKey(scopes: string[], admin: string, ctx: ProviderContext, previous: string[]): Promise<{ value: string; id: string }> {
   // Scopes are always explicit: SendGrid gives a key created without scopes Full Access.
-  const response = await request(ctx, {
+  const response = await mutationRequest(ctx, {
     method: 'POST', url: `${API}/api_keys`,
     headers: { ...auth(admin), 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: `keysentry-${new Date().toISOString()}`, scopes }),
   }, PROVIDER);
   ensureOk(response, PROVIDER);
-  const data = record(readJson<unknown>(response, PROVIDER));
+  let data: Row | undefined;
+  try {
+    data = record(response.json<unknown>());
+  } catch {
+    data = undefined;
+  }
   const value = data?.api_key;
   const id = data?.api_key_id;
   const known = secrets(ctx, [...previous, ...(typeof value === 'string' && value ? [value] : [])]);
   if (typeof id !== 'string' || !REF.test(id) || safeIdentity(id, '', known) !== id) {
-    throw new Error('SendGrid returned an invalid API key creation response; check the SendGrid dashboard for an unused keysentry API key.');
+    throw new ProviderMutationUncertainError('SendGrid returned an invalid API key creation response; check the SendGrid dashboard for an unused keysentry API key.');
   }
   const returned = scopeList(data?.scopes);
   if (typeof value !== 'string' || value.trim().length === 0 || previous.includes(value) || value === admin
