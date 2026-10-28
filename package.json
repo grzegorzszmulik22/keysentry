@@ -8,7 +8,6 @@
   },
   "files": [
     "dist",
-    "skill",
     "README.md"
   ],
   "engines": {
@@ -17,6 +16,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "vitest run",
     "dev": "tsx src/cli/index.ts",
     "bundle": "node scripts/build-bundle.mjs",
@@ -35,12 +38,17 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/libsodium-wrappers": "^0.7.14",
     "@types/node": "^22.20.5",
     "esbuild": "0.28.2",
+    "eslint": "10.13.0",
+    "globals": "17.13.0",
     "happy-dom": "21.0.4",
+    "prettier": "3.9.10",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
+    "typescript-eslint": "8.72.1",
     "vitest": "5.0.5"
   }
 }

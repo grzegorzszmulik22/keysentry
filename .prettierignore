@@ -1,0 +1,14 @@
+**/dist/
+**/dist-release/
+**/dist-control-plane/
+**/node_modules/
+**/package-lock.json
+**/.keysentry/
+**/logs/
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/.terraform.lock.hcl
+src/dashboard/generated/assets.ts
+packages/control-plane/src/ui-assets.ts
