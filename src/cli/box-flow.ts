@@ -132,6 +132,11 @@ export async function openVerifiedBoxSession(options: BoxSessionOptions): Promis
   const result: AttestationResult = await verifyAttestation({ token: attest.message.attestationToken, jwks: options.trust.jwks,
     ...(options.trust.root ? { root: options.trust.root } : {}), policy, expectedNonces, now: now() });
   // The emulator's digests are its own test values, not entries of the signed public allow-list.
+  // Every tenant's box shares one project and service account, so the machine's name is what ties the token to this box.
+  const instance = result.claims?.submods?.gce?.instance_name;
+  own.push(!result.claims ? { name: 'instance-name', ok: false, detail: 'Not checked: the token did not verify.' }
+    : instance === options.boxId ? { name: 'instance-name', ok: true, detail: 'The attested machine is this box.' }
+      : { name: 'instance-name', ok: false, detail: 'The attested machine is a different box.' });
   const checks = [...own, ...result.checks.map(check => !options.trust.emulator || check.name !== 'image-digest' ? check
     : { ...check, detail: check.ok ? 'One of the emulator\x27s test image digests.' : 'Not one of the emulator\x27s test image digests.' })];
   const ok = result.ok && own.every(check => check.ok);

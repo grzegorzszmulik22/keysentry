@@ -34,7 +34,7 @@ interface BoxRegistry { v: 1; boxes: BoxRecord[] }
 
 /** The parts of the control-plane package's local runner the CLI uses (it is loaded, never bundled). */
 export interface LocalBoxRunner {
-  startLocalBox(options: { boxId?: string; bootBox(runtime: {
+  startLocalBox(options: { boxId?: string; enrollmentDeviceKey?: Buffer; bootBox(runtime: {
     boxId: string; relay: BoxRelay; tee: { token(input: { audience: string; nonces: string[] }): Promise<string>; defaultToken(): Promise<string> }; http: HttpClient;
   }): Promise<{ stop(): Promise<void> }> }): Promise<{
     boxId: string; origin: string; cliToken: string; restart(): Promise<void>; close(): Promise<void>;
@@ -195,7 +195,8 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
         const { runCli } = await import('./index.js');
         return runCli(['watch'], { env, cwd, signal, stdinIsTTY: false, stdoutIsTTY: false, output: () => {}, error: () => {} });
       });
-      const local = await runner.startLocalBox({ boxId: options.name, bootBox: runtime => startBoxAgent({ boxId: runtime.boxId, relay: runtime.relay,
+      // The emulator writes this key into the instance metadata, as the hosted control plane does.
+      const local = await runner.startLocalBox({ boxId: options.name, enrollmentDeviceKey: device[0], bootBox: runtime => startBoxAgent({ boxId: runtime.boxId, relay: runtime.relay,
         tee: runtime.tee, http: runtime.http, stateDir, enrollmentDeviceKeys: device, log: quietLog, pollIntervalMs: 1_000,
         startWatcher: (env, signal) => startWatcher(env, signal, stateDir),
         sendNotice: createNoticeSender({ transport: createFetchHttp(), log: quietLog }) }) });
@@ -226,6 +227,17 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
         await rt.store.writeJson('plan', registryPath(rt), { v: 1, boxes: after.boxes.filter(item => item.boxId !== entry.boxId) });
         await rm(stateDir, { recursive: true, force: true });
       }
+    });
+
+  box.command('card').description('Print this computer\'s device public key, for creating a cloud box')
+    .action(async () => {
+      const rt = await opts.getRuntime();
+      const [device] = await localDeviceKeys(rt);
+      if (!device) throw new CliError('This computer has no device key yet. Run keysentry init first.');
+      const deviceKey = device.publicKeyDer.toString('base64');
+      opts.emit({ deviceKey, keyId: device.keyId }, ['Device public key for this computer:', deviceKey, '', `Key ID: ${device.keyId}`,
+        'Paste it into "Create a box" on the keysentry cloud box page. It is a public key, not a secret.',
+        'Only this computer can then send the box its tokens, after checking what the box runs.'].join('\n'));
     });
 
   box.command('check <box>').description('Verify the box\'s attestation and image before anything is sent')

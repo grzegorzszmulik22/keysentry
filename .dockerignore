@@ -13,3 +13,4 @@ tools/probes
 **/logs
 **/.env
 **/.env.*
+dist-control-plane

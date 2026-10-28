@@ -200,6 +200,30 @@ describe('cloud box end to end against the local emulator', () => {
     expect(await bundlesSent(h)).toBe(0);
   });
 
+  it('refuses a genuine box that answers under another machine name, naming the instance-name check', async () => {
+    const h = await harness();
+    await eventually(async () => expect((await h.relay.poll()).some(message => (message as { type?: string }).type === 'box-hello')).toBe(true));
+    // Another tenant's box: same project, service account and image, correctly bound keys, but not this box.
+    const other = { boxKey: generateBoxKeyPair(), signingKey: generateDeviceKey() };
+    const binding = boxKeyBindingNonce(other.boxKey.publicKeyRaw, other.signingKey.publicKeyDer.subarray(-32));
+    let fake = createHandshake('box', { devicePublicKeyDer: h.device.publicKeyDer, ...other });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const hello = fake.next({ now: new Date(), attestationToken: h.local.emulator.mintToken({ audience: 'keysentry-box:test-box', nonces: [binding], instanceName: 'other-box' }) });
+    fake = hello.handshake;
+    await h.relay.publish(hello.message!);
+    const pending = session(h);
+    await eventually(async () => {
+      const challenge = (await h.relay.poll(fake.sessionId!)).find(message => (message as { type?: string }).type === 'cli-challenge') as { challenge: string } | undefined;
+      expect(challenge).toBeDefined();
+      const token = h.local.emulator.mintToken({ audience: 'keysentry-box:test-box', nonces: [binding, challenge!.challenge], instanceName: 'other-box' });
+      await h.relay.publish(fake.next({ now: new Date(), message: challenge, attestationToken: token }).message!);
+    });
+    const opened = await pending;
+    expect(opened.verification.failed).toEqual(['instance-name']);
+    expect(opened.send).toBeUndefined();
+    expect(await bundlesSent(h)).toBe(0);
+  });
+
   it('moves on from an announced session nobody answers to one the box still serves', async () => {
     const h = await harness();
     await eventually(async () => expect((await h.relay.poll()).some(message => (message as { type?: string }).type === 'box-hello')).toBe(true));

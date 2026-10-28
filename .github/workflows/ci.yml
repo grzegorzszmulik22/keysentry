@@ -31,6 +31,29 @@ jobs:
       - run: npx tsc -p tsconfig.client.json --noEmit
       - run: npx tsc -p packages/control-plane/tsconfig.json --noEmit
       - run: node tools/vitest-sandbox.mjs packages/control-plane/test
+      - run: npx tsc -p packages/control-plane/tsconfig.ui.json --noEmit
+      - run: node packages/control-plane/scripts/build-ui.mjs --check
+
+  images:
+    name: Box and control-plane images build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Built locally only: nothing is pushed or deployed.
+      - run: docker build -f Dockerfile.box -t keysentry-box:ci --build-arg KEYSENTRY_BUILD_COMMIT=${{ github.sha }} .
+      - name: Box image keeps its launch policy, user and entry point
+        run: |
+          docker image inspect keysentry-box:ci --format '{{json .Config.Labels}} {{json .Config.Entrypoint}} {{.Config.User}} {{.Architecture}}' > box.txt
+          grep -q '"tee.launch_policy.allow_cmd_override":"false"' box.txt
+          grep -q '"tee.launch_policy.log_redirect":"debugonly"' box.txt
+          grep -q '"tee.launch_policy.monitoring_memory_allow":"never"' box.txt
+          ! grep -q allow_env_override box.txt
+          grep -q '"box","agent"] 65532 amd64' box.txt
+      - run: docker build -f Dockerfile.control-plane -t keysentry-control-plane:ci .
 
   release-build:
     name: Audit and reproducible release build

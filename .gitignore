@@ -7,3 +7,4 @@ dist-release/
 .terraform/
 *.tfstate
 *.tfstate.*
+dist-control-plane/

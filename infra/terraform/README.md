@@ -72,10 +72,12 @@ checks remain separate release checks. Terraform configuration and its outputs a
 
 ## Control-plane boundary
 
-The service image is required by digest. Cloud Run retains its invoker IAM check, and this root grants no invoker
-access; ingress routing alone does not make it public. Its account has only bucket-scoped
-`roles/storage.objectUser`, with no KMS release, project-wide storage, IAM administration or Compute provisioning
-permission. Uniform bucket access, enforced public-access prevention, versioning, `force_destroy = false` and
+The service runs the `Dockerfile.control-plane` image by digest, as a public Cloud Run service
+(`invoker_iam_disabled`; every route authenticates its own caller: passkey sessions, box attestation tokens, Stripe
+signatures). Its account has bucket-scoped `roles/storage.objectUser` and `secretAccessor` on the two Stripe secrets,
+whose references (never values) the service reads at startup. Only with `live_provisioning = true` does it get a
+create-only custom role in the box project and `roles/iam.serviceAccountUser` on the box service account. It has no
+KMS, IAM administration or project-wide storage permission. Uniform bucket access, enforced public-access prevention, versioning, `force_destroy = false` and
 `prevent_destroy` protect the ciphertext store against unintended exposure or removal through this configuration.
 
 Before a future launch, separately review application authentication, relay routing, bucket configuration in the

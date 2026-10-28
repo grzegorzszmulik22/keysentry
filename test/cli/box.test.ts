@@ -139,6 +139,16 @@ describe('keysentry box', () => {
     }
   });
 
+  it('prints this computer\'s device public key for the cloud box page, and nothing secret', async () => {
+    const f = await fixture();
+    expect(await runCli(['box', 'card', '--json'], f.options())).toBe(0);
+    const card = JSON.parse(f.output.join('\n')) as { deviceKey: string; keyId: string };
+    const device = (await f.runtime.signingKey());
+    expect(card.deviceKey).toBe(device.publicKeyDer.toString('base64'));
+    expect(card.keyId).toBe(device.keyId);
+    expect(f.output.join('\n')).not.toContain(device.privateKeyDer.toString('base64'));
+  });
+
   it('explains a box that does not exist', async () => {
     const f = await fixture();
     expect(await runCli(['box', 'check', 'missing-box'], f.options())).toBe(1);
