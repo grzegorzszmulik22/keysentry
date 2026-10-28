@@ -679,6 +679,8 @@ export interface ApprovalGrant {
   digest: string;
   at: string;
   by: { kind: 'passkey'; credentialId: string } | { kind: 'device'; keyId: string };
+  /** Team quorum (phase 5): every distinct approver, including `by`. Absent for a single approval. */
+  approvers?: ApprovalApprover[];
 }
 
 // ---------------------------------------------------------------- phase 3: first run and everyday features
@@ -784,3 +786,84 @@ export interface AllowListEntry {
   hash: string;
   sig: string;
 }
+
+// ---------------------------------------------------------------- phase 5: teams and enterprise
+/** viewer: read the dashboard; operator: approve rotations and disarm; admin: also change the roster and policy. */
+export type TeamRole = 'viewer' | 'operator' | 'admin';
+
+export interface TeamMember {
+  /** Stable lowercase id, e.g. "ana". */
+  id: string;
+  name: string;
+  role: TeamRole;
+  /** Verified email for single sign-on mapping; absent means the member cannot sign in with OIDC. */
+  email?: string;
+  passkeys: PasskeyCredential[];
+  deviceKeys: { keyId: string; publicKeyDer: string }[];
+  /** Channel ids from notify settings this member receives, and the lowest severity routed to them. */
+  notify?: { channels: string[]; minSeverity: NotifySeverity };
+}
+
+/** The membership document. Each version links to the previous one by hash and is signed by its admins. */
+export interface TeamRoster {
+  v: 1;
+  teamId: string;
+  version: number;
+  /** sha256 hex of the canonical previous signed roster; null for version 1. */
+  prev: string | null;
+  updatedAt: string;
+  members: TeamMember[];
+  /** Distinct admins whose signatures a roster or policy change needs (1 for a team of one). */
+  adminThreshold: number;
+}
+
+/** Signature by an admin's device key over `keysentry-team:v1\n` + canonical JSON of the document. */
+export interface TeamSignature { memberId: string; keyId: string; sig: string }
+export interface SignedTeamRoster { roster: TeamRoster; signatures: TeamSignature[] }
+
+/** Policy-as-code. Rules only narrow what local configuration allows; they never widen it. */
+export interface TeamPolicy {
+  v: 1;
+  teamId: string;
+  version: number;
+  prev: string | null;
+  updatedAt: string;
+  autopilot: {
+    allowedHosts?: HostId[];
+    allowedProviders?: ProviderId[];
+    maxServicesPerWave?: number;
+    /** Tiers whose rotations always need an approval, even inside an armed plan. */
+    approvalTiers?: RiskTier[];
+  };
+  approvals: {
+    /** Distinct operators or admins per approval (default 1). */
+    required: number;
+    requiredByTier?: Partial<Record<RiskTier, number>>;
+    /** Approvals for policy-widening actions need this many admins. */
+    wideningAdmins: number;
+  };
+  network: { offline?: boolean; allowHosts?: string[]; requireProxy?: boolean };
+  notify: { allowedKinds?: NotifyChannelKind[] };
+  rotation: { revoke?: 'after-deploy' | 'never'; minGraceSeconds?: number };
+  audit: { exportRequired?: boolean };
+}
+export interface SignedTeamPolicy { policy: TeamPolicy; signatures: TeamSignature[] }
+
+/** One approver counted toward a quorum. */
+export type ApprovalApprover = ApprovalGrant['by'] & { memberId?: string; at?: string };
+
+/** Wraps and unwraps a data key with a key that never leaves a KMS (AWS KMS, GCP KMS, Azure Key Vault, Vault Transit). */
+export type KmsProviderId = 'aws-kms' | 'gcp-kms' | 'azure-key-vault' | 'vault-transit';
+export interface KeyWrapper {
+  readonly provider: KmsProviderId;
+  /** A stable, non-secret description of the key, e.g. its ARN or resource name. */
+  readonly keyRef: string;
+  /** Returns opaque bytes; the caller stores them. `context` is bound as additional authenticated data. */
+  wrap(dataKey: Buffer, context: string): Promise<Buffer>;
+  /** Returns caller-owned plaintext; the caller clears it. */
+  unwrap(wrapped: Buffer, context: string): Promise<Buffer>;
+}
+
+export type AuditExportKind = 'syslog' | 'otlp' | 's3' | 'webhook';
+/** Every exported record is value-free and carries the audit sequence number, so receivers can deduplicate. */
+export interface AuditExportRecord { seq: number; at: string; kind: string; summary: string; data?: Record<string, unknown>; actor?: string }

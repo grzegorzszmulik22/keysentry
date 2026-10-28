@@ -80,7 +80,43 @@ export const configSchema = z.object({
     deployTimeoutMs: positive.int().default(600_000),
     pollIntervalMs: positive.int().default(5_000),
   }).strict().prefault({}),
-  network: z.object({ allowHosts: z.array(exactHostname).default([]) }).strict().prefault({}),
+  network: z.object({
+    allowHosts: z.array(exactHostname).default([]),
+    /** Phase 5: an HTTP(S) proxy for every outbound request (HTTPS_PROXY is also honoured), hosts that bypass it, and
+     * a PEM bundle trusted in addition to the system roots. */
+    proxy: safeUrl.refine(value => { const url = new URL(value); return !url.pathname.replace(/^\/$/, '') && !url.search && !url.hash; }).optional(),
+    noProxy: z.array(exactHostname).default([]),
+    caFile: nonempty.optional(),
+    /** No breach feeds or news: only the hosts and providers you configured are contacted. */
+    offline: z.boolean().default(false),
+  }).strict().prefault({}),
+  /** Phase 5: team mode keeps a signed roster in encrypted state; the policy file narrows what this project may do. */
+  team: z.object({ enabled: z.boolean().default(false), policyFile: nonempty.optional() }).strict().prefault({}),
+  audit: z.object({
+    export: z.array(z.discriminatedUnion('kind', [
+      // Syslog over TLS (RFC 5425), host:port only.
+      z.object({ kind: z.literal('syslog'), id: channelId, host: exactHostname, port: z.number().int().min(1).max(65535).default(6514),
+        appName: z.string().regex(/^[!-~]{1,48}$/).default('keysentry') }).strict(),
+      // OpenTelemetry logs over OTLP/HTTP JSON; an optional bearer or header secret lives in the vault.
+      z.object({ kind: z.literal('otlp'), id: channelId, url: guardedUrl }).strict(),
+      // S3-compatible object storage with SigV4; credentials live in the vault.
+      z.object({ kind: z.literal('s3'), id: channelId, endpoint: guardedUrl, bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/),
+        region: z.string().regex(/^[a-z0-9-]{1,32}$/), prefix: z.string().regex(/^[A-Za-z0-9!_.*'()/-]{0,512}$/).default('keysentry-audit/') }).strict(),
+      // Signed webhook: Ed25519 signature by the watcher key, or HMAC with a secret in the vault.
+      z.object({ kind: z.literal('webhook'), id: channelId, url: guardedUrl, signing: z.enum(['ed25519', 'hmac-sha256']).default('ed25519') }).strict(),
+    ])).max(10).refine(items => new Set(items.map(item => item.id)).size === items.length).default([]),
+  }).strict().prefault({}),
+  /** Phase 5: wrap the project's state key with your own KMS key; the unwrapped key exists only in memory. */
+  kms: z.discriminatedUnion('provider', [
+    z.object({ provider: z.literal('aws-kms'), keyId: z.string().regex(/^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:(?:key|alias)\/[A-Za-z0-9/_-]{1,256}$/),
+      region: z.string().regex(/^[a-z0-9-]{1,32}$/) }).strict(),
+    z.object({ provider: z.literal('gcp-kms'),
+      keyName: z.string().regex(/^projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/locations\/[a-z0-9-]+\/keyRings\/[A-Za-z0-9_-]{1,63}\/cryptoKeys\/[A-Za-z0-9_-]{1,63}$/) }).strict(),
+    z.object({ provider: z.literal('azure-key-vault'), vaultUrl: guardedUrl, keyName: z.string().regex(/^[A-Za-z0-9-]{1,127}$/),
+      keyVersion: z.string().regex(/^[A-Za-z0-9]{32}$/).optional() }).strict(),
+    z.object({ provider: z.literal('vault-transit'), address: guardedUrl, mount: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).default('transit'),
+      keyName: z.string().regex(/^[A-Za-z0-9_.-]{1,128}$/), namespace: z.string().regex(/^[A-Za-z0-9_/-]{1,256}$/).optional() }).strict(),
+  ]).optional(),
   autopilot: z.object({
     graceMinutes: z.number().finite().nonnegative().default(15),
     maxServices: z.number().int().positive().default(10), showHints: z.boolean().default(false),
