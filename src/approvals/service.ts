@@ -45,6 +45,11 @@ export interface ApprovalService {
   request(action: ApprovalAction, widening: boolean): Promise<ApprovalRequestDetails>;
   approveWithPasskey(actionId: string, assertion: PasskeyAssertion, expectedDigest?: string): Promise<ApprovalGrant>;
   approveWithDevice(actionId: string, signed: DeviceApproval): Promise<ApprovalGrant>;
+  /**
+   * Team mode only: count a roster member whose own passkey the caller has already verified over this exact request
+   * (the team dashboard's passkey gate). The credential must be that member's roster passkey; without a team this refuses.
+   */
+  approveAsMember(actionId: string, approver: { memberId: string; credentialId: string }, expectedDigest?: string): Promise<ApprovalGrant>;
   status(actionId: string): Promise<ApprovalStatus>;
   describe(actionId: string): Promise<ApprovalDescription | null>;
   challenge(actionId: string, expectedDigest?: string): Promise<ApprovalChallenge>;
@@ -60,9 +65,17 @@ export class ApprovalError extends Error {
 /** A team approval was verified and recorded, but more distinct members must approve before the action may run. */
 export class ApprovalPendingError extends ApprovalError {
   readonly pending = true;
-  constructor(readonly approvals: number, readonly required: number) {
+  /** How many more distinct members must approve. */
+  readonly remaining: number;
+  constructor(readonly approvals: number, readonly required: number, readonly role: 'operator' | 'admin' = 'operator') {
     super(`Your approval was recorded: ${approvals} of ${required} team approvals so far. The action runs only after ${required} different team members approve it.`);
     this.name = 'ApprovalPendingError';
+    this.remaining = Math.max(0, required - approvals);
+  }
+  /** Who still needs to approve, in plain words, e.g. "1 more approval from a team operator or admin". */
+  get needed(): string {
+    const who = this.role === 'admin' ? (this.remaining === 1 ? 'a team admin' : 'team admins') : (this.remaining === 1 ? 'a team operator or admin' : 'team operators or admins');
+    return `${this.remaining} more approval${this.remaining === 1 ? '' : 's'} from ${who} who ${this.remaining === 1 ? 'has' : 'have'} not approved yet`;
   }
 }
 const TEN_MINUTES = 10 * 60 * 1000;
@@ -222,7 +235,7 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     if (counted.length < need.required) {
       events.push({ kind: 'approvals:quorum-progress', summary: 'Team approval recorded; more approvals are needed.',
         data: { actionId: request.actionId, memberId: member.id, approvals: counted.length, required: need.required } });
-      throw new ApprovalPendingError(counted.length, need.required);
+      throw new ApprovalPendingError(counted.length, need.required, need.admins ? 'admin' : 'operator');
     }
     return approve(state, request, by, at, events, counted.map(entry => ({ ...entry })));
   }
@@ -338,6 +351,20 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
           }
         } catch { return attemptFailed(request, events); }
         return recordApprover(state, request, team!, { kind: 'device', keyId: verified!.keyId }, verified!.member, at, events);
+      });
+    },
+    approveAsMember(actionId, input, expectedDigest) {
+      return transaction(async (state, events, at) => {
+        const request = pending(state, actionId, events, expectedDigest);
+        if (request.widening) return attemptFailed(request, events, WIDENING, 'widening-refused');
+        const team = await teamNow();
+        if (!team) { events.push(event('rejected', actionId)); return reject('Team approvals need a team roster.'); }
+        const memberId = typeof input?.memberId === 'string' ? input.memberId : '';
+        const credentialId = typeof input?.credentialId === 'string' ? input.credentialId : '';
+        const member = team.roster.members.find(candidate => candidate.id === memberId);
+        // The gate verified this credential; the roster must still list it for this member.
+        if (member && !member.passkeys.some(passkey => passkey.id === credentialId)) return attemptFailed(request, events);
+        return recordApprover(state, request, team, { kind: 'passkey', credentialId }, member, at, events);
       });
     },
     status(actionId) {

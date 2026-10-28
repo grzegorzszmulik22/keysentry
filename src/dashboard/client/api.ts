@@ -1,8 +1,17 @@
-export interface DashboardSession { csrf: string; readOnly: boolean; passkeys: number }
+export interface DashboardSession {
+  csrf: string; readOnly: boolean; passkeys: number;
+  /** Team mode (OIDC sign-in behind the team's proxy). Absent on the local dashboard. */
+  team?: boolean;
+  member?: { id: string; name: string; role: 'viewer' | 'operator' | 'admin' };
+  /** The identity provider's issuer and subject of this sign-in; pinned is true when the roster pins this member. */
+  identity?: { issuer: string; subject: string; pinned: boolean };
+}
 
 let session: DashboardSession | undefined;
 const requestError = 'The request could not be completed. Try again.';
 export const passkeyRegistrationNotice = 'Register a passkey with keysentry passkey register in your terminal, then reload this page.';
+/** Team mode: matches the server's TEAM_PASSKEY_NOTICE. */
+export const teamPasskeyNotice = 'Ask a team admin to add your passkey to the team roster, then reload this page.';
 
 export function configureSession(value: DashboardSession): void {
   session = { ...value };
@@ -53,8 +62,23 @@ export async function post<T = unknown>(route: string, body: unknown = {}): Prom
 export async function fetchSession(): Promise<DashboardSession> {
   const value = await get<DashboardSession>('session');
   if (typeof value?.csrf !== 'string' || typeof value?.readOnly !== 'boolean' || !Number.isInteger(value?.passkeys) || value.passkeys < 0) throw new Error(requestError);
-  configureSession(value);
-  return { ...value };
+  const team = value.team === true;
+  const member = team && value.member && typeof value.member.id === 'string' && typeof value.member.name === 'string'
+    && ['viewer', 'operator', 'admin'].includes(value.member.role) ? { id: value.member.id, name: value.member.name, role: value.member.role } : undefined;
+  const identity = team && value.identity && typeof value.identity.issuer === 'string' && typeof value.identity.subject === 'string'
+    ? { issuer: value.identity.issuer, subject: value.identity.subject, pinned: value.identity.pinned === true } : undefined;
+  const checked: DashboardSession = { csrf: value.csrf, readOnly: value.readOnly, passkeys: value.passkeys,
+    ...(team ? { team: true } : {}), ...(member ? { member } : {}), ...(identity ? { identity } : {}) };
+  configureSession(checked);
+  return { ...checked };
+}
+
+/** Team mode: end this dashboard session, then return to the sign-in page. */
+export async function signOut(): Promise<void> {
+  if (!session) return;
+  try { await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers: { 'X-CSRF-Token': session.csrf } }); }
+  catch { /* The sign-in page is shown either way. */ }
+  finally { location.assign('/'); }
 }
 
 function base64url(bytes: ArrayBuffer): string {
@@ -84,7 +108,7 @@ function descriptors(value: unknown): PublicKeyCredentialDescriptor[] {
 
 function writable(): void {
   if (!session) throw new Error('Open keysentry again from your terminal.');
-  if (session.passkeys === 0) throw new Error(passkeyRegistrationNotice);
+  if (session.passkeys === 0) throw new Error(session.team ? teamPasskeyNotice : passkeyRegistrationNotice);
   if (session.readOnly) throw new Error('Changes are unavailable in this session.');
 }
 

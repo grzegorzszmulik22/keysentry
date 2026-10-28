@@ -15,6 +15,8 @@ import { promptVaultValue, type PromptIO } from './prompts.js';
 import { BUILD_VERSION, checkLocalIntegrity } from '../release/index.js';
 import { DEFAULT_SOURCES, verifyArmedPlan } from '../autopilot/index.js';
 import { CliError } from './errors.js';
+import { buildTeamBundle } from '../policy/index.js';
+import { governanceBundle } from './team-governance.js';
 import { assertHumanForMutation } from '../safety/index.js';
 import { providerName } from './display.js';
 import { trustedWatcherKeys } from './watcher-keys.js';
@@ -122,6 +124,8 @@ export async function executeLocalApprovedAction(rt: KeysentryRuntime, actionId:
       const result = await checkLocalIntegrity(); const ok = result.status === 'dev' || result.status === 'ok';
       return { ok, reasons: ok ? [] : ['The watcher installation integrity could not be verified.'] };
     },
+    // Team mode: the same quorum and policy as the approval that granted this action.
+    team: governanceBundle(rt.governance), quorum: rt.teamQuorum(),
   });
   return watcher.executeApprovedAction(actionId);
 }
@@ -159,7 +163,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       return { settings: rt.config.settings.notify.channels, vault: rt.vault, http: rt.http, redactor: rt.redactor,
         log: rt.log, store: rt.store, deviceKey: rt.signingKey, audit: rt.audit, receipt: rt.receipt, now: opts.now, write: opts.diagnostic,
         watcherPublicKeys: () => trustedWatcherKeys(rt.vault),
-        saveSettings: async settings => { await saveNotificationSettings(rt.config.configPath, settings); rt.config.settings.notify.channels = settings; },
+        // Channels a team policy hides stay in keysentry.yaml when the visible list is saved.
+        saveSettings: async settings => { await saveNotificationSettings(rt.config.configPath, rt.withHiddenChannels(settings)); rt.config.settings.notify.channels = settings; },
       };
     } });
   const passkey = program.command('passkey').description('Manage local passkey credentials');
@@ -193,8 +198,10 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
     .action(async options => {
       opts.human('set up a watcher'); const rt = await opts.getRuntime();
       if (options.relay || options.remote || opts.json() || !opts.interactive()) throw new CliError('Watcher setup needs a local interactive terminal and cannot print secrets in JSON.');
+      // The verified roster and policy travel sealed with the watcher; setup refuses while governance blocks changes.
+      const team = await buildTeamBundle({ store: rt.store, settings: rt.rawSettings, cwd: rt.config.cwd, env: opts.env, anchors: rt.teamAnchors });
       if (options.relayServer) await configureApprovalRelay(rt, options.relayServer);
-      const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault,
+      const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault, team,
         notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
         intervalSeconds: rt.config.monitor.intervalMs / 1000, publicOrigin: options.origin,
         relayServer: options.relayServer ?? rt.config.settings.notify.relay?.server,
@@ -231,6 +238,9 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
         stdinIsTTY: true, stdoutIsTTY: true, action });
       watcherGuard('run the watcher');
       const rt = await opts.getRuntime(true); const sealed = opts.watcherConfig();
+      // Team governance (sealed: from the authenticated config): an untrusted roster, an invalid policy or an unmet
+      // policy requirement (for example audit.exportRequired with no export) stops the watcher before it starts.
+      await rt.assertGovernance();
       const actions = detectPlatform(opts.env).platform === 'github-actions';
       const watchStore = createWatcherStateStore(rt.store, actions);
       if (!sealed) await rt.prepareExecution(opts.diagnostic);
@@ -273,8 +283,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
             if (target.status === 'failed' || target.status === 'refused') rt.log.warn(`Audit export to ${target.id} did not complete: ${target.error ?? 'delivery failed'}`);
           }
         },
-        // ORCHESTRATOR HOOK (team policy): when a verified TeamPolicy.audit.exportRequired is true and audit.export is empty,
-        // refuse to run the watcher here (and in doctor and autopilot arm), as notes/audit-export.md suggests.
+        // Team mode: the sealed roster and policy, or this computer's (whose quorum re-reads the saved roster each time).
+        ...(sealed ? { team: sealed.team ?? null } : { team: governanceBundle(rt.governance), quorum: rt.teamQuorum() }),
       }, { ...options, ...(opts.signal ? { signal: opts.signal } : {}) }));
     });
 }

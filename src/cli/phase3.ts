@@ -10,7 +10,9 @@ import type { PromptIO } from './prompts.js';
 import type { GitRunner } from '../firstrun/index.js';
 import { guardStaged, formatGuardStaged, installHook, uninstallHook } from '../guard/index.js';
 import { detectAgentEnvironment } from '../safety/index.js';
-import { createStatePasskeyCounters, startDashboard } from '../dashboard/server/index.js';
+import { createStatePasskeyCounters, startDashboard, type TeamEnrollmentHooks } from '../dashboard/server/index.js';
+import { DashboardError } from '../dashboard/server/security.js';
+import { checkInvite, completeEnrollment, EnrollmentError } from '../team/index.js';
 import { createOidcClient, OIDC_CLIENT_SECRET_NAME, OidcError, parseTeamUiOptions, teamAuditEvent } from '../dashboard/oidc/index.js';
 import type { TeamMember } from '../types.js';
 import { credentialVaultName } from '../vault/index.js';
@@ -88,6 +90,41 @@ async function writeNew(cwd: string, file: string, text: string): Promise<string
   return path;
 }
 
+/** Fixed-text refusal for an enrollment problem; anything unexpected becomes the server's generic error. */
+function enrollmentRefusal(error: unknown): unknown {
+  if (!(error instanceof EnrollmentError)) return error;
+  const status = { invalid: 403, expired: 410, used: 409, origin: 403, member: 403, full: 429, duplicate: 409, state: 503 }[error.reason];
+  return new DashboardError(status, error.message);
+}
+
+/**
+ * `/enroll` on the team dashboard: invitations from `keysentry team invite` (encrypted state, hashed tokens) become
+ * pending candidates. Nothing here touches the roster; admins add a candidate with `keysentry team add-passkey`.
+ */
+export function enrollmentHooks(rt: Pick<KeysentryRuntime, 'store' | 'audit' | 'now'>, origin: string, opts: Pick<Phase3CommandsOptions, 'diagnostic'>): TeamEnrollmentHooks {
+  const refusals = { start: Number.NEGATIVE_INFINITY, count: 0 };
+  return {
+    async check(token) {
+      try { return await checkInvite(rt.store, token, origin, rt.now()); } catch (error) { throw enrollmentRefusal(error); }
+    },
+    async complete(input) {
+      try { await completeEnrollment(rt.store, { ...input, origin, now: rt.now() }); } catch (error) { throw enrollmentRefusal(error); }
+    },
+    async onEvent(event) {
+      if (event.kind === 'enrollment-refused') {
+        // Anonymous traffic can cause refusals; at most ten are recorded per minute.
+        const time = rt.now().getTime();
+        if (time - refusals.start >= 60_000) { refusals.start = time; refusals.count = 0; }
+        if (++refusals.count > 10) return;
+      }
+      await rt.audit.append(event.kind === 'passkey-enrolled'
+        ? { kind: 'team:passkey-enrolled', summary: 'A team member created a passkey on the team dashboard; it waits for an admin.', data: { memberId: event.memberId } }
+        : { kind: 'team:enrollment-refused', summary: 'A passkey enrollment on the team dashboard was refused.' })
+        .catch(() => opts.diagnostic('A passkey enrollment event could not be added to the audit log.'));
+    },
+  };
+}
+
 export function registerPhase3Commands(program: Command, opts: Phase3CommandsOptions): void {
   const reports = async () => createPhase3Runtime(await opts.getRuntime());
   const openDashboard = async (readOnly = false, printUrl = false) => {
@@ -160,6 +197,13 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
     if (!opts.teamMembers) throw new CliError('Team mode needs a team roster. Run keysentry team init first.');
     const rt = await opts.getRuntime();
     const members = () => opts.teamMembers!(rt);
+    // A team policy's network.allowHosts also limits which identity provider hosts the dashboard may reach. (A forced
+    // offline mode only stops feeds, so it does not affect sign-in.)
+    const allowHosts = rt.teamPolicy?.network.allowHosts;
+    if (allowHosts) {
+      const outside = [new URL(settings.issuer).hostname, ...settings.hosts].filter(host => !allowHosts.includes(host));
+      if (outside.length) throw new CliError(`The team policy's network.allowHosts does not list ${outside.join(', ')}, so single sign-on cannot reach the identity provider. Ask a team admin to add it to the policy.`);
+    }
     let http: ReturnType<typeof rt.httpForUrls>;
     try { http = rt.httpForUrls([settings.issuer, ...settings.hosts.map(host => `https://${host}/`)], 'single sign-on for the team dashboard'); }
     catch { throw new CliError('Use identity provider hosts on https with the default port.'); }
@@ -179,12 +223,15 @@ export function registerPhase3Commands(program: Command, opts: Phase3CommandsOpt
     }
     const oidc = createOidcClient({ issuer: settings.issuer, clientId: settings.clientId, redirectUri: `${settings.publicOrigin}/auth/callback`, http, clientSecret, allowedHosts: settings.hosts });
     try { await oidc.metadata(); } catch (error) { throw new CliError(error instanceof OidcError ? error.message : 'The identity provider could not be reached.'); }
-    if (!(await members()).some(member => typeof member.email === 'string')) opts.diagnostic('No roster member has an email address yet, so nobody can sign in. Add emails with keysentry team.');
+    if (!(await members()).some(member => typeof member.email === 'string' || member.sso !== undefined)) {
+      opts.diagnostic('No roster member has an email address or a pinned single sign-on identity yet, so nobody can sign in. Add them with keysentry team.');
+    }
     const dashboard = await startDashboard({ api: createDashboardApi(rt),
       readOnly: options.readOnly === true || detectAgentEnvironment(opts.env) !== null,
       onError: (name: string) => { opts.diagnostic(`Dashboard request failed: ${/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name) ? name : 'Error'}`); },
       team: { publicOrigin: settings.publicOrigin, listen: settings.listen, oidc, members, passkeyCounters: createStatePasskeyCounters(rt.store),
-        onAuthEvent: async event => { await rt.audit.append(teamAuditEvent(event)).catch(() => opts.diagnostic('A dashboard sign-in event could not be added to the audit log.')); } },
+        onAuthEvent: async event => { await rt.audit.append(teamAuditEvent(event)).catch(() => opts.diagnostic('A dashboard sign-in event could not be added to the audit log.')); },
+        enrollment: enrollmentHooks(rt, settings.publicOrigin, opts) },
     });
     opts.emit({ url: dashboard.url, listen: `${settings.listen.host}:${dashboard.port}` },
       `Team dashboard: ${dashboard.url}\nListening on ${settings.listen.host}:${dashboard.port}. Serve it through your TLS proxy and keep the Host header unchanged.`);

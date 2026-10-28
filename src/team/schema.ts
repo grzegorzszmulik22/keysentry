@@ -45,6 +45,19 @@ export const deviceKeySchema = z.object({ keyId: z.string().regex(/^[a-f0-9]{16}
     } catch { return false; }
   });
 
+/** An OIDC issuer as the provider publishes it: https, no credentials, query or fragment. */
+export const ssoIssuerSchema = z.string().min(1).max(512).refine(value => {
+  if (/[\u0000- \u007f-\u009f]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash && !value.includes('?') && !value.includes('#')
+      && url.href.replace(/\/$/, '') === value.replace(/\/$/, '');
+  } catch { return false; }
+});
+/** OIDC `sub`: at most 255 ASCII characters (OpenID Connect Core §2), printable, compared exactly. */
+export const ssoSubjectSchema = z.string().min(1).max(255).regex(/^[\x21-\x7e]+$/);
+export const ssoSchema = z.object({ issuer: ssoIssuerSchema, subject: ssoSubjectSchema }).strict();
+
 export const passkeySchema = z.object({
   id: base64url, publicKeyCose: base64url, alg: z.union([z.literal(-7), z.literal(-8), z.literal(-257)]),
   signCount: z.number().int().min(0).max(0xffffffff), backupEligible: z.boolean(),
@@ -57,6 +70,7 @@ export const memberSchema = z.object({
   name: printable(80),
   role: z.enum(['viewer', 'operator', 'admin']),
   email: emailSchema.optional(),
+  sso: ssoSchema.optional(),
   passkeys: z.array(passkeySchema).max(MAX_PASSKEYS_PER_MEMBER),
   deviceKeys: z.array(deviceKeySchema).max(MAX_DEVICE_KEYS_PER_MEMBER),
   notify: z.object({
@@ -105,6 +119,8 @@ export function rosterProblem(roster: z.infer<typeof rosterSchema>): string | nu
   if (new Set(passkeyIds).size !== passkeyIds.length) return 'A passkey is listed more than once.';
   const emails = roster.members.flatMap(member => member.email === undefined ? [] : [member.email]);
   if (new Set(emails).size !== emails.length) return 'Two members share the same email.';
+  const identities = roster.members.flatMap(member => member.sso === undefined ? [] : [`${member.sso.issuer}\n${member.sso.subject}`]);
+  if (new Set(identities).size !== identities.length) return 'Two members share the same single sign-on identity.';
   const admins = roster.members.filter(member => member.role === 'admin');
   if (!admins.length) return 'A team needs at least one admin.';
   if (roster.adminThreshold > admins.length) return 'The admin threshold is higher than the number of admins.';

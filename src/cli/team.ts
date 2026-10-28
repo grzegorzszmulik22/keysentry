@@ -8,9 +8,11 @@ import { parseDocument } from 'yaml';
 import type { DeviceKey } from '../security/index.js';
 import type { NotifySeverity, SignedTeamPolicy, SignedTeamRoster, TeamRole, TeamRoster } from '../types.js';
 import {
-  applyRoster, checkProposal, createRoster, describeRosterChange, devicePublicKey, loadTeam, memberCardSchema, nextRoster, parseSignedRoster,
-  rosterFingerprint, rosterHash, signRoster, TeamError, vaultTeamAnchor, verifyFirstUse, verifyRoster, type LoadedTeam, type RosterChange, type TeamAnchor,
+  applyRoster, checkProposal, createInvite, createRoster, describeRosterChange, devicePublicKey, INVITE_TTL_MS, listCandidates, loadTeam, memberCardSchema,
+  nextRoster, parseSignedRoster, removeCandidates, rosterFingerprint, rosterHash, signRoster, TeamError, vaultTeamAnchor, verifyFirstUse, verifyRoster,
+  type LoadedTeam, type RosterChange, type TeamAnchor,
 } from '../team/index.js';
+import { ssoSchema } from '../team/schema.js';
 import {
   applyPolicy, checkPolicyProposal, describePolicy, loadGovernance, loadPolicyHead, policyFingerprint, preparePolicyDraft, readTeamFile, signPolicy,
   verifyPolicy, type Governance,
@@ -39,6 +41,8 @@ export interface TeamCommandsOptions {
   promptIO?: PromptIO;
   /** Typed confirmation before signing or applying, unless --yes. Defaults to the terminal prompt. */
   confirm?: (word: string) => Promise<boolean>;
+  /** True when `text` prints unchanged (the output redactor would not mask it). Used for enrollment links. */
+  printable?: (text: string) => boolean;
 }
 
 const ROLES: readonly TeamRole[] = ['viewer', 'operator', 'admin'];
@@ -131,12 +135,24 @@ export async function updateTeamSettings(configPath: string, change: { enabled?:
   catch { throw new CliError('Unable to write the configuration file.'); }
 }
 
+/** An https origin without a path, as members open the team dashboard. */
+function dashboardOrigin(value: string): string {
+  const message = 'Use --origin with the team dashboard’s https address, for example https://keysentry.example.com.';
+  let url: URL;
+  try { url = new URL(value); } catch { throw new CliError(message); }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/' || value.replace(/\/$/, '') !== url.origin) {
+    throw new CliError(message);
+  }
+  return url.origin;
+}
+
 function rosterSummary(team: { roster: SignedTeamRoster; hash: string }) {
   const { roster } = team.roster;
   return {
     teamId: roster.teamId, version: roster.version, fingerprint: rosterFingerprint(team.roster), hash: team.hash,
     adminThreshold: roster.adminThreshold, updatedAt: roster.updatedAt,
     members: roster.members.map(member => ({ id: member.id, name: member.name, role: member.role, ...(member.email ? { email: member.email } : {}),
+      ...(member.sso ? { sso: { ...member.sso } } : {}),
       deviceKeys: member.deviceKeys.map(key => key.keyId), passkeys: member.passkeys.map(passkey => ({ id: passkey.id, label: passkey.label, rpId: passkey.rpId })),
       ...(member.notify ? { notify: member.notify } : {}) })),
   };
@@ -184,6 +200,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
     const required = team.roster.roster.adminThreshold;
     if (required <= 1) {
       const result = await applyRoster(rt.store, signed, { anchor: anchors(rt).roster });
+      await settleCandidates(rt, result.roster);
       await rt.audit.append({ kind: 'team:roster-applied', summary: 'Team roster change applied.', data: { version: next.version } });
       options.emit({ status: 'applied', version: next.version, fingerprint: rosterFingerprint(result.roster) },
         `Roster version ${next.version} applied (fingerprint ${rosterFingerprint(result.roster)}). Share the roster with other members' computers: keysentry team apply.`);
@@ -361,6 +378,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       const result = await applyRoster(rt.store, input, { anchor, ...(current ? {} : { trust: { fingerprint: opts.fingerprint! } }) });
       if (result.status === 'unchanged') { options.emit({ status: 'unchanged', version: result.roster.roster.version }, `Roster version ${result.roster.roster.version} is already in use.`); return; }
       await rt.audit.append({ kind: 'team:roster-applied', summary: 'Team roster change applied.', data: { version: result.roster.roster.version } });
+      await settleCandidates(rt, result.roster);
       let enabledNote = '';
       if (!rt.config.settings.team.enabled) {
         await updateTeamSettings(rt.config.configPath, { enabled: true });
@@ -369,6 +387,67 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       }
       options.emit({ status: 'applied', version: result.roster.roster.version, fingerprint: rosterFingerprint(result.roster) },
         `Roster version ${result.roster.roster.version} applied (fingerprint ${rosterFingerprint(result.roster)}).${enabledNote}`);
+    });
+
+  team.command('sso <id>').description('Pin a member’s single sign-on identity (issuer and subject) in the roster')
+    .option('--issuer <url>', 'The identity provider issuer, exactly as it publishes it').option('--subject <sub>', 'The member’s subject (sub) at that provider')
+    .option('--clear', 'Remove the pinned identity; the member signs in by verified email again')
+    .option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
+    .action(async (id: string, opts: { issuer?: string; subject?: string; clear?: boolean; output?: string }) => {
+      options.human('pin a single sign-on identity');
+      if (!!opts.clear === (opts.issuer !== undefined || opts.subject !== undefined)) throw new CliError('Use --issuer with --subject, or --clear.');
+      let sso: { issuer: string; subject: string } | null = null;
+      if (!opts.clear) {
+        const parsed = ssoSchema.safeParse({ issuer: opts.issuer, subject: opts.subject });
+        if (!parsed.success) {
+          throw new CliError('Use --issuer with the provider’s https issuer URL and --subject with the member’s subject (1 to 255 printable characters). The team dashboard’s account page shows both.');
+        }
+        sso = parsed.data;
+      }
+      await change(await options.getRuntime(), { kind: 'sso', memberId: id, sso }, opts.output);
+    });
+  team.command('invite <id>').description('Print a single-use link that lets a member add a passkey on the team dashboard (15 minutes)')
+    .requiredOption('--origin <url>', 'The team dashboard’s https address (its public origin)')
+    .action(async (id: string, opts: { origin: string }) => {
+      options.human('invite a team member to add a passkey');
+      const origin = dashboardOrigin(opts.origin);
+      const rt = await options.getRuntime();
+      const current = await requireTeam(rt);
+      const signer = await localAdmin(rt, current.roster.roster);
+      signer.key.privateKeyDer.fill(0);
+      const member = current.roster.roster.members.find(candidate => candidate.id === id);
+      if (!member) throw new TeamError(`There is no member ${/^[a-z][a-z0-9_-]{0,31}$/.test(id) ? id : 'with that id'} on this team.`);
+      const invite = await createInvite(rt.store, { memberId: member.id, origin, now: now(rt), ttlMs: INVITE_TTL_MS,
+        ...(options.printable ? { printable: (token: string) => options.printable!(`${origin}/enroll#${token}`) } : {}) });
+      await rt.audit.append({ kind: 'team:invite', summary: 'A passkey enrollment link was created.', data: { memberId: member.id } });
+      // The token is in the fragment, so browsers never send it with the page request or put it in a request log.
+      const link = `${origin}/enroll#${invite.token}`;
+      options.emit({ memberId: member.id, origin, expiresAt: invite.expiresAt, link },
+        [`Enrollment link for ${member.id} (works once, until ${invite.expiresAt}):`, link,
+          `Send it to ${member.id} privately. The passkey they create works only after admins add it to the roster: keysentry team passkeys pending, then keysentry team add-passkey ${member.id} <credential-id>.`].join('\n'));
+    });
+  const passkeys = team.command('passkeys').description('Passkeys members created on the team dashboard');
+  passkeys.command('pending').description('List passkeys waiting for an admin to add them to the roster').action(async () => {
+    const rt = await options.getRuntime();
+    const loaded = await loadTeam(rt.store, { anchor: anchors(rt).roster });
+    const onRoster = new Set(loaded?.roster.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.id)) ?? []);
+    const pending = (await listCandidates(rt.store)).filter(candidate => !onRoster.has(candidate.credential.id))
+      .map(candidate => ({ memberId: candidate.memberId, credentialId: candidate.credential.id, createdAt: candidate.createdAt,
+        rpId: candidate.credential.rpId, ...(candidate.aaguid ? { aaguid: candidate.aaguid } : {}) }));
+    options.emit({ pending }, pending.length ? ['Member         Created at                Credential id', ...pending.map(item =>
+      `${item.memberId.padEnd(14)} ${item.createdAt.padEnd(25)} ${item.credentialId}${item.aaguid ? `  (authenticator ${item.aaguid})` : ''}`),
+    'Compare the credential id with the member before you add it: keysentry team add-passkey <member> <credential-id>.'].join('\n') : 'No passkeys are waiting.');
+  });
+  team.command('add-passkey <id> <credentialId>').description('Add a passkey from team passkeys pending to its member (a signed roster change)')
+    .option('-o, --output <file>', 'Where to save a proposal that other admins must sign')
+    .action(async (id: string, credentialId: string, opts: { output?: string }) => {
+      options.human('add a passkey to the team roster');
+      const rt = await options.getRuntime();
+      const candidate = (await listCandidates(rt.store)).find(item => item.credential.id === credentialId);
+      if (!candidate) throw new TeamError('No pending passkey has that credential id. Run keysentry team passkeys pending.');
+      // A candidate is bound to the member whose invitation created it; it never goes on anyone else's card.
+      if (candidate.memberId !== id) throw new TeamError('That passkey was enrolled from another member’s link. Add it only to that member.');
+      await change(rt, { kind: 'passkey', memberId: id, passkey: candidate.credential }, opts.output);
     });
 
   const policy = program.command('policy').description('Team policy-as-code: rules that only narrow what this project may do');
@@ -452,6 +531,13 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
     governanceLines(result).join('\n'));
     if (result.blockers.length) options.setExit(1);
   });
+
+  /** Pending passkeys that the applied roster now lists are done; drop them from the waiting list. */
+  async function settleCandidates(rt: TeamRuntime, roster: SignedTeamRoster): Promise<void> {
+    const ids = roster.roster.members.flatMap(member => member.passkeys.map(passkey => passkey.id));
+    try { await removeCandidates(rt.store, ids); }
+    catch { options.diagnostic('The list of pending passkeys could not be updated. Run keysentry team passkeys pending to review it.'); }
+  }
 
   function warnUnknownChannels(rt: TeamRuntime, channels: string[] | undefined): void {
     if (!channels) return;

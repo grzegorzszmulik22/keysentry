@@ -38,6 +38,7 @@ export interface NewMember {
   name: string;
   role: TeamRole;
   email?: string;
+  sso?: { issuer: string; subject: string };
   passkeys?: PasskeyCredential[];
   deviceKeys?: { keyId: string; publicKeyDer: string }[];
   notify?: { channels: string[]; minSeverity: NotifySeverity };
@@ -48,6 +49,7 @@ function member(input: NewMember): TeamMember {
   return {
     id: input.id, name: input.name, role: input.role,
     ...(input.email === undefined ? {} : { email: input.email.toLowerCase() }),
+    ...(input.sso === undefined ? {} : { sso: { issuer: input.sso.issuer, subject: input.sso.subject } }),
     passkeys: clone(input.passkeys ?? []), deviceKeys: clone(input.deviceKeys ?? []),
     ...(input.notify ? { notify: { channels: [...input.notify.channels], minSeverity: input.notify.minSeverity } } : {}),
   };
@@ -69,7 +71,11 @@ export type RosterChange =
   | { kind: 'remove'; memberId: string }
   | { kind: 'role'; memberId: string; role: TeamRole }
   | { kind: 'threshold'; adminThreshold: number }
-  | { kind: 'notify'; memberId: string; notify: { channels: string[]; minSeverity: NotifySeverity } | null };
+  | { kind: 'notify'; memberId: string; notify: { channels: string[]; minSeverity: NotifySeverity } | null }
+  /** Pin (or clear) the identity provider's subject for single sign-on. */
+  | { kind: 'sso'; memberId: string; sso: { issuer: string; subject: string } | null }
+  /** Add a passkey enrolled on the team dashboard (its public credential only). */
+  | { kind: 'passkey'; memberId: string; passkey: PasskeyCredential };
 
 /** The unsigned next version of `current` with one change applied. */
 export function nextRoster(current: SignedTeamRoster, change: RosterChange, now: Date): TeamRoster {
@@ -97,6 +103,18 @@ export function nextRoster(current: SignedTeamRoster, change: RosterChange, now:
       const target = find(change.memberId);
       if (change.notify) target.notify = { channels: [...change.notify.channels], minSeverity: change.notify.minSeverity };
       else delete target.notify;
+      break;
+    }
+    case 'sso': {
+      const target = find(change.memberId);
+      if (change.sso) target.sso = { issuer: change.sso.issuer, subject: change.sso.subject };
+      else delete target.sso;
+      break;
+    }
+    case 'passkey': {
+      const target = find(change.memberId);
+      if (members.some(candidate => candidate.passkeys.some(passkey => passkey.id === change.passkey.id))) throw new TeamError('This passkey is already on the team roster.');
+      target.passkeys.push(clone(change.passkey));
       break;
     }
   }
@@ -210,10 +228,18 @@ export function teamDeviceKeys(roster: TeamRoster, minRole: TeamRole = 'viewer')
     .flatMap(candidate => candidate.deviceKeys.map(key => ({ keyId: key.keyId, publicKeyDer: Buffer.from(key.publicKeyDer, 'base64'), memberId: candidate.id })));
 }
 
-/** Single sign-on maps a verified email to exactly one member. */
+/**
+ * Single sign-on maps a verified email to exactly one member. Members with a pinned `sso` identity are never matched
+ * by email; their subject decides (`memberForSso`).
+ */
 export function memberForEmail(roster: TeamRoster, email: string): TeamMember | undefined {
   const wanted = email.toLowerCase();
-  return roster.members.find(candidate => candidate.email === wanted);
+  return roster.members.find(candidate => candidate.email === wanted && candidate.sso === undefined);
+}
+
+/** The member whose pinned single sign-on identity is exactly (`issuer`, `subject`). */
+export function memberForSso(roster: TeamRoster, issuer: string, subject: string): TeamMember | undefined {
+  return roster.members.find(candidate => candidate.sso?.issuer === issuer && candidate.sso.subject === subject);
 }
 
 // ------------------------------------------------------------------------------------------------ storage
@@ -322,6 +348,10 @@ export function describeRosterChange(previous: TeamRoster | null, next: TeamRost
       lines.push(`Change the device keys or passkeys of ${entry.id}.`);
     }
     if (before.email !== entry.email || before.name !== entry.name) lines.push(`Change the name or email of ${entry.id}.`);
+    if (JSON.stringify(before.sso ?? null) !== JSON.stringify(entry.sso ?? null)) {
+      lines.push(entry.sso ? `Pin the single sign-on identity of ${entry.id} to issuer ${entry.sso.issuer}, subject ${entry.sso.subject}.`
+        : `Remove the pinned single sign-on identity of ${entry.id}.`);
+    }
     if (JSON.stringify(before.notify ?? null) !== JSON.stringify(entry.notify ?? null)) lines.push(`Change notification routing for ${entry.id}.`);
   }
   for (const entry of previous.members) if (!next.members.some(candidate => candidate.id === entry.id)) lines.push(`Remove ${entry.id} (${entry.role}).`);

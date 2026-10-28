@@ -118,7 +118,8 @@ describe('team dashboard sign-in', () => {
     expect(callback.headers['strict-transport-security']).toBe('max-age=31536000');
     expect(callback.headers['content-security-policy']).toContain("default-src 'none'");
     const session = await t.req('/api/session', { headers: { Cookie: auth!.cookie } });
-    expect(session.json).toEqual({ csrf: auth!.csrf, readOnly: false, passkeys: 1, team: true, member: { id: 'ana', name: 'Ana', role: 'operator' } });
+    expect(session.json).toEqual({ csrf: auth!.csrf, readOnly: false, passkeys: 1, team: true, member: { id: 'ana', name: 'Ana', role: 'operator' },
+      identity: { issuer: ISSUER, subject: 'sub-ana', pinned: false } });
     expect((await t.req('/', { headers: { Cookie: auth!.cookie } })).text).toContain('/app/main.js');
     expect((await t.req('/api/keys', { headers: { Cookie: auth!.cookie } })).json).toEqual({ count: 2 });
     expect(t.events).toEqual([{ kind: 'sign-in', memberId: 'ana', role: 'operator' }]);

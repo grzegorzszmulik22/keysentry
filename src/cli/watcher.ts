@@ -6,9 +6,12 @@ import { DEFAULT_SOURCES, classifyItem, executeApprovedAction, isAlertOnly, plan
 import type { AutopilotDeps, AutopilotState, PendingAutopilotAction } from '../autopilot/index.js';
 import { filterNewItems, type IncidentsState } from '../autopilot/incidents.js';
 import { ApprovalError, createApprovalServer, createApprovalService, createRelay, verifyDisarm } from '../approvals/index.js';
-import type { SignedDeviceApproval, SignedDisarm } from '../approvals/index.js';
+import type { ApprovalQuorum, SignedDeviceApproval, SignedDisarm } from '../approvals/index.js';
+import { checkArmedPlan, narrowRotationOptions, type TeamBundle } from '../policy/index.js';
+import { createRoutedDispatcher, teamDeviceKeys, teamPasskeys } from '../team/index.js';
+import { bundleQuorum, bundleRules } from './team-governance.js';
 import { fetchFeed, type FeedCache } from '../feeds/index.js';
-import { createDispatcher, signMessage } from '../notify/index.js';
+import { signMessage } from '../notify/index.js';
 import type { EngineDeps, RotateOptions } from '../rotate/index.js';
 import { canonicalJson, signDetached, type DeviceKey } from '../security/index.js';
 import { CREDENTIAL_NAMES } from '../vault/index.js';
@@ -52,6 +55,14 @@ export interface WatchRuntimeDependencies {
   integrityCheck?: () => Promise<{ ok: boolean; reasons: string[] }>;
   /** Runs after every watcher cycle (audit export). Failures are logged with fixed text and never stop the watcher. */
   afterCycle?: () => Promise<void>;
+  /**
+   * Phase 5 team governance: the verified roster and policy (sealed config, or this computer's applied ones). The
+   * roster routes notifications and lists members' passkeys and device keys; the policy narrows rotation options,
+   * notification kinds and the armed plan.
+   */
+  team?: TeamBundle | null;
+  /** The approval quorum; defaults to one read from `team`. A local watcher passes one that re-reads its state. */
+  quorum?: ApprovalQuorum | null;
 }
 
 const path = (store: StateStore, name: string) => join(store.paths.dir, name);
@@ -116,12 +127,31 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
   const signing = await deps.signingKey();
   const publicKeys = await deps.deviceKeys();
   const trustedKeyIds = publicKeys.map(key => key.keyId);
-  const dispatcher = createDispatcher(await deps.channels(), { log: deps.log, now });
+  // Team governance: the policy narrows rotation options and notification kinds; the roster routes notifications.
+  const team = bundleRules(deps.team);
+  const rotation = narrowRotationOptions(deps.rotation, team.policy);
+  const allowedKinds = team.policy?.notify.allowedKinds;
+  const channels = (await deps.channels()).filter(channel => !allowedKinds || allowedKinds.includes(channel.kind));
+  const dispatcher = createRoutedDispatcher(channels, team.roster, { log: deps.log, now });
+  const quorum = deps.quorum !== undefined ? deps.quorum : bundleQuorum(deps.team, deps.store);
+  // Members' roster passkeys are verified here (so a viewer is told the role refusal, not a failed check); the approval
+  // service decides who may approve, and only operators' and admins' passkeys make an approval link worth sending.
+  const passkeys = async (minRole: 'viewer' | 'operator' = 'viewer'): Promise<PasskeyCredential[]> => {
+    const local = await deps.passkeys();
+    return [...local, ...(team.roster ? teamPasskeys(team.roster, minRole).filter(passkey => !local.some(item => item.id === passkey.id)) : [])];
+  };
+  const relayKeys = async () => {
+    const local = await deps.deviceKeys();
+    return [...local, ...(team.roster ? teamDeviceKeys(team.roster, 'operator').filter(key => !local.some(item => item.keyId === key.keyId))
+      .map(key => ({ keyId: key.keyId, publicKeyDer: key.publicKeyDer })) : [])];
+  };
+  const relayKeyIds = [...new Set([...trustedKeyIds, ...(team.roster ? teamDeviceKeys(team.roster, 'operator').map(key => key.keyId) : [])])];
   let lastSuccess = tickState.lastExternalSuccessAt ?? null;
   let approvalOrigin = deps.publicOrigin ?? 'http://localhost';
   const watcherCheckMinutes = Math.max(1, Math.ceil((deps.intervalSeconds ?? 300) / 60));
-  const approvals = createApprovalService({ store: deps.store, audit: deps.audit, credentials: async () => passkeysForWatcherOrigin(await deps.passkeys(), approvalOrigin),
-    deviceKeys: deps.deviceKeys, rpId: new URL(approvalOrigin).hostname, origins: [approvalOrigin], now, mode: actions ? 'actions' : 'interactive' });
+  const approvals = createApprovalService({ store: deps.store, audit: deps.audit, credentials: async () => passkeysForWatcherOrigin(await passkeys(), approvalOrigin),
+    deviceKeys: deps.deviceKeys, rpId: new URL(approvalOrigin).hostname, origins: [approvalOrigin], now, mode: actions ? 'actions' : 'interactive',
+    ...(quorum ? { quorum } : {}) });
 
   const recoveryFile = path(deps.store, 'watcher-recovery.json');
   const recovery = actions ? createActionsRecovery({ watcherId: deps.projectId ?? '',
@@ -149,7 +179,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
   async function notify(message: NotifyMessage): Promise<void> {
     if (message.actionId) {
       const origin = deps.publicOrigin;
-      const available = origin && passkeysForWatcherOrigin(await deps.passkeys(), origin).some(credential =>
+      const available = origin && passkeysForWatcherOrigin(await passkeys('operator'), origin).some(credential =>
         credential.rpId === new URL(origin).hostname && credential.origins.includes(origin));
       const { approveUrl: _oldUrl, ...body } = message;
       message = { ...body, lines: [...message.lines], ...(available ? { approveUrl: `${origin}/a/${message.actionId}` } : {}) };
@@ -160,7 +190,10 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
     lastSuccess = dispatcher.lastExternalSuccessAt() ?? lastSuccess;
     await cacheNotificationMessage({ store: deps.store, now }, signed, result.delivered.length > 0);
     await deps.onSignedMessage?.(signed, result.delivered.length > 0);
-    if (!result.delivered.length) throw new CliError('No notification channel delivered the message. Automatic actions are paused.');
+    // Team routing may send a message to no channel (every member's minimum severity is higher); that is not a failure.
+    if (!result.delivered.length && (channels.length === 0 || result.skipped.length < channels.length)) {
+      throw new CliError('No notification channel delivered the message. Automatic actions are paused.');
+    }
   }
   async function saveState(): Promise<void> {
     // A separate local disarm must not be overwritten by this process's wave metadata.
@@ -193,9 +226,12 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
     const approvedWithoutArm = !armed && state.armedPlanId === null && ((await approvals.approved()).some(entry =>
       entry.action.kind === 'autopilot' && !!entry.action.planHash) || state.waves.some(wave =>
       wave.approval && wave.status !== 'stopped' && wave.plan && wave.inventory));
+    // The team policy is checked again here: a plan signed before the policy narrowed may no longer act.
+    const insidePolicy = !valid.ok || checkArmedPlan(valid.plan, team.policy).ok;
     const result = selfCheck({ ...input, lastExternalSuccessAt: input.lastExternalSuccessAt ?? lastSuccess,
-      stateWritable: writable, armedValid: valid.ok && state.armedPlanId === valid.plan.id || approvedWithoutArm,
+      stateWritable: writable, armedValid: valid.ok && state.armedPlanId === valid.plan.id && insidePolicy || approvedWithoutArm,
       clockSkewSeconds: clock.clockSkewSeconds() });
+    if (!insidePolicy) { result.ok = false; result.reasons.push('The armed plan is outside the team policy. Re-arm within the policy.'); }
     if (deps.integrityCheck) {
       try {
         const integrity = await deps.integrityCheck();
@@ -256,7 +292,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
   async function runner(context?: WatcherActionContext) : Promise<AutopilotDeps> {
     const engine = await deps.engine();
     return { engine: { ...engine, providerCtx: { ...engine.providerCtx, http: clock.http } },
-      options: { ...deps.rotation, dryRun: false, showHints: deps.showHints === true }, notify, requestApproval: request, audit: deps.audit,
+      options: { ...rotation, dryRun: false, showHints: deps.showHints === true }, notify, requestApproval: request, audit: deps.audit,
       shouldStop: context?.shouldStop ?? (async () => !(await check()).ok),
       async saveState() { await saveState(); } };
   }
@@ -314,8 +350,8 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
     }
     return { executed };
   }
-  const relay = deps.relay ? createRelay({ ...deps.relay, http: clock.http, trustedKeyIds, watcherId: deps.projectId,
-    deviceKeys: deps.deviceKeys, audit: deps.audit, now }) : undefined;
+  const relay = deps.relay ? createRelay({ ...deps.relay, http: clock.http, trustedKeyIds: relayKeyIds, watcherId: deps.projectId,
+    deviceKeys: relayKeys, audit: deps.audit, now }) : undefined;
   const resumeRelay = deps.relay && deps.projectId ? createWatcherResumeRelay({ ...deps.relay, watcherId: deps.projectId,
     http: clock.http, trustedKeyIds, deviceKeys: deps.deviceKeys, now }) : undefined;
   const relayState = await deps.store.readJson<{ cursor: string | null; resumeCursor?: string | null; pendingResumes?: SignedWatcherResume[];
@@ -384,7 +420,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
         const message = input as SignedDisarm;
         // Saved inboxes may predate project-bound disarms. Never apply an old
         // or foreign recipient after an upgrade or a moved state directory.
-        if (deps.projectId && verifyDisarm(message, await deps.deviceKeys(), deps.projectId)) {
+        if (deps.projectId && verifyDisarm(message, await relayKeys(), deps.projectId)) {
           if (!state.disarmed) await disarm();
           else await saveState();
         }
@@ -449,8 +485,9 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
       if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new CliError('The approval port must be from 1 to 65535.');
       approvalOrigin = deps.publicOrigin ?? `http://localhost:${port}`;
       // A local server must create its service with that exact ceremony origin.
-      const service = createApprovalService({ store: deps.store, audit: deps.audit, credentials: async () => passkeysForWatcherOrigin(await deps.passkeys(), approvalOrigin),
-        deviceKeys: deps.deviceKeys, rpId: new URL(approvalOrigin).hostname, origins: [approvalOrigin], now, mode: actions ? 'actions' : 'interactive' });
+      const service = createApprovalService({ store: deps.store, audit: deps.audit, credentials: async () => passkeysForWatcherOrigin(await passkeys(), approvalOrigin),
+        deviceKeys: deps.deviceKeys, rpId: new URL(approvalOrigin).hostname, origins: [approvalOrigin], now, mode: actions ? 'actions' : 'interactive',
+        ...(quorum ? { quorum } : {}) });
       const server = createApprovalServer({ service, port, host: deps.publicOrigin ? '0.0.0.0' : '127.0.0.1', publicOrigin: approvalOrigin, disarm,
         watcherCheckMinutes, trustProxyHops: approvalProxyHops(deps.publicOrigin, env) });
       await server.listen(); return server;
@@ -490,6 +527,8 @@ export interface WatcherSetupConfigDependencies {
   passkeys(): Promise<PasskeyCredential[]>;
   sources?: { disabled: string[]; extra: FeedSource[] }; intervalSeconds?: number;
   publicOrigin?: string | null; relayServer?: string;
+  /** The verified team roster and policy to seal (buildTeamBundle); omitted without a team. */
+  team?: TeamBundle | null;
 }
 
 /** Resolve only the sealed-config contract's settings. Host tokens remain in the portable encrypted vault. */
@@ -517,5 +556,6 @@ export async function buildWatcherSetupConfig(deps: WatcherSetupConfigDependenci
     armed: await deps.store.readJson<ArmedPlan>('plan', path(deps.store, 'armed-plan.json')),
     trustedKeyIds: keys.map(key => key.keyId), devicePublicKeys: keys.map(key => ({ keyId: key.keyId, publicKeyDer: key.publicKeyDer.toString('base64') })),
     passkeys: await deps.passkeys(), notify: { channels }, sources: deps.sources ?? { disabled: [], extra: [] },
-    approvals: { publicOrigin: deps.publicOrigin ?? null, relay }, intervalSeconds: deps.intervalSeconds ?? 300 };
+    approvals: { publicOrigin: deps.publicOrigin ?? null, relay }, intervalSeconds: deps.intervalSeconds ?? 300,
+    ...(deps.team ? { team: structuredClone(deps.team) } : {}) };
 }

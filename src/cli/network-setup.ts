@@ -40,7 +40,9 @@ export async function setupNetwork(input: {
   let problem: Error | null = null;
   let proxy: ResolvedProxy | null = null;
   try {
-    proxy = await resolveProxySettings({ configProxy: settings.proxy, configNoProxy: settings.noProxy, env: input.env,
+    // A team policy that requires the proxy makes it carry every request: no-proxy lists are ignored, not honoured.
+    const env = requireProxy ? Object.fromEntries(Object.entries(input.env).filter(([name]) => name.toUpperCase() !== 'NO_PROXY')) : input.env;
+    proxy = await resolveProxySettings({ configProxy: settings.proxy, configNoProxy: requireProxy ? [] : settings.noProxy, env,
       ...(input.vault ? { vault: input.vault } : {}), ...(input.redactor ? { redactor: input.redactor } : {}) });
   } catch (error) {
     if (!(error instanceof TransportConfigError)) throw error;

@@ -1,11 +1,13 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
-import type { TeamMember, TeamRole } from '../../types.js';
+import { decodeCbor, parseAuthData, verifyRegistration } from '../../approvals/webauthn/index.js';
+import type { PasskeyCredential, TeamMember, TeamRole } from '../../types.js';
 import { ASSETS } from '../generated/assets.js';
 import type { OidcClient } from '../oidc/client.js';
 import { OIDC_MESSAGES, OidcError, type OidcFailure } from '../oidc/errors.js';
-import { isTeamRole, memberForIdentity, normalizeEmail } from '../oidc/members.js';
+import { isTeamRole, memberForIdentity, normalizeEmail, pinnedTo } from '../oidc/members.js';
 import { createLoginTransactions } from '../oidc/transactions.js';
 import { apiRoute, bodyDigest, validateApi } from './api.js';
 import { createPasskeyGate, PasskeyGateError, type PasskeyStore } from './passkey-gate.js';
@@ -41,7 +43,28 @@ export interface TeamDashboardOptions {
   /** Minimum roles per route on top of `TEAM_ROUTE_ROLES`; mutating routes never drop below operator. */
   routeRoles?: Readonly<Record<string, TeamRole>>;
   onAuthEvent?: (event: TeamAuthEvent) => void | Promise<void>;
+  /**
+   * Passkey enrollment for this public host (`/enroll`). Without it the route does not exist. The hooks check and use
+   * single-use invitations created by an admin's terminal; they throw `DashboardError` with fixed text to refuse.
+   */
+  enrollment?: TeamEnrollmentHooks;
 }
+
+/** Invitation checks for `/enroll`, backed by encrypted project state (src/team/enrollment.ts). */
+export interface TeamEnrollmentHooks {
+  /** The member a valid, unexpired, unused invitation for this origin was made for. */
+  check(token: string): Promise<{ memberId: string }>;
+  /** Use the invitation once and keep the verified public credential as a pending candidate. Grants nothing. */
+  complete(input: { token: string; memberId: string; credential: PasskeyCredential; aaguid: string | null }): Promise<void>;
+  onEvent?: (event: { kind: 'passkey-enrolled'; memberId: string } | { kind: 'enrollment-refused' }) => void | Promise<void>;
+}
+
+/** Permissions-Policy for the enrollment page only: it may create a credential, and nothing else may. */
+const ENROLL_PERMISSIONS = 'publickey-credentials-create=(self), publickey-credentials-get=()';
+const ENROLL_PAGE = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>Add a passkey · keysentry</title><script type="module" src="/enroll/app.js"></script></head><body><main><h1>Add a passkey for the team dashboard</h1><p id="enroll-intro">This page creates a passkey for this dashboard. It grants nothing by itself: a team admin adds it to the signed team roster.</p><button id="enroll-start" type="button" disabled>Create passkey</button><p id="enroll-status" role="status" aria-live="polite">Checking your enrollment link.</p></main><noscript>Enable JavaScript to add a passkey.</noscript></body></html>';
+const ENROLL_LIMIT = 30;
+const CEREMONY_MS = 5 * 60_000;
+const tokenDigest = (token: string) => createHash('sha256').update(`keysentry-enroll-ceremony\n${token}`).digest('hex');
 
 const NOT_AVAILABLE = 'This page is not available.';
 const SIGN_IN_AGAIN = 'Sign in again to continue.';
@@ -80,7 +103,8 @@ function checkPublicOrigin(value: string): URL {
 
 const refusalStatus = (reason: OidcFailure): number =>
   reason === 'state' ? 400 : reason === 'unavailable' || reason === 'roster-unavailable' ? 503
-    : reason === 'not-member' || reason === 'email-missing' || reason === 'email-unverified' ? 403 : reason === 'configuration' ? 500 : 401;
+    : reason === 'not-member' || reason === 'email-missing' || reason === 'email-unverified' || reason === 'identity-mismatch' ? 403
+      : reason === 'configuration' ? 500 : 401;
 
 export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashboardOptions): Promise<{ url: string; port: number; close(): Promise<void> }> {
   validateApi(opts.api);
@@ -128,6 +152,113 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
     try { opts.onError?.(errorClass); } catch { /* Reporting must not interrupt the fixed response. */ }
   }
 
+  // ---------------------------------------------------------------------------------------------- passkey enrollment
+  // The invitation token travels in the URL fragment (never sent with the page request, never in a log) and is posted
+  // by the page. Each check returns a ceremony bound to the invited member; the verified public credential becomes a
+  // pending candidate that only a signed roster change can make usable.
+  const ceremonies = new Map<string, { challenge: Buffer; memberId: string; expires: number }>();
+  const enrollWindow = { start: Number.NEGATIVE_INFINITY, count: 0 };
+  function enrollEvent(event: Parameters<NonNullable<TeamEnrollmentHooks['onEvent']>>[0]): void {
+    try { void Promise.resolve(team.enrollment?.onEvent?.(event)).catch(() => {}); } catch { /* Reporting never changes a response. */ }
+  }
+  function enrollRate(): void {
+    const time = now();
+    if (time - enrollWindow.start >= 60_000) { enrollWindow.start = time; enrollWindow.count = 0; }
+    if (++enrollWindow.count > ENROLL_LIMIT) throw new DashboardError(429, 'Too many enrollment attempts. Wait a minute, then try again.');
+  }
+  function enrollToken(input: unknown): string {
+    const token = (input as { token?: unknown } | null)?.token;
+    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new DashboardError(400, 'This enrollment link is not valid. Ask a team admin for a new one (keysentry team invite).');
+    return token;
+  }
+  function decodeField(value: unknown, maxBytes: number): Buffer {
+    if (typeof value !== 'string' || !value.length || value.length > Math.ceil(maxBytes * 4 / 3) || !/^[A-Za-z0-9_-]+$/.test(value)) {
+      throw new DashboardError(400, 'The passkey could not be verified. Open your enrollment link again.');
+    }
+    const bytes = Buffer.from(value, 'base64url');
+    if (bytes.length > maxBytes || bytes.toString('base64url') !== value) throw new DashboardError(400, 'The passkey could not be verified. Open your enrollment link again.');
+    return bytes;
+  }
+  async function enrollMember(memberId: string): Promise<TeamMember> {
+    let members: TeamMember[];
+    try { members = await team.members(); } catch { throw new DashboardError(503, 'The team roster could not be read. Try again in a moment.'); }
+    const matches = Array.isArray(members) ? members.filter(member => member && member.id === memberId && isTeamRole(member.role)) : [];
+    if (matches.length !== 1) throw new DashboardError(403, 'This enrollment link is for someone who is no longer on the team roster.');
+    return matches[0]!;
+  }
+  async function enroll(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+    const hooks = team.enrollment;
+    if (!hooks) throw new DashboardError(404, NOT_AVAILABLE);
+    if (req.method === 'GET' && path === '/enroll') {
+      res.setHeader('Permissions-Policy', ENROLL_PERMISSIONS);
+      html(res, 200, ENROLL_PAGE); return;
+    }
+    if (req.method === 'GET' && path === '/enroll/app.js') {
+      const asset = ASSETS['/app/enroll.js'];
+      if (!asset) throw new DashboardError(404, NOT_AVAILABLE);
+      res.writeHead(200, { 'Content-Type': asset.type }); res.end(asset.body); return;
+    }
+    if (path !== '/enroll/options' && path !== '/enroll/finish') throw new DashboardError(404, NOT_AVAILABLE);
+    if (req.method !== 'POST') throw new DashboardError(405, 'Use POST for this request.');
+    const site = req.headers['sec-fetch-site'];
+    if (site !== undefined && site !== 'same-origin') throw new DashboardError(403, WRONG_SITE);
+    enrollRate();
+    const body = await readJson(req) as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new DashboardError(400, 'Send a valid enrollment request.');
+    try {
+      const token = enrollToken(body);
+      const key = tokenDigest(token);
+      if (path === '/enroll/options') {
+        if (Object.keys(body).length !== 1) throw new DashboardError(400, 'Send a valid enrollment request.');
+        const { memberId } = await hooks.check(token);
+        const member = await enrollMember(memberId);
+        const time = now();
+        for (const [id, entry] of ceremonies) if (entry.expires <= time) ceremonies.delete(id);
+        if (!ceremonies.has(key) && ceremonies.size >= 100) throw new DashboardError(429, 'Too many enrollments are in progress. Try again in a few minutes.');
+        const challenge = randomBytes(32);
+        ceremonies.set(key, { challenge, memberId, expires: time + CEREMONY_MS });
+        json(res, 200, { member: { id: member.id, name: member.name }, publicKey: {
+          rp: { id: rpId, name: 'keysentry' }, user: { id: randomBytes(32).toString('base64url'), name: member.id, displayName: member.name },
+          challenge: challenge.toString('base64url'), pubKeyCredParams: [-8, -7, -257].map(alg => ({ type: 'public-key', alg })), timeout: 120_000,
+          attestation: 'none', authenticatorSelection: { userVerification: 'required', residentKey: 'preferred' },
+          excludeCredentials: (Array.isArray(member.passkeys) ? member.passkeys : []).filter(credential => credential?.rpId === rpId).map(credential => ({ type: 'public-key', id: credential.id })),
+        } });
+        return;
+      }
+      const fields = ['token', 'clientDataJSON', 'attestationObject'];
+      if (Object.keys(body).length !== fields.length || Object.keys(body).some(name => !fields.includes(name))) throw new DashboardError(400, 'Send a valid enrollment request.');
+      // One ceremony per check: a failed verification needs a fresh start from the page.
+      const ceremony = ceremonies.get(key);
+      ceremonies.delete(key);
+      if (!ceremony || ceremony.expires <= now()) throw new DashboardError(409, 'This enrollment step expired. Open your enrollment link again.');
+      const clientDataJSON = decodeField(body.clientDataJSON, 8192);
+      const attestationObject = decodeField(body.attestationObject, 32 * 1024);
+      let credential: PasskeyCredential;
+      let aaguid: string | null = null;
+      try {
+        credential = verifyRegistration({ clientDataJSON, attestationObject, expectedChallenge: ceremony.challenge, expectedOrigins: [origin], rpId, requireUserVerification: true });
+        const decoded = decodeCbor(attestationObject);
+        const authData = decoded instanceof Map ? decoded.get('authData') : undefined;
+        const parsed = Buffer.isBuffer(authData) ? parseAuthData(authData) : undefined;
+        if (parsed?.credential) aaguid = parsed.credential.aaguid.toString('hex');
+      } catch { throw new DashboardError(400, 'The passkey could not be verified. Open your enrollment link again.'); }
+      const member = await enrollMember(ceremony.memberId);
+      if ((Array.isArray(member.passkeys) ? member.passkeys : []).some(existing => existing?.id === credential.id)) {
+        throw new DashboardError(409, 'This passkey is already on the team roster.');
+      }
+      credential.origins = [origin];
+      credential.label = 'Team dashboard passkey';
+      credential.createdAt = new Date(now()).toISOString();
+      await hooks.complete({ token, memberId: ceremony.memberId, credential, aaguid });
+      enrollEvent({ kind: 'passkey-enrolled', memberId: ceremony.memberId });
+      json(res, 200, { enrolled: true, member: ceremony.memberId, credentialId: credential.id,
+        next: `Ask a team admin to run: keysentry team add-passkey ${ceremony.memberId} ${credential.id}` });
+    } catch (error) {
+      enrollEvent({ kind: 'enrollment-refused' });
+      throw error;
+    }
+  }
+
   /** Forwarded headers are ignored: the proxy must pass the browser's Host through unchanged. */
   function checkHost(req: IncomingMessage): void {
     if (req.headers.host !== publicHost) throw new DashboardError(403, 'Open keysentry at its team address.');
@@ -151,7 +282,10 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
     const members = await team.members();
     const matches = Array.isArray(members) ? members.filter(member => member && member.id === session.memberId) : [];
     const member = matches.length === 1 ? matches[0]! : undefined;
-    if (!member || typeof member.email !== 'string' || normalizeEmail(member.email) !== session.email || !isTeamRole(member.role)) {
+    // A pinned member must keep the exact issuer and subject; others must keep the verified email that signed in.
+    const sameIdentity = member !== undefined && (member.sso !== undefined ? pinnedTo(member, session.issuer, session.subject)
+      : typeof member.email === 'string' && session.email !== null && normalizeEmail(member.email) === session.email);
+    if (!member || !sameIdentity || !isTeamRole(member.role)) {
       sessions.remove(session.id);
       res.setHeader('Set-Cookie', clearSession);
       emit({ kind: 'session-ended', memberId: session.memberId, reason: 'roster' });
@@ -191,20 +325,20 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
     for (const name of new Set(params.keys())) if (params.getAll(name).length !== 1) return refuse('provider-error');
     const value = (name: string) => params.get(name) ?? undefined;
     let member: TeamMember;
-    let email: string;
+    let identity: Awaited<ReturnType<OidcClient['complete']>>;
     try {
-      const identity = await team.oidc.complete({ code: value('code'), state: value('state'), iss: value('iss'), error: value('error') }, transaction);
+      identity = await team.oidc.complete({ code: value('code'), state: value('state'), iss: value('iss'), error: value('error') }, transaction);
       let members: TeamMember[];
       try { members = await team.members(); } catch { return refuse('roster-unavailable'); }
       if (!Array.isArray(members)) return refuse('roster-unavailable');
       member = memberForIdentity(identity, members);
-      email = normalizeEmail(identity.email!);
     } catch (error) {
       return refuse(error instanceof OidcError ? error.reason : 'unavailable');
     }
     const previous = sessions.authenticate(req.headers.cookie);
     if (previous) sessions.remove(previous.id);
-    const session = sessions.create({ memberId: member.id, email });
+    const email = identity.email !== undefined && identity.emailVerified === true ? normalizeEmail(identity.email) : null;
+    const session = sessions.create({ memberId: member.id, email, issuer: identity.issuer, subject: identity.subject });
     res.setHeader('Set-Cookie', [clearSignIn, `${TEAM_SESSION_COOKIE}=${session.id}; Path=/; Secure; HttpOnly; SameSite=Strict`]);
     emit({ kind: 'sign-in', memberId: member.id, role: member.role });
     html(res, 200, SIGNED_IN_PAGE);
@@ -234,8 +368,13 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
       if (req.method !== 'GET' && req.method !== 'POST') throw new DashboardError(405, 'Use GET or POST for this request.');
       const mark = target.indexOf('?');
       const path = mark === -1 ? target : target.slice(0, mark);
-      checkSite(req, req.method === 'GET' && (path === '/' || path === '/auth/callback'));
+      checkSite(req, req.method === 'GET' && (path === '/' || path === '/auth/callback' || path === '/enroll'));
       if (req.method === 'POST' && req.headers.origin !== origin) throw new DashboardError(403, WRONG_SITE);
+      // Enrollment needs no session: the invitation is the authority, and the result grants nothing on its own.
+      if (path === '/enroll' || path.startsWith('/enroll/')) {
+        if (mark !== -1) throw new DashboardError(404, NOT_AVAILABLE);
+        return await enroll(req, res, path);
+      }
       if (path === '/auth/callback') {
         if (req.method !== 'GET') throw new DashboardError(405, 'Use GET for this request.');
         return await callback(req, res, mark === -1 ? '' : target.slice(mark + 1));
@@ -267,6 +406,8 @@ export async function startTeamDashboard(opts: DashboardOptions, team: TeamDashb
         json(res, 200, {
           csrf: session.csrf, readOnly: opts.readOnly || member.role === 'viewer', passkeys: memberPasskeys(member, rpId, origin).length,
           team: true, member: { id: member.id, name: member.name, role: member.role },
+          // Shown on the account page so an admin can pin it: keysentry team sso <member> --issuer ... --subject ...
+          identity: { issuer: session.issuer, subject: session.subject, pinned: member.sso !== undefined },
         });
         return;
       }

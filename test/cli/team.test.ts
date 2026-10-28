@@ -54,6 +54,7 @@ const MUTATING = [
   ['team', 'init'], ['team', 'add', 'bob', '--role', 'operator'], ['team', 'remove', 'bob'], ['team', 'role', 'bob', 'admin'],
   ['team', 'threshold', '2'], ['team', 'notify', 'bob', '--clear'], ['team', 'sign', 'proposal.json'], ['team', 'apply', 'roster.json', '--fingerprint', 'a'.repeat(16)],
   ['policy', 'sign', 'policy.json'], ['policy', 'apply', 'policy.json'],
+  ['team', 'sso', 'bob', '--clear'], ['team', 'invite', 'bob', '--origin', 'https://keysentry.example.com'], ['team', 'add-passkey', 'bob', 'Y3JlZA'],
 ];
 
 describe('team and policy commands refuse agents and non-terminals', () => {
@@ -164,6 +165,45 @@ describe('a team across three computers', () => {
     expect(verify.exit).toBe(1);
     expect(verify.output).toMatch(/Changes are paused: The team policy file is not valid: A signature does not match the document/);
     expect((await run(ana, ['team', 'verify'])).exit).toBe(1);
+  });
+
+  test('sso pins a subject as a roster change; invite prints a single-use link only an admin can make', async () => {
+    const ana = await computer('ana-sso'); const ben = await computer('ben-sso');
+    await run(ana, ['team', 'init', '--id', 'ana', '--email', 'ana@example.com']);
+    await run(ben, ['team', 'card', '-o', 'ben.json']);
+    await copyFile(ben.path('ben.json'), ana.path('ben.json'));
+    expect((await run(ana, ['team', 'add', 'ben', '--role', 'operator', '--card', 'ben.json', '--email', 'ben@example.com'])).exit).toBe(0);
+
+    const pinned = await run(ana, ['team', 'sso', 'ben', '--issuer', 'https://idp.example.com', '--subject', 'sub-ben-123']);
+    expect(pinned).toMatchObject({ exit: 0, output: expect.stringMatching(/^Roster version 3 applied/) });
+    expect(pinned.diagnostics).toContain('Pin the single sign-on identity of ben to issuer https://idp.example.com, subject sub-ben-123.');
+    const listed = JSON.parse((await run(ana, ['team', 'list'], { json: true })).output);
+    expect(listed.members[1]).toMatchObject({ id: 'ben', email: 'ben@example.com', sso: { issuer: 'https://idp.example.com', subject: 'sub-ben-123' } });
+    expect((await run(ana, ['team', 'sso', 'ben', '--issuer', 'http://idp.example.com', '--subject', 's'])).message).toMatch(/^Use --issuer with the provider/);
+    expect((await run(ana, ['team', 'sso', 'ben', '--issuer', 'https://idp.example.com'])).message).toMatch(/^Use --issuer with the provider/);
+    expect((await run(ana, ['team', 'sso', 'ben'])).message).toBe('Use --issuer with --subject, or --clear.');
+    expect(await run(ana, ['team', 'sso', 'ben', '--clear'])).toMatchObject({ exit: 0, diagnostics: 'Remove the pinned single sign-on identity of ben.' });
+
+    const invite = await run(ana, ['team', 'invite', 'ben', '--origin', 'https://keysentry.example.com']);
+    expect(invite.exit).toBe(0);
+    const link = /https:\/\/keysentry\.example\.com\/enroll#([A-Za-z0-9_-]{43})/.exec(invite.output);
+    expect(link).not.toBeNull();
+    expect(invite.output).toMatch(/works once, until 2026-10-28T10:15:00\.000Z/);
+    // The audit event names the member, never the token.
+    expect(ana.events.at(-1)).toEqual({ kind: 'team:invite', summary: 'A passkey enrollment link was created.', data: { memberId: 'ben' } });
+    expect(JSON.stringify(ana.events)).not.toContain(link![1]);
+    expect((await run(ana, ['team', 'invite', 'zed', '--origin', 'https://keysentry.example.com'])).message).toBe('There is no member zed on this team.');
+    expect((await run(ana, ['team', 'invite', 'ben', '--origin', 'http://keysentry.example.com'])).message).toMatch(/^Use --origin with the team dashboard/);
+    expect((await run(ana, ['team', 'invite', 'ben', '--origin', 'https://keysentry.example.com/enroll'])).message).toMatch(/^Use --origin/);
+    expect(await run(ana, ['team', 'passkeys', 'pending'])).toMatchObject({ exit: 0, output: 'No passkeys are waiting.' });
+    expect((await run(ana, ['team', 'add-passkey', 'ben', 'Y3JlZA'])).message).toBe('No pending passkey has that credential id. Run keysentry team passkeys pending.');
+
+    // Ben's computer (not an admin) cannot invite.
+    await run(ana, ['team', 'export', '-o', 'roster.json']);
+    await copyFile(ana.path('roster.json'), ben.path('roster.json'));
+    const fp = JSON.parse((await run(ana, ['team', 'list'], { json: true })).output).fingerprint as string;
+    expect((await run(ben, ['team', 'apply', 'roster.json', '--fingerprint', fp])).exit).toBe(0);
+    expect((await run(ben, ['team', 'invite', 'ben', '--origin', 'https://keysentry.example.com'])).message).toMatch(/does not belong to an admin/);
   });
 
   test('team verify reports team mode without a roster', async () => {

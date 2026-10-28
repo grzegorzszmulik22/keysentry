@@ -83,3 +83,15 @@ test('ui --team is read-only for coding agents and refuses unsafe or incomplete 
   const wrongIssuer = await setup({ discovery: { issuer: 'https://other.example.test' } });
   await expect(wrongIssuer.run(...team)).rejects.toThrow('sign-in settings do not match');
 });
+
+test('ui --team keeps single sign-on inside the team policy and offers passkey enrollment', async () => {
+  const s = await setup();
+  const policy = { v: 1, teamId: 'team-test-0001', version: 1, prev: null, updatedAt: '2026-10-28T00:00:00.000Z', autopilot: {},
+    approvals: { required: 1, wideningAdmins: 1 }, network: { allowHosts: ['other.example.test'] }, notify: {}, rotation: {}, audit: {} } as const;
+  Object.assign(s.runtime, { teamPolicy: structuredClone(policy) });
+  await expect(s.run(...team)).rejects.toThrow("The team policy's network.allowHosts does not list idp.example.test, so single sign-on cannot reach the identity provider. Ask a team admin to add it to the policy.");
+  expect(s.http.calls).toHaveLength(0);
+  Object.assign(s.runtime, { teamPolicy: { ...structuredClone(policy), network: { allowHosts: ['idp.example.test'] } } });
+  await s.run(...team);
+  expect(started.options.at(-1)!.team!.enrollment).toMatchObject({ check: expect.any(Function), complete: expect.any(Function) });
+});

@@ -260,9 +260,9 @@ export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherB
     if (wrappedState) {
       stateKey = await unwrapDeploymentStateKey({ encoded: wrappedState, kms: settings.kms, projectId: loaded.config.projectId,
         credentials: createCredentialSource(vault, env),
-        // The deployment's proxy and CA settings apply to the KMS call too. ORCHESTRATOR HOOK (team policy): pass the
-        // verified team policy instead of null once the sealed deployment carries it.
-        transport: options.http ?? (await setupNetwork({ settings: settings.network, cwd: loaded.stateDir, env, vault, policy: null })).transport,
+        // The deployment's proxy and CA settings apply to the KMS call too, with the sealed team policy's network rules.
+        transport: options.http ?? (await setupNetwork({ settings: settings.network, cwd: loaded.stateDir, env, vault,
+          policy: loaded.config.team?.policy?.policy ?? null })).transport,
         receiptPath: join(loaded.stateDir, '.keysentry', 'network.jsonl'), ...(options.now ? { now: options.now } : {}) });
     }
     // The state key now comes from the environment in either form, so the runtime does not unwrap it again.
@@ -271,6 +271,8 @@ export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherB
     return {
       config: loaded.config,
       options: { cwd: loaded.stateDir, userDir, vault: wrapped, settings,
+        // The sealed roster and policy (authenticated by the deploy key) are this watcher's team governance.
+        teamBundle: loaded.config.team ?? null,
         trustedPlanKeyIds: [...loaded.config.trustedKeyIds],
         env: { ...env, KEYSENTRY_VAULT: 'encrypted-file' }, stdinIsTTY: false, stdoutIsTTY: false,
       },

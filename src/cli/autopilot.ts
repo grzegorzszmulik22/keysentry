@@ -9,7 +9,8 @@ import {
 import { signDisarm, type SignedDisarm } from '../approvals/index.js';
 import { signWatcherResume, type SignedWatcherResume } from '../watcher/index.js';
 import { canonicalJson, type DeviceKey } from '../security/index.js';
-import type { ArmedCluster, ArmedPlan, AuditLog, Cluster, HostId, Inventory, RotationReport } from '../types.js';
+import type { ArmedCluster, ArmedPlan, AuditLog, Cluster, HostId, Inventory, RotationReport, TeamPolicy } from '../types.js';
+import { autopilotRefusal, checkArmedPlan } from '../policy/index.js';
 import { CliError } from './errors.js';
 
 export interface EligibilityRow { clusterId: string; hint: string | null; provider: string; eligible: boolean; reason?: string }
@@ -35,6 +36,10 @@ export interface AutopilotManagerOptions {
   selfCheck?: () => Promise<SelfCheckResult>;
   lastNotificationSuccess?: () => Promise<string | null>;
   env?: NodeJS.ProcessEnv; now?: () => Date;
+  /** The verified team policy in force (null without one). Arming stays inside it. */
+  teamPolicy?: () => TeamPolicy | null;
+  /** Refuses while team governance blocks changes (untrusted roster, invalid policy, unmet requirement). */
+  assertChanges?: () => Promise<void>;
 }
 
 export async function recordDrill(store: StateStore, result: { passed: boolean; at: Date }): Promise<void> {
@@ -110,6 +115,9 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
   }
   async function saveSigned(body: Omit<ArmedPlan, 'signer' | 'sig'>, state: AutopilotState, kind: string, activate = true,
     active: () => void | Promise<void> = () => opts.assertActive?.()): Promise<ArmedPlan> {
+    // Every plan this device signs stays inside the team policy (checked again by the watcher before it acts).
+    const check = checkArmedPlan(body, opts.teamPolicy?.() ?? null);
+    if (!check.ok) throw new CliError(`The armed plan is outside the team policy. ${check.reasons.join(' ')}`);
     return serial(async () => {
       await active();
       const sourceKey = await opts.deviceKey();
@@ -173,6 +181,16 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
 
   async function arm(options: ArmOptions = {}): Promise<{ plan: ArmedPlan; refused: { clusterId: string; reason: string }[] }> {
     opts.assertHuman('arm automatic rotations'); localOnly(options);
+    await opts.assertChanges?.();
+    const policy = opts.teamPolicy?.() ?? null;
+    // Arming more keys widens what may happen unattended. One device signs the plan, so a policy that wants more than
+    // one admin for widening changes cannot be met here: refuse rather than arm with fewer approvals than it asks for.
+    const widening = policy?.approvals.wideningAdmins ?? 1;
+    if (widening > 1) {
+      throw new CliError(`The team policy says policy-widening changes such as arming need ${widening} admins, and arming is signed by one admin's device. Arming is paused until a policy with approvals.wideningAdmins: 1 is signed and applied.`);
+    }
+    const policyReason = (cluster: Cluster): string | null =>
+      autopilotRefusal({ provider: cluster.provider, hosts: [...new Set(cluster.consumers.map(consumer => consumer.service.host))] }, policy);
     const epoch = shared.epoch;
     const active = async () => {
       if (epoch !== shared.epoch) throw new CliError('Arming was cancelled because autopilot was disarmed.');
@@ -198,7 +216,11 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
         }
       }
     }
-    const rows = inventory.clusters.map(cluster => ({ clusterId: cluster.id, hint: cluster.hint, provider: cluster.provider, ...autopilotEligibility(cluster) }));
+    const rows = inventory.clusters.map(cluster => {
+      const eligibility = autopilotEligibility(cluster);
+      const reason = eligibility.eligible ? policyReason(cluster) : null;
+      return { clusterId: cluster.id, hint: cluster.hint, provider: cluster.provider, ...(reason ? { eligible: false, reason } : eligibility) };
+    });
     opts.emitEligibility?.(rows);
     await requireDrill();
     if (inventory.errors.length) throw new CliError('The scan was incomplete. Resolve its errors before arming.');
@@ -211,17 +233,26 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
     }
     const graceMinutes = options.graceMinutes ?? opts.settings?.graceMinutes ?? 15;
     if (!Number.isFinite(graceMinutes) || graceMinutes < 0) throw new CliError('Grace minutes must be a finite nonnegative number.');
+    // A team policy only narrows: at least its minimum grace, at most its services per wave.
     const resolvedOptions = {
-      graceSeconds: Math.round(graceMinutes * 60), maxServicesPerWave: options.maxServices ?? opts.settings?.maxServices ?? 10,
+      graceSeconds: Math.max(Math.round(graceMinutes * 60), policy?.rotation.minGraceSeconds ?? 0),
+      maxServicesPerWave: Math.min(options.maxServices ?? opts.settings?.maxServices ?? 10, policy?.autopilot.maxServicesPerWave ?? Number.POSITIVE_INFINITY),
       validDays: options.validDays, healthChecks: options.healthChecks ?? opts.settings?.healthChecks ?? [],
       nextDeployAcceptance: options.nextDeployAcceptance,
     };
+    // Without --hosts, watch only the hosts the team policy allows; an explicit list outside it is refused below.
+    const allowedHosts = policy?.autopilot.allowedHosts;
+    const hosts = options.hosts ?? (allowedHosts ? inventory.hosts.filter(host => allowedHosts.includes(host)) : inventory.hosts);
+    if (allowedHosts && !hosts.length) throw new CliError('The team policy does not let autopilot change any host this project uses, so nothing can be armed.');
     // Validate all authorization settings before adoption can change a provider or host.
-    buildArmedPlan({ projectId: opts.projectId, inventory, clusterIds: [], hosts: options.hosts ?? inventory.hosts, now: now(), options: resolvedOptions });
+    buildArmedPlan({ projectId: opts.projectId, inventory, clusterIds: [], hosts, now: now(), options: resolvedOptions });
     const selected = options.clusterIds ?? inventory.clusters.map(c => c.id);
     const selectedIds: string[] = []; const adopted = existingAdoptions;
+    const policyRefused: { clusterId: string; reason: string }[] = [];
     for (const id of new Set(selected)) {
       const cluster = inventory.clusters.find(c => c.id === id);
+      const outside = cluster ? policyReason(cluster) : null;
+      if (outside) { policyRefused.push({ clusterId: id, reason: outside }); continue; }
       if (!cluster || !adoptionNeeded(cluster)) { selectedIds.push(id); continue; }
       // A placeholder tests all other eligibility gates before offering a real write.
       const potential = { ...cluster, adopted: { fingerprint: 'pending-adoption', keyRef: 'pending-adoption', at: now().toISOString() } };
@@ -253,11 +284,13 @@ export function createAutopilotManager(opts: AutopilotManagerOptions) {
       if (record) Object.assign(cluster, { adopted: record });
     }
     const built = buildArmedPlan({ projectId: opts.projectId, inventory, clusterIds: selectedIds,
-      hosts: options.hosts ?? inventory.hosts, now: now(), options: resolvedOptions });
-    if (!built.plan.clusters.length) throw new CliError('No selected keys are eligible for autopilot. Review the eligibility reasons.');
+      hosts, now: now(), options: resolvedOptions });
+    if (!built.plan.clusters.length) {
+      throw new CliError(policyRefused.length ? `No selected keys are eligible for autopilot. ${policyRefused[0]!.reason}` : 'No selected keys are eligible for autopilot. Review the eligibility reasons.');
+    }
     const existed = await loadPlan();
     const plan = await saveSigned(built.plan, state, existed ? 'rearm' : 'arm', true, active);
-    return { plan, refused: built.refused };
+    return { plan, refused: [...policyRefused, ...built.refused] };
   }
 
   async function disarm(options: { relay?: boolean } = {}): Promise<{ disarmed: true; relay: boolean }> {

@@ -14,6 +14,8 @@ import { auditExportEgressRules } from '../audit-export/index.js';
 import { offlineEgressRules } from '../feeds/index.js';
 import { networkStatusLines } from '../net/transport.js';
 import { CliError } from './errors.js';
+import { effectiveSettings, parseSignedPolicy, readTeamFile, restrictUserEgress } from '../policy/index.js';
+import type { TeamPolicy } from '../types.js';
 import { confirmVaultFallback, promptPassphrase, promptVaultBackend } from './prompts.js';
 import type { RuntimeOptions } from './runtime.js';
 
@@ -27,36 +29,59 @@ function validTimestamp(value: string): boolean {
     && hour <= 23 && minute <= 59 && second <= 59 && Number.isFinite(Date.parse(value));
 }
 
+/**
+ * The team policy for commands that open no project state (the roster that verifies its signatures lives there).
+ * Every policy rule only narrows, so applying the file's rules here can only make these views stricter; the
+ * signatures are checked whenever a command opens the project state (`keysentry policy verify`).
+ */
+async function policyForInspection(metadata: Awaited<ReturnType<typeof loadConfigMetadata>>): Promise<{ policy: TeamPolicy | null; problem: string | null }> {
+  const file = metadata.settings.team.policyFile;
+  if (!file) return { policy: null, problem: null };
+  try {
+    const parsed = parseSignedPolicy(await readTeamFile(resolve(metadata.cwd, file), 'team policy file named in team.policyFile'));
+    return parsed.ok ? { policy: parsed.value.policy, problem: null } : { policy: null, problem: parsed.reason };
+  } catch (error) {
+    return { policy: null, problem: error instanceof CliError ? error.message : 'The team policy file could not be read.' };
+  }
+}
+
 /** Inspection commands have no need to load state keys or credential adapters. */
 export async function inspectNetwork(options: RuntimeOptions, since?: string) {
   if (since !== undefined && !validTimestamp(since)) {
     throw new CliError('Use an ISO timestamp for --since.');
   }
-  const metadata = await loadConfigMetadata(options);
-  // ORCHESTRATOR HOOK (team policy): pass the verified team policy here, as in createRuntime.
+  const configured = await loadConfigMetadata(options);
+  const team = await policyForInspection(configured);
+  const metadata = team.policy ? await loadConfigMetadata({ ...options, settings: effectiveSettings(configured.settings, team.policy) }) : configured;
   const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env: options.env ?? process.env,
-    policy: null, injected: options.http ?? { request: async () => { throw new CliError('keysentry network does not contact any host.'); } } });
+    policy: team.policy, injected: options.http ?? { request: async () => { throw new CliError('keysentry network does not contact any host.'); } } });
   const all = [...EGRESS_RULES, ...rulesForUserFeeds(network.feedMode.offline ? [] : metadata.feedUrls),
     ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules,
     ...(metadata.settings.kms ? kmsEgressRules(metadata.settings.kms) : []), ...auditExportEgressRules(metadata.settings.audit.export)];
-  const rules = network.feedMode.offline ? offlineEgressRules(all) : all;
+  const rules = restrictUserEgress(network.feedMode.offline ? offlineEgressRules(all) : all, team.policy);
   const receipt = await createFileReceipt(join(metadata.cwd, '.keysentry', 'network.jsonl')).summarize(since);
-  return { rules, receipt, status: networkStatusLines(network.summary) };
+  const teamLines = team.policy ? [`Team policy version ${team.policy.version} narrows these hosts (keysentry policy verify checks its signatures).`]
+    : team.problem ? [`The team policy file could not be used, so changes are paused: ${team.problem}`] : [];
+  return { rules, receipt, status: [...networkStatusLines(network.summary), ...teamLines] };
 }
 
 export async function inspectRelease(options: RuntimeOptions, offline = false) {
   const local = await checkLocalIntegrity();
   if (offline || local.status === 'mismatch') return { local };
-  const metadata = await loadConfigMetadata(options);
+  const configured = await loadConfigMetadata(options);
+  // A team policy file that cannot be read stops the online check rather than letting it skip a required proxy.
+  const team = await policyForInspection(configured);
+  if (team.problem) throw new CliError(`The online release check did not run because the team policy file could not be used: ${team.problem}`);
+  const metadata = team.policy ? await loadConfigMetadata({ ...options, settings: effectiveSettings(configured.settings, team.policy) }) : configured;
   const redactor = createRedactor();
   const log = options.log ?? createLogger({ redactor });
   // Release checks use the configured proxy and CA like every other request. Proxy credentials come from HTTPS_PROXY
   // here, because this check opens no vault.
   const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env: options.env ?? process.env,
-    redactor, policy: null, ...(options.http ? { injected: options.http } : {}) });
+    redactor, policy: team.policy, ...(options.http ? { injected: options.http } : {}) });
   const http = createGuardedHttp(network.transport, {
-    rules: [...EGRESS_RULES, ...rulesForUserFeeds(metadata.feedUrls),
-      ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules],
+    rules: restrictUserEgress([...EGRESS_RULES, ...rulesForUserFeeds(metadata.feedUrls),
+      ...rulesForUserUrls(metadata.webhooks, 'notification webhook you configured'), ...metadata.userHostRules], team.policy),
     receipt: createFileReceipt(join(metadata.cwd, '.keysentry', 'network.jsonl')),
     trustedUrls: metadata.webhooks, log,
   });

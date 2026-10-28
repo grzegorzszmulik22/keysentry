@@ -14,8 +14,11 @@ export interface TeamSession {
   id: string;
   csrf: string;
   memberId: string;
-  /** The verified, normalized email that signed in; the session ends if the roster no longer lists it. */
-  email: string;
+  /** The verified, normalized email that signed in (null when a pinned identity matched without one). */
+  email: string | null;
+  /** The identity provider's issuer and subject for this sign-in. Pinned members must keep matching them. */
+  issuer: string;
+  subject: string;
   created: number;
   lastSeen: number;
 }
@@ -40,7 +43,7 @@ export function createTeamSessions(opts: { idleMs: number; absoluteMs: number; m
     for (const [id, session] of sessions) if (!live(session, time)) sessions.delete(id);
   }
   return {
-    create(member: { memberId: string; email: string }): TeamSession {
+    create(member: { memberId: string; email: string | null; issuer: string; subject: string }): TeamSession {
       prune();
       while (sessions.size >= max) sessions.delete(sessions.keys().next().value!);
       const time = now();

@@ -1,9 +1,10 @@
-import { fetchSession, passkeyRegistrationNotice } from './api.js';
+import { fetchSession, passkeyRegistrationNotice, signOut, teamPasskeyNotice } from './api.js';
 import type { DashboardSession } from './api.js';
-import { emptyState, notice } from './components.js';
+import { button, emptyState, notice } from './components.js';
 import { createRouter } from './router.js';
 import { registerScreensA } from './screens/a.js';
 import { registerScreensB } from './screens/b.js';
+import { renderAccount } from './screens/account.js';
 import type { DashboardRouter } from './router.js';
 
 export interface DashboardApp { session: DashboardSession; router: DashboardRouter; destroy(): void }
@@ -26,6 +27,12 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   const header = document.createElement('header'); header.className = 'app-header';
   const brand = link('keysentry', 'home'); brand.className = 'app-brand';
   const headerLinks = document.createElement('div'); headerLinks.className = 'app-header-links'; headerLinks.append(link('What keysentry can access', 'access'), link('Network', 'network'));
+  if (session.team && session.member) {
+    // Team mode: who is signed in, their account page, and sign-out.
+    const who = document.createElement('span'); who.className = 'app-header-member';
+    who.textContent = `Signed in as ${session.member.name} (${session.member.role})`;
+    headerLinks.append(who, link('Account', 'account'), button('Sign out', () => { void signOut(); }, 'secondary'));
+  }
   header.append(brand, headerLinks);
   const body = document.createElement('div'); body.className = 'app-body';
   const nav = document.createElement('nav'); nav.className = 'app-nav'; nav.setAttribute('aria-label', 'Main navigation');
@@ -34,15 +41,21 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   const main = document.createElement('main'); main.className = 'page'; main.id = 'main-content';
   skip.addEventListener('click', event => { event.preventDefault(); main.querySelector<HTMLElement>('h1')?.focus(); });
   let sessionNotice: HTMLElement | undefined;
+  const viewer = session.team === true && session.member?.role === 'viewer';
   if (session.readOnly) {
-    const readOnly = notice('info', 'Read-only', 'This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.'); readOnly.classList.add('read-only-notice');
+    const readOnly = viewer
+      ? notice('info', 'Read-only', 'You are signed in as a viewer. Ask a team admin for the operator role to make changes.')
+      : notice('info', 'Read-only', session.team ? 'This team dashboard was started read-only. Changes are unavailable.'
+        : 'This dashboard is read-only because it was opened by an automated tool or with --read-only. To make changes, run keysentry ui in your own terminal.');
+    readOnly.classList.add('read-only-notice');
     sessionNotice = readOnly;
   }
-  if (session.passkeys === 0) {
+  const passkeyNotice = session.team ? teamPasskeyNotice : passkeyRegistrationNotice;
+  if (session.passkeys === 0 && !viewer) {
     if (sessionNotice) {
-      const instruction = document.createElement('p'); instruction.textContent = passkeyRegistrationNotice;
+      const instruction = document.createElement('p'); instruction.textContent = passkeyNotice;
       sessionNotice.append(instruction);
-    } else sessionNotice = notice('info', 'Register a passkey', passkeyRegistrationNotice);
+    } else sessionNotice = notice('info', session.team ? 'Add your passkey' : 'Register a passkey', passkeyNotice);
   }
   content.append(main); body.append(nav, content); shell.append(skip, header, body); root.replaceChildren(shell);
   const router = createRouter(main, {}, route => {
@@ -58,6 +71,7 @@ export async function boot(root: HTMLElement): Promise<DashboardApp> {
   // Real screens replace the placeholders above (tasks 6a and 6b each own one registration module).
   registerScreensA(router, session);
   registerScreensB(router, session);
+  router.register('account', { title: 'Your account', render: () => renderAccount(session) });
   await router.start();
   return { session, router, destroy() { router.stop(); root.replaceChildren(); } };
 }

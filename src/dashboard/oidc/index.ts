@@ -8,7 +8,7 @@ export { verifyIdToken } from './id-token.js';
 export type { IdTokenExpectations, VerifiedIdentity } from './id-token.js';
 export { createJwksSource, importJwk, parseJwks } from './jwks.js';
 export type { KeySource, VerificationKey } from './jwks.js';
-export { isTeamRole, memberForIdentity, normalizeEmail, roleRank } from './members.js';
+export { isTeamRole, memberForIdentity, normalizeEmail, pinnedTo, roleRank } from './members.js';
 export { DEFAULT_TEAM_LISTEN, OIDC_CLIENT_SECRET_NAME, parseListen, parsePublicOrigin, parseTeamUiOptions, teamAuditEvent } from './options.js';
 export type { TeamUiOptions } from './options.js';
 export { createLoginTransactions } from './transactions.js';

@@ -145,3 +145,23 @@ it('signed audit inspection refuses a nonempty log without an anchor in the sele
   expect(f.output.join('\n')).toContain('This audit log has no anchor in your vault; it may have been replaced.');
   expect(f.opened).not.toHaveBeenCalled();
 });
+
+it('network applies the team policy file narrowing without opening the vault; verify refuses an unreadable policy file', async () => {
+  const f = await fixture();
+  await writeFile(join(f.cwd, 'keysentry.yaml'), 'team:\n  enabled: true\n  policyFile: policy.json\nmonitor:\n  webhooks: [https://notify.example.com/hook]\n');
+  const policy = { v: 1, teamId: 'team-test-0001', version: 1, prev: null, updatedAt: '2026-10-28T00:00:00.000Z', autopilot: {}, approvals: { required: 1, wideningAdmins: 1 },
+    network: { offline: true, allowHosts: ['other.example.com'] }, notify: {}, rotation: {}, audit: {} };
+  await writeFile(join(f.cwd, 'policy.json'), JSON.stringify({ policy, signatures: [] }));
+  expect(await runCli(['network', '--json'], f.options)).toBe(0);
+  const shown = JSON.parse(f.output.join('\n'));
+  expect(shown.rules.some((rule: { host: string }) => rule.host === 'notify.example.com')).toBe(false);
+  expect(shown.status).toContain('Team policy version 1 narrows these hosts (keysentry policy verify checks its signatures).');
+  expect(shown.status.join('\n')).toMatch(/offline/i);
+  await writeFile(join(f.cwd, 'policy.json'), '{ not json');
+  f.output.length = 0;
+  expect(await runCli(['network'], f.options)).toBe(0);
+  expect(f.output.join('\n')).toContain('The team policy file could not be used, so changes are paused: The team policy file named in team.policyFile is not valid JSON.');
+  expect(await runCli(['verify'], f.options)).toBe(1);
+  expect(f.errors.join('\n')).toContain('The online release check did not run because the team policy file could not be used');
+  expect(f.opened).not.toHaveBeenCalled();
+});

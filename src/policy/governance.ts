@@ -7,7 +7,7 @@ import type { SignedTeamPolicy, SignedTeamRoster, TeamPolicy } from '../types.js
 import { loadTeam, rosterHash, TeamError, type LoadedTeam, type TeamAnchor } from '../team/roster.js';
 import { parseSignedRoster } from '../team/schema.js';
 import { effectiveSettings, policyBlockers } from './effective.js';
-import { loadPolicy, PolicyError, verifyPolicy, type PolicyStatus } from './policy.js';
+import { loadPolicy, policyHash, PolicyError, verifyPolicy, type PolicyStatus } from './policy.js';
 
 export interface Governance {
   team: LoadedTeam | null;
@@ -76,6 +76,25 @@ export function parseTeamBundle(input: unknown): TeamBundle & { rosterHash: stri
     policy = verified.policy;
   }
   return { roster: roster.value, policy, rosterHash: rosterHash(roster.value) };
+}
+
+/**
+ * Governance for a sealed watcher: the roster and policy come from its authenticated config (the deploy key seals
+ * them), not from local state, which a fresh watcher does not have.
+ */
+export function governanceFromBundle(bundle: TeamBundle | null | undefined, settings: ConfigSettings, env?: NodeJS.ProcessEnv): Governance {
+  if (!bundle) {
+    const blockers = settings.team.enabled ? ['Team mode is on, but the sealed watcher config carries no team roster. Run keysentry watcher setup again.'] : [];
+    return { team: null, policy: { status: 'none' }, settings: effectiveSettings(settings, null), blockers };
+  }
+  const rules = bundle.policy?.policy ?? null;
+  const effective = effectiveSettings(settings, rules);
+  return {
+    team: { roster: structuredClone(bundle.roster), hash: rosterHash(bundle.roster) },
+    policy: bundle.policy ? { status: 'ok', policy: structuredClone(bundle.policy), hash: policyHash(bundle.policy), path: 'sealed watcher config', advanced: false } : { status: 'none' },
+    settings: effective,
+    blockers: policyBlockers(effective, rules, env),
+  };
 }
 
 /** What `watcher setup` seals for the watcher, or null without a team. Refuses when governance blocks changes. */

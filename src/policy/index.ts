@@ -9,6 +9,6 @@ export {
   tiersForClusters,
 } from './effective.js';
 export type { PlanCheck } from './effective.js';
-export { loadGovernance, policyRules, assertChangesAllowed, parseTeamBundle, buildTeamBundle } from './governance.js';
+export { loadGovernance, policyRules, assertChangesAllowed, parseTeamBundle, buildTeamBundle, governanceFromBundle } from './governance.js';
 export type { Governance, GovernanceOptions, TeamBundle } from './governance.js';
 export { describePolicy } from './describe.js';

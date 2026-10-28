@@ -3,7 +3,7 @@ import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse }
 import { isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { BUILD_VERSION } from '../release/build-info.js';
-import { ApprovalError, type ApprovalService } from './service.js';
+import { ApprovalError, ApprovalPendingError, type ApprovalService } from './service.js';
 import { APPROVE_JS, approvalPage, approvedOutcome, disarmedPage, disarmPage } from './page.js';
 
 type Service = Pick<ApprovalService, 'describe' | 'challenge' | 'approveWithPasskey' | 'recordDisarm'>;
@@ -222,6 +222,8 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
     } catch (error) {
       if (res.headersSent) { res.end(); return; }
       if (error instanceof HttpError) { send(res, error.status, `${error.message}\n`); return; }
+      // A recorded team approval that still needs other members is progress, not a failure.
+      if (error instanceof ApprovalPendingError) { json(res, 202, { ok: true, pending: true, approvals: error.approvals, required: error.required, text: `${error.message} ${error.needed.replace(/^./, c => c.toUpperCase())}.` }); return; }
       if (error instanceof ApprovalError) { json(res, 403, { ok: false, text: error.message }); return; }
       send(res, 500, 'The request could not be completed.\n');
     }

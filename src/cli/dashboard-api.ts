@@ -17,7 +17,9 @@ import { executeLocalApprovedAction } from './phase2.js';
 import { CREDENTIAL_NAMES } from '../vault/index.js';
 import { HOST_CREDENTIALS } from '../hosts/credentials.js';
 import { PROVIDER_IDS } from '../core/provider-ids.js';
-import type { DashboardApi } from '../dashboard/server/api.js';
+import type { DashboardApi, DashboardRequestContext } from '../dashboard/server/api.js';
+import { approveMonitorAsTeam } from './team-approvals.js';
+import { CliError } from './errors.js';
 import type { PasskeyStore } from '../dashboard/server/passkey-gate.js';
 import { DashboardError } from '../dashboard/server/security.js';
 import type { ApprovalRequest, HostId, RotationPlan, Vault } from '../types.js';
@@ -68,12 +70,21 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
   let armingEpoch = 0;
   const api: DashboardApi = {};
   const read = (name: string, handler: () => Promise<unknown>) => { api[name] = { method: 'GET', mutating: false, handler: async () => runtime.safe(await handler()) }; };
-  function post<S extends z.ZodType>(name: string, schema: S, mutating: boolean, handler: (body: z.output<S>) => Promise<unknown>) {
-    api[name] = { method: 'POST', mutating, handler: async body => {
+  function post<S extends z.ZodType>(name: string, schema: S, mutating: boolean, handler: (body: z.output<S>, ctx: DashboardRequestContext) => Promise<unknown>) {
+    api[name] = { method: 'POST', mutating, handler: async (body, ctx) => {
       const input = parse(schema, body);
-      if (!mutating) return runtime.safe(await handler(input));
-      return runtime.dashboardAction(async () => { try { const result = await handler(input); return name === 'reveal' ? result : runtime.safe(result); } finally { await runtime.checkpoint(); } });
+      if (!mutating) return runtime.safe(await handler(input, ctx));
+      // Team governance: an untrusted roster, an invalid policy or an unmet policy requirement pauses every change.
+      await runtime.assertGovernance();
+      return runtime.dashboardAction(async () => { try { const result = await handler(input, ctx); return name === 'reveal' ? result : runtime.safe(result); } finally { await runtime.checkpoint(); } });
     } };
+  }
+  /** Team quorum progress of a pending approval request, when there is one. */
+  async function quorumOf(actionId: string): Promise<{ approvals: number; required: number } | undefined> {
+    const request = await transactApprovals(runtime.store, async state => state.requests.find(item => item.actionId === actionId && item.status === 'pending'
+      && Date.parse(item.expiresAt) > runtime.now().getTime()));
+    if (!request?.quorum) return undefined;
+    return { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required };
   }
   async function autopilot() {
     const manager = createCliAutopilotManager(runtime);
@@ -181,9 +192,13 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
           ...(review.requiresInteractive ? ['This action requires recovery in an interactive terminal.'] : []),
           ...(review.manualRestarts.length ? [`Restart or activate manually: ${review.manualRestarts.map(serviceLabel).join(', ')}.`] : [])] : []),
       ];
-      return { id: action.id, kind: action.action, summary: `${rotation ? 'Rotate' : 'Disable or cap'} ${action.clusterIds.length} selected ${action.clusterIds.length === 1 ? 'key' : 'keys'}.`, changes, reviewHash: review.reviewHash, createdAt: action.createdAt, source: 'monitor' as const };
+      const quorum = await quorumOf(action.id);
+      return { id: action.id, kind: action.action, summary: `${rotation ? 'Rotate' : 'Disable or cap'} ${action.clusterIds.length} selected ${action.clusterIds.length === 1 ? 'key' : 'keys'}.`, changes, reviewHash: review.reviewHash, createdAt: action.createdAt, source: 'monitor' as const,
+        ...(quorum ? { quorum } : {}) };
     }));
-    const requests = await transactApprovals(runtime.store, async state => state.requests.filter(request => request.status === 'pending' && Date.parse(request.expiresAt) > runtime.now().getTime()));
+    // Monitor actions' team approval requests are listed above with their action, not as separate requests.
+    const requests = await transactApprovals(runtime.store, async state => state.requests.filter(request => request.status === 'pending' && request.kind !== 'monitor'
+      && Date.parse(request.expiresAt) > runtime.now().getTime()));
     return { pending: [...pending, ...await Promise.all(requests.map(autopilotReview))] };
   });
   async function autopilotReview(request: StoredApproval) {
@@ -198,7 +213,8 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
       }), `Rotation plan: ${action.planHash ?? 'unavailable'}.`];
     return { id: request.actionId, kind: request.kind, summary: `Rotate ${request.keyCount} selected ${request.keyCount === 1 ? 'key' : 'keys'} with autopilot.`, changes,
       reviewHash: createHash('sha256').update(canonicalJson({ action, digest: request.digest, expiresAt: request.expiresAt, changes })).digest('hex'),
-      createdAt: request.createdAt, expiresAt: request.expiresAt, source: 'autopilot' as const };
+      createdAt: request.createdAt, expiresAt: request.expiresAt, source: 'autopilot' as const,
+      ...(request.quorum ? { quorum: { approvals: new Set(request.quorum.approvers.map(approver => approver.memberId)).size, required: request.quorum.required } } : {}) };
   }
   read('settings', () => phase3.settings());
   read('hygiene', async () => ({ keys: await phase3.hygiene() }));
@@ -252,8 +268,21 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     const result = await testNotificationChannels(await notificationContext());
     return { delivered: result.delivered, failed: result.failed };
   });
-  post('approvals/approve', z.object({ id, reviewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(), true, async body => {
-    const pending = await transactApprovals(runtime.store, async state => state.requests.find(request => request.actionId === body.id && request.status === 'pending' && Date.parse(request.expiresAt) > runtime.now().getTime()));
+  post('approvals/approve', z.object({ id, reviewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(), true, async (body, ctx) => {
+    try { return await approveRequest(body, ctx); }
+    catch (error) {
+      // Approval refusals are fixed text ("You have already approved…", "not on the team roster", "paused"): show them.
+      if (error instanceof CliError) throw new DashboardError(409, error.message);
+      throw error;
+    }
+  });
+  async function approveRequest(body: { id: string; reviewHash: string }, ctx: DashboardRequestContext) {
+    // Team dashboard: the signed-in member's own passkey (verified by the gate over this exact body, which carries the
+    // review hash) is the approver. The server's device key belongs to the server, not to a member, so it never counts.
+    if (ctx.member && !ctx.passkey) throw new DashboardError(403, 'Confirm this approval with your passkey.');
+    const member = ctx.member && ctx.passkey ? { memberId: ctx.member.id, credentialId: ctx.passkey } : undefined;
+    const pending = await transactApprovals(runtime.store, async state => state.requests.find(request => request.actionId === body.id && request.status === 'pending'
+      && request.kind !== 'monitor' && Date.parse(request.expiresAt) > runtime.now().getTime()));
     if (pending) {
       const review = await autopilotReview(pending);
       if (review.reviewHash !== body.reviewHash) throw new DashboardError(409, 'The action changed. Review it again before approving.');
@@ -261,14 +290,21 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     const deviceKeys = async () => { const key = await runtime.signingKey(); try { return [{ keyId: key.keyId, publicKeyDer: key.publicKeyDer }]; } finally { key.privateKeyDer.fill(0); } };
     const result = pending ? await approveAutopilot(body.id, { reviewDigest: pending.digest }, { store: runtime.store, audit: runtime.audit, http: runtime.http, deviceKey: runtime.signingKey,
       deviceKeys, watcherPublicKeys: async () => [], passkeys: () => passkeys.list(), assertHuman: runtime.assertHuman,
-      now: runtime.now, confirm: async () => true, executeApprovedAction: actionId => executeLocalApprovedAction(runtime, actionId) }) : null;
+      now: runtime.now, confirm: async () => true, executeApprovedAction: actionId => executeLocalApprovedAction(runtime, actionId),
+      quorum: runtime.teamQuorum(), ...(member ? { member } : {}) }) : null;
+    if (result?.status === 'recorded') return { result: 'recorded', approvals: result.approvals, required: result.required, text: result.text };
     if (result) return { result: result.status };
     const review = await runtime.reviewAction(body.id);
     if (review.reviewHash !== body.reviewHash) throw new DashboardError(409, 'The action changed. Review it again before approving.');
+    // Team mode: monitor actions need the same quorum; the action runs only once enough members approved it.
+    const team = await approveMonitorAsTeam(runtime, { id: review.action.id, reviewHash: review.reviewHash, clusterIds: review.action.clusterIds,
+      approver: member ? { kind: 'member', ...member } : { kind: 'device' } });
+    if (team?.status === 'recorded') return { result: 'recorded', approvals: team.approvals, required: team.required, text: team.text };
+    if (!team && ctx.member) throw new DashboardError(409, 'Team approvals need a team roster. Ask a team admin to check keysentry.');
     const approved = await runtime.approve(body.id, { interactive: false, reviewHash: body.reviewHash, prompt: async () => null });
     const action = approved ? undefined : (await runtime.monitorStatus()).pendingActions.find(action => action.id === body.id);
     return { result: approved?.status ?? action?.status ?? 'not-available' };
-  });
+  }
   post('approvals/dismiss', z.object({ id }).strict(), true, async body => {
     const dismissed = await transactApprovals(runtime.store, async (state, commit) => { const request = state.requests.find(request => request.actionId === body.id && request.status === 'pending'); if (!request) return false; request.status = 'rejected'; await commit(); return true; });
     if (!dismissed) await runtime.dismiss(body.id);
@@ -300,7 +336,8 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     return { settings: runtime.config.settings.notify.channels, vault: runtime.vault, http, redactor: runtime.redactor,
       log: runtime.log, store: runtime.store, deviceKey: runtime.signingKey, now: runtime.now, receipt: runtime.receipt, audit: runtime.audit,
       watcherPublicKeys: () => trustedWatcherKeys(runtime.vault),
-      saveSettings: async settings => { await saveNotificationSettings(runtime.config.configPath, settings); runtime.config.settings.notify.channels = settings; },
+      // Channels a team policy hides stay in keysentry.yaml when the visible list is saved.
+      saveSettings: async settings => { await saveNotificationSettings(runtime.config.configPath, runtime.withHiddenChannels(settings)); runtime.config.settings.notify.channels = settings; },
     };
   }
   async function addNotification(body: z.output<typeof channelInput>): Promise<NotifyChannelSettings> {

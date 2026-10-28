@@ -4,6 +4,8 @@ export interface ApprovalPageDetails {
   keyCount: number;
   expiresAt: string;
   status: string;
+  /** Team mode: distinct team approvals so far and how many are needed. */
+  quorum?: { approvals: number; required: number };
 }
 
 function escapeHtml(value: string): string {
@@ -22,7 +24,7 @@ export function approvalPage(details: ApprovalPageDetails, watcherCheckMinutes =
   const outcome = details.status === 'pending' ? '' : details.status === 'approved' ? approvedOutcome(watcherCheckMinutes)
     : details.status === 'executed' ? 'Executed. The watcher has carried out this action.'
     : details.status === 'superseded' ? 'This request was replaced by a newer version.' : 'This request is no longer pending.';
-  return document('Approve an action | keysentry', `<h1>Approve an action</h1><dl><dt>Action</dt><dd>${escapeHtml(details.kind)}</dd><dt>Keys</dt><dd>${details.keyCount} ${details.keyCount === 1 ? 'key' : 'keys'}</dd><dt>Expires</dt><dd><time>${escapeHtml(details.expiresAt)}</time></dd></dl><button id="approve" type="button" data-digest="${escapeHtml(details.digest)}"${details.status === 'pending' ? '' : ' disabled'}>Approve with a passkey</button><p id="result" role="status" aria-live="polite">${escapeHtml(outcome)}</p><p><a href="/disarm">Turn off autopilot</a></p>`, true);
+  return document('Approve an action | keysentry', `<h1>Approve an action</h1><dl><dt>Action</dt><dd>${escapeHtml(details.kind)}</dd><dt>Keys</dt><dd>${details.keyCount} ${details.keyCount === 1 ? 'key' : 'keys'}</dd><dt>Expires</dt><dd><time>${escapeHtml(details.expiresAt)}</time></dd>${details.quorum ? `<dt>Team approvals</dt><dd>${details.quorum.approvals} of ${details.quorum.required}</dd>` : ''}</dl><button id="approve" type="button" data-digest="${escapeHtml(details.digest)}"${details.status === 'pending' ? '' : ' disabled'}>Approve with a passkey</button><p id="result" role="status" aria-live="polite">${escapeHtml(outcome)}</p><p><a href="/disarm">Turn off autopilot</a></p>`, true);
 }
 
 export function disarmPage(): string {

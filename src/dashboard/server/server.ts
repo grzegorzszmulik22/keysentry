@@ -72,6 +72,8 @@ export async function startDashboard(opts: DashboardOptions): Promise<{ url: str
       // Match raw paths: URL normalization must not turn traversal or encoded paths into assets/routes.
       if (!target.startsWith('/') || target.startsWith('//') || target.includes('#')) throw new DashboardError(404, 'This page is not available.');
       if (req.method !== 'GET' && req.method !== 'POST') throw new DashboardError(405, 'Use GET or POST for this request.');
+      // Browser passkey registration stays impossible on the local dashboard (phase 3); enrollment is team-mode only.
+      if (/^\/enroll(?:[/?]|$)/.test(target)) throw new DashboardError(404, 'Passkey enrollment is available only on the team dashboard. Register a local passkey with keysentry passkey register.');
       const session = sessions.authenticate(req.headers.cookie);
       if (req.method === 'GET' && target.startsWith('/?')) {
         const params = new URLSearchParams(target.slice(2));

@@ -29,6 +29,10 @@ import { bootstrapWatcher } from './watcher-bootstrap.js';
 import { registerBoxCommands, type BoxCommandsOptions } from './box.js';
 import { registerKmsCommands } from './kms.js';
 import { registerAuditExportCommands } from './audit-export.js';
+import { registerTeamCommands } from './team.js';
+import { approveMonitorAsTeam } from './team-approvals.js';
+import { loadTeam } from '../team/index.js';
+import type { TeamMember } from '../types.js';
 import { ruleAuthority } from '../net/index.js';
 import { VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
 import { acceptedCredentialName } from './credential-names.js';
@@ -183,6 +187,14 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       emit(await createCliAutopilotManager(rt).resume(opts),
         'Signed resume message published. The watcher checks it on its next check; local disarm and other holds still apply.');
     });
+  // Phase 5 governance (notes/team-policy.md): roster, roles, admin signatures, policy-as-code and enrollment.
+  registerTeamCommands(program, { getRuntime: () => getRuntime(), human, emit, diagnostic, json: () => !!program.opts().json,
+    setExit: code => { exitCode = code; }, env: options.env ?? process.env, promptIO: options.promptIO,
+    printable: text => redact(runtime?.humanize(text) ?? text) === text,
+    ...(options.confirmAction ? { confirm: options.confirmAction } : {}) });
+  // The team dashboard re-reads the verified roster on every request; five seconds of caching avoids a keychain read
+  // per request, and failures are never cached.
+  let teamCache: { at: number; members: TeamMember[] } | undefined;
   registerPhase3Commands(program, { getRuntime, peekRuntime: () => runtime,
     firstRunSettings: () => ({ vault: options.vault ?? runtime?.vault, userDir: options.userDir,
       env: options.env ?? runtime?.mutationContext.env ?? process.env, passphrase: options.passphrase }),
@@ -192,9 +204,15 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     firstRunGit: options.firstRunGit, guardGit: options.guardGit,
     confirmFirstRunSave: options.confirmFirstRunSave, confirmDashboard: options.confirmDashboard,
     openBrowser: options.openBrowser,
-    // ORCHESTRATOR HOOK (OIDC team members, notes/oidc.md wiring 1): pass teamMembers here once the governance roster
-    // wiring lands (loadTeam + vaultTeamAnchor). Until then `ui --team` refuses with "team roster" guidance. Team approvals
-    // (notes/oidc.md wiring 4) also wait for the governance quorum entry point.
+    teamMembers: async rt => {
+      if (!rt.config.settings.team.enabled) throw new CliError('Turn on team mode in keysentry.yaml (team.enabled: true), then run keysentry team init.');
+      if (teamCache && Date.now() - teamCache.at < 5_000) return structuredClone(teamCache.members);
+      teamCache = undefined;
+      const team = await loadTeam(rt.store, { anchor: rt.teamAnchors.roster });
+      if (!team) throw new CliError('Team mode needs a team roster. Run keysentry team init first.');
+      teamCache = { at: Date.now(), members: team.roster.roster.members };
+      return structuredClone(teamCache.members);
+    },
   });
 
   program.command('init').description('Create private local state and sample config without overwriting files').action(async () => {
@@ -306,8 +324,10 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     .action(async (id: string, opts: { yes?: boolean; relay?: boolean }) => {
     human('approve a key change');
     const rt = await getRuntime();
+    // An untrusted roster, an invalid policy or an unmet policy requirement pauses approvals as well as changes.
+    await rt.assertGovernance();
     const relay = await relaySettings(rt);
-    const approved = await approveAutopilot(id, opts, { store: rt.store, audit: rt.audit,
+    const approved = await approveAutopilot(id, opts, { store: rt.store, audit: rt.audit, quorum: rt.teamQuorum(),
       http: relay ? rt.httpForUrls([relay.server], 'approval relay you configured') : rt.http,
       deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
       watcherPublicKeys: () => trustedWatcherKeys(rt.vault),
@@ -322,6 +342,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       } });
     if (approved) {
       const text = approved.status === 'cancelled' ? 'Approval cancelled.'
+        : approved.status === 'recorded' ? approved.text ?? 'Your team approval was recorded. More team members must approve.'
         : approved.status === 'published' ? `Signed approval published to the watcher relay. ${approvedOutcome(approved.watcherCheckMinutes ?? 10)}`
           : approved.status === 'executed' ? 'Autopilot action executed.'
             : `Autopilot action approved. ${approved.reason ?? 'The grant remains available for the watcher.'}`;
@@ -344,6 +365,11 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if (!await (options.confirmAction ?? (actionId => confirmAction(actionId, diagnostic, options.promptIO)))(review.action.id)) {
         emit({ cancelled: true, action: review.action }, 'Approval cancelled. No host or provider changes.'); return;
       }
+    }
+    // Team mode: this computer's member is counted toward the quorum; the action runs only once enough members approved.
+    const team = await approveMonitorAsTeam(rt, { id: review.action.id, reviewHash: review.reviewHash, clusterIds: review.action.clusterIds, approver: { kind: 'device' } });
+    if (team?.status === 'recorded') {
+      emit({ status: 'recorded', action: review.action.id, approvals: team.approvals, required: team.required, role: team.role }, team.text); return;
     }
     const prompt = options.prompt ?? ((p: GuidedPrompt) => promptSecret(p, diagnostic, options.promptIO));
     const reveal = options.reveal ?? ((info, value) => revealSecret(info, value, diagnostic, options.promptIO));

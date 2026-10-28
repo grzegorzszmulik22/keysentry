@@ -23,6 +23,7 @@ export type OidcFailure =
   | 'email-missing'
   | 'email-unverified'
   | 'not-member'
+  | 'identity-mismatch'
   | 'roster-unavailable';
 
 const VERIFY = 'The sign-in could not be verified. Sign in again, or ask a team admin to check the identity provider settings.';
@@ -50,6 +51,7 @@ export const OIDC_MESSAGES: Readonly<Record<OidcFailure, string>> = Object.freez
   'email-missing': EMAIL,
   'email-unverified': EMAIL,
   'not-member': 'This account is not on the team roster. Ask a team admin to add your email address.',
+  'identity-mismatch': 'This account does not match the identity pinned for that team member. Ask a team admin to check the member’s single sign-on identity (keysentry team sso).',
   'roster-unavailable': 'The team roster could not be read, so nobody can sign in right now. Ask a team admin to check keysentry.',
 });
 

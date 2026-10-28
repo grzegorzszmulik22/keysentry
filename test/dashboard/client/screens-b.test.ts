@@ -217,6 +217,20 @@ describe('activity and approvals', () => {
     await open('approvals'); control('Dismiss').click(); await tick(); if (document.querySelector('dialog')) await accept('Dismiss');
     expect(api.postWithPasskey).toHaveBeenCalledWith('approvals/dismiss', { id: 'approval-one' });
   });
+  it('shows team approval progress and treats a recorded approval as progress, not a failure', async () => {
+    const data = fixtures.approvals as { pending: Record<string, unknown>[] };
+    data.pending[0]!.quorum = { approvals: 0, required: 2 };
+    api.postWithPasskey.mockImplementation(async () => ({ result: 'recorded', approvals: 1, required: 2,
+      text: 'Your approval was recorded: 1 of 2 team approvals so far. 1 more approval from a team operator or admin who has not approved yet.' }));
+    await open('approvals');
+    expect(outlet.textContent).toContain('0 of 2 team approvals so far.');
+    control('Approve').click(); await tick(); await accept('Approve');
+    expect(outlet.textContent).toContain('Waiting for more team approvals');
+    expect(outlet.textContent).toContain('1 of 2 team approvals so far.');
+    expect(outlet.textContent).toContain('Approval recorded');
+    expect(outlet.textContent).not.toContain('Approved');
+    expect(api.postWithPasskey).toHaveBeenCalledTimes(1);
+  });
   it('shows expired approvals without usable action controls', async () => {
     fixtures.approvals = { pending: [{ id: 'old', kind: 'rotate', summary: 'Old request.', createdAt: '2020-01-01T00:00:00Z', expiresAt: '2020-01-01T00:10:00Z', source: 'monitor' }] };
     await open('approvals'); expect(outlet.textContent).toContain('Expired');

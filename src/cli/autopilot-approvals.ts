@@ -3,8 +3,9 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { canonicalJson, signDetached, verifyDetached, type DeviceKey } from '../security/index.js';
 import type { ApprovalRequest, AuditLog, HttpClient, PasskeyCredential } from '../types.js';
-import { actionDigest, APPROVAL_PREFIX, ApprovalError, createApprovalService, createRelay } from '../approvals/index.js';
-import type { ApprovalAction, ApprovalCluster, SignedDeviceApproval } from '../approvals/index.js';
+import { actionDigest, APPROVAL_PREFIX, ApprovalError, ApprovalPendingError, createApprovalService, createRelay } from '../approvals/index.js';
+import type { ApprovalAction, ApprovalCluster, ApprovalQuorum, SignedDeviceApproval } from '../approvals/index.js';
+import { pendingText } from './team-governance.js';
 import { APPROVAL_REQUEST_PREFIX } from './watcher.js';
 import { CliError } from './errors.js';
 
@@ -16,6 +17,13 @@ export interface AutopilotApprovalDependencies {
   review?(request: AutopilotApprovalReview): void;
   confirm?(actionId: string): Promise<boolean>;
   executeApprovedAction?(actionId: string): Promise<{ executed: boolean; reason?: string }>;
+  /** Team mode: the roster and policy decide how many distinct members must approve (src/cli/team-governance.ts). */
+  quorum?: ApprovalQuorum | null;
+  /**
+   * Team dashboard: the signed-in member whose own roster passkey the dashboard's gate verified over this request.
+   * Counted as that member instead of this computer's device key.
+   */
+  member?: { memberId: string; credentialId: string };
 }
 
 interface PendingAutopilot { action: ApprovalAction; request: ApprovalRequest }
@@ -24,8 +32,11 @@ interface RequestMetadata extends AutopilotApprovalReview {
   digest: string; expiresAt: string; kind: 'autopilot'; keyCount: number; watcherCheckMinutes: number;
 }
 export interface AutopilotApprovalResult {
-  actionId: string; digest: string; status: 'approved' | 'published' | 'executed' | 'cancelled';
+  /** `recorded`: a team approval was saved and more distinct members must approve before anything runs. */
+  actionId: string; digest: string; status: 'approved' | 'published' | 'executed' | 'cancelled' | 'recorded';
   watcherCheckMinutes?: number; reason?: string;
+  /** Team quorum progress (status `recorded`). */
+  approvals?: number; required?: number; role?: 'operator' | 'admin'; text?: string;
 }
 const MAX_RESPONSE = 4 * 1024 * 1024;
 const MAX_LINE = 16 * 1024;
@@ -134,7 +145,7 @@ export async function approveAutopilot(id: string, options: {relay?: boolean; re
     const local = pending?.actions.find(entry => entry.action?.id === id || entry.request?.actionId === id);
     if (!local && !options.relay) return null;
     const service = !options.relay ? createApprovalService({ store: deps.store, audit: deps.audit, credentials: deps.passkeys, deviceKeys: deps.deviceKeys,
-      rpId: 'localhost', origins: ['http://localhost'], now: deps.now }) : null;
+      rpId: 'localhost', origins: ['http://localhost'], now: deps.now, ...(deps.quorum ? { quorum: deps.quorum } : {}) }) : null;
     const priorGrant = service ? (await service.approved()).find(entry => entry.action.id === id) : undefined;
     const request = local ? checkLocal(local, id, now, priorGrant?.grant.digest) : await remoteRequest(id, deps, now);
     if (options.reviewDigest !== undefined && request.digest !== options.reviewDigest) throw new CliError('The action changed. Review it again before approving.');
@@ -150,6 +161,17 @@ export async function approveAutopilot(id: string, options: {relay?: boolean; re
       return { actionId: id, digest: request.digest, status: 'approved' };
     };
     if (priorGrant?.grant.digest === request.digest) { approvalAccepted = true; return await execute(); }
+    const recorded = async (error: ApprovalPendingError): Promise<AutopilotApprovalResult> => {
+      // Recorded, and more team members must approve: progress, not a failure, and nothing runs yet.
+      await deps.audit.append({ kind: 'autopilot-approval-recorded', summary: 'A team approval was recorded; more approvals are needed.', data: { actionId: id } });
+      return { actionId: id, digest: request.digest, status: 'recorded', approvals: error.approvals, required: error.required, role: error.role, text: pendingText(error) };
+    };
+    if (deps.member && !options.relay) {
+      try { await service!.approveAsMember(id, deps.member, request.digest); }
+      catch (error) { if (error instanceof ApprovalPendingError) return await recorded(error); throw error; }
+      approvalAccepted = true;
+      return await execute();
+    }
     const key = await deps.deviceKey();
     const signingAt = deps.now?.() ?? new Date();
     if (!Number.isFinite(signingAt.getTime())) throw new CliError('The approval clock could not be read.');
@@ -164,7 +186,8 @@ export async function approveAutopilot(id: string, options: {relay?: boolean; re
       await deps.audit.append({ kind: 'autopilot-approval-published', summary: 'A device-signed autopilot approval was published to the configured relay.', data: { actionId: id } });
       return { actionId: id, digest: request.digest, status: 'published', watcherCheckMinutes: request.watcherCheckMinutes };
     }
-    await service!.approveWithDevice(id, signed);
+    try { await service!.approveWithDevice(id, signed); }
+    catch (error) { if (error instanceof ApprovalPendingError) return await recorded(error); throw error; }
     approvalAccepted = true;
     return await execute();
   } catch (error) {

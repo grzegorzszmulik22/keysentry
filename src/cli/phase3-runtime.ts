@@ -44,8 +44,10 @@ export function createPhase3Runtime(rt: KeysentryRuntime) {
       digestDay: 'off', showHints: rt.config.settings.autopilot.showHints,
     });
     if (!parsed.success) throw new CliError('Saved dashboard settings are invalid. Restore them before making changes.');
-    rt.config.rotation.graceMs = parsed.data.graceMinutes * 60000;
-    rt.config.settings.autopilot.graceMinutes = parsed.data.graceMinutes;
+    // A team policy's minimum grace still applies to a grace period saved here.
+    const minGrace = rt.teamPolicy?.rotation.minGraceSeconds ?? 0;
+    rt.config.rotation.graceMs = Math.max(parsed.data.graceMinutes * 60000, minGrace * 1000);
+    rt.config.settings.autopilot.graceMinutes = Math.max(parsed.data.graceMinutes, Math.ceil(minGrace / 60));
     rt.config.settings.autopilot.showHints = parsed.data.showHints;
     return parsed.data;
   }

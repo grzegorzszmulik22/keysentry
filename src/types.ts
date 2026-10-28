@@ -817,6 +817,11 @@ export interface TeamMember {
   role: TeamRole;
   /** Verified email for single sign-on mapping; absent means the member cannot sign in with OIDC. */
   email?: string;
+  /**
+   * The identity provider's stable identity for this member (OIDC `iss` and `sub`). When present, single sign-on maps
+   * only this pair to the member and refuses a matching email with another subject; the email is then just a label.
+   */
+  sso?: { issuer: string; subject: string };
   passkeys: PasskeyCredential[];
   deviceKeys: { keyId: string; publicKeyDer: string }[];
   /** Channel ids from notify settings this member receives, and the lowest severity routed to them. */

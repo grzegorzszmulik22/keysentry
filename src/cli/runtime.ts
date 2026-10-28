@@ -45,6 +45,10 @@ import { RotationAbortedError } from '../types.js';
 import { readinessScore } from '../report/index.js';
 import { createHygieneState, createHygieneStateStore, updateFirstSeen, updateLastRotation } from '../hygiene/index.js';
 import { dashboardSettingsSchema } from './phase3-runtime.js';
+import { assertChangesAllowed, governanceFromBundle, loadGovernance, narrowRotationOptions, policyRules, restrictUserEgress, type Governance, type TeamBundle } from '../policy/index.js';
+import { stateQuorum, teamAnchors } from './team-governance.js';
+import { actionDigest, createApprovalService } from '../approvals/index.js';
+import type { NotifyChannelSettings } from './notifications.js';
 
 export type PlanFilters = NonNullable<Parameters<typeof buildPlan>[1]>;
 type Reveal = (info: RevealInfo, value: string) => Promise<boolean>;
@@ -55,6 +59,8 @@ export interface RuntimeOptions {
   trustedPlanKeyIds?: string[];
   /** Set only after authenticated sealed-watcher bootstrap in the CLI entry point. */
   watcherAuthorized?: boolean;
+  /** Sealed watcher only (with watcherAuthorized): the team roster and policy from the authenticated config. */
+  teamBundle?: TeamBundle | null;
   hosts?: HostAdapter[]; providers?: (id: ProviderId) => ProviderAdapter;
   policy?: Policy; feeds?: BreachFeed[]; fingerprintKey?: Buffer;
   prompt?: (p: GuidedPrompt) => Promise<string | null>; log?: Logger;
@@ -126,7 +132,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     (message: string, data?: Record<string, unknown>) => baseLog[level](redactor.redact(humanize(message)), data === undefined ? undefined : logValue(data) as Record<string, unknown>),
   ])) as unknown as Logger;
   const diagnostic = (text: string) => log.info(text);
-  const metadata = await loadConfigMetadata(options);
+  let metadata = await loadConfigMetadata(options);
+  /** keysentry.yaml as written. Everything that acts uses `metadata.settings`, narrowed by a verified team policy below. */
+  const rawSettings = metadata.settings;
   const paths = statePaths(metadata.cwd);
   async function prepareDirectory(path: string, variable: string) {
     try { await mkdir(path, { recursive: true, mode: 0o700 }); }
@@ -162,20 +170,15 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   });
   const projectId = await getProjectId(paths.dir);
   const receipt = createFileReceipt(join(paths.dir, 'network.jsonl'));
-  // Phase 5 network (notes/network-enterprise.md): proxy, extra CA and offline mode.
-  // ORCHESTRATOR HOOK (team policy): pass the *verified* SignedTeamPolicy.policy from the governance wiring here, or
-  // keep null when team mode is off. Its network.offline and network.requireProxy then take effect, and
-  // network.allowHosts should narrow metadata.userHostRules below. An unverifiable policy must stop the command first.
-  const teamPolicy: TeamPolicy | null = null;
-  const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env, vault, redactor,
-    policy: teamPolicy, ...(options.http ? { injected: options.http } : {}) });
-  const rawTransport = network.transport;
   // With kms configured the state key exists only wrapped and is unwrapped into memory here; a KMS failure
-  // refuses to start and never creates a new key (src/kms/state-key.ts).
+  // refuses to start and never creates a new key (src/kms/state-key.ts). The team roster and policy live in the
+  // encrypted state, so this one call uses keysentry.yaml's proxy and CA settings; the team policy applies after it.
   const stateKms = metadata.settings.kms;
+  const kmsTransport = stateKms ? (await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env, vault, redactor,
+    policy: null, ...(options.http ? { injected: options.http } : {}) })).transport : undefined;
   const key = await loadProjectStateKey({ vault, projectId, log, now: options.now,
     envWrapped: vault.backend === 'env' ? env.KEYSENTRY_STATE_KEY_WRAPPED || undefined : undefined,
-    ...(stateKms ? { wrapper: createKeyWrapper(stateKms, { http: createKmsHttp(rawTransport, stateKms, { receipt, log }),
+    ...(stateKms && kmsTransport ? { wrapper: createKeyWrapper(stateKms, { http: createKmsHttp(kmsTransport, stateKms, { receipt, log }),
       credentials: createCredentialSource(vault, env), now: options.now }) } : {}) });
   // The env backend has no writable durable store. Keep internal binding markers
   // process-local, like its in-flight values; supplied environment markers win.
@@ -196,6 +199,26 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   finally { key.fill(0); }
   const migration = await baseStore.migratePlaintext();
   if (migration.migrated.length) log.info(`Encrypted ${migration.migrated.length} files saved by keysentry 0.1. Nothing else changed.`);
+  // Phase 5 team governance (notes/team-policy.md): the verified roster and policy. A sealed watcher reads them from
+  // its authenticated config; everyone else from encrypted state, checked against the vault checkpoints.
+  const anchors = teamAnchors(vault, projectId);
+  const sealedTeam = options.watcherAuthorized === true && options.teamBundle !== undefined;
+  // `team init`, `team apply` and `policy apply` update the team settings in this process; later reads must see them.
+  let teamSettings = () => rawSettings.team;
+  const readGovernance = async (): Promise<Governance> => sealedTeam ? governanceFromBundle(options.teamBundle, rawSettings, env)
+    : loadGovernance({ store: baseStore, settings: { ...rawSettings, team: teamSettings() }, cwd: metadata.cwd, env, anchors });
+  const governance = await readGovernance();
+  const teamPolicy: TeamPolicy | null = policyRules(governance);
+  // Everything built from settings below (hosts, channels, egress rules, feeds) sees the narrowed copy.
+  metadata = await loadConfigMetadata({ ...options, settings: governance.settings });
+  const configOptions: RuntimeOptions = { ...options, settings: metadata.settings };
+  // Phase 5 network (notes/network-enterprise.md): proxy, extra CA and offline mode, with the verified team policy's
+  // offline and requireProxy rules (a required proxy carries every request; network.noProxy is emptied by the policy).
+  const network = await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env, vault, redactor,
+    policy: teamPolicy, ...(options.http ? { injected: options.http } : {}) });
+  const rawTransport = network.transport;
+  /** Refuse a change while governance blocks changes. Re-read each time, so a long-running dashboard sees roster changes. */
+  async function assertGovernance(): Promise<void> { assertChangesAllowed(await readGovernance()); }
   const fingerprintKey = options.fingerprintKey ?? await vaultFingerprintKey(vault, projectId, join(userDir, 'fingerprint.key'));
   const transientHeads = createMemoryVault();
   const anchorMarker = join(userDir, 'audit-heads', `${createHash('sha256').update(resolve(paths.audit)).digest('hex').slice(0, 16)}.json`);
@@ -298,10 +321,12 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     // Shown in `keysentry network`; the KMS and audit export clients also carry their own narrower rule lists.
     ...(metadata.settings.kms ? kmsEgressRules(metadata.settings.kms) : []),
     ...auditExportEgressRules(metadata.settings.audit.export)];
-  const rules = network.feedMode.offline ? offlineEgressRules(allRules) : allRules;
+  // A team policy's network.allowHosts drops user-added destinations it does not list (notes/team-policy.md).
+  const rules = restrictUserEgress(network.feedMode.offline ? offlineEgressRules(allRules) : allRules, teamPolicy);
   const http = createGuardedHttp(transport, { rules, receipt,
     trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls], log });
-  const config = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
+  const config = await loadConfig({ ...configOptions, vault, http, role: 'read', redactor, log });
+  teamSettings = () => config.settings.team;
   try {
     const saved = await store.readJson('monitor', join(paths.dir, 'dashboard-settings.json'));
     if (saved !== null) {
@@ -316,12 +341,15 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     // loss. The unreadable preferences stay intact for later recovery/reset.
     if (!(error instanceof StateLockedError)) throw error;
   }
+  // The policy's revocation rule and minimum grace also clamp a grace period saved from the dashboard.
+  config.rotation = narrowRotationOptions(config.rotation, teamPolicy);
   if (options.policy) config.monitor.policy = options.policy;
   if (options.feeds) config.monitor.feeds = options.feeds;
   // Offline mode: the legacy monitor detector would otherwise fall back to DEFAULT_BREACH_FEEDS.
   if (network.feedMode.offline) config.monitor.feeds = [];
   const providers = options.providers ?? getProvider;
   const stateStore = createFileMonitorStateStore(config.cwd, store);
+  const visibleChannelIds = new Set(metadata.settings.notify.channels.map(channel => channel.id));
 
   /** Project typed metadata before persistence; never serialize a raw adapter response. */
   function safe<T>(value: T): T {
@@ -359,7 +387,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const providerList = () => (Object.keys(PROVIDER_CREDENTIALS) as ProviderId[]).map(providers);
   const grace = options.grace ?? (info => promptGrace(info, diagnostic, options.promptIO, options.now));
   async function refreshConnections(): Promise<void> {
-    const fresh = await loadConfig({ ...options, vault, http, role: 'read', redactor, log });
+    const fresh = await loadConfig({ ...configOptions, vault, http, role: 'read', redactor, log });
     config.providerCtx = fresh.providerCtx;
     if (!options.hosts) {
       config.hosts = fresh.hosts; config.disabledHosts = fresh.disabledHosts;
@@ -372,7 +400,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   /** Write credentials are fetched only after the calling operation's human gate. */
   async function adapters(role: TokenRole) {
     if (role === 'read') return { hosts, hostMap, providerCtx: config.providerCtx };
-    const writeConfig = await loadConfig({ ...options, vault, http, role, redactor, log });
+    const writeConfig = await loadConfig({ ...configOptions, vault, http, role, redactor, log });
     const selected = wrapHosts(options.hosts ?? writeConfig.hosts);
     return { hosts: selected, hostMap: Object.fromEntries(selected.map(host => [host.id, host])) as Partial<Record<HostId, HostAdapter>>,
       providerCtx: writeConfig.providerCtx };
@@ -382,6 +410,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   let developmentWarningShown = false;
   let missingManifestAccepted = false;
   async function prepareExecution(write: (text: string) => void = diagnostic, developmentAlreadyReported = false) {
+    // Team governance first: an untrusted roster, an invalid policy or an unmet policy requirement stops every change.
+    await assertGovernance();
     developmentWarningShown ||= developmentAlreadyReported;
     if (!rotationVaultWarningShown && (vault.backend === 'env' || vault.backend === 'memory')) {
       write(MEMORY_ONLY_ROTATION_WARNING); rotationVaultWarningShown = true;
@@ -509,6 +539,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function execute(rotationPlan: RotationPlan, inv: Inventory, opts: ExecutionOptions, inheritInteraction = true): Promise<RotationReport> {
+    // A team policy clamps per-run choices too, e.g. rotate --revoke immediately under revoke: after-deploy.
+    opts = narrowRotationOptions(opts, teamPolicy);
     const selected = await adapters(opts.execute === true ? 'write' : 'read');
     remember(rotationPlan.services);
     if (opts.execute === true) assertPlanScan(rotationPlan, inv);
@@ -616,6 +648,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
 
   function autopilotManager(overrides: Partial<Pick<AutopilotManagerOptions, 'confirmAdoption' | 'emitEligibility' | 'relayDisarm' | 'relayResume' | 'selfCheck' | 'lastNotificationSuccess' | 'assertActive'>> = {}) {
     return createAutopilotManager({ store, audit, projectId, deviceKey: () => deviceKey(vault), assertHuman,
+      teamPolicy: () => teamPolicy, assertChanges: assertGovernance,
       scan: async () => rotationInventory(await scan()), rotateCluster: async clusterId => rotate(await plan({ clusterIds: [clusterId] }), {
         execute: true, prompt: options.prompt ?? (p => promptSecret(p, diagnostic, options.promptIO)),
       }),
@@ -741,6 +774,21 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     return describeAction(id, await inventory(), await stateStore.load());
   }
 
+  /** Team mode: the met quorum for this reviewed monitor action, or a refusal. Null without a team. */
+  async function monitorTeamGrant(id: string, clusterIds: string[], reviewHash: string): Promise<{ markExecuted(): Promise<void> } | null> {
+    if (sealedTeam) return null;
+    const quorum = stateQuorum({ store, cwd: metadata.cwd, policyFile: () => config.settings.team.policyFile, anchors });
+    try { if (await quorum.team() === null) return null; }
+    catch { throw new CliError('The team roster or policy could not be verified, so approvals are paused.'); }
+    const service = createApprovalService({ store, audit, credentials: async () => [], deviceKeys: async () => [], rpId: 'localhost', origins: ['http://localhost'],
+      now: options.now, quorum });
+    const digest = actionDigest({ id, kind: 'monitor', clusterIds: [...clusterIds], planHash: reviewHash });
+    if (!(await service.approved()).some(entry => entry.action.id === id && entry.request.digest === digest)) {
+      throw new CliError('This action needs the team\'s approvals first. Approve it with keysentry approve <id> or on the team dashboard.');
+    }
+    return { markExecuted: () => service.markExecuted(id, digest) };
+  }
+
   async function approveAction(id: string, opts: ApprovalOptions = {}) {
     assertHuman('approve a key change');
     await prepareExecution();
@@ -754,6 +802,9 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     const review = describeAction(id, ctx.inventory, ctx.state);
     if (opts.reviewHash !== undefined && opts.reviewHash !== review.reviewHash) throw new CliError('Pending action changed after review; inspect it and approve again.');
     if (review.requiresInteractive && !interactive) throw new CliError('This action requires an interactive terminal for atomic-roll recovery. Run keysentry approve <id> in a terminal; --yes only skips confirmation.');
+    // Team mode: the action runs only with a met quorum for exactly this review (recorded by keysentry approve or the
+    // team dashboard, src/cli/team-approvals.ts). Checked here too, so no caller can run it on one approval.
+    const teamGrant = await monitorTeamGrant(id, review.action.clusterIds, review.reviewHash);
     // Monitor integrations may translate executor errors into a failed action. Preserve
     // explicit operator cancellation so the CLI always reports a whole-run abort.
     let aborted: RotationAbortedError | undefined;
@@ -763,6 +814,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       catch (error) { if (error instanceof RotationAbortedError) aborted = error; throw error; }
     };
     const result = await approve(id, ctx);
+    await teamGrant?.markExecuted().catch(() => log.warn('The team approval could not be marked as used. It expires on its own.'));
     await audit.append({ kind: 'approval', summary: 'Monitor action approved.', data: { id } });
     if (aborted) throw aborted;
     await scan();
@@ -900,6 +952,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     // All path checks finish before any recovery key is destroyed.
     for (const id of planIds) await inflight.shred(id);
     for (const name of await vault.list(`project/${projectId}/inflight/`)) await vault.delete(name);
+    // The team roster and policy state files are removed below; their checkpoints go too, or the next run would refuse.
+    if (vault.backend !== 'env') for (const name of [`project/${projectId}/team/roster-head`, `project/${projectId}/team/policy-head`]) await vault.delete(name);
     for (const path of files) { await rm(path); deleted.push(relative(paths.dir, path)); }
     await rm(inflightDir, { recursive: true, force: true });
     await audit.append({ kind: 'state-reset', summary: 'Encrypted saved state reset.', data: { files: deleted.length, force } });
@@ -920,7 +974,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
       assertHuman: () => {}, env, now: options.now }).disarm()),
     projectId, log, fingerprintKey, autopilotManager, signingKey: () => deviceKey(vault), recoveryDeps,
     httpForUrls: (urls: string[], purpose: string) => createGuardedHttp(transport, {
-      rules: [...rules, ...rulesForUserUrls(urls, purpose)], receipt, log,
+      rules: restrictUserEgress([...rules, ...rulesForUserUrls(urls, purpose)], teamPolicy), receipt, log,
       trustedUrls: [...metadata.webhooks, ...notification.trustedUrls, ...relayUrls],
     }),
     /**
@@ -928,8 +982,18 @@ export async function createRuntime(options: RuntimeOptions = {}) {
      * transport. Audit export gives each target its own, so a custom header can never be redirected elsewhere.
      */
     singleHostHttp: (url: string, purpose: string) => createGuardedHttp(rawTransport, {
-      rules: rulesForUserUrls([url], purpose, 'config'), receipt, log, maxRedirects: 0,
+      rules: restrictUserEgress(rulesForUserUrls([url], purpose, 'config'), teamPolicy), receipt, log, maxRedirects: 0,
     }),
+    /** Team governance as loaded at start: roster, policy, narrowed settings and blockers. */
+    governance, teamPolicy, teamAnchors: anchors, rawSettings, assertGovernance,
+    /** The approval quorum from the verified roster and policy on this computer; null for a sealed watcher (its config carries them). */
+    teamQuorum: () => sealedTeam ? null : stateQuorum({ store, cwd: metadata.cwd, policyFile: () => config.settings.team.policyFile, anchors }),
+    /**
+     * Notification settings to save: `channels` plus the channels keysentry.yaml lists but the team policy hides, so
+     * editing channels in the narrowed view never deletes the hidden ones.
+     */
+    withHiddenChannels: (channels: NotifyChannelSettings[]): NotifyChannelSettings[] => [...channels,
+      ...rawSettings.notify.channels.filter(channel => !visibleChannelIds.has(channel.id) && !channels.some(item => item.id === channel.id))],
     /** Proxy, extra CA and offline state (notes/network-enterprise.md); `transport` is only ever wrapped by a guard. */
     network: { feedMode: network.feedMode, summary: network.summary, transport: rawTransport },
     freshInventory: async () => rotationInventory(await scan()),
@@ -1014,6 +1078,15 @@ export async function createRuntime(options: RuntimeOptions = {}) {
         ...(probe ? { probe: { http } } : {}), previous, integrity: await checkLocalIntegrity(),
         sandboxed: !!process.permission, network: network.summary });
       if (probe) await store.writeJson('doctor', path, result.fingerprints);
+      // Team governance (fresh read): roster and policy in force, and anything that pauses changes.
+      const current = await readGovernance();
+      if (current.team || current.blockers.length || current.policy.status !== 'none') {
+        const team = current.team ? `Roster version ${current.team.roster.roster.version} verified.` : 'No team roster.';
+        const policy = current.policy.status === 'ok' ? ` Policy version ${current.policy.policy.policy.version} verified.` : '';
+        result.items.push(current.blockers.length
+          ? { area: 'team', status: 'fail', title: 'Team governance', detail: `${team}${policy} Changes are paused: ${current.blockers.join(' ')}`, fix: 'Run keysentry team verify and keysentry policy verify for details.' }
+          : { area: 'team', status: 'ok', title: 'Team governance', detail: `${team}${policy}` });
+      }
       await audit.append({ kind: 'doctor', summary: 'Doctor checks completed.', data: { probe, checks: result.items.length, warnings: result.items.filter(item => item.status === 'warn').length } });
       return safe(result);
     }),
