@@ -207,12 +207,54 @@ describe('cloud box account page', () => {
       boxes: [{ name: '<img src=x onerror=alert(1)>', state: 'active' }, { name: 'ok-box', state: 'pending' }] } });
     route('POST', '/boxes', { status: 400, body: { error: '<img src=x onerror=alert(1)>' } });
     await boot();
-    expect([...el('boxes-list').querySelectorAll('li')].map(item => item.textContent)).toEqual(['ok-boxBeing created']);
+    expect([...el('boxes-list').querySelectorAll('li')].map(item => item.textContent)).toEqual([
+      'ok-boxBeing createdkeysentry is creating this box or checking whether it was created. Reload this page in a few minutes.']);
     el('box-name').value = 'new-box';
     el('device-key').value = DEVICE_KEY;
     await click('create');
     expect(el('create-error').textContent).toBe('<img src=x onerror=alert(1)>');
     expect(document.querySelector('img')).toBeNull();
+  });
+
+  it('says a box is being checked when Compute gave no definite answer (202)', async () => {
+    account('paid');
+    route('POST', '/boxes', () => { account('paid', [{ name: 'web-box', state: 'pending' }]); return { status: 202, body: { boxId: 'web-box', state: 'pending' } }; });
+    await boot();
+    el('box-name').value = 'web-box';
+    el('device-key').value = DEVICE_KEY;
+    await click('create');
+    expect(status()).toBe('Box web-box is being checked. Its state shows here within a few minutes.');
+    expect(el('create-error').hidden).toBe(true);
+    expect([...el('boxes-list').querySelectorAll('.box-state')].map(item => item.textContent)).toEqual(['Being created']);
+  });
+
+  it('says plainly that a box is suspended when the plan ended, and offers no start until the plan is paid', async () => {
+    account('free', [{ name: 'held-box', state: 'suspended' }]);
+    await boot();
+    const [item] = [...el('boxes-list').querySelectorAll('li')];
+    expect([...item!.querySelectorAll('.box-state')].map(node => node.textContent)).toEqual(['Suspended']);
+    expect([...item!.querySelectorAll('.box-note')].map(node => node.textContent)).toEqual([
+      'The paid plan ended, so this box was stopped and cannot reach keysentry. Nothing on it was deleted. Start the paid plan again, then start the box here.']);
+    expect([...item!.querySelectorAll('button')]).toEqual([]);
+    expect(el('checkout').hidden).toBe(false);
+  });
+
+  it('starts a stopped box with the CSRF token and shows the server\'s refusal as text', async () => {
+    account('paid', [{ name: 'held-box', state: 'stopped' }]);
+    route('POST', '/boxes/held-box/start', { status: 502, body: { error: 'The box could not be started. Try again in a few minutes.' } });
+    await boot();
+    const start = () => [...el('boxes-list').querySelectorAll('.box-start')][0]!;
+    expect(start().getAttribute('aria-label')).toBe('Start box held-box');
+    start().click();
+    await vi.waitFor(() => expect(status()).toBe('The box could not be started. Try again in a few minutes.'));
+    route('POST', '/boxes/held-box/start', () => { account('paid', [{ name: 'held-box', state: 'active' }]); return { status: 202, body: { boxId: 'held-box', state: 'starting' } }; });
+    start().click();
+    await vi.waitFor(() => expect(status()).toBe('Box held-box is starting.'));
+    const request = sent.filter(item => item.path === '/boxes/held-box/start').at(-1)!;
+    expect(request).toMatchObject({ method: 'POST', body: {} });
+    expect(request.headers['x-csrf-token']).toBe(CSRF);
+    expect([...el('boxes-list').querySelectorAll('.box-state')].map(item => item.textContent)).toEqual(['Created']);
+    expect([...el('boxes-list').querySelectorAll('.box-start')]).toEqual([]);
   });
 
   it('signs out with the CSRF token', async () => {

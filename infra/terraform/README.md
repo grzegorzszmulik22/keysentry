@@ -76,7 +76,7 @@ The service runs the `Dockerfile.control-plane` image by digest, as a public Clo
 (`invoker_iam_disabled`; every route authenticates its own caller: passkey sessions, box attestation tokens, Stripe
 signatures). Its account has bucket-scoped `roles/storage.objectUser` and `secretAccessor` on the two Stripe secrets,
 whose references (never values) the service reads at startup. Only with `live_provisioning = true` does it get a
-create-only custom role in the box project and `roles/iam.serviceAccountUser` on the box service account. It has no
+custom role in the box project that can create, read, stop and start box instances (no delete or reconfigure) and `roles/iam.serviceAccountUser` on the box service account. It has no
 KMS, IAM administration or project-wide storage permission. Uniform bucket access, enforced public-access prevention, versioning, `force_destroy = false` and
 `prevent_destroy` protect the ciphertext store against unintended exposure or removal through this configuration.
 

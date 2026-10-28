@@ -1,18 +1,19 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { parseHandshakeMessage } from '../../../src/box/handshake/index.js';
 import { canonicalJson } from '../../../src/security/index.js';
 import { keyedLock } from './lock.js';
 import type { Storage } from './storage.js';
 
-export interface CiphertextBlob {kind:'sealed-bundle'|'sealed-state'; ciphertext:string; expiresAt:number}
 interface Queued {id:string; sessionId?:string; expiresAt:number; message:unknown}
-/** Per-box index: what the box holds, so quotas never require reading its blobs. */
-interface BoxIndex {v:1; queueBytes:number; queueCount:number; blobs:{id:string; bytes:number; expiresAt:number}[]}
+/** Per-box index: the size of the box's queue, so the global quota never requires reading queues. */
+interface BoxIndex {v:1; queueBytes:number; queueCount:number}
+/**
+ * Short-lived message queues only. There is no blob storage (M-a): nothing in keysentry used it, and a shared blob
+ * quota let a few tenants refuse every other box's disarms.
+ */
 export interface RelayStore {
   publish(boxId:string,message:unknown):Promise<{id:string}>;
   poll(boxId:string,sessionId?:string):Promise<unknown[]>;
-  putBlob(boxId:string,input:{kind:'sealed-bundle'|'sealed-state';ciphertext:string;ttlMs?:number}):Promise<{id:string;expiresAt:number}>;
-  getBlob(boxId:string,id:string):Promise<CiphertextBlob|null>;
   /** Removes expired records for the next few boxes; repeated calls cover every box. */
   sweep():Promise<void>;
 }
@@ -21,16 +22,18 @@ export interface RelayOptions {
   now?:()=>number;
   /** One queued message (canonical JSON). Default 1 MiB, at most 2 MiB. */
   maxMessageBytes?:number;
-  /** Decoded bytes of one blob. Default 2 MiB, at most 4 MiB. */
-  maxBlobBytes?:number;
   maxQueueMessages?:number;
-  /** Stored bytes of one box's queue. Default 4 MiB. */
+  /** Stored bytes of one box's queue. Default 2 MiB, at most 8 MiB. */
   maxQueueBytes?:number;
-  maxBlobsPerBox?:number;
-  /** Stored bytes of one box's blobs. Default 16 MiB. */
-  maxBlobBytesPerBox?:number;
-  /** Stored bytes of every box's queues and blobs together. Default 64 MiB. */
+  /** Stored bytes of every box's queues together. Default 64 MiB. */
   maxTotalBytes?:number;
+  /**
+   * The last part of the global quota, kept for boxes within their share: once usage reaches it, a message that
+   * would take its box's queue above `shareBytes` is refused (507). Default a quarter of `maxTotalBytes`.
+   */
+  reserveBytes?:number;
+  /** A box's share of the reserve. Default 256 KiB (or `maxQueueBytes` when smaller): far above a handshake or a disarm. */
+  shareBytes?:number;
   ttlMs?:number;
   /** Boxes visited by one sweep() call. Default 64. */
   sweepBatch?:number;
@@ -94,11 +97,10 @@ function limit(value:number|undefined,fallback:number,max:number):number {
   return result;
 }
 const bytesOf = (value:unknown) => Buffer.byteLength(JSON.stringify(value));
+/** Older index records may carry other fields (the removed blob list); only the queue size and count are read. */
 function validIndex(value:unknown):value is BoxIndex {
   return record(value) && value.v === 1 && Number.isSafeInteger(value.queueBytes) && (value.queueBytes as number) >= 0
-    && Number.isSafeInteger(value.queueCount) && (value.queueCount as number) >= 0 && Array.isArray(value.blobs)
-    && value.blobs.every(entry=>record(entry) && typeof entry.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(entry.id)
-      && Number.isSafeInteger(entry.bytes) && (entry.bytes as number) > 0 && Number.isSafeInteger(entry.expiresAt));
+    && Number.isSafeInteger(value.queueCount) && (value.queueCount as number) >= 0;
 }
 
 /** Schema/expiry checks only. Endpoints verify signatures, attestations and transcript ordering. */
@@ -106,12 +108,12 @@ export function createRelayStore(options:RelayOptions):RelayStore {
   const {storage} = options;
   const now = options.now ?? Date.now;
   const maxMessage = limit(options.maxMessageBytes,MiB,2*MiB);
-  const maxBlob = limit(options.maxBlobBytes,2*MiB,4*MiB);
   const maxQueue = limit(options.maxQueueMessages,128,128);
-  const maxQueueBytes = limit(options.maxQueueBytes,4*MiB,8*MiB);
-  const maxBlobs = limit(options.maxBlobsPerBox,128,128);
-  const maxBoxBlobBytes = limit(options.maxBlobBytesPerBox,16*MiB,64*MiB);
+  const maxQueueBytes = limit(options.maxQueueBytes,2*MiB,8*MiB);
   const maxTotal = limit(options.maxTotalBytes,64*MiB,1024*MiB);
+  const reserveBytes = limit(options.reserveBytes,Math.max(1,Math.floor(maxTotal/4)),1024*MiB);
+  const shareBytes = limit(options.shareBytes,Math.min(256*1024,maxQueueBytes),8*MiB);
+  if (reserveBytes >= maxTotal || shareBytes > maxQueueBytes) throw new RelayError('Invalid relay limits.');
   const ttl = limit(options.ttlMs,600000,86400000);
   const sweepBatch = limit(options.sweepBatch,64,4096);
 
@@ -130,35 +132,35 @@ export function createRelayStore(options:RelayOptions):RelayStore {
       let total = 0;
       for (const key of await storage.list('relay-index/')) {
         const index = await storage.get<unknown>(key);
-        if (validIndex(index)) total += index.queueBytes + index.blobs.reduce((sum,entry)=>sum+entry.bytes,0);
+        if (validIndex(index)) total += index.queueBytes;
       }
       used = total;
     })().catch(error=>{ loaded = undefined; throw error; });
     return loaded;
   }
-  function reserve(delta:number):void {
-    if (delta > 0 && used + delta > maxTotal) throw new RelayError('Relay storage is full.',507);
-    used = Math.max(0,used+delta);
+  /** Records what storage already holds (expiry, repairs); never refuses. */
+  function track(delta:number):void { used = Math.max(0,used+delta); }
+  /**
+   * M-a: admits `delta` new bytes for a box whose queue would then hold `boxBytes`. The total is a hard limit; its
+   * last `reserveBytes` are only for boxes within their share, so boxes that fill their queues are refused before
+   * they can refuse a small message (a disarm, a handshake) for any other box.
+   */
+  function admit(delta:number,boxBytes:number):void {
+    if (delta <= 0) { track(delta); return; }
+    if (used + delta > maxTotal) throw new RelayError('Relay storage is full.',507);
+    if (used + delta > maxTotal - reserveBytes && boxBytes > shareBytes) throw new RelayError('Relay storage is full.',507);
+    used += delta;
   }
 
   async function readIndex(boxId:string):Promise<BoxIndex> {
     const stored = await storage.get<unknown>(`relay-index/${boxId}`);
-    if (stored === null) return {v:1,queueBytes:0,queueCount:0,blobs:[]};
+    if (stored === null) return {v:1,queueBytes:0,queueCount:0};
     if (!validIndex(stored)) throw new RelayError('Relay storage is unavailable.',503);
-    return stored;
+    return {v:1,queueBytes:stored.queueBytes,queueCount:stored.queueCount};
   }
   async function writeIndex(boxId:string,index:BoxIndex):Promise<void> {
-    if (index.queueCount === 0 && index.blobs.length === 0) await storage.delete(`relay-index/${boxId}`);
+    if (index.queueCount === 0) await storage.delete(`relay-index/${boxId}`);
     else await storage.put(`relay-index/${boxId}`,index);
-  }
-  /** Expired blobs are deleted first, then dropped from the index, so a crash never leaves an unindexed blob. */
-  async function pruneBlobs(boxId:string,index:BoxIndex):Promise<boolean> {
-    const expired = index.blobs.filter(entry=>entry.expiresAt<=now());
-    if (!expired.length) return false;
-    for (const entry of expired) await storage.delete(`blobs/${boxId}/${entry.id}`);
-    index.blobs = index.blobs.filter(entry=>entry.expiresAt>now());
-    reserve(-expired.reduce((sum,entry)=>sum+entry.bytes,0));
-    return true;
   }
   /** Reads the queue, drops expired messages and reconciles the index's queue size with the stored queue. */
   async function queue(boxId:string,index:BoxIndex):Promise<{messages:Queued[];changed:boolean}> {
@@ -171,10 +173,9 @@ export function createRelayStore(options:RelayOptions):RelayStore {
     }
     const bytes = messages.length ? bytesOf(messages) : 0;
     const changed = bytes !== index.queueBytes || messages.length !== index.queueCount;
-    if (changed) { reserve(bytes-index.queueBytes); index.queueBytes = bytes; index.queueCount = messages.length; }
+    if (changed) { track(bytes-index.queueBytes); index.queueBytes = bytes; index.queueCount = messages.length; }
     return {messages,changed};
   }
-
   function message(input:unknown):Queued {
     let json:string;
     try { json = canonicalJson(input); } catch { throw new RelayError('Invalid relay message.'); }
@@ -228,9 +229,9 @@ export function createRelayStore(options:RelayOptions):RelayStore {
       const next = [...messages,queued];
       const bytes = bytesOf(next);
       if (next.length>maxQueue || bytes>maxQueueBytes) throw new RelayError('Relay queue is full.');
-      reserve(bytes-index.queueBytes);
+      admit(bytes-index.queueBytes,bytes);
       try { await storage.put(`relay/${boxId}`,next); }
-      catch (error) { reserve(index.queueBytes-bytes); throw error; }
+      catch (error) { track(index.queueBytes-bytes); throw error; }
       index.queueBytes = bytes; index.queueCount = next.length;
       await writeIndex(boxId,index);
       return {id:queued.id};
@@ -243,52 +244,6 @@ export function createRelayStore(options:RelayOptions):RelayStore {
       if (changed) await writeIndex(boxId,index);
       return messages.filter(item=>sessionId===undefined || item.sessionId===sessionId).map(item=>item.message);
     }); },
-    putBlob(boxId,input) { return withBox(boxId,async()=>{
-      if (!record(input) || !Object.keys(input).every(k=>['kind','ciphertext','ttlMs'].includes(k)) || !['sealed-bundle','sealed-state'].includes(input.kind)
-        || typeof input.ciphertext !== 'string') throw new RelayError('Invalid ciphertext blob.');
-      if (input.ciphertext.length>Math.ceil(maxBlob*4/3)+4 || Buffer.from(input.ciphertext,'base64url').length>maxBlob) throw new RelayError('Ciphertext blob is too large.');
-      const duration = input.ttlMs ?? ttl;
-      if (!binary(input.ciphertext,32,maxBlob) || !Number.isSafeInteger(duration) || duration<1 || duration>86400000) throw new RelayError('Invalid ciphertext blob.');
-      await ready();
-      const index = await readIndex(boxId);
-      const pruned = await pruneBlobs(boxId,index);
-      // Lower-case hex: a blob id in a Cloud Storage URL can never look like a provider key to the egress guard.
-      const blobId = randomBytes(16).toString('hex'), expiresAt = now()+duration;
-      const stored:CiphertextBlob = {kind:input.kind,ciphertext:input.ciphertext,expiresAt};
-      const bytes = bytesOf(stored);
-      const held = index.blobs.reduce((sum,entry)=>sum+entry.bytes,0);
-      if (index.blobs.length>=maxBlobs || held+bytes>maxBoxBlobBytes) {
-        if (pruned) await writeIndex(boxId,index);
-        throw new RelayError('Ciphertext blob storage is full.');
-      }
-      reserve(bytes);
-      // The index entry is written before the blob: a crash leaves a counted entry for a missing blob, never an
-      // uncounted blob.
-      index.blobs.push({id:blobId,bytes,expiresAt});
-      try {
-        await writeIndex(boxId,index);
-        await storage.put(`blobs/${boxId}/${blobId}`,stored);
-      } catch (error) {
-        index.blobs = index.blobs.filter(entry=>entry.id!==blobId);
-        reserve(-bytes);
-        await writeIndex(boxId,index).catch(()=>undefined);
-        throw error;
-      }
-      return {id:blobId,expiresAt};
-    }); },
-    getBlob(boxId,blobId) { return withBox(boxId,async()=>{
-      id(blobId);
-      const blob = await storage.get<CiphertextBlob>(`blobs/${boxId}/${blobId}`);
-      if (!blob) return null;
-      if (!record(blob) || typeof blob.expiresAt !== 'number' || blob.expiresAt<=now()) {
-        await ready();
-        const index = await readIndex(boxId);
-        if (await pruneBlobs(boxId,index)) await writeIndex(boxId,index);
-        else await storage.delete(`blobs/${boxId}/${blobId}`);
-        return null;
-      }
-      return blob;
-    }); },
     async sweep() {
       await ready();
       const boxes = (await storage.list('relay-index/')).map(key=>key.slice('relay-index/'.length));
@@ -299,9 +254,8 @@ export function createRelayStore(options:RelayOptions):RelayStore {
       for (const boxId of batch) {
         await withBox(boxId,async()=>{
           const index = await readIndex(boxId);
-          const pruned = await pruneBlobs(boxId,index);
           const {changed} = await queue(boxId,index);
-          if (pruned || changed) await writeIndex(boxId,index);
+          if (changed) await writeIndex(boxId,index);
         });
       }
     },

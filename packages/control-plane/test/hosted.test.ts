@@ -180,30 +180,35 @@ describe('guarded clients', () => {
     expect(error!.message).not.toMatch(/example\.com|someone-else|refunds|user:pass|142\.250/);
     expect(calls).toEqual([]);
   });
-  it('reaches Compute only with live provisioning, only to create instances in the box project and zone', async () => {
+  it('reaches Compute only with live provisioning: create, read, stop and start box instances in the box project and zone', async () => {
     const { calls, transport } = recorder();
     const http = createHostedHttp(transport, { bucket: 'ks-control-state', compute: { projectId: 'keysentry-box', zone: 'us-central1-a' } });
-    expect((await http.request({ method: 'POST', url: 'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-central1-a/instances', body: '{}' })).status).toBe(200);
-    for (const url of ['https://compute.googleapis.com/compute/v1/projects/other-project/zones/us-central1-a/instances',
-      'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-central1-a/instances/box-one']) {
-      await expect(http.request({ method: 'POST', url })).rejects.toBeInstanceOf(DestinationRefusedError);
-    }
-    await expect(http.request({ method: 'DELETE', url: 'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-central1-a/instances' })).rejects.toThrow();
-    expect(calls).toHaveLength(1);
+    const instances = 'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-central1-a/instances';
+    const allowedCompute: HttpRequest[] = [{ method: 'POST', url: instances, body: '{}' }, { method: 'GET', url: `${instances}/box-one` },
+      { method: 'POST', url: `${instances}/box-one/stop` }, { method: 'POST', url: `${instances}/box-one/start` }];
+    for (const req of allowedCompute) expect((await http.request(req)).status, req.url).toBe(200);
+    for (const req of [
+      { method: 'POST', url: 'https://compute.googleapis.com/compute/v1/projects/other-project/zones/us-central1-a/instances' },
+      { method: 'POST', url: `${instances}/box-one` }, { method: 'DELETE', url: `${instances}/box-one` }, { method: 'DELETE', url: instances },
+      { method: 'POST', url: `${instances}/box-one/delete` }, { method: 'POST', url: `${instances}/box-one/setMetadata` },
+      { method: 'POST', url: `${instances}/box-one/stop/extra` }, { method: 'GET', url: instances },
+      { method: 'GET', url: `${instances}/Box_One` }, { method: 'GET', url: 'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-east1-b/instances/box-one' },
+    ] as HttpRequest[]) await expect(http.request(req), `${req.method} ${req.url}`).rejects.toBeInstanceOf(DestinationRefusedError);
+    expect(calls).toHaveLength(allowedCompute.length);
   });
   it('storage names the control plane writes never look like a provider key to the guard', async () => {
     const { calls, transport } = recorder();
     const http = createHostedHttp(transport, { bucket: 'ks-control-state' });
     const object = (key: string) => `https://storage.googleapis.com/storage/v1/b/ks-control-state/o/${encodeURIComponent(key)}?alt=media`;
-    // Why account and blob ids are hex: a base64url id can contain a key prefix such as re_ and 16 more characters.
+    // Why account ids are hex: a base64url id can contain a key prefix such as re_ and 16 more characters.
     await expect(http.request({ method: 'GET', url: object('accounts/Xre_AAAAAAAAAAAAAAAAAAX') })).rejects.toThrow();
     expect(calls).toEqual([]);
     for (let i = 0; i < 200; i++) {
       const account = randomBytes(32).toString('hex'), session = createHash('sha256').update(randomBytes(32)).digest('hex');
       for (const key of [`accounts/${account}`, `account-sessions/${account}`, `account-boxes/${account}`, `sessions/${session}`,
-        `blobs/box-one/${randomBytes(16).toString('hex')}`, `credentials/${session}`]) await http.request({ method: 'GET', url: object(key) });
+        `credentials/${session}`, 'box-reconcile/box-one', 'box-stops/box-one']) await http.request({ method: 'GET', url: object(key) });
     }
-    expect(calls).toHaveLength(1200);
+    expect(calls).toHaveLength(1400);
   });
   it('the hosted client never follows a redirect', async () => {
     const calls: HttpRequest[] = [];
@@ -361,6 +366,21 @@ describe('hosted process', () => {
     const metadata = (JSON.parse(insert.body!) as { metadata: { items: { key: string; value: string }[] } }).metadata.items;
     expect(Object.fromEntries(metadata.map(item => [item.key, item.value]))).toMatchObject({
       'tee-image-reference': live.KEYSENTRY_BOX_IMAGE_REFERENCE, 'keysentry-box-id': 'box-one', 'keysentry-relay-origin': ORIGIN, 'keysentry-enroll-device-key': deviceKey });
+
+    // Downgrade: the subscription ends, the page says the box is suspended, and Compute is asked to stop it.
+    const ended = JSON.stringify({ id: 'evt_end', type: 'customer.subscription.deleted', created: Math.floor(Date.now() / 1000) + 1, data: { object: {
+      id: 'sub_live', customer: 'cus_live', status: 'canceled' } } });
+    const t2 = Math.floor(Date.now() / 1000);
+    const downgraded = await call(ctx.running.port, '/billing/webhook', { method: 'POST', body: ended, headers: { 'Content-Type': 'application/json',
+      'Stripe-Signature': `t=${t2},v1=${createHmac('sha256', WEBHOOK_SECRET).update(`${t2}.${ended}`).digest('hex')}` } });
+    expect(JSON.parse(downgraded.body)).toMatchObject({ applied: true });
+    await vi.waitFor(() => expect(ctx.calls.some(item => item.url.endsWith('/instances/box-one/stop'))).toBe(true));
+    const stop = ctx.calls.find(item => item.url.endsWith('/instances/box-one/stop'))!;
+    expect(stop).toMatchObject({ method: 'POST', url: 'https://compute.googleapis.com/compute/v1/projects/keysentry-box/zones/us-central1-a/instances/box-one/stop' });
+    expect(stop.headers?.authorization).toBe('Bearer ya29.hosted');
+    expect(stop.body).toBeUndefined();
+    const page = JSON.parse((await call(ctx.running.port, '/account', { headers: { Cookie: user.cookie } })).body) as { plan: string; boxes: unknown[] };
+    expect(page).toMatchObject({ plan: 'free', boxes: [{ name: 'box-one', state: 'suspended' }] });
   });
   it.each([
     [{ KEYSENTRY_CONTROL_ORIGIN: 'http://planted.example' }, 'KEYSENTRY_CONTROL_ORIGIN'],

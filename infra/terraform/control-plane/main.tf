@@ -43,12 +43,12 @@ resource "google_storage_bucket" "ciphertext" {
     }
   }
 
-  # Backstop for the relay's own expiry: blobs live at most 24 hours, queued messages ten minutes and sessions
-  # twelve hours, so anything older is unreachable.
+  # Backstop for the relay's own expiry: queued messages live ten minutes and sessions twelve hours, so anything older
+  # is unreachable. (The relay keeps no blobs.)
   lifecycle_rule {
     condition {
       age            = 2
-      matches_prefix = ["blobs/", "relay/", "sessions/"]
+      matches_prefix = ["relay/", "sessions/"]
     }
     action {
       type = "Delete"
@@ -181,19 +181,24 @@ resource "google_cloud_run_v2_service" "control_plane" {
   ]
 }
 
-# Live provisioning only: exactly the permissions instances.insert needs for the Terraform-shaped box (instance,
-# boot disk, metadata, attached service account, existing subnet), in the box project, and nothing else.
+# Live provisioning only, in the box project, and nothing else: what instances.insert needs for the Terraform-shaped
+# box (instance, boot disk, metadata, attached service account, existing subnet); instances.get to reconcile a
+# reservation whose insert had no definite answer; instances.stop to stop the boxes of an account that stopped paying;
+# instances.start for the owner's start request after paying again. It cannot delete or reconfigure an instance.
 resource "google_project_iam_custom_role" "provision" {
   count       = var.live_provisioning ? 1 : 0
   project     = var.box_project_id
   role_id     = "${replace(var.name_prefix, "-", "_")}_provisioner"
   title       = "keysentry control plane box provisioner"
-  description = "Creates keysentry box instances; cannot read, change or delete them."
+  description = "Creates, reads, stops and starts keysentry box instances; cannot delete or reconfigure them."
   permissions = [
     "compute.disks.create",
     "compute.instances.create",
+    "compute.instances.get",
     "compute.instances.setMetadata",
     "compute.instances.setServiceAccount",
+    "compute.instances.start",
+    "compute.instances.stop",
     "compute.subnetworks.use",
   ]
 }

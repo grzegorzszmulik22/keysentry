@@ -249,6 +249,29 @@ it('provisions Terraform-shaped settings through the real provisioner into the i
   } finally { await local.close(); }
 });
 
+it('models instances.get, stop and start for the instances it created, with no request body', async () => {
+  const local = await startEmulator({ now: () => now });
+  try {
+    const base = `${local.computeOrigin}/compute/v1/projects/${local.policy.projectId}/zones/us-central1-a/instances`;
+    const get = async (name: string) => local.http.request({ method: 'GET', url: `${base}/${name}` });
+    expect((await get('box-one')).status).toBe(404);
+    const body = instance(local, 'box-one');
+    expect((await local.http.request({ method: 'POST', url: base, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).status).toBe(200);
+    expect((await get('box-one')).json()).toMatchObject({ name: 'box-one', status: 'RUNNING', metadata: body.metadata });
+    const stopped = await local.http.request({ method: 'POST', url: `${base}/box-one/stop` });
+    expect(stopped.json()).toMatchObject({ status: 'DONE', operationType: 'stop' });
+    expect((await get('box-one')).json<{ status: string }>().status).toBe('TERMINATED');
+    expect((await local.http.request({ method: 'POST', url: `${base}/box-one/start` })).json()).toMatchObject({ operationType: 'start' });
+    expect((await get('box-one')).json<{ status: string }>().status).toBe('RUNNING');
+    expect((await local.http.request({ method: 'POST', url: `${base}/box-one/stop`, headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(400);
+    expect((await local.http.request({ method: 'GET', url: `${base}/box-one/stop` })).status).toBe(405);
+    expect((await local.http.request({ method: 'POST', url: `${base}/box-two/stop` })).status).toBe(404);
+    expect((await local.http.request({ method: 'GET', url: `${local.computeOrigin}/compute/v1/projects/other-project/zones/us-central1-a/instances/box-one` })).status).toBe(404);
+    expect(await raw(`${base}/box-one`)).toBe(403);
+    expect((await get('box-one')).json<{ status: string }>().status).toBe('RUNNING');
+  } finally { await local.close(); }
+});
+
 it('boots a concurrently requested instance name once and permits retry after a failed boot', async () => {
   let starts = 0, failBoot = false;
   const local = await startEmulator({ startBox: async () => {

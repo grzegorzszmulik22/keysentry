@@ -65,6 +65,8 @@ const CALLER_HEADER = 'x-keysentry-emulator-token';
 const PRODUCTION_IMAGE = /^projects\/confidential-space-images\/global\/images\/(?:family\/confidential-space|confidential-space-[0-9]+)$/;
 const MAX_BODY = 512 * 1024;
 type Body = Record<string, unknown>;
+/** Compute's instance lifecycle as far as the emulator models it. */
+type InstanceStatus = 'PROVISIONING' | 'RUNNING' | 'TERMINATED';
 class RequestError extends Error {
   constructor(readonly status: number) { super('Emulator request was refused.'); }
 }
@@ -169,7 +171,8 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
   let previousToken: string | undefined;
   const issued = new Map<string, { claims: AttestationClaims; expiresAt: number }>();
   const kmsKeys = new Map<string, Buffer>([[release.keyName, randomBytes(32)]]);
-  const instances = new Set<string>();
+  // Compute's instances by `project/zone/name`: the accepted insert body and the lifecycle status.
+  const instances = new Map<string, { body: Body; status: InstanceStatus }>();
   let closed = false;
   const callerToken = randomBytes(32).toString('base64url');
   let expectedHost = '';
@@ -276,6 +279,24 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
       if (typeof presented !== 'string' || presented.length !== callerToken.length
         || !timingSafeEqual(Buffer.from(presented), Buffer.from(callerToken))) throw new RequestError(403);
       if (path === '/v1/token' && req.method === 'GET') { send(res, 200, mintToken({ audience: 'https://sts.googleapis.com', nonces: [] }), true); return; }
+      // instances.get, instances.stop and instances.start: no request body. Stopping and starting change only the
+      // recorded status (the injected box is booted on insert alone); nothing is ever deleted.
+      const one = /^\/compute\/v1\/projects\/([A-Za-z0-9_-]+)\/zones\/([A-Za-z0-9_-]+)\/instances\/([A-Za-z0-9_-]+)(\/stop|\/start)?$/.exec(path ?? '');
+      if (one) {
+        const [, project, zone, name, action] = one;
+        if ((action === undefined ? req.method !== 'GET' : req.method !== 'POST')) throw new RequestError(405);
+        const length = req.headers['content-length'];
+        if ((length !== undefined && length !== '0') || req.headers['transfer-encoding'] !== undefined) throw new RequestError(400);
+        const instance = project === identity.projectId ? instances.get(`${project}/${zone}/${name}`) : undefined;
+        if (!instance) throw new RequestError(404);
+        if (action === undefined) {
+          send(res, 200, { kind: 'compute#instance', id: '987654321', name, zone: `projects/${project}/zones/${zone}`, status: instance.status,
+            machineType: instance.body.machineType, metadata: structuredClone(instance.body.metadata) }); return;
+        }
+        instance.status = action === '/stop' ? 'TERMINATED' : 'RUNNING';
+        send(res, 200, { name: `operation-${randomBytes(8).toString('hex')}`, status: 'DONE', targetLink: `projects/${project}/zones/${zone}/instances/${name}`,
+          operationType: action.slice(1) }); return;
+      }
       if (req.method !== 'POST') throw new RequestError(404);
       const body = await readBody(req);
       if (path === '/v1/token') {
@@ -304,10 +325,12 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
         const name = body.name as string;
         const instanceKey = `${compute[1]}/${compute[2]}/${name}`;
         if (instances.has(instanceKey)) throw new RequestError(409);
-        instances.add(instanceKey);
+        const record = { body: structuredClone(body), status: 'PROVISIONING' as InstanceStatus };
+        instances.set(instanceKey, record);
         try {
           await options.startBox?.({ projectId: compute[1]!, zone: compute[2]!, instanceName: name, instance: structuredClone(body) });
         } catch { instances.delete(instanceKey); throw new RequestError(400); }
+        record.status = 'RUNNING';
         send(res, 200, { name: `operation-${randomBytes(8).toString('hex')}`, status: 'DONE', targetLink: `projects/${instanceKey}`, operationType: 'insert' }); return;
       }
       throw new RequestError(404);

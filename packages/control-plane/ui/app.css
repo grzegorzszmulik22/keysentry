@@ -152,6 +152,8 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .box-name { font-family: var(--font-mono); font-size: 0.9375em; }
 .box-state { color: var(--muted); }
 .box-state[data-state="active"] { color: var(--ok); }
+.box-state[data-state="suspended"] { color: var(--attention); font-weight: 600; }
+.box-note { flex-basis: 100%; margin: 0; color: var(--muted); font-size: var(--text-small); }
 
 @media (max-width: 560px) {
   .app-header, .page { padding-inline: var(--space-4); }

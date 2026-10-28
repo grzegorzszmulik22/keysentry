@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { isIP } from 'node:net';
 import { verifyAttestation, type JwksFetcher } from '../../../src/box/attestation/index.js';
 import { Lru } from './lock.js';
-import { isBoxName, isDeviceKey } from './provision.js';
+import { isBoxName, isDeviceKey, type InstanceState } from './provision.js';
 import { UI_ASSETS } from './ui-assets.js';
 
 interface Session { accountId: string; id: string; csrf: string }
@@ -17,10 +17,26 @@ export interface AccountsService {
   authenticate(cookie: string | undefined): Session | null | Promise<Session | null>;
   clearSession(cookie: string | undefined): void | Promise<void>;
   ownsBox(accountId: string, boxId: string): Promise<boolean>;
-  /** H1: plan, quota and name checks plus a pending ownership record, before any Compute call. */
-  reserveBox?(accountId: string, boxId: string): Promise<void>;
+  /** H1/N1: plan, quota and name checks plus a pending ownership record, before any Compute call. */
+  reserveBox?(accountId: string, boxId: string, deviceKey?: string): Promise<void>;
+  /** Idempotent: Compute accepted the instance. */
   confirmBox?(accountId: string, boxId: string): Promise<void>;
+  /** Only after a definite refusal from Compute (no instance was created). */
   releaseBox?(accountId: string, boxId: string): Promise<void>;
+  /** N1: no definite outcome; the name stays held until reconciliation settles it. */
+  holdBox?(accountId: string, boxId: string): Promise<void>;
+  /** Names awaiting reconciliation (`reconcile`) or a stop request (`stops`). */
+  boxQueue?(kind: 'reconcile' | 'stops'): Promise<string[]>;
+  /** A pending reservation nothing in this process is provisioning, or null. */
+  pendingBox?(boxId: string): Promise<{ accountId: string; reservation: string; deviceKey?: string; ageMs: number } | null>;
+  settleBox?(boxId: string, reservation: string, outcome: 'present' | 'absent' | 'foreign'): Promise<boolean>;
+  /** Downgrade: `suspended` refuses the box's relay access. */
+  boxAccess?(boxId: string): Promise<'allowed' | 'suspended' | 'none'>;
+  stopDue?(boxId: string): Promise<boolean>;
+  markStopped?(boxId: string): Promise<void>;
+  /** Refuses (402 unpaid, 403 not this account's active box) a start request from the owner's page. */
+  startTarget?(accountId: string, boxId: string): Promise<void>;
+  markStarted?(boxId: string): Promise<void>;
   /** Owner of an active box; the default existence check for attested boxes. */
   boxOwner?(boxId: string): Promise<string | null>;
   /** True when checking this cookie needs no storage read. */
@@ -33,9 +49,14 @@ export interface AccountsService {
 interface RelayService {
   publish(boxId:string,message:unknown):Promise<{id:string}>;
   poll(boxId:string,sessionId?:string):Promise<unknown[]>;
-  putBlob(boxId:string,input:{kind:'sealed-bundle'|'sealed-state';ciphertext:string;ttlMs?:number}):Promise<{id:string;expiresAt:number}>;
-  getBlob(boxId:string,id:string):Promise<unknown|null>;
   sweep?():Promise<void>;
+}
+/** `createProvisioner`. Without `inspect`, `stop` or `start` the matching lifecycle step is skipped (or answers 503). */
+export interface BoxProvisioner {
+  provision(input:{name:string;deviceKey:string}):Promise<unknown>;
+  inspect?(name:string):Promise<InstanceState>;
+  stop?(name:string):Promise<unknown>;
+  start?(name:string):Promise<unknown>;
 }
 /**
  * A hosted box authenticates with a Confidential Space attestation token whose audience is this server's origin
@@ -73,7 +94,12 @@ export interface ControlPlaneServerOptions {
     checkout?(input:{accountId:string;origin:string}):Promise<{url:string}>;
   };
   relay: RelayService;
-  provisioner?: {provision(input:{name:string;deviceKey:string}):Promise<unknown>};
+  provisioner?: BoxProvisioner;
+  /**
+   * N1: reconciliation releases a reservation whose instance Compute does not know only once the reservation is this
+   * old, so an insert Compute accepted moments ago is not mistaken for a refusal. Default two minutes.
+   */
+  reconcileSettleMs?: number;
   boxAttestation?: BoxAttestationOptions;
   /** Without it the socket peer is the client; forwarded headers are never trusted. */
   trustedProxy?: TrustedProxy;
@@ -183,7 +209,7 @@ function jsonRecord(body:Buffer):Record<string,unknown> {
 }
 type Route =
   | {kind:'health'} | {kind:'session'} | {kind:'webhook'} | {kind:'boxes'} | {kind:'auth';path:string}
-  | {kind:'messages';boxId:string;sessionId?:string} | {kind:'blobs';boxId:string} | {kind:'blob';boxId:string;blobId:string}
+  | {kind:'messages';boxId:string;sessionId?:string} | {kind:'start';boxId:string}
   | {kind:'asset';path:string} | {kind:'account'} | {kind:'checkout'};
 function route(raw:string):Route|null {
   // Cloud Run reserves some paths ending in `z`, so `/health` is the hosted health path; `/healthz` stays for loopback.
@@ -199,18 +225,16 @@ function route(raw:string):Route|null {
   if (['/auth/register/challenge','/auth/register/finish','/auth/login/challenge','/auth/login/finish'].includes(raw)) return {kind:'auth',path:raw};
   const message=/^\/boxes\/([A-Za-z0-9_-]{1,128})\/messages(?:\?sessionId=([A-Za-z0-9_-]{1,128}))?$/.exec(raw);
   if (message) return {kind:'messages',boxId:message[1]!,...(message[2]===undefined?{}:{sessionId:message[2]})};
-  const blobs=/^\/boxes\/([A-Za-z0-9_-]{1,128})\/blobs$/.exec(raw);
-  if (blobs) return {kind:'blobs',boxId:blobs[1]!};
-  const blob=/^\/boxes\/([A-Za-z0-9_-]{1,128})\/blobs\/([A-Za-z0-9_-]{1,128})$/.exec(raw);
-  if (blob) return {kind:'blob',boxId:blob[1]!,blobId:blob[2]!};
+  const start=/^\/boxes\/([A-Za-z0-9_-]{1,128})\/start$/.exec(raw);
+  if (start) return {kind:'start',boxId:start[1]!};
   return null;
 }
 const METHODS:Record<Route['kind'],string[]> = {
-  health:['GET'], blob:['GET'], session:['GET','DELETE'], messages:['GET','POST'],
-  webhook:['POST'], boxes:['POST'], auth:['POST'], blobs:['POST'], asset:['GET'], account:['GET'], checkout:['POST'],
+  health:['GET'], session:['GET','DELETE'], messages:['GET','POST'], start:['POST'],
+  webhook:['POST'], boxes:['POST'], auth:['POST'], asset:['GET'], account:['GET'], checkout:['POST'],
 };
 /** Credentialed routes that accept only a browser session (never a box credential). */
-const SESSION_ONLY = new Set<Route['kind']>(['session','boxes','account','checkout']);
+const SESSION_ONLY = new Set<Route['kind']>(['session','boxes','account','checkout','start']);
 type Principal = {kind:'box';boxId:string} | {kind:'session';session:Session} | {kind:'none';presented:boolean};
 const sha256 = (value:string) => createHash('sha256').update(value).digest('hex');
 function budgetOf(value:number|undefined,fallback:number):number {
@@ -219,7 +243,7 @@ function budgetOf(value:number|undefined,fallback:number):number {
   return result;
 }
 
-/** JSON transport only. It does not decrypt blobs, verify device authority or run a box. */
+/** JSON transport only: it never sees plaintext, never verifies device authority and never runs a box. */
 export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
   let origin=publicOrigin(opts.origin);
   let accountService=typeof opts.accounts==='function'?null:opts.accounts;
@@ -237,6 +261,8 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
   const perAddress=budgetOf(opts.maxConnectionsPerAddress,64);
   const now=opts.now ?? Date.now;
   const trusted=opts.trustedProxy;
+  const settleMs=opts.reconcileSettleMs ?? 120_000;
+  if (!Number.isSafeInteger(settleMs) || settleMs<0 || settleMs>86_400_000) throw new TypeError('Invalid control plane configuration.');
   if ((host !== 'localhost' && !isIP(host)) || !Number.isInteger(port) || port<0 || port>65535 || !Number.isSafeInteger(max) || max<1 || max>4*1024*1024
     || (trusted !== undefined && (typeof trusted.header !== 'string' || !/^[a-z0-9-]{1,64}$/.test(trusted.header) || !Number.isSafeInteger(trusted.hops) || trusted.hops<1 || trusted.hops>10))) {
     throw new TypeError('Invalid control plane configuration.');
@@ -357,6 +383,54 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
     if(who.kind!=='session') fail(401,'Sign in to continue.');
     return who.session;
   }
+  /**
+   * N1 reconciliation of one name: asks Compute (`instances.get`) about a pending reservation that nothing in this
+   * process is provisioning. Its own instance (same box id and enrollment key) confirms it. An instance that is not
+   * its own, or none once the reservation is `reconcileSettleMs` old, releases it. No answer keeps it pending.
+   */
+  async function reconcile(name:string):Promise<void> {
+    const service=accountService;
+    if(!opts.provisioner?.inspect||!service?.pendingBox||!service.settleBox) return;
+    const pending=await service.pendingBox(name);
+    if(!pending) return;
+    let found:InstanceState;
+    try{found=await opts.provisioner.inspect(name);}catch{return;}
+    const outcome=found.exists
+      ? (found.boxId===name&&(pending.deviceKey===undefined||found.deviceKey===pending.deviceKey)?'present':'foreign')
+      : pending.ageMs>=settleMs?'absent':null;
+    // An instance this control plane has no record of holds the name: one log line (status only) for the operator.
+    if(outcome==='foreign') log('cleanup',409);
+    if(outcome) await service.settleBox(name,pending.reservation,outcome);
+  }
+  /** Downgrade: asks Compute (`instances.stop`) to stop a box whose account is no longer paid. Nothing is deleted. */
+  async function stopUnpaid(name:string):Promise<void> {
+    const service=accountService;
+    if(!opts.provisioner?.stop||!service?.stopDue||!service.markStopped) return;
+    if(!await service.stopDue(name)) return;
+    try{await opts.provisioner.stop(name);}catch{log('cleanup',502);return;}
+    await service.markStopped(name);
+  }
+  // The minute sweep's box work: a bounded batch of reconciliations and stops per run; failures are retried next run.
+  const BOX_BATCH=32;
+  const cursors={reconcile:'',stops:''};
+  let maintaining:Promise<void>|undefined;
+  function maintain():Promise<void> {
+    maintaining??=(async()=>{
+      const service=accountService;
+      if(!service?.boxQueue) return;
+      for(const kind of ['reconcile','stops'] as const) {
+        const names=(await service.boxQueue(kind)).filter(name=>isBoxName(name)).sort();
+        let candidates=names.filter(name=>name>cursors[kind]);
+        if(!candidates.length) candidates=names;
+        const batch=candidates.slice(0,BOX_BATCH);
+        cursors[kind]=candidates.length>BOX_BATCH?batch[batch.length-1]!:'';
+        for(const name of batch) {
+          try{await (kind==='reconcile'?reconcile(name):stopUnpaid(name));}catch{log('cleanup',500);}
+        }
+      }
+    })().finally(()=>{maintaining=undefined;});
+    return maintaining;
+  }
   const open=new Map<string,number>();
   const server=createServer({maxHeaderSize:16*1024},(req,res)=>{void handle(req,res);});
   server.requestTimeout=15_000;
@@ -378,7 +452,7 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
       const target=route(req.url??'');
       let who:Principal={kind:'none',presented:false};
       if(target?.kind==='webhook') {if(!take(`webhook:${client}`,webhookBudget)) limited(res,webhookBudget);}
-      else if(target&&['session','boxes','account','checkout','messages','blobs','blob'].includes(target.kind)) {
+      else if(target&&['session','boxes','account','checkout','messages','start'].includes(target.kind)) {
         const resolved=await principal(req,res,client,SESSION_ONLY.has(target.kind));
         who=resolved.who;
         if(who.kind==='box') {if(!take(`box:${who.boxId}`,boxBudget)) limited(res,boxBudget);}
@@ -404,7 +478,10 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
           if((error as {status?:unknown}|null)?.status===503) fail(503,'Billing is temporarily unavailable.');
           fail(400,'Webhook could not be verified.');
         }
-        send(req,res,200,result);return;
+        send(req,res,200,result);
+        // A plan change may have queued stops; request them now rather than at the next minute sweep.
+        void maintain().catch(()=>log('cleanup',500));
+        return;
       }
       if(target.kind==='auth') {
         browserOrigin(req);
@@ -469,40 +546,65 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
         if(!isBoxName(body.name)) fail(400,'Box names use lowercase letters, digits and hyphens, and start with a letter.');
         if(!isDeviceKey(body.deviceKey)) fail(400,'The enrollment device key is invalid.');
         const name=body.name, deviceKey=body.deviceKey;
-        // H1: plan, quota and a pending name reservation come before Compute; a failed provision releases it.
-        try{await service.reserveBox(active.accountId,name);}
+        // N1: an earlier reservation of this name that nothing here is provisioning is settled with Compute first.
+        await reconcile(name).catch(()=>log('cleanup',500));
+        // H1: plan, quota and a pending name reservation come before Compute. A name in flight is refused (409).
+        try{await service.reserveBox(active.accountId,name,deviceKey);}
         catch(error){
-          const status=(error as {status?:unknown}|null)?.status;
-          if(status===402) fail(402,'A paid plan is required to create a box.');
-          if(status===403) fail(403,'This account has reached its box limit.');
-          if(status===409) fail(409,'That box name is taken.');
+          const refusal=error as {status?:unknown;pending?:unknown}|null;
+          if(refusal?.status===402) fail(402,'A paid plan is required to create a box.');
+          if(refusal?.status===403) fail(403,'This account has reached its box limit.');
+          if(refusal?.status===409) fail(409,refusal.pending===true?'That box is still being created or checked. Try again in a few minutes.':'That box name is taken.');
           throw error;
         }
         let operation:unknown;
         try{operation=await opts.provisioner.provision({name,deviceKey});}
-        catch{await service.releaseBox(active.accountId,name).catch(()=>undefined);fail(502,'The box could not be created. Try again in a few minutes.');}
+        catch(error){
+          // N1: only a definite refusal (no instance was created) releases the name. A 409, a timeout or any other
+          // unknown outcome keeps it held, counted against the quota, until reconciliation settles it.
+          if((error as {outcome?:unknown}|null)?.outcome==='refused') {
+            await service.releaseBox(active.accountId,name).catch(()=>log('cleanup',500));
+            fail(502,'The box could not be created. Try again in a few minutes.');
+          }
+          await service.holdBox?.(active.accountId,name).catch(()=>log('cleanup',500));
+          send(req,res,202,{boxId:name,state:'pending'});return;
+        }
         await service.confirmBox(active.accountId,name);
         send(req,res,201,{boxId:name,operation});return;
       }
+      if(target.kind==='start') {
+        // The owner's page restarts a stopped box once the plan is paid again (`instances.start`).
+        const active=signedIn(who);csrf(req,active);
+        const body=jsonRecord(await rawBody(req,Math.min(max,1024)));exact(body,[]);
+        const service=accounts();
+        if(!opts.provisioner?.start||!service.startTarget) fail(503,'Starting boxes is not available yet.');
+        try{await service.startTarget(active.accountId,target.boxId);}
+        catch(error){
+          const status=(error as {status?:unknown}|null)?.status;
+          if(status===402) fail(402,'A paid plan is required to start a box.');
+          if(status===403) fail(403,'Box access is not allowed.');
+          throw error;
+        }
+        try{await opts.provisioner.start(target.boxId);}
+        catch{fail(502,'The box could not be started. Try again in a few minutes.');}
+        await service.markStarted?.(target.boxId);
+        send(req,res,202,{boxId:target.boxId,state:'starting'});return;
+      }
       const boxId=target.boxId;
-      if(who.kind==='box') {if(who.boxId!==boxId) fail(403,'Box access is not allowed.');}
+      if(who.kind==='box') {
+        if(who.boxId!==boxId) fail(403,'Box access is not allowed.');
+        // Downgrade: whatever credential it holds (bearer or attestation token), a box whose account has no paid plan
+        // has no relay access. Checked on every request, so a cached attestation cannot outlive a suspension.
+        const service=accounts();
+        if(service.boxAccess&&await service.boxAccess(boxId)==='suspended') fail(403,'This box is suspended: its account has no paid plan.');
+      }
       else if(who.kind==='session') {
         if(!await accounts().ownsBox(who.session.accountId,boxId)) fail(403,'Box access is not allowed.');
         if(req.method!=='GET') csrf(req,who.session);
       }
       else fail(401,'Sign in to continue.');
-      if(target.kind==='messages') {
-        if(req.method==='GET'){send(req,res,200,{messages:await opts.relay.poll(boxId,target.sessionId)});return;}
-        send(req,res,201,await opts.relay.publish(boxId,jsonRecord(await rawBody(req,max))));return;
-      }
-      if(target.kind==='blobs') {
-        const body=jsonRecord(await rawBody(req,max));exact(body,['kind','ciphertext'],['ttlMs']);
-        if((body.kind!=='sealed-bundle'&&body.kind!=='sealed-state')||typeof body.ciphertext!=='string'||(body.ttlMs!==undefined&&typeof body.ttlMs!=='number')) fail(400);
-        send(req,res,201,await opts.relay.putBlob(boxId,{kind:body.kind,ciphertext:body.ciphertext,ttlMs:body.ttlMs as number|undefined}));return;
-      }
-      const stored=await opts.relay.getBlob(boxId,target.blobId);
-      if(stored===null) fail(404,'Not found.');
-      send(req,res,200,stored);
+      if(req.method==='GET'){send(req,res,200,{messages:await opts.relay.poll(boxId,target.sessionId)});return;}
+      send(req,res,201,await opts.relay.publish(boxId,jsonRecord(await rawBody(req,max))));
     }catch(error) {
       if(res.headersSent){res.end();return;}
       if(error instanceof HttpError){send(req,res,error.status,{error:error.message});return;}
@@ -515,7 +617,10 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
   const cleanup=setInterval(()=>{
     if(sweeping) return;
     sweeping=true;
-    void (opts.relay.sweep?.()??Promise.resolve()).catch(()=>log('cleanup',500)).finally(()=>{sweeping=false;});
+    void Promise.all([
+      (opts.relay.sweep?.()??Promise.resolve()).catch(()=>log('cleanup',500)),
+      maintain().catch(()=>log('cleanup',500)),
+    ]).finally(()=>{sweeping=false;});
   },60_000);
   cleanup.unref();
   return {
@@ -558,5 +663,7 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
       return token;
     },
     revokeBoxToken(boxId:string):void {const previous=bearerOf.get(boxId);if(previous)bearers.delete(previous);bearerOf.delete(boxId);},
+    /** Runs the minute sweep's box work now (reconciliation and stop requests); the timer calls the same. */
+    maintain,
   };
 }

@@ -224,8 +224,9 @@ describe('H1: box reservations', () => {
     await paid(ctx); await paid(other);
     await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
     await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-two')).rejects.toMatchObject({ status: 403 });
-    await expect(ctx.accounts.reserveBox(other.account.id, 'box-one')).rejects.toMatchObject({ status: 409 });
-    await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
+    await expect(ctx.accounts.reserveBox(other.account.id, 'box-one')).rejects.toMatchObject({ status: 409, pending: false });
+    // N1: a reservation still in flight is never reserved again, not even by its own account.
+    await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-one')).rejects.toMatchObject({ status: 409, pending: true });
     await ctx.accounts.releaseBox(ctx.account.id, 'box-one');
     await other.accounts.reserveBox(other.account.id, 'box-one');
     await ctx.accounts.reserveBox(ctx.account.id, 'box-two');
@@ -240,6 +241,157 @@ describe('H1: box reservations', () => {
     await paid(ctx);
     await accounts.reserveBox(ctx.account.id, 'box-one'); await accounts.reserveBox(ctx.account.id, 'box-two');
     await expect(accounts.reserveBox(ctx.account.id, 'box-three')).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe('N1: reservations in flight, uncertain outcomes and reconciliation', () => {
+  const key = generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+  async function paidAccount(boxQuota = 1) {
+    let now = 1_000_000;
+    const storage = memory();
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => now, boxQuota });
+    const ctx = await signup({ accounts, storage, advance(ms: number) { now += ms; } });
+    await accounts.setPlan(ctx.account.id, 'paid');
+    return ctx;
+  }
+  test('confirmBox is idempotent, and records an instance whose reservation record is gone', async () => {
+    const ctx = await paidAccount(2);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-one');
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-one');
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'active' }]);
+    expect(await ctx.storage.list('box-reconcile/')).toEqual([]);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-two', key);
+    await ctx.storage.delete('box-owners/box-two');
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-two');
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-two')).toBe(true);
+    const other = await signup(ctx);
+    await expect(ctx.accounts.confirmBox(other.account.id, 'box-two')).rejects.toThrow('Account request could not be verified.');
+  });
+  test('a held reservation is offered to reconciliation only when nothing in this process provisions it', async () => {
+    const ctx = await paidAccount();
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    expect(await ctx.accounts.pendingBox('box-one')).toBeNull();
+    expect(await ctx.accounts.boxQueue('reconcile')).toEqual(['box-one']);
+    await ctx.accounts.holdBox(ctx.account.id, 'box-one');
+    ctx.advance(5_000);
+    const pending = await ctx.accounts.pendingBox('box-one');
+    expect(pending).toEqual({ accountId: ctx.account.id, reservation: expect.stringMatching(/^[a-f0-9]{24}$/), deviceKey: key, ageMs: 5_000 });
+    await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-one', key)).rejects.toMatchObject({ status: 409, pending: true });
+    await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-two', key)).rejects.toMatchObject({ status: 403 });
+    expect(await ctx.accounts.settleBox('box-one', 'f'.repeat(24), 'present')).toBe(false);
+    expect(await ctx.accounts.settleBox('box-one', pending!.reservation, 'present')).toBe(true);
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(true);
+    expect(await ctx.accounts.boxQueue('reconcile')).toEqual([]);
+    expect(await ctx.accounts.settleBox('box-one', pending!.reservation, 'absent')).toBe(false);
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(true);
+  });
+  test.each(['absent', 'foreign'] as const)('settling %s frees the name and the quota slot, and an older answer never settles a newer reservation', async outcome => {
+    const ctx = await paidAccount();
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    await ctx.accounts.holdBox(ctx.account.id, 'box-one');
+    const old = (await ctx.accounts.pendingBox('box-one'))!;
+    expect(await ctx.accounts.settleBox('box-one', old.reservation, outcome)).toBe(true);
+    expect(await ctx.accounts.overview(ctx.account.id)).toMatchObject({ boxes: [] });
+    expect(await ctx.storage.list('box-')).toEqual([]);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    await ctx.accounts.holdBox(ctx.account.id, 'box-one');
+    expect(await ctx.accounts.settleBox('box-one', old.reservation, outcome)).toBe(false);
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'pending' }]);
+  });
+  test('a definite refusal releases; an active box is never released or held', async () => {
+    const ctx = await paidAccount();
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    await ctx.accounts.releaseBox(ctx.account.id, 'box-one');
+    expect(await ctx.storage.list('box-')).toEqual([]);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-one');
+    await ctx.accounts.releaseBox(ctx.account.id, 'box-one');
+    await ctx.accounts.holdBox(ctx.account.id, 'box-one');
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(true);
+    expect(await ctx.accounts.pendingBox('box-one')).toBeNull();
+  });
+  test('the sweep index drops entries whose reservation is gone, and repairs one already active', async () => {
+    const ctx = await paidAccount();
+    await ctx.storage.put('box-reconcile/ghost-box', { v: 1 });
+    expect(await ctx.accounts.pendingBox('ghost-box')).toBeNull();
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one', key);
+    // A crash between writing the active owner record and the rest of confirmBox.
+    await ctx.storage.put('box-owners/box-one', { accountId: ctx.account.id, state: 'active', since: new Date(0).toISOString() });
+    expect(await ctx.accounts.pendingBox('box-one')).toBeNull();
+    expect(await ctx.accounts.boxQueue('reconcile')).toEqual([]);
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'active' }]);
+  });
+  test('refuses a device key that is not base64', async () => {
+    const ctx = await paidAccount();
+    for (const bad of ['not a key', 'a'.repeat(200), 'x\ny']) await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-one', bad)).rejects.toThrow('Account request could not be verified.');
+    expect(await ctx.storage.list('box-')).toEqual([]);
+  });
+});
+
+describe('downgrade: suspension, stops and resuming', () => {
+  async function withBox(boxAccessCacheMs?: number) {
+    let now = 1_000_000;
+    const storage = memory();
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => now, ...(boxAccessCacheMs === undefined ? {} : { boxAccessCacheMs }) });
+    const ctx = await signup({ accounts, storage, advance(ms: number) { now += ms; } });
+    await accounts.setPlan(ctx.account.id, 'paid');
+    await accounts.reserveBox(ctx.account.id, 'box-one');
+    expect(await accounts.boxAccess('box-one')).toBe('none');
+    await accounts.confirmBox(ctx.account.id, 'box-one');
+    return ctx;
+  }
+  test('an unpaid account\'s boxes lose relay access and get a queued stop; paying again restores access and offers a start', async () => {
+    const ctx = await withBox();
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('allowed');
+    await ctx.accounts.setPlan(ctx.account.id, 'free');
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('suspended');
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(true);
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'suspended' }]);
+    expect(await ctx.accounts.boxQueue('stops')).toEqual(['box-one']);
+    expect(await ctx.accounts.stopDue('box-one')).toBe(true);
+    await expect(ctx.accounts.startTarget(ctx.account.id, 'box-one')).rejects.toMatchObject({ status: 402 });
+    await ctx.accounts.markStopped('box-one');
+    expect(await ctx.accounts.boxQueue('stops')).toEqual([]);
+    await ctx.accounts.setPlan(ctx.account.id, 'paid');
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('allowed');
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'stopped' }]);
+    await ctx.accounts.startTarget(ctx.account.id, 'box-one');
+    await ctx.accounts.markStarted('box-one');
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'active' }]);
+    expect(await ctx.storage.get('box-owners/box-one')).toMatchObject({ accountId: ctx.account.id, state: 'active' });
+  });
+  test('a plan that comes back before the stop is sent drops the queued stop', async () => {
+    const ctx = await withBox();
+    await ctx.accounts.setPlan(ctx.account.id, 'free');
+    await ctx.accounts.setPlan(ctx.account.id, 'paid');
+    expect(await ctx.accounts.boxQueue('stops')).toEqual([]);
+    await ctx.storage.put('box-stops/box-one', { v: 1 });
+    expect(await ctx.accounts.stopDue('box-one')).toBe(false);
+    expect(await ctx.accounts.boxQueue('stops')).toEqual([]);
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'active' }]);
+  });
+  test('only the owner\'s active box can be started', async () => {
+    const ctx = await withBox();
+    const other = await signup(ctx);
+    await ctx.accounts.setPlan(other.account.id, 'paid');
+    await expect(ctx.accounts.startTarget(other.account.id, 'box-one')).rejects.toMatchObject({ status: 403 });
+    await expect(ctx.accounts.startTarget(ctx.account.id, 'missing-box')).rejects.toMatchObject({ status: 403 });
+    await ctx.accounts.reserveBox(other.account.id, 'box-two');
+    await expect(ctx.accounts.startTarget(other.account.id, 'box-two')).rejects.toMatchObject({ status: 403 });
+  });
+  test('access decisions are cached for boxAccessCacheMs; this process\'s own writes drop them at once', async () => {
+    const ctx = await withBox(30_000);
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('allowed');
+    // Another instance (a rollout) changes the plan behind this one's back.
+    await ctx.storage.put(`accounts/${ctx.account.id}`, { ...await ctx.storage.get<object>(`accounts/${ctx.account.id}`), plan: 'free' });
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('allowed');
+    ctx.advance(30_000);
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('suspended');
+    await ctx.accounts.setPlan(ctx.account.id, 'paid');
+    expect(await ctx.accounts.boxAccess('box-one')).toBe('allowed');
+    expect(await ctx.accounts.boxAccess('Not a box!')).toBe('none');
+    expect(await ctx.accounts.boxAccess('unknown-box')).toBe('none');
   });
 });
 

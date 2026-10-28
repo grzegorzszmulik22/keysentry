@@ -3,7 +3,15 @@
 'use strict';
 
 interface ApiResult { status: number; data: Record<string, unknown> }
-interface BoxView { name: string; state: string }
+type BoxState = 'pending' | 'active' | 'suspended' | 'stopped';
+interface BoxView { name: string; state: BoxState }
+const BOX_STATES: readonly string[] = ['pending', 'active', 'suspended', 'stopped'];
+const STATE_TEXT: Record<BoxState, string> = { pending: 'Being created', active: 'Created', suspended: 'Suspended', stopped: 'Stopped' };
+const STATE_NOTE: Partial<Record<BoxState, string>> = {
+  pending: 'keysentry is creating this box or checking whether it was created. Reload this page in a few minutes.',
+  suspended: 'The paid plan ended, so this box was stopped and cannot reach keysentry. Nothing on it was deleted. Start the paid plan again, then start the box here.',
+  stopped: 'This box was stopped when the paid plan ended. Start it to run the watcher again.',
+};
 type View = 'loading' | 'signed-out' | 'signed-in';
 
 const BOX_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -35,6 +43,7 @@ function show(view: View, focus = false): void {
 function setBusy(value: boolean): void {
   busy = value;
   for (const id of ['sign-up', 'sign-in', 'checkout', 'create', 'sign-out']) (byId<HTMLButtonElement>(id)).disabled = value;
+  for (const button of document.querySelectorAll<HTMLButtonElement>('.box-start')) button.disabled = value;
   byId('main').setAttribute('aria-busy', value ? 'true' : 'false');
 }
 
@@ -168,8 +177,24 @@ function renderBoxes(boxes: BoxView[]): void {
     const state = document.createElement('span');
     state.className = 'box-state';
     state.dataset.state = box.state;
-    state.textContent = box.state === 'active' ? 'Created' : 'Being created';
+    state.textContent = STATE_TEXT[box.state];
     item.append(name, state);
+    const note = STATE_NOTE[box.state];
+    if (note) {
+      const text = document.createElement('p');
+      text.className = 'box-note';
+      text.textContent = note;
+      item.append(text);
+    }
+    if (box.state === 'stopped') {
+      const start = document.createElement('button');
+      start.type = 'button';
+      start.className = 'button secondary box-start';
+      start.textContent = 'Start box';
+      start.setAttribute('aria-label', `Start box ${box.name}`);
+      start.addEventListener('click', guarded(() => startBox(box.name)));
+      item.append(start);
+    }
     return item;
   }));
   list.hidden = boxes.length === 0;
@@ -182,8 +207,8 @@ function render(data: Record<string, unknown>): boolean {
   if (!plan || quota === null || !Array.isArray(data.boxes)) return false;
   const boxes: BoxView[] = data.boxes.flatMap((box: unknown) => {
     const record = box as Record<string, unknown> | null;
-    return record && typeof record.name === 'string' && BOX_NAME.test(record.name) && (record.state === 'active' || record.state === 'pending')
-      ? [{ name: record.name, state: record.state }] : [];
+    return record && typeof record.name === 'string' && BOX_NAME.test(record.name) && typeof record.state === 'string' && BOX_STATES.includes(record.state)
+      ? [{ name: record.name, state: record.state as BoxState }] : [];
   });
   byId('plan-text').textContent = plan === 'paid'
     ? `Paid. This account can run up to ${plural(quota, 'box', 'boxes')}.`
@@ -258,13 +283,21 @@ async function createBox(): Promise<void> {
   }
   fieldError(null, '');
   const result = await api('/boxes', 'POST', { name, deviceKey }, true);
-  if (result.status !== 201) {
+  if (result.status !== 201 && result.status !== 202) {
     fieldError(result.status === 409 ? nameInput : result.status === 400 ? keyInput : null, failure(result, 'The box could not be created. Try again.'));
     return;
   }
   byId<HTMLFormElement>('create-form').reset();
   await load();
-  announce(`Box ${name} is being created.`);
+  // 202: Compute gave no definite answer; the name stays held while keysentry checks whether the box exists.
+  announce(result.status === 201 ? `Box ${name} is being created.` : `Box ${name} is being checked. Its state shows here within a few minutes.`);
+}
+
+async function startBox(name: string): Promise<void> {
+  const result = await api('/boxes/' + encodeURIComponent(name) + '/start', 'POST', {}, true);
+  if (result.status !== 202) { announce(failure(result, 'The box could not be started. Try again in a few minutes.')); return; }
+  await load();
+  announce(`Box ${name} is starting.`);
 }
 
 function guarded(action: () => Promise<void>): () => void {

@@ -24,21 +24,27 @@ Built and tested locally (fakes, happy-dom and the loopback emulator):
 - Stripe webhooks that grant the paid plan only for a paid subscription to the configured price, confirmed through
   the Stripe API, and revoke it on failed payments and subscription status changes.
 - `POST /boxes` gated by the paid plan, a per-account box quota and a name reservation before any Compute call; in the
-  hosted service it creates the instance only with `KEYSENTRY_CONTROL_PLANE_LIVE=1`.
-- The relay, box authentication by Confidential Space attestation token, rate limits, and storage in memory, in a
-  private directory or in a Cloud Storage bucket.
+  hosted service it creates the instance only with `KEYSENTRY_CONTROL_PLANE_LIVE=1`. A name in flight cannot be
+  reserved twice, and a Compute call with no definite outcome keeps the name held until reconciliation
+  (`instances.get`) confirms the instance or frees the name.
+- Downgrade: when an account stops paying, its boxes lose relay access, the page shows them as suspended and the
+  control plane asks Compute to stop them (`instances.stop`). Paying again restores access, and the page starts a
+  stopped box (`instances.start`). Nothing is deleted.
+- The relay (short-lived message queues only, no blob storage), box authentication by Confidential Space attestation
+  token, rate limits, and storage in memory, in a private directory or in a Cloud Storage bucket.
 - Terraform (`infra/terraform/control-plane`) that runs exactly this entry with exactly these settings and grants
   exactly what it uses.
 
 Not verified, because it needs real accounts: Stripe (Checkout Session creation, the restricted key's permissions,
 webhook delivery), Cloud Run (startup, `X-Forwarded-For`, SIGTERM timing), Secret Manager reads, Cloud Storage under
-load, Compute instance creation with the custom role, and the Confidential Space tokens of a real box. See
-`notes/control-plane.md` for the deploy steps and the list.
+load, Compute instance creation, reads, stops and starts with the custom role, and the Confidential Space tokens of a
+real box. See `notes/control-plane.md` for the deploy steps and the list.
 
 Known limits: one instance only (per-box and per-account work is serialized in process and Cloud Storage writes have no
-compare-and-swap, so Terraform pins `max_instance_count = 1`; a revision rollout can briefly run two). No cancel or
-billing-portal link on the page yet (customers cancel through Stripe's emails or support). No route to stop or delete a
-box. Passkeys are bound to the origin's host name, so choose the final domain before anyone signs up.
+compare-and-swap, so Terraform pins `max_instance_count = 1`; a revision rollout can briefly run two, and the other
+instance may then keep a box's relay access for up to 30 seconds after a downgrade). No cancel or billing-portal link
+on the page yet (customers cancel through Stripe's emails or support). No route to delete a box; a box is stopped only
+when its plan ends. Passkeys are bound to the origin's host name, so choose the final domain before anyone signs up.
 
 ## Local validation
 
@@ -76,7 +82,10 @@ inline script, style or event handler, and the script builds the page with DOM n
   page refuses any other host). Stripe returns to `/?checkout=done` or `/?checkout=cancelled`; the plan changes only
   when the verified webhook arrives.
 - Create a box: name plus the device public key `keysentry box card` prints (Ed25519 SPKI DER, base64), checked on the
-  page and again on the server.
+  page and again on the server. A 202 is announced as "being checked".
+- Boxes: each box shows its state (being created, created, suspended, stopped) with a short explanation; a suspended
+  box says the paid plan ended, it was stopped, nothing was deleted, and how to resume. A stopped box on a paid account
+  has a "Start box" button (`POST /boxes/:boxId/start`).
 
 ## Storage
 
@@ -90,15 +99,17 @@ inline script, style or event handler, and the script builds the page with DOM n
   through the injected `HttpClient`, bounded retries with backoff on 429 and 5xx, fixed error text.
   `metadataAccessToken(http)` reads the service account's token from the metadata server and caches it.
 
-Account ids and blob ids are lower-case hex, so an object name in a Cloud Storage URL can never look like a provider key
-to the egress guard (which refuses such URLs).
+Account ids are lower-case hex, so an object name in a Cloud Storage URL can never look like a provider key to the
+egress guard (which refuses such URLs).
 
 ## Relay
 
-`createRelayStore({ storage, now?, ...limits })` exposes `publish`, `poll`, `putBlob`, `getBlob` and `sweep`. Work is
-serialized per box, so one box never delays another. Each box has an index record (`relay-index/<box>`: queue size and
-count, and each blob's size and expiry), so quotas never read blobs; global usage is rebuilt from index records once
-per process. `sweep()` visits a bounded batch of boxes per call (64 by default) and the server runs it every minute.
+`createRelayStore({ storage, now?, ...limits })` exposes `publish`, `poll` and `sweep`: short-lived message queues
+only. There is no blob storage: nothing in keysentry used it, and its shared quota let a few tenants refuse every other
+box's disarms. Work is serialized per box, so one box never delays another. Each box has an index record
+(`relay-index/<box>`: queue size and count), so the global quota never reads queues; global usage is rebuilt from index
+records once per process. `sweep()` visits a bounded batch of boxes per call (64 by default) and the server runs it
+every minute.
 
 Accepted messages:
 
@@ -111,9 +122,12 @@ Accepted messages:
 
 The relay validates shape, encoding, size and expiry only; endpoints verify signatures, attestation and authority.
 
-Default limits: message 1 MiB; queue 128 messages and 4 MiB per box; blob 2 MiB decoded, 128 blobs and 16 MiB stored
-per box; 64 MiB for every box's queues and blobs together (507 when full); ten-minute delivery TTL; blob TTL at most
-24 hours.
+Default limits: message 1 MiB; queue 128 messages and 2 MiB per box; 64 MiB for every box's queues together (507 when
+full); ten-minute delivery TTL. The last quarter of the global quota (`reserveBytes`, 16 MiB) is kept for boxes within
+their share (`shareBytes`, 256 KiB): once usage reaches it, a message that would take its box's queue above the share
+is refused with 507, so boxes that fill their queues are stopped before they can refuse a disarm or a handshake for any
+other box. To use up the reserve, a tenant would need 64 boxes (a paid account each, at the default quota) kept just
+under their share.
 
 ## Accounts
 
@@ -131,9 +145,20 @@ and one-use challenges, and refuses counter regression and cross-account credent
   fails, so a refused registration never burns the passkey.
 - `overview(accountId)` returns `{ accountId, plan, boxes: [{ name, state }], boxQuota }` for `GET /account`, never
   billing identifiers.
-- `reserveBox` (402 unpaid, 403 at quota, 409 name held by another account) writes a pending ownership record;
-  `confirmBox` makes it active; `releaseBox` rolls a pending one back. The quota (default 1) counts pending and active
-  boxes. `ownsBox` and `boxOwner` see active boxes only.
+- `reserveBox(accountId, name, deviceKey)` (402 unpaid, 403 at quota, 409 for any name already held, with `pending`
+  set when it is this account's reservation still in flight or awaiting reconciliation) writes a pending ownership
+  record with a reservation id and the enrollment key, and a `box-reconcile/<name>` index entry. `confirmBox` makes it
+  active and is idempotent; `releaseBox` rolls a pending one back (only after a definite refusal); `holdBox` keeps it
+  pending after a Compute call with no definite outcome. `pendingBox` offers a pending reservation that no request in
+  this process is provisioning to reconciliation, and `settleBox(name, reservation, 'present' | 'absent' | 'foreign')`
+  applies Compute's answer to that same reservation only. The quota (default 1) counts pending and active boxes.
+  `ownsBox` and `boxOwner` see active boxes only.
+- Downgrade: `boxAccess(name)` is `allowed` while the box's account is paid, `suspended` when it is not and `none`
+  without an active owner; it is cached for `boxAccessCacheMs` (30 seconds), and this process's own writes drop the
+  cache at once. `setPlan` from paid to free queues a stop for each active box (`box-stops/<name>`, written before the
+  plan), and from free to paid drops stops not yet sent. `stopDue`, `markStopped`, `startTarget` and `markStarted`
+  serve the server's stop and start steps. `overview` shows each box as `pending`, `active`, `suspended` (no paid plan)
+  or `stopped` (stopped while unpaid, plan paid again). No box record is deleted.
 
 ## Billing
 
@@ -158,8 +183,9 @@ event-id replay record, written only after the event was handled.
 | `customer.subscription.updated` | For the account's current subscription: `unpaid`, `canceled`, `incomplete_expired`, `paused` or another price revoke; `active` and `trialing` with the configured price grant; `past_due` keeps the plan while Stripe retries; `incomplete` changes nothing. An event older than one already applied is ignored; a grant needs the event's `created` time. |
 | `customer.subscription.deleted` | Free, for the account's current subscription. |
 
-The paid plan gates creating boxes; it does not stop running ones. `apiKey` should be a restricted key with Checkout
-Sessions write and Subscriptions read only.
+The paid plan gates creating boxes and keeps them running: when it ends, the account's boxes are suspended and stopped
+(see Accounts and HTTP server). `apiKey` should be a restricted key with Checkout Sessions write and Subscriptions read
+only.
 
 ## HTTP server
 
@@ -177,17 +203,33 @@ equal the origin (DNS rebinding is refused). Pass `accounts: origin => createAcc
 | POST | `/billing/checkout` | Session, Origin and CSRF; body `{}` |
 | POST | `/billing/webhook` | Stripe signature over the raw bytes |
 | POST | `/boxes` | Owner session, Origin and CSRF; body `{ "name", "deviceKey" }` |
-| GET, POST | `/boxes/:boxId/messages` | Owner session, or that box's attestation token or issued bearer |
-| POST | `/boxes/:boxId/blobs` | Same |
-| GET | `/boxes/:boxId/blobs/:blobId` | Same |
+| POST | `/boxes/:boxId/start` | Owner session, Origin and CSRF; body `{}`; the paid plan and this account's active box |
+| GET, POST | `/boxes/:boxId/messages` | Owner session, or that box's attestation token or issued bearer while its account is paid |
 
 Cloud Run reserves some paths that end in `z`, so the hosted health path is `/health`.
 
 `POST /boxes`: `name` must be a Compute instance name (`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`, not `gcp-`) and
-`deviceKey` the owner's enrollment device public key (Ed25519 SPKI DER, base64, 44 bytes); otherwise 400. Then the
-plan, quota and name are checked and the name reserved (402, 403, 409) before the provisioner is called; a failed
-provision releases the reservation and answers 502. Without a provisioner it answers 503 "Creating boxes is not
-available yet."
+`deviceKey` the owner's enrollment device public key (Ed25519 SPKI DER, base64, 44 bytes); otherwise 400. A pending
+reservation of that name that nothing in this process is provisioning is reconciled first (below). Then the plan,
+quota and name are checked and the name reserved (402, 403, 409; a name in flight is refused without a Compute call)
+before the provisioner is called. Compute accepts: 201. A definite refusal (no instance was created: nothing was sent,
+or a 4xx other than 408 and 409): the reservation is released and the answer is 502. Any other outcome (409
+alreadyExists, 408, 5xx, a timeout or transport error, an unreadable reply): the name stays held and counted against
+the quota, and the answer is 202 `{ "boxId", "state": "pending" }`. Without a provisioner it answers 503 "Creating
+boxes is not available yet."
+
+Reconciliation (on the next request for the name, and in the minute sweep for every `box-reconcile/` entry) asks
+Compute for the instance (`instances.get`). An instance with this box id and the reservation's enrollment key confirms
+the box; an instance that is not this reservation's releases the name (it is never adopted); no instance releases the
+name once the reservation is `reconcileSettleMs` old (two minutes), so an insert Compute accepted moments ago is not
+taken for a refusal; no answer keeps it pending.
+
+Downgrade: a box credential (attestation token or bearer) for a box whose account has no paid plan is refused with
+403 "This box is suspended: its account has no paid plan." on every request, so a cached attestation cannot outlive
+the suspension. The minute sweep, and every handled webhook, request a stop (`instances.stop`) for each queued box
+still unpaid; a failed request is retried. `POST /boxes/:boxId/start` asks Compute to start the box (`instances.start`)
+once the plan is paid again (402 unpaid, 403 not this account's active box, 502 when Compute refuses, 503 without a
+provisioner). `server.maintain()` runs the sweep's box work on demand.
 
 Box access: a hosted box presents a Confidential Space token for this server's origin (`relayCredential` in
 `src/box/agent/main.ts`), checked by the shared verifier against `boxAttestation`'s JWKS (or the pinned PKI root),
@@ -229,7 +271,7 @@ Network clients, each wrapping the fetch transport:
 
 | Client | Reaches |
 |---|---|
-| Hosted (egress guard: HTTPS only, DNS names only, no redirects) | `storage.googleapis.com` (this bucket's objects only), `api.stripe.com` (`GET /v1/subscriptions/{id}`, `POST /v1/checkout/sessions`), `www.googleapis.com` (the Confidential Space JWKS URL only) and, only with live provisioning, `compute.googleapis.com` (`POST .../projects/BOX_PROJECT/zones/ZONE/instances`) |
+| Hosted (egress guard: HTTPS only, DNS names only, no redirects) | `storage.googleapis.com` (this bucket's objects only), `api.stripe.com` (`GET /v1/subscriptions/{id}`, `POST /v1/checkout/sessions`), `www.googleapis.com` (the Confidential Space JWKS URL only) and, only with live provisioning, `compute.googleapis.com` in `projects/BOX_PROJECT/zones/ZONE`: `POST .../instances`, `GET .../instances/NAME`, `POST .../instances/NAME/stop` and `POST .../instances/NAME/start` |
 | Metadata | `GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token` with `Metadata-Flavor: Google`, nothing else |
 | Secret Manager (startup only) | `GET` the `:access` URL of the two configured references, nothing else |
 
@@ -256,13 +298,17 @@ barrel, whose audit module imports `src/vault/keys.ts`. They are never called by
 `startEmulator({ policy?, now?, startBox? })` serves attestation, JWKS, STS, KMS and Compute on one `127.0.0.1` port.
 Every request must carry the exact loopback Host; token minting, STS, KMS and Compute also require a random per-start
 secret held only by the emulator's own `http` client. Compute accepts only what Confidential Space would run as a
-keysentry box and calls the injected `startBox(config)`; it never starts a VM.
+keysentry box and calls the injected `startBox(config)`; it never starts a VM. It also models `instances.get` (the
+instance's status and metadata, or 404) and `instances.stop` and `instances.start` (no request body; they change only
+the recorded status).
 
 `createProvisioner({ ..., relayOrigin })` creates the Terraform-shaped TDX instance with metadata
 `tee-image-reference`, `tee-restart-policy`, `keysentry-box-id`, `keysentry-relay-origin` and
-`keysentry-enroll-device-key` (non-secret routing, read by `readBoxRoute`). It refuses live calls unless
-`KEYSENTRY_CONTROL_PLANE_LIVE=1` and an access-token provider are supplied. Network, firewall, box IAM and KMS are
-prerequisites (`infra/terraform/box`).
+`keysentry-enroll-device-key` (non-secret routing, read by `readBoxRoute`). `inspect(name)`, `stop(name)` and
+`start(name)` call `instances.get`, `instances.stop` and `instances.start` (stop and start with an empty body). Failures
+are a `ProvisionError` with fixed text and an `outcome`: `refused` when no instance can have been created, `unknown`
+otherwise. It refuses live calls unless `KEYSENTRY_CONTROL_PLANE_LIVE=1` and an access-token provider are supplied.
+Network, firewall, box IAM and KMS are prerequisites (`infra/terraform/box`).
 
 `startLocalBox({ bootBox, boxId?, enrollmentDeviceKey? })` runs the emulator, a loopback control plane and one box
 provisioned through emulator Compute. `close()` closes both listeners even if the box fails to stop.

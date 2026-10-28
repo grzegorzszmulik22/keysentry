@@ -36,9 +36,12 @@ function endpoints(inner: HttpClient, allowed: readonly Endpoint[]): HttpClient 
 export interface HostedEgressOptions {
   /** The state bucket; only its objects are reachable. */
   bucket: string;
-  /** Only with live provisioning: instance creation in this project and zone. */
+  /** Only with live provisioning: creating, reading, stopping and starting instances in this project and zone. */
   compute?: { projectId: string; zone: string } | null;
 }
+/** A box instance name (the provisioner's `BOX_NAME`). */
+const INSTANCE_NAME = '[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const instances = (compute: { projectId: string; zone: string }) => `/compute/v1/projects/${compute.projectId}/zones/${compute.zone}/instances`;
 
 /**
  * The hosted control plane's HTTPS client: the runtime's egress guard (HTTPS only, DNS names only, no redirects across
@@ -55,7 +58,7 @@ export function createHostedHttp(transport: HttpClient, options: HostedEgressOpt
     { host: 'storage.googleapis.com', owner: 'control-plane-storage', purpose: 'Control-plane state bucket (Cloud Storage JSON API)' },
     { host: 'api.stripe.com', owner: 'control-plane-stripe', purpose: 'Stripe Checkout Sessions and subscription confirmation' },
     { host: 'www.googleapis.com', owner: 'control-plane-attestation', purpose: 'Confidential Space token signing keys' },
-    ...(compute ? [{ host: 'compute.googleapis.com', owner: 'control-plane-compute', purpose: 'Box instance creation (live provisioning)' }] : []),
+    ...(compute ? [{ host: 'compute.googleapis.com', owner: 'control-plane-compute', purpose: 'Box instances: create, read, stop and start (live provisioning)' }] : []),
   ];
   const bucket = options.bucket;
   return endpoints(createGuardedHttp(transport, { rules, maxRedirects: 0 }), [
@@ -65,7 +68,12 @@ export function createHostedHttp(transport: HttpClient, options: HostedEgressOpt
     { method: 'GET', origin: STRIPE, path: /^\/v1\/subscriptions\/[A-Za-z0-9_-]{1,128}$/ },
     { method: 'POST', origin: STRIPE, path: '/v1/checkout/sessions' },
     { method: 'GET', origin: JWKS.origin, path: JWKS.pathname },
-    ...(compute ? [{ method: 'POST' as const, origin: COMPUTE, path: `/compute/v1/projects/${compute.projectId}/zones/${compute.zone}/instances` }] : []),
+    ...(compute ? [
+      { method: 'POST' as const, origin: COMPUTE, path: instances(compute) },
+      // N1 reconciliation (instances.get) and the downgrade stop and owner's start, for one box name each.
+      { method: 'GET' as const, origin: COMPUTE, path: new RegExp(`^${instances(compute)}/${INSTANCE_NAME}$`) },
+      { method: 'POST' as const, origin: COMPUTE, path: new RegExp(`^${instances(compute)}/${INSTANCE_NAME}/(?:stop|start)$`) },
+    ] : []),
   ]);
 }
 

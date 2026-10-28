@@ -1,10 +1,11 @@
 import { request } from 'node:http';
 import { connect } from 'node:net';
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clientKey, createControlPlaneServer } from '../src/server.js';
 import { createAccounts } from '../src/accounts.js';
 import { startEmulator, type Emulator } from '../src/emulator/index.js';
+import { createProvisioner } from '../src/provision.js';
 import { createMemoryStorage } from '../src/storage.js';
 import { encode } from '../../../test/approvals/webauthn/helpers.js';
 import type { HttpClient } from '../../../src/types.js';
@@ -33,18 +34,17 @@ function services() {
       ownsBox: async (accountId: string, boxId: string) => ownership.get(boxId) === accountId && !pending.has(boxId),
       reserveBox: async (accountId: string, boxId: string) => {
         if (plan !== 'paid') throw Object.assign(new Error('unpaid'), {status:402});
-        if (ownership.has(boxId) && (ownership.get(boxId) !== accountId || !pending.has(boxId))) throw Object.assign(new Error('taken'), {status:409});
+        if (ownership.has(boxId)) throw Object.assign(new Error('taken'), {status:409, pending:ownership.get(boxId) === accountId && pending.has(boxId)});
         ownership.set(boxId, accountId); pending.add(boxId);
       },
       confirmBox: async (_accountId: string, boxId: string) => { pending.delete(boxId); },
       releaseBox: async (_accountId: string, boxId: string) => { if (pending.delete(boxId)) ownership.delete(boxId); },
+      holdBox: async (_accountId: string, _boxId: string) => undefined,
       boxOwner: async (boxId: string) => pending.has(boxId) ? null : ownership.get(boxId) ?? null,
     },
     relay: {
       publish: async (boxId: string, message: unknown) => { messages.set(boxId, [...(messages.get(boxId) ?? []), message]); return { id: 'message' }; },
       poll: async (boxId: string, _sessionId?: string) => messages.get(boxId) ?? [],
-      putBlob: async (_boxId: string, input: {kind: string; ciphertext: string; ttlMs?: number}) => ({id:'blob',expiresAt:999}),
-      getBlob: async (_boxId: string, _id: string) => null,
     },
     billing: { handle: async (_body: Buffer, _signature: string) => ({ received: true, applied: false, replayed: false }) },
     provisioner: { provision: async ({name}: {name: string; deviceKey: string}) => { provisioned.push(name); return {name, status:'PENDING'}; } },
@@ -140,16 +140,13 @@ describe('control plane HTTP server', () => {
     expect(response.headers['set-cookie']).toContain('HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure');
   });
 
-  it('passes blob ciphertext without returning other boxes blobs', async () => {
-    let stored:unknown=null;
-    const dependencies=services();
-    const {call,browser}=await setup({...dependencies,relay:{...dependencies.relay,
-      putBlob:async(_boxId:string,input:unknown)=>{stored=input;return{id:'blob',expiresAt:999};},
-      getBlob:async()=>stored,
-    }});
-    expect((await call('/boxes/alpha/blobs','POST',{kind:'sealed-state',ciphertext:'Y2lwaGVydGV4dA'},browser)).json()).toEqual({id:'blob',expiresAt:999});
-    expect((await call('/boxes/alpha/blobs/blob','GET',undefined,browser)).json()).toEqual({kind:'sealed-state',ciphertext:'Y2lwaGVydGV4dA'});
-    expect((await call('/boxes/beta/blobs/blob','GET',undefined,browser)).status).toBe(403);
+  it('M-a: has no blob routes, for any credential', async () => {
+    const {call,browser,server} = await setup();
+    const bearer = {Authorization:`Bearer ${server.issueBoxToken('alpha')}`};
+    for (const headers of [browser, bearer]) {
+      expect((await call('/boxes/alpha/blobs','POST',{kind:'sealed-state',ciphertext:'Y2lwaGVydGV4dA'},headers)).status).toBe(404);
+      expect((await call('/boxes/alpha/blobs/blob','GET',undefined,headers)).status).toBe(404);
+    }
   });
 
   it('requires matching Origin and CSRF for browser writes', async () => {
@@ -274,16 +271,30 @@ describe('H1: provisioning needs a paid plan, quota and a free name before Compu
     expect((await call('/boxes','POST',body,browser)).status).toBe(400);
     expect(dependencies.provisioned).toEqual([]);
   });
-  it('releases the reservation when Compute fails, so the name can be tried again', async () => {
+  it('releases the reservation only after a definite refusal from Compute, so the name can be tried again', async () => {
     const dependencies = services();
     let fail = true;
-    const {call,browser} = await setup({...dependencies,provisioner:{provision:async({name}:{name:string})=>{if(fail)throw new Error('planted-compute-detail');return{name,status:'DONE'};}}});
+    const {call,browser} = await setup({...dependencies,provisioner:{provision:async({name}:{name:string})=>{
+      if(fail)throw Object.assign(new Error('planted-compute-detail'),{outcome:'refused'});return{name,status:'DONE'};}}});
     const failed = await call('/boxes','POST',{name:'new-box',deviceKey},browser);
     expect(failed.status).toBe(502);
     expect(failed.text).not.toContain('planted-compute-detail');
     expect(dependencies.ownership.has('new-box')).toBe(false);
     fail = false;
     expect((await call('/boxes','POST',{name:'new-box',deviceKey},browser)).status).toBe(201);
+  });
+  it.each([['an unknown outcome', {outcome:'unknown'}], ['an error with no outcome', {}]])('N1: keeps the name held after %s, and a retry never reaches Compute', async (_name, extra) => {
+    const dependencies = services();
+    const calls: string[] = [];
+    const {call,browser} = await setup({...dependencies,provisioner:{provision:async({name}:{name:string})=>{calls.push(name);throw Object.assign(new Error('planted-compute-detail'),extra);}}});
+    const first = await call('/boxes','POST',{name:'new-box',deviceKey},browser);
+    expect(first.status).toBe(202);
+    expect(first.json()).toEqual({boxId:'new-box',state:'pending'});
+    expect(dependencies.ownership.get('new-box')).toBe('owner');
+    const retry = await call('/boxes','POST',{name:'new-box',deviceKey},browser);
+    expect(retry.status).toBe(409);
+    expect(retry.json()).toEqual({error:'That box is still being created or checked. Try again in a few minutes.'});
+    expect(calls).toEqual(['new-box']);
   });
   it('is unavailable (503) when the accounts service cannot reserve boxes', async () => {
     const dependencies = services();
@@ -426,6 +437,185 @@ describe('M5: boxes authenticate with an attestation token for the relay origin'
     expect((await call('/boxes/gamma/messages','GET',undefined,bearer(token('gamma')))).status).toBe(200);
     const plain = await setup();
     expect((await plain.call('/boxes/alpha/messages','GET',undefined,bearer(token('alpha')))).status).toBe(401);
+  });
+});
+
+
+/** Registers a real passkey account over HTTP at a loopback origin; returns its cookie and browser headers. */
+async function register(call: Awaited<ReturnType<typeof setup>>['call'], origin: string) {
+  const challenge = (await call('/auth/register/challenge','POST',{},{Origin:origin})).json<{id:string;challenge:string}>();
+  const publicKey = generateKeyPairSync('ed25519').publicKey;
+  const credentialId = randomBytes(16);
+  const cose = encode(new Map<number,unknown>([[1,1],[3,-8],[-1,6],[-2,Buffer.from(publicKey.export({format:'jwk'}).x!,'base64url')]]));
+  const length = Buffer.alloc(2); length.writeUInt16BE(credentialId.length);
+  const authData = Buffer.concat([createHash('sha256').update('127.0.0.1').digest(),Buffer.from([0x45]),Buffer.alloc(4),Buffer.alloc(16),length,credentialId,cose]);
+  const clientDataJSON = Buffer.from(JSON.stringify({type:'webauthn.create',challenge:challenge.challenge,origin}));
+  const attestationObject = encode(new Map<string,unknown>([['fmt','none'],['attStmt',new Map()],['authData',authData]]));
+  const registered = await call('/auth/register/finish','POST',{challengeId:challenge.id,clientDataJSON:clientDataJSON.toString('base64url'),attestationObject:attestationObject.toString('base64url')},{Origin:origin});
+  const result = registered.json<{account:{id:string};csrf:string}>();
+  const cookie = registered.headers['set-cookie']!.split(';')[0]!;
+  return { accountId: result.account.id, cookie, browser: {Origin:origin,Cookie:cookie,'X-CSRF-Token':result.csrf} };
+}
+
+describe('box lifecycle against the emulator: N1 reservations and the downgrade', () => {
+  let emulator: Emulator;
+  afterEach(async () => { await emulator?.close(); });
+  const isInsert = (input: {method: string; url: string}) => input.method === 'POST' && input.url.endsWith('/zones/us-central1-a/instances');
+  /** Real accounts and provisioner, the emulator's Compute (optionally wrapped), and one paid account. */
+  async function lifecycle(options: { compute?: (inner: HttpClient) => HttpClient; settleMs?: number; billing?: (accounts: () => ReturnType<typeof createAccounts>) => unknown; log?: (entry: unknown) => void } = {}) {
+    emulator = await startEmulator();
+    let clock = Date.now();
+    let accounts!: ReturnType<typeof createAccounts>;
+    const storage = createMemoryStorage();
+    const policy = emulator.policy;
+    const provisioner = createProvisioner({ http: options.compute ? options.compute(emulator.http) : emulator.http, emulatorOrigin: emulator.computeOrigin,
+      relayOrigin: 'https://control.example', projectId: policy.projectId, zone: 'us-central1-a',
+      subnetwork: `projects/${policy.projectId}/regions/us-central1/subnetworks/box-subnet`, serviceAccount: policy.serviceAccount,
+      imageReference: `registry.invalid/keysentry/box@${policy.allowedDigests[0]}`, allowedDigests: policy.allowedDigests });
+    const context = await setup({ now: () => clock, provisioner, reconcileSettleMs: options.settleMs ?? 120_000,
+      accounts: (origin: string) => (accounts = createAccounts({ storage, origin, now: () => clock, boxAccessCacheMs: 0 })),
+      boxAttestation: { jwks: async () => emulator.jwks, root: emulator.root, projectIds: [policy.projectId], serviceAccounts: [policy.serviceAccount],
+        allowedDigests: policy.allowedDigests, hardwareModels: ['GCP_INTEL_TDX'] },
+      ...(options.billing ? { billing: options.billing(() => accounts) } : {}), ...(options.log ? { log: options.log } : {}) });
+    const user = await register(context.call, context.origin);
+    await accounts.setPlan(user.accountId, 'paid');
+    const post = (name: string, headers = user.browser, key = deviceKey) => context.call('/boxes','POST',{name,deviceKey:key},headers);
+    const overview = async (headers = user.browser) => (await context.call('/account','GET',undefined,headers)).json<{plan:string;boxes:{name:string;state:string}[]}>();
+    return { ...context, storage, provisioner, user, post, overview, accounts: () => accounts, advance(ms: number) { clock += ms; } };
+  }
+
+  it('two parallel requests for one name reach Compute once, and a pending box counts against the quota', async () => {
+    let inserts = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ctx = await lifecycle({ compute: inner => ({ async request(input) { if (isInsert(input)) { inserts++; await gate; } return inner.request(input); } }) });
+    const first = ctx.post('race-box'), second = ctx.post('race-box');
+    await vi.waitFor(() => expect(inserts).toBe(1));
+    expect((await ctx.post('other-box')).status).toBe(403);
+    release();
+    expect([(await first).status, (await second).status].sort()).toEqual([201, 409]);
+    expect(inserts).toBe(1);
+    expect((await ctx.overview()).boxes).toEqual([{name:'race-box',state:'active'}]);
+  });
+
+  it('an insert whose reply is lost stays held, and the next request for the name confirms it from Compute', async () => {
+    let inserts = 0, lose = true;
+    const ctx = await lifecycle({ compute: inner => ({ async request(input) {
+      const response = await inner.request(input);
+      if (isInsert(input)) { inserts++; if (lose) throw new Error('socket hang up'); }
+      return response;
+    } }) });
+    const first = await ctx.post('lost-box');
+    expect(first.status).toBe(202);
+    expect((await ctx.overview()).boxes).toEqual([{name:'lost-box',state:'pending'}]);
+    expect((await ctx.post('second-box')).status).toBe(403);
+    lose = false;
+    expect((await ctx.post('lost-box')).json()).toEqual({error:'That box name is taken.'});
+    expect(inserts).toBe(1);
+    expect((await ctx.overview()).boxes).toEqual([{name:'lost-box',state:'active'}]);
+    expect(await ctx.storage.list('box-reconcile/')).toEqual([]);
+  });
+
+  it('the minute sweep frees a name Compute never created, but only after the settle time', async () => {
+    let fail = true;
+    const ctx = await lifecycle({ compute: inner => ({ async request(input) { if (isInsert(input) && fail) throw new Error('timeout'); return inner.request(input); } }) });
+    expect((await ctx.post('ghost-box')).status).toBe(202);
+    await ctx.server.maintain();
+    expect((await ctx.overview()).boxes).toEqual([{name:'ghost-box',state:'pending'}]);
+    ctx.advance(120_000);
+    await ctx.server.maintain();
+    expect((await ctx.overview()).boxes).toEqual([]);
+    expect(await ctx.storage.list('box-reconcile/')).toEqual([]);
+    fail = false;
+    expect((await ctx.post('real-box')).status).toBe(201);
+  });
+
+  it('a Compute 409 is not a refusal, and an existing instance that is not this reservation\'s is never adopted', async () => {
+    const logs: unknown[] = [];
+    const ctx = await lifecycle({ log: entry => logs.push(entry) });
+    const otherKey = generateKeyPairSync('ed25519').publicKey.export({format:'der',type:'spki'}).toString('base64');
+    await ctx.provisioner.provision({ name: 'taken-box', deviceKey: otherKey });
+    expect((await ctx.post('taken-box')).status).toBe(202);
+    expect((await ctx.overview()).boxes).toEqual([{name:'taken-box',state:'pending'}]);
+    await ctx.server.maintain();
+    expect((await ctx.overview()).boxes).toEqual([]);
+    expect(logs).toContainEqual({event:'cleanup',status:409});
+    expect((await ctx.call('/boxes/taken-box/messages','GET',undefined,{Cookie:ctx.user.cookie})).status).toBe(403);
+  });
+
+  it('downgrade: relay access is refused, the page says so and Compute stops the box; paying again lifts it and the page starts it', async () => {
+    const ctx = await lifecycle();
+    expect((await ctx.post('paid-box')).status).toBe(201);
+    const credentials = [{Authorization:`Bearer ${emulator.mintToken({audience:ctx.origin,nonces:[],instanceName:'paid-box'})}`},
+      {Authorization:`Bearer ${ctx.server.issueBoxToken('paid-box')}`}];
+    for (const headers of credentials) expect((await ctx.call('/boxes/paid-box/messages','GET',undefined,headers)).status).toBe(200);
+
+    await ctx.accounts().setPlan(ctx.user.accountId, 'free');
+    for (const headers of credentials) {
+      const refused = await ctx.call('/boxes/paid-box/messages','POST',{opaque:true},headers);
+      expect(refused.status).toBe(403);
+      expect(refused.json()).toEqual({error:'This box is suspended: its account has no paid plan.'});
+    }
+    expect(await ctx.overview()).toMatchObject({plan:'free',boxes:[{name:'paid-box',state:'suspended'}]});
+    await ctx.server.maintain();
+    expect(await ctx.provisioner.inspect('paid-box')).toMatchObject({exists:true,status:'TERMINATED',boxId:'paid-box',deviceKey});
+    expect(await ctx.storage.list('box-stops/')).toEqual([]);
+    // Nothing is deleted: the owner still owns the box and its queue; starting it needs the paid plan.
+    expect((await ctx.call('/boxes/paid-box/messages','GET',undefined,{Cookie:ctx.user.cookie})).status).toBe(200);
+    expect((await ctx.call('/boxes/paid-box/start','POST',{},ctx.user.browser)).json()).toEqual({error:'A paid plan is required to start a box.'});
+
+    await ctx.accounts().setPlan(ctx.user.accountId, 'paid');
+    for (const headers of credentials) expect((await ctx.call('/boxes/paid-box/messages','GET',undefined,headers)).status).toBe(200);
+    expect((await ctx.overview()).boxes).toEqual([{name:'paid-box',state:'stopped'}]);
+    const started = await ctx.call('/boxes/paid-box/start','POST',{},ctx.user.browser);
+    expect(started.status).toBe(202);
+    expect(started.json()).toEqual({boxId:'paid-box',state:'starting'});
+    expect(await ctx.provisioner.inspect('paid-box')).toMatchObject({status:'RUNNING'});
+    expect((await ctx.overview()).boxes).toEqual([{name:'paid-box',state:'active'}]);
+  });
+
+  it('a plan that ends and resumes before the sweep never stops the box', async () => {
+    const ctx = await lifecycle();
+    expect((await ctx.post('steady-box')).status).toBe(201);
+    await ctx.accounts().setPlan(ctx.user.accountId, 'free');
+    await ctx.accounts().setPlan(ctx.user.accountId, 'paid');
+    await ctx.server.maintain();
+    expect(await ctx.provisioner.inspect('steady-box')).toMatchObject({status:'RUNNING'});
+    expect((await ctx.overview()).boxes).toEqual([{name:'steady-box',state:'active'}]);
+  });
+
+  it('a webhook that ends the plan requests the stop without waiting for the minute sweep', async () => {
+    let userId = '';
+    const ctx = await lifecycle({ billing: accounts => ({ handle: async () => { await accounts().setPlan(userId, 'free'); return {received:true}; } }) });
+    userId = ctx.user.accountId;
+    expect((await ctx.post('hook-box')).status).toBe(201);
+    expect((await ctx.call('/billing/webhook','POST','{}',{'Stripe-Signature':'t=1,v1=abc'})).status).toBe(200);
+    await vi.waitFor(async () => expect(await ctx.provisioner.inspect('hook-box')).toMatchObject({status:'TERMINATED'}));
+  });
+
+  it('a box confirmed after its account stopped paying is suspended and stopped at once', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ctx = await lifecycle({ compute: inner => ({ async request(input) { if (isInsert(input)) await gate; return inner.request(input); } }) });
+    const created = ctx.post('late-box');
+    await vi.waitFor(async () => expect((await ctx.overview()).boxes).toEqual([{name:'late-box',state:'pending'}]));
+    await ctx.accounts().setPlan(ctx.user.accountId, 'free');
+    release();
+    expect((await created).status).toBe(201);
+    expect((await ctx.overview()).boxes).toEqual([{name:'late-box',state:'suspended'}]);
+    await ctx.server.maintain();
+    expect(await ctx.provisioner.inspect('late-box')).toMatchObject({status:'TERMINATED'});
+  });
+
+  it('the start route needs the owner\'s session, Origin and CSRF, and the owner\'s own box', async () => {
+    const ctx = await lifecycle();
+    expect((await ctx.post('own-box')).status).toBe(201);
+    const other = await register(ctx.call, ctx.origin);
+    await ctx.accounts().setPlan(other.accountId, 'paid');
+    expect((await ctx.call('/boxes/own-box/start','POST',{},other.browser)).status).toBe(403);
+    expect((await ctx.call('/boxes/own-box/start','POST',{},{...ctx.user.browser,'X-CSRF-Token':'bad'})).status).toBe(403);
+    expect((await ctx.call('/boxes/own-box/start','POST',{},{Authorization:`Bearer ${ctx.server.issueBoxToken('own-box')}`})).status).toBe(401);
+    expect((await ctx.call('/boxes/own-box/start','POST',{force:true},ctx.user.browser)).status).toBe(400);
+    expect((await ctx.call('/boxes/own-box/start','POST',{},ctx.user.browser)).status).toBe(202);
   });
 });
 

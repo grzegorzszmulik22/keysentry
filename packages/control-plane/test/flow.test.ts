@@ -1,8 +1,7 @@
-import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { verifyAttestation } from '../../../src/box/attestation/index.js';
 import { boxKeyBindingNonce, createHandshake, generateBoxKeyPair, handshakeAttestationNonces } from '../../../src/box/handshake/index.js';
-import { generateDeviceKey, sealBytes } from '../../../src/security/index.js';
+import { generateDeviceKey } from '../../../src/security/index.js';
 import { createRelayStore } from '../src/relay.js';
 import { createMemoryStorage } from '../src/storage.js';
 import { startEmulator, type Emulator } from '../src/emulator/index.js';
@@ -34,7 +33,7 @@ async function setup(tamper=false) {
 }
 
 describe('local control plane with the real handshake',()=>{
-  it('relays the five-message exchange and stores neither planted token nor backup plaintext',async()=>{
+  it('relays the five-message exchange and never stores the planted token',async()=>{
     const {storage,relay,box,cli,attest,verified}=await setup();
     expect(verified.ok).toBe(true);
     const planted='sk-or-v1-planted-plaintext-token-01234567890123456789';
@@ -45,8 +44,6 @@ describe('local control plane with the real handshake',()=>{
     expect(opened.plaintext?.toString()).toBe(plaintext.toString());
     await relay.publish('cloud-box',opened.message);
     expect(bundle.handshake.next({now,message:(await relay.poll('cloud-box'))[4]}).handshake.state).toBe('complete');
-    const backup=sealBytes(randomBytes(32),plaintext,'keysentry-box-backup:v1').toString('base64url');
-    await relay.putBlob('cloud-box',{kind:'sealed-state',ciphertext:backup});
     for(const key of await storage.list(''))expect(JSON.stringify(await storage.get(key))).not.toContain(planted);
     opened.plaintext?.fill(0);plaintext.fill(0);
   });

@@ -123,7 +123,7 @@ export interface HostedOptions {
   secrets: HostedSecrets;
   /**
    * The egress-guarded HTTPS client (createHostedHttp): the bucket's objects, Stripe Checkout and subscriptions, the
-   * attestation JWKS and, with live provisioning only, instance creation in the box project.
+   * attestation JWKS and, with live provisioning only, creating, reading, stopping and starting box instances in the box project.
    */
   http: HttpClient;
   /** Reaches only the metadata server's token URL (createMetadataHttp). Unused when `accessToken` is given. */

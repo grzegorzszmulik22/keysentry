@@ -272,15 +272,17 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(tf).not.toMatch(/roles\/(?:owner|editor|storage\.admin|compute\.|cloudkms\.|secretmanager\.admin|iam\.serviceAccountTokenCreator)/);
   });
 
-  test('control plane gets Compute rights only with live provisioning: create-only, in the box project, acting as the box account', () => {
+  test('control plane gets Compute rights only with live provisioning: create, read, stop and start, in the box project, acting as the box account', () => {
     const tf = source('control-plane');
     const role = resource(tf, 'google_project_iam_custom_role');
     const member = resource(tf, 'google_project_iam_member');
     const user = resource(tf, 'google_service_account_iam_member');
     for (const block of [role, member, user]) expect(block).toMatch(/count\s*=\s*var\.live_provisioning \? 1 : 0/);
     const permissions = [...role.match(/permissions = \[([\s\S]*?)\]/)![1]!.matchAll(/"([a-z.A-Z]+)"/g)].map(match => match[1]!);
-    expect(permissions).toEqual(['compute.disks.create', 'compute.instances.create', 'compute.instances.setMetadata',
-      'compute.instances.setServiceAccount', 'compute.subnetworks.use']);
+    // N1 reconciliation reads (get); the downgrade stops; the owner's page starts. Never delete, update or setters beyond insert's.
+    expect(permissions).toEqual(['compute.disks.create', 'compute.instances.create', 'compute.instances.get', 'compute.instances.setMetadata',
+      'compute.instances.setServiceAccount', 'compute.instances.start', 'compute.instances.stop', 'compute.subnetworks.use']);
+    expect(permissions.some(permission => /delete|update|setMachineType|setScheduling|attachDisk|addAccessConfig/.test(permission))).toBe(false);
     expect(role).toMatch(/project\s*=\s*var\.box_project_id/);
     expect(member).toMatch(/project\s*=\s*var\.box_project_id/);
     expect(member).toMatch(/role\s*=\s*google_project_iam_custom_role\.provision\[0\]\.name/);

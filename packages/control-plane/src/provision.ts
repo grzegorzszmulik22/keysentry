@@ -1,4 +1,4 @@
-import type { HttpClient } from '../../../src/types.js';
+import type { HttpClient, HttpResponse } from '../../../src/types.js';
 
 export interface ProvisionerOptions {
   http: HttpClient;
@@ -33,8 +33,31 @@ export interface ProvisionInput {
   deviceKey: string;
 }
 
+/** What Compute says about one instance (`instances.get`): absent, or present with its keysentry routing metadata. */
+export type InstanceState =
+  | { exists: false }
+  | { exists: true; status: string; boxId?: string; deviceKey?: string };
+
 export interface Provisioner {
   provision(input: ProvisionInput): Promise<ProvisionOperation>;
+  /** N1 reconciliation: `instances.get`. Throws a `ProvisionError` when Compute gives no definite answer. */
+  inspect(name: string): Promise<InstanceState>;
+  /** Downgrade: `instances.stop`; `absent` when the instance does not exist. Nothing is ever deleted. */
+  stop(name: string): Promise<'stopping' | 'absent'>;
+  /** The owner's start request once the plan is paid again: `instances.start`. */
+  start(name: string): Promise<void>;
+}
+
+/**
+ * Fixed text only. `refused` is a definite refusal, so no instance was created: nothing was sent, or Compute rejected
+ * the request (4xx other than 408 and 409). `unknown` is everything else (409 alreadyExists, 408, 5xx, a timeout or
+ * transport error after sending, an unreadable reply): the instance may exist and the reservation must be reconciled.
+ */
+export class ProvisionError extends Error {
+  constructor(readonly outcome: 'refused' | 'unknown', message = 'Box provisioning failed.') {
+    super(message);
+    this.name = 'ProvisionError';
+  }
 }
 
 /** Compute instance names (RFC 1035 label), excluding Google's reserved `gcp-` prefix. */
@@ -53,7 +76,13 @@ export function isDeviceKey(value: unknown): value is string {
 export const BOX_METADATA_KEYS = ['tee-image-reference', 'tee-restart-policy', 'keysentry-box-id', 'keysentry-relay-origin', 'keysentry-enroll-device-key'] as const;
 
 function configurationError(): never { throw new TypeError('Invalid provisioning configuration.'); }
-function failed(): never { throw new Error('Box provisioning failed.'); }
+function refused(message?: string): never { throw new ProvisionError('refused', message); }
+function unknown(): never { throw new ProvisionError('unknown'); }
+/** A non-2xx reply: a definite rejection, or no definite answer (see `ProvisionError`). */
+function rejection(status: number): never {
+  if (status >= 400 && status < 500 && status !== 408 && status !== 409) refused();
+  unknown();
+}
 
 function emulatorOrigin(value: string): string {
   try {
@@ -100,15 +129,50 @@ export function createProvisioner(options: ProvisionerOptions): Provisioner {
   const relayOrigin = relay(options.relayOrigin, localOrigin !== null);
   const instanceUrl = `${localOrigin ?? 'https://compute.googleapis.com'}/compute/v1/projects/${projectId}/zones/${zone}/instances`;
 
+  const live = () => {
+    if (localOrigin === null && process.env.KEYSENTRY_CONTROL_PLANE_LIVE !== '1') refused('Live provisioning is disabled.');
+  };
+  /** The call's headers. A token that cannot be obtained means nothing was sent: a definite refusal. */
+  async function headers(json: boolean): Promise<Record<string, string>> {
+    const result: Record<string, string> = json ? { 'content-type': 'application/json' } : {};
+    if (localOrigin === null) {
+      let token: unknown;
+      try { token = await options.accessToken?.(); } catch { refused(); }
+      if (typeof token !== 'string' || token.length === 0 || token.length > 16_384 || /[\r\n\x00]/.test(token)) refused();
+      result.authorization = `Bearer ${token}`;
+    }
+    return result;
+  }
+  async function send(method: 'GET' | 'POST', url: string, body: string | undefined, maxBytes: number): Promise<HttpResponse> {
+    const sent = await headers(body !== undefined);
+    let response: HttpResponse;
+    try { response = await http.request({ method, url, headers: sent, ...(body === undefined ? {} : { body }) }); }
+    catch (error) {
+      // The egress guard refuses before any I/O; every other transport failure may have reached Compute.
+      if ((error as { code?: unknown } | null)?.code === 'EGRESS_BLOCKED') refused();
+      unknown();
+    }
+    if (typeof response?.status !== 'number' || typeof response.text !== 'string' || Buffer.byteLength(response.text) > maxBytes) unknown();
+    return response;
+  }
+  function record(response: HttpResponse): Record<string, unknown> {
+    let data: unknown;
+    try { data = response.json<unknown>(); } catch { unknown(); }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) unknown();
+    return data as Record<string, unknown>;
+  }
+  function instance(name: unknown): string {
+    if (!isBoxName(name)) refused('Invalid box name.');
+    return `${instanceUrl}/${name}`;
+  }
+
   return {
     async provision(input): Promise<ProvisionOperation> {
       const { name, deviceKey } = input ?? {} as ProvisionInput;
-      if (!isBoxName(name)) throw new TypeError('Invalid box name.');
-      if (!isDeviceKey(deviceKey)) throw new TypeError('Invalid enrollment device key.');
-      if (localOrigin === null && process.env.KEYSENTRY_CONTROL_PLANE_LIVE !== '1') {
-        throw new Error('Live provisioning is disabled.');
-      }
-      const instance = {
+      instance(name);
+      if (!isDeviceKey(deviceKey)) refused('Invalid enrollment device key.');
+      live();
+      const body = {
         name,
         machineType: `zones/${zone}/machineTypes/c3-standard-4`,
         confidentialInstanceConfig: { enableConfidentialCompute: true, confidentialInstanceType: 'TDX' },
@@ -127,27 +191,50 @@ export function createProvisioner(options: ProvisionerOptions): Provisioner {
           { key: 'keysentry-enroll-device-key', value: deviceKey },
         ] },
       };
-      try {
-        const headers: Record<string, string> = { 'content-type': 'application/json' };
-        if (localOrigin === null) {
-          const token = await options.accessToken?.();
-          if (typeof token !== 'string' || token.length === 0 || token.length > 16_384 || /[\r\n\x00]/.test(token)) failed();
-          headers.authorization = `Bearer ${token}`;
-        }
-        const response = await http.request({ method: 'POST', url: instanceUrl, headers, body: JSON.stringify(instance) });
-        if (response.status < 200 || response.status >= 300 || Buffer.byteLength(response.text) > 64 * 1024) failed();
-        const data = response.json<unknown>();
-        if (!data || typeof data !== 'object' || Array.isArray(data)) failed();
-        const record = data as Record<string, unknown>;
-        if (record.error !== undefined || typeof record.name !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(record.name)
-          || (record.status !== 'PENDING' && record.status !== 'RUNNING' && record.status !== 'DONE')
-          || (record.targetId !== undefined && (typeof record.targetId !== 'string' || !/^[0-9]{1,32}$/.test(record.targetId)))) failed();
-        return {
-          name: record.name,
-          status: record.status,
-          ...(record.targetId === undefined ? {} : { targetId: record.targetId as string }),
-        };
-      } catch { failed(); }
+      const response = await send('POST', instanceUrl, JSON.stringify(body), 64 * 1024);
+      if (response.status < 200 || response.status >= 300) rejection(response.status);
+      // Accepted: from here on the instance may exist, so a malformed or failed operation is `unknown`, not a refusal.
+      const data = record(response);
+      if (data.error !== undefined || typeof data.name !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(data.name)
+        || (data.status !== 'PENDING' && data.status !== 'RUNNING' && data.status !== 'DONE')
+        || (data.targetId !== undefined && (typeof data.targetId !== 'string' || !/^[0-9]{1,32}$/.test(data.targetId)))) unknown();
+      return {
+        name: data.name,
+        status: data.status,
+        ...(data.targetId === undefined ? {} : { targetId: data.targetId as string }),
+      };
+    },
+    async inspect(name): Promise<InstanceState> {
+      const url = instance(name);
+      live();
+      const response = await send('GET', url, undefined, 256 * 1024);
+      if (response.status === 404) return { exists: false };
+      if (response.status !== 200) unknown();
+      const data = record(response);
+      if (data.name !== name || typeof data.status !== 'string' || !/^[A-Z_]{1,32}$/.test(data.status)) unknown();
+      const items = (data.metadata as { items?: unknown } | null | undefined)?.items;
+      const values = new Map<string, string>();
+      for (const item of Array.isArray(items) ? items : []) {
+        const entry = item as { key?: unknown; value?: unknown } | null;
+        if (entry && typeof entry.key === 'string' && typeof entry.value === 'string' && !values.has(entry.key)) values.set(entry.key, entry.value);
+      }
+      const boxId = values.get('keysentry-box-id'), deviceKey = values.get('keysentry-enroll-device-key');
+      return { exists: true, status: data.status, ...(isBoxName(boxId) ? { boxId } : {}), ...(isDeviceKey(deviceKey) ? { deviceKey } : {}) };
+    },
+    async stop(name): Promise<'stopping' | 'absent'> {
+      const url = instance(name);
+      live();
+      // instances.stop takes only query parameters; the request body must be empty.
+      const response = await send('POST', `${url}/stop`, undefined, 64 * 1024);
+      if (response.status === 404) return 'absent';
+      if (response.status < 200 || response.status >= 300) rejection(response.status);
+      return 'stopping';
+    },
+    async start(name): Promise<void> {
+      const url = instance(name);
+      live();
+      const response = await send('POST', `${url}/start`, undefined, 64 * 1024);
+      if (response.status < 200 || response.status >= 300) rejection(response.status);
     },
   };
 }
