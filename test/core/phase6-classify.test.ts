@@ -71,7 +71,7 @@ describe('Google service-account JSON keys (decision 4)', () => {
     const apiKey = inventory.clusters.find(cluster => cluster.consumers[0]!.varName === 'GOOGLE_API_KEY')!;
     expect(json).toMatchObject({ provider: 'google', method: 'guided' });
     expect(apiKey).toMatchObject({ provider: 'google', method: 'auto' });
-    expect(autopilotEligibility(json)).toEqual({ eligible: false, reason: 'Google service-account keys are always rotated by a person, so they cannot be armed.' });
+    expect(autopilotEligibility(json)).toEqual({ eligible: false, reason: 'Google service-account keys and public (client-side) Google API keys are always rotated by a person, so they cannot be armed.' });
     expect(autopilotEligibility(apiKey)).toMatchObject({ eligible: true, method: 'auto' });
   });
 });
