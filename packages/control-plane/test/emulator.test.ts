@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { JsonWebKey } from 'node:crypto';
+import { generateKeyPairSync, type JsonWebKey } from 'node:crypto';
+import { request as rawRequest } from 'node:http';
 import { challengeNonce, verifyAttestation } from '../../../src/box/attestation/index.js';
 import { exchangeForAccessToken, kmsDecrypt, kmsEncrypt } from '../../../src/box/seal/index.js';
 import { startEmulator, type Emulator } from '../src/emulator/index.js';
@@ -10,6 +11,33 @@ const now = Date.parse('2026-10-27T12:00:00.000Z');
 let emulator: Emulator;
 const nonces = [Buffer.alloc(32, 1).toString('base64url'), Buffer.alloc(32, 2).toString('base64url')];
 const audience = 'keysentry-test-session';
+const deviceKey = generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+/** Exactly what the provisioner sends for a box, so each test changes one property. */
+function instance(local: Emulator, name: string, change: (body: Record<string, any>) => void = () => undefined) {
+  const body: Record<string, any> = {
+    name, machineType: 'zones/us-central1-a/machineTypes/c3-standard-4',
+    confidentialInstanceConfig: { enableConfidentialCompute: true, confidentialInstanceType: 'TDX' },
+    shieldedInstanceConfig: { enableSecureBoot: true }, scheduling: { onHostMaintenance: 'TERMINATE', automaticRestart: true },
+    disks: [{ boot: true, autoDelete: true, initializeParams: { sourceImage: 'projects/confidential-space-images/global/images/family/confidential-space',
+      diskType: 'zones/us-central1-a/diskTypes/pd-balanced', diskSizeGb: '20' } }],
+    networkInterfaces: [{ subnetwork: `projects/${local.policy.projectId}/regions/us-central1/subnetworks/box-subnet` }],
+    serviceAccounts: [{ email: local.policy.serviceAccount, scopes: ['https://www.googleapis.com/auth/cloud-platform'] }],
+    metadata: { items: [
+      { key: 'tee-image-reference', value: `registry.invalid/box@${local.policy.allowedDigests[0]}` }, { key: 'tee-restart-policy', value: 'Always' },
+      { key: 'keysentry-box-id', value: name }, { key: 'keysentry-relay-origin', value: 'https://control.example' },
+      { key: 'keysentry-enroll-device-key', value: deviceKey },
+    ] },
+  };
+  change(body);
+  return body;
+}
+/** A raw loopback request with no emulator caller secret, as a web page or another local user would send. */
+function raw(url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = rawRequest(url, { method: init.method ?? 'GET', headers: init.headers, agent: false }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)); });
+    req.on('error', reject); req.end(init.body);
+  });
+}
 function policy(): AttestationPolicy {
   return { audience, projectIds: [emulator.policy.projectId], serviceAccounts: [emulator.policy.serviceAccount],
     allowedDigests: [...emulator.policy.allowedDigests], hardwareModels: ['GCP_INTEL_TDX'], maxTokenAgeSeconds: 300, clockSkewSeconds: 60 };
@@ -132,30 +160,88 @@ it('Compute boots only an injected in-process box and rejects unsafe metadata', 
   const local = await startEmulator({ now: () => now, startBox: config => { started = config; } });
   try {
     const url = `${local.computeOrigin}/compute/v1/projects/${local.policy.projectId}/zones/us-central1-a/instances`;
-    const instance = { name: 'box-one', metadata: { items: [{ key: 'tee-image-reference', value: `registry/box@${local.policy.allowedDigests[0]}` }] } };
-    const response = await local.http.request({ method: 'POST', url, headers: { 'content-type': 'application/json' }, body: JSON.stringify(instance) });
+    const body = instance(local, 'box-one');
+    const response = await local.http.request({ method: 'POST', url, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     expect(response.status).toBe(200);
     expect(response.json<{status: string}>().status).toBe('DONE');
-    expect(started).toEqual({ projectId: local.policy.projectId, zone: 'us-central1-a', instanceName: 'box-one', instance });
+    expect(started).toEqual({ projectId: local.policy.projectId, zone: 'us-central1-a', instanceName: 'box-one', instance: body });
     expect((await local.http.request({ method: 'POST', url, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...instance, name: 'a' }) })).status).toBe(200);
+      body: JSON.stringify(instance(local, 'a')) })).status).toBe(200);
     const refused = await local.http.request({ method: 'POST', url, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'box-two', metadata: { items: [{ key: 'tee-env-SECRET', value: 'planted-token-value' }] } }) });
+      body: JSON.stringify(instance(local, 'box-two', b => { b.metadata.items.push({ key: 'tee-env-SECRET', value: 'planted-token-value' }); })) });
     expect(refused.status).toBe(400);
     expect(refused.text).not.toContain('planted-token-value');
   } finally { await local.close(); }
+});
+
+it.each([
+  ['the debug image', (b: Record<string, any>) => { b.disks[0].initializeParams.sourceImage = 'projects/confidential-space-images/global/images/family/confidential-space-debug'; }],
+  ['an external IP', (b: Record<string, any>) => { b.networkInterfaces[0].accessConfigs = [{ type: 'ONE_TO_ONE_NAT' }]; }],
+  ['no TDX', (b: Record<string, any>) => { delete b.confidentialInstanceConfig; }],
+  ['SEV on a C3 machine', (b: Record<string, any>) => { b.confidentialInstanceConfig.confidentialInstanceType = 'SEV'; }],
+  ['no secure boot', (b: Record<string, any>) => { b.shieldedInstanceConfig.enableSecureBoot = false; }],
+  ['live migration', (b: Record<string, any>) => { b.scheduling.onHostMaintenance = 'MIGRATE'; }],
+  ['another service account', (b: Record<string, any>) => { b.serviceAccounts[0].email = 'other@keysentry-box.iam.gserviceaccount.com'; }],
+  ['a box id that is not the instance', (b: Record<string, any>) => { b.metadata.items[2].value = 'other-box'; }],
+  ['a missing routing attribute', (b: Record<string, any>) => { b.metadata.items.pop(); }],
+  ['an unsigned image tag', (b: Record<string, any>) => { b.metadata.items[0].value = 'registry.invalid/box:latest'; }],
+  ['a bad enrollment key', (b: Record<string, any>) => { b.metadata.items[4].value = Buffer.alloc(44).toString('base64'); }],
+  ['a plain-HTTP public relay', (b: Record<string, any>) => { b.metadata.items[3].value = 'http://control.example'; }],
+])('L6: Compute refuses an instance Confidential Space would not run as a box: %s', async (_name, change) => {
+  let starts = 0;
+  const local = await startEmulator({ now: () => now, startBox: () => { starts++; } });
+  try {
+    const url = `${local.computeOrigin}/compute/v1/projects/${local.policy.projectId}/zones/us-central1-a/instances`;
+    const response = await local.http.request({ method: 'POST', url, headers: { 'content-type': 'application/json' }, body: JSON.stringify(instance(local, 'box-one', change)) });
+    expect(response.status).toBe(400);
+    expect(starts).toBe(0);
+  } finally { await local.close(); }
+});
+
+describe('L6: the emulator listener is not a local token mint', () => {
+  it('refuses token, STS, KMS and Compute calls without the per-start secret, but serves public anchors', async () => {
+    const local = await startEmulator({ now: () => now });
+    try {
+      const jsonPost = (path: string, body: unknown) => raw(`${local.baseUrl}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      expect(await raw(`${local.baseUrl}/v1/token`)).toBe(403);
+      expect(await jsonPost('/v1/token', { audience, nonces, token_type: 'OIDC' })).toBe(403);
+      expect(await jsonPost('/v1/sts/token', {})).toBe(403);
+      expect(await jsonPost(`/v1/${local.keyName}:encrypt`, {})).toBe(403);
+      expect(await jsonPost(`/compute/v1/projects/${local.policy.projectId}/zones/us-central1-a/instances`, instance(local, 'box-one'))).toBe(403);
+      expect(await raw(`${local.baseUrl}/v1/token`, { headers: { 'x-keysentry-emulator-token': 'guessed-value' } })).toBe(403);
+      expect(await raw(`${local.baseUrl}/jwks`)).toBe(200);
+      expect(await raw(`${local.baseUrl}/health`)).toBe(200);
+      expect((await local.http.request({ method: 'GET', url: `${local.baseUrl}/v1/token` })).status).toBe(200);
+    } finally { await local.close(); }
+  });
+  it('refuses a rebinding Host header on every route', async () => {
+    const local = await startEmulator({ now: () => now });
+    try {
+      const port = new URL(local.baseUrl).port;
+      for (const host of [`localhost:${port}`, `attacker.example:${port}`, '127.0.0.1']) {
+        expect(await raw(`${local.baseUrl}/jwks`, { headers: { host } })).toBe(403);
+      }
+    } finally { await local.close(); }
+  });
+  it('names the booted instance in its tokens when asked', async () => {
+    const token = emulator.mintToken({ audience, nonces, instanceName: 'box-one' });
+    const claims = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8'));
+    expect(claims.submods.gce.instance_name).toBe('box-one');
+    expect(claims.sub).toMatch(/\/instances\/box-one$/);
+    expect(() => emulator.mintToken({ audience, nonces, instanceName: 'Bad_Name' })).toThrow();
+  });
 });
 
 it('provisions Terraform-shaped settings through the real provisioner into the injected box', async () => {
   let started: Record<string, unknown> | undefined;
   const local = await startEmulator({ startBox: config => { started = config.instance; } });
   try {
-    const provisioner = createProvisioner({ http: local.http, emulatorOrigin: local.computeOrigin,
+    const provisioner = createProvisioner({ http: local.http, emulatorOrigin: local.computeOrigin, relayOrigin: 'https://control.example',
       projectId: local.policy.projectId, zone: 'us-central1-a',
       subnetwork: `projects/${local.policy.projectId}/regions/us-central1/subnetworks/box-subnet`,
       serviceAccount: local.policy.serviceAccount, imageReference: `registry.invalid/box@${local.policy.allowedDigests[0]}`,
       allowedDigests: local.policy.allowedDigests });
-    const result = await provisioner.provision({ name: 'keysentry-box' });
+    const result = await provisioner.provision({ name: 'keysentry-box', deviceKey });
     expect(result.status).toBe('DONE');
     expect(started?.machineType).toBe('zones/us-central1-a/machineTypes/c3-standard-4');
     expect(started?.confidentialInstanceConfig).toEqual({ enableConfidentialCompute: true, confidentialInstanceType: 'TDX' });
@@ -173,7 +259,7 @@ it('boots a concurrently requested instance name once and permits retry after a 
   try {
     const post = (name: string) => local.http.request({ method: 'POST',
       url: `${local.computeOrigin}/compute/v1/projects/${local.policy.projectId}/zones/us-central1-a/instances`,
-      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) });
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(instance(local, name)) });
     const responses = await Promise.all([post('same-box'), post('same-box')]);
     expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
     expect(starts).toBe(1);

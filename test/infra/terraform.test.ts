@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
+import { hostedConfigFromEnv } from '../../packages/control-plane/src/hosted.js';
 
 const root = new URL('../../infra/terraform/', import.meta.url);
 const modules = ['box', 'byo-kms', 'control-plane'] as const;
@@ -180,17 +181,47 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(tf).toContain('endswith(var.box_service_account_email, "@${var.box_project_id}.iam.gserviceaccount.com")');
   });
 
-  test('control plane is an authenticated Cloud Run service with a digest-pinned image and dedicated account', () => {
+  test('control plane is a public Cloud Run service with a digest-pinned image, one instance and a dedicated account', () => {
     const tf = source('control-plane');
     const service = resource(tf, 'google_cloud_run_v2_service');
     expect(service).toMatch(/service_account\s*=\s*google_service_account\.control_plane\.email/);
     expect(service).toMatch(/image\s*=\s*var\.image_reference/);
     expect(service).toMatch(/deletion_protection\s*=\s*true/);
-    expect(tf).not.toMatch(/allUsers|allAuthenticatedUsers|invoker_iam_disabled\s*=\s*true/);
+    // Browsers, the CLI, boxes and Stripe call it without Google credentials; every route authenticates its caller.
+    expect(service).toMatch(/invoker_iam_disabled\s*=\s*true/);
+    expect(service).toMatch(/ingress\s*=\s*"INGRESS_TRAFFIC_ALL"/);
+    expect(tf).not.toMatch(/allAuthenticatedUsers/);
+    // In-process serialization and a bucket without compare-and-swap need a single writer.
+    expect(service).toMatch(/max_instance_count\s*=\s*1\b/);
+    expect(service).toMatch(/memory\s*=\s*"512Mi"/);
     const image = blocks(tf, 'variable').find(block => block.startsWith('variable "image_reference"'))!;
     expect(image).toContain('@sha256:[a-f0-9]{64}$');
     expect(image).not.toMatch(/\bdefault\s*=/);
-    expect(service).not.toMatch(/\benv\s*\{/);
+  });
+
+  test('control plane passes the hosted configuration, with Stripe credentials only by Secret Manager reference', () => {
+    const service = resource(source('control-plane'), 'google_cloud_run_v2_service');
+    const names = [...service.matchAll(/name\s*=\s*"(KEYSENTRY_[A-Z_]+)"/g)].map(match => match[1]!).sort();
+    expect(names).toEqual(['KEYSENTRY_BOX_ALLOWED_DIGESTS', 'KEYSENTRY_BOX_PROJECT_ID', 'KEYSENTRY_BOX_SERVICE_ACCOUNT', 'KEYSENTRY_CONTROL_BUCKET',
+      'KEYSENTRY_CONTROL_ORIGIN', 'KEYSENTRY_STRIPE_API_KEY', 'KEYSENTRY_STRIPE_PRICE_ID', 'KEYSENTRY_STRIPE_WEBHOOK_SECRET', 'KEYSENTRY_TRUSTED_PROXY_HOPS']);
+    expect(service).toMatch(/name\s*=\s*"KEYSENTRY_CONTROL_BUCKET"\s*value\s*=\s*google_storage_bucket\.ciphertext\.name/);
+    for (const [name, variable] of [['KEYSENTRY_STRIPE_WEBHOOK_SECRET', 'stripe_webhook_secret_id'], ['KEYSENTRY_STRIPE_API_KEY', 'stripe_api_key_secret_id']]) {
+      expect(service).toMatch(new RegExp(`name\\s*=\\s*"${name}"\\s*value_source\\s*\\{\\s*secret_key_ref\\s*\\{\\s*secret\\s*=\\s*var\\.${variable}`));
+    }
+    expect(service).not.toMatch(/whsec_|[sr]k_(?:live|test)_/);
+    // Exactly the variables the hosted composition reads (Cloud Run sets PORT itself).
+    const sample: Record<string, string> = {
+      KEYSENTRY_BOX_ALLOWED_DIGESTS: `sha256:${'a'.repeat(64)}`, KEYSENTRY_BOX_PROJECT_ID: 'keysentry-box',
+      KEYSENTRY_BOX_SERVICE_ACCOUNT: 'keysentry-box@keysentry-box.iam.gserviceaccount.com', KEYSENTRY_CONTROL_BUCKET: 'ks-control-state',
+      KEYSENTRY_CONTROL_ORIGIN: 'https://control.example', KEYSENTRY_STRIPE_API_KEY: 'rk_live_sampleonly', KEYSENTRY_STRIPE_PRICE_ID: 'price_sample',
+      KEYSENTRY_STRIPE_WEBHOOK_SECRET: 'whsec_sampleonly', KEYSENTRY_TRUSTED_PROXY_HOPS: '1',
+    };
+    expect(Object.keys(sample).sort()).toEqual(names);
+    expect(() => hostedConfigFromEnv(sample)).not.toThrow();
+    for (const name of names.filter(name => name !== 'KEYSENTRY_TRUSTED_PROXY_HOPS')) {
+      const { [name]: _removed, ...rest } = sample;
+      expect(() => hostedConfigFromEnv(rest)).toThrow(name);
+    }
   });
 
   test('control plane stores ciphertext in a private versioned bucket and cannot destroy it implicitly', () => {
@@ -200,16 +231,22 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(bucket).toMatch(/versioning\s*\{\s*enabled\s*=\s*true/);
     expect(bucket).toMatch(/force_destroy\s*=\s*false/);
     expect(bucket).toMatch(/prevent_destroy\s*=\s*true/);
+    // Old versions of overwritten or deleted records do not accumulate.
+    expect(bucket).toMatch(/days_since_noncurrent_time\s*=\s*7/);
   });
 
-  test('control plane has bucket-scoped object access only, without key release or provisioning authority', () => {
+  test('control plane has bucket object access and two Stripe secret reads only, without key release or provisioning authority', () => {
     const tf = source('control-plane');
     const grant = resource(tf, 'google_storage_bucket_iam_member');
     expect(grant).toMatch(/role\s*=\s*"roles\/storage\.objectUser"/);
     expect(grant).toContain('serviceAccount:${google_service_account.control_plane.email}');
     expect(grant).toMatch(/bucket\s*=\s*google_storage_bucket\.ciphertext\.name/);
-    expect(tf).not.toMatch(/resource "google_(?:project_iam|kms_|compute_)/);
-    expect(tf).not.toMatch(/roles\/(?:owner|editor|storage\.admin|compute\.admin|cloudkms\.)/);
+    const secrets = resource(tf, 'google_secret_manager_secret_iam_member');
+    expect(secrets).toMatch(/role\s*=\s*"roles\/secretmanager\.secretAccessor"/);
+    expect(secrets).toContain('toset([var.stripe_webhook_secret_id, var.stripe_api_key_secret_id])');
+    expect(secrets).toContain('serviceAccount:${google_service_account.control_plane.email}');
+    expect(tf).not.toMatch(/resource "google_(?:project_iam|kms_|compute_|secret_manager_secret")/);
+    expect(tf).not.toMatch(/roles\/(?:owner|editor|storage\.admin|compute\.|cloudkms\.|iam\.serviceAccountUser|secretmanager\.admin)/);
   });
 
   test.each(modules)('%s outputs resource identifiers only', module => {

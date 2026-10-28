@@ -1,19 +1,37 @@
 # keysentry control plane — not deployed
 
-Private Apache-2.0 package for the phase 4 cloud-box control plane and local emulator. Nothing in this package has
-been deployed. Tests use local fakes; they do not call Google, Stripe or any other external service. Node >=22.13
-is required. There are no package dependencies to install; shared TypeScript modules resolve from the repository.
+Private Apache-2.0 package for the cloud-box control plane and its local emulator. Nothing in this package has been
+deployed, and no test calls Google, Stripe or any other external service. Node >=22.13 is required. The package
+declares no dependencies of its own; the shared repository modules it imports (WebAuthn, box handshake schemas,
+attestation verifier, security primitives) bring the root's dependencies with them, for example zod through
+`src/box/handshake`. It never imports the watcher, CLI, vault or providers.
 
-The control plane provides passkey accounts, account-owned boxes, a relay for the five signed handshake messages
-and signed approval/disarm documents, expiring ciphertext blobs, Stripe billing hooks, provisioning and health.
-Its public TypeScript API is exported from `src/index.ts`. It never imports the watcher, CLI, vault or providers.
+## What is built, and what is not
 
-Provider tokens and device unlock shares are encrypted by the CLI before relay publication. The relay never
-decrypts them. It stores public handshake keys, attestation documents, signatures, ciphertext, hashes and expiry
-metadata. Account records contain public passkey credentials and plan/ownership metadata. Stripe request bodies
-and session, challenge and box bearer tokens are not persisted. Structured server logs contain only an event name
-and status code. An opaque ciphertext format cannot establish that an untrusted caller actually encrypted its
-input; callers must use the shared handshake/sealing code and keep secrets out of metadata and signed documents.
+Built and tested locally (fakes and the loopback emulator):
+
+- Passkey accounts with durable sessions (stored by hash), per-account session caps and bounded challenges.
+- Stripe webhooks that grant the paid plan only for a paid subscription to the configured price, confirmed through
+  the Stripe API, and revoke it on failed payments and subscription status changes.
+- `POST /boxes` gated by the paid plan, a per-account box quota and a name reservation before any Compute call.
+- The relay: handshake messages, the approval and disarm wire formats the code base emits, ciphertext blobs, per-box
+  serialization and per-box and global byte quotas.
+- Box authentication by Confidential Space attestation token (hosted) or issued bearer (emulator and tests).
+- Rate limits keyed by credential or by the client address a configured front end reports.
+- Storage in memory, in a private directory, or in a Cloud Storage bucket through the JSON API.
+- `createHostedControlPlane(hostedConfigFromEnv(env))`: the hosted composition, and a Terraform module that passes
+  exactly that environment.
+
+Not built, so the hosted service is **not launch-ready**:
+
+- No container image or process entry point for Cloud Run. The entry must create the egress-guarded HTTPS client and
+  a metadata-only client (see `notes/control-plane.md`), then call `createHostedControlPlane(...).listen()`.
+- No browser UI, no Stripe Checkout creation and no billing pages.
+- Live box provisioning is not wired into the hosted composition (`POST /boxes` answers 503 there) and Terraform grants
+  the service no Compute or service-account-user rights. The provisioner still refuses live calls unless
+  `KEYSENTRY_CONTROL_PLANE_LIVE=1` and an access-token provider are supplied.
+- One instance only: per-box and per-account work is serialized in process and Cloud Storage writes have no
+  compare-and-swap, so Terraform pins `max_instance_count = 1`. A revision rollout can briefly run two instances.
 
 ## Local validation
 
@@ -21,121 +39,147 @@ Run from the repository root:
 
 ```powershell
 node tools/vitest-sandbox.mjs packages/control-plane/test
-npx tsc -p tsconfig.json --noEmit
+node tools/vitest-sandbox.mjs tools/probes/phase4/control-plane
 npx tsc -p packages/control-plane/tsconfig.json --noEmit
+node tools/vitest-sandbox.mjs test/infra/terraform.test.ts
 ```
 
-The root TypeScript project and ordinary root Vitest configuration do not include this separate package. CI must
-include the package test path and package typecheck explicitly. The prescribed sandbox runner disables the root
-Vitest configuration and discovers these tests. From this directory, `npm test` and `npm run typecheck` also work
-with the repository's already installed tooling.
+The root TypeScript project and ordinary root Vitest configuration do not include this package. CI must include the
+package test path and typecheck explicitly.
 
-## Services and storage
+## Storage
 
-`createMemoryStorage()` and `createFileStorage(directory)` implement `Storage` (`get`, `put`, `delete`, `list`). The
-file implementation uses encoded flat filenames, private modes where supported, exclusive temporary files,
-fsync and atomic rename. It rejects symlink records and bounds JSON reads. The configured directory must be
-private; Windows deployment must supply its filesystem ACLs. Atomic writes protect individual records. This is
-a single-process store, with no cross-process transactions or distributed replay lock.
+`Storage` is `get`, `put`, `delete`, `list(prefix)` over JSON records with keys of at most 150 characters
+(`[A-Za-z0-9_-]` segments joined by `/`).
 
-`createRelayStore({ storage, now? })` exposes `publish`, `poll`, `putBlob`, `getBlob` and `sweep`. Handshake messages
-use the existing strict schemas. Approval/disarm wrappers match the existing approval relay wire format:
+- `createMemoryStorage()`.
+- `createFileStorage(directory)`: one private directory, lower-case base32 file names (so case-folding file systems such
+  as NTFS and default APFS never alias two keys), exclusive temporary files, fsync and atomic rename, symlinks refused,
+  reads sized to the file. Windows deployments must supply the directory ACLs.
+- `createGcsStorage({ http, bucket, accessToken, objectPrefix? })`: one object per key over the Cloud Storage JSON API
+  through the injected `HttpClient`, bounded retries with backoff on 429 and 5xx, fixed error text.
+  `metadataAccessToken(http)` reads the service account's token from the metadata server and caches it.
 
-```json
-{"type":"keysentry-approval","v":1,"approval":{"actionId":"...","keyId":"...","digest":"...","at":"...","sig":"..."}}
-```
+## Relay
 
-Disarms use `type: "keysentry-disarm"` and a `disarm` object with `watcherId`, `keyId`, `at`, `sig`. The watcher ID
-must match the box queue. The relay validates schema, encoding, size and expiry; the CLI/box verifies signatures,
-attestation, transcript links and authority. It never treats relay acceptance as authorization.
+`createRelayStore({ storage, now?, ...limits })` exposes `publish`, `poll`, `putBlob`, `getBlob` and `sweep`. Work is
+serialized per box, so one box never delays another. Each box has an index record (`relay-index/<box>`: queue size and
+count, and each blob's size and expiry), so quotas never read blobs; global usage is rebuilt from index records once
+per process. `sweep()` visits a bounded batch of boxes per call (64 by default) and the server runs it every minute.
 
-Queues are per box and can be filtered by session ID. Polling is non-destructive so both endpoints can read the
-transcript. Duplicate queued IDs are refused. Defaults: ten-minute delivery TTL, 128 messages and 7 MiB per queue,
-2 MiB per message, 128 blobs per box and 2 MiB decoded bytes per blob. Blobs carry
-`{ kind: 'sealed-bundle' | 'sealed-state', ciphertext: <canonical base64url>, ttlMs? }`; TTL cannot exceed 24 hours.
-Handshake TTL cannot extend signed expiry. Old valid disarms can be delivered because disarming removes authority;
-their storage TTL begins at receipt. Expired entries are inaccessible immediately and removed lazily or by the
-server's minute sweep. TTL cleanup resumes when the process runs again.
+Accepted messages:
 
-`createAccounts({ storage, origin, ... })` reuses `verifyRegistration` and `verifyAssertion`, requires user
-verification and one-use challenges, rejects assertion counter regression, and creates idle-expiring sessions.
-Cookies use `Path=/; HttpOnly; SameSite=Strict` and `Secure` for HTTPS. Loopback HTTP is allowed for the emulator.
-Sessions/challenges stay in memory and disappear on restart. Ownership cannot be reassigned to another account.
+- The five handshake messages, validated with the shared strict schemas, signed lifetime exactly ten minutes.
+- Approvals exactly as `publishApproval` sends them: `{"type":"keysentry-approval","v":1,"approval":{"actionId",
+  "keyId","digest","at","sig"}}`, relayed only while `at` is within the verifier's ten-minute window.
+- Disarms exactly as `publishDisarm` sends them: `{"type":"keysentry-disarm","v":2,"watcherId","keyId","at","sig"}`.
+  `at` takes the same two forms as `validAt` (with or without milliseconds). The relay does not bind `watcherId` to the
+  box id (the CLI signs with the project id); the watcher checks its own id and the signature. An old disarm is
+  delivered, with a storage TTL from receipt.
 
-`createBilling({ storage, accounts, endpointSecret, now? }).handle(rawBody, stripeSignature)` verifies the original
-bytes using HMAC-SHA256, constant-time comparisons, multiple `v1` signatures and a 300-second tolerance. Event IDs
-provide durable replay detection. Checkout completion marks an existing account paid; subscription deletion
-marks the matching current subscription free. Unknown events are acknowledged without changing a plan. A
-checkout identifies its account through `client_reference_id` or `metadata.accountId`; customer/subscription
-references are remembered for deletion. There is no checkout creation, Stripe API client or billing UI.
+The relay validates shape, encoding, size and expiry only; endpoints verify signatures, attestation and authority.
+
+Default limits: message 1 MiB; queue 128 messages and 4 MiB per box; blob 2 MiB decoded, 128 blobs and 16 MiB stored
+per box; 64 MiB for every box's queues and blobs together (507 when full); ten-minute delivery TTL; blob TTL at most
+24 hours. These are far below the 512 MiB Cloud Run memory, and with Cloud Storage the bytes live in the bucket.
+
+## Accounts
+
+`createAccounts({ storage, origin, ... })` reuses `verifyRegistration` and `verifyAssertion` with user verification
+and one-use challenges, and refuses counter regression and cross-account credential reuse.
+
+- Sessions are stored as `sessions/<sha256(id)>` (the id itself is never stored), with a 30-minute sliding idle expiry
+  (written at most once a minute) and a 12-hour absolute lifetime. A sign-in beyond 8 sessions evicts that account's
+  oldest. A restart or scale-to-zero keeps everyone signed in.
+- The cookie is `__Host-ks_control_session` over HTTPS (`Path=/; HttpOnly; SameSite=Strict; Secure`), so a sibling
+  subdomain can neither plant nor shadow it; loopback HTTP uses `ks_control_session` without `Secure`.
+- Challenges stay in memory: 2-minute TTL, at most 16 pending per client address (a new one evicts that client's
+  oldest) and 20,000 in total (oldest evicted).
+- Registration writes the account, credential index, session and session index, and deletes all of them if any write
+  fails, so a refused registration never burns the passkey.
+- `reserveBox` (402 unpaid, 403 at quota, 409 name held by another account) writes a pending ownership record;
+  `confirmBox` makes it active; `releaseBox` rolls a pending one back. The quota (default 1) counts pending and active
+  boxes. `ownsBox` and `boxOwner` see active boxes only.
+
+## Billing
+
+`createBilling({ storage, accounts, endpointSecret, priceId, stripe: { http, apiKey } })` verifies the raw bytes
+(HMAC-SHA256, any `v1`, one `t`, ±300 s) and keeps a durable event-id replay record, written only after the event was
+handled.
+
+| Event | Effect |
+|---|---|
+| `checkout.session.completed`, `checkout.session.async_payment_succeeded` | Paid only for `mode: subscription`, `status: complete`, `payment_status` `paid` or `no_payment_required`, an existing account (`client_reference_id` or `metadata.accountId`), and a subscription that `GET /v1/subscriptions/{id}` reports `active` or `trialing`, for the same customer, with the configured price. If Stripe cannot be reached the webhook answers 503 and Stripe retries. |
+| `checkout.session.async_payment_failed` | Free, when that checkout's subscription is the account's current one. |
+| `customer.subscription.updated` | For the account's current subscription: `unpaid`, `canceled`, `incomplete_expired`, `paused` or another price revoke; `active` and `trialing` with the configured price grant; `past_due` keeps the plan while Stripe retries; `incomplete` changes nothing. An event older than one already applied is ignored; a grant needs the event's `created` time. |
+| `customer.subscription.deleted` | Free, for the account's current subscription. |
+
+The paid plan gates creating boxes; it does not stop running ones. `apiKey` should be a restricted key that can only
+read subscriptions. Checkout creation and the billing UI are not built.
 
 ## HTTP server
 
-`createControlPlaneServer({ origin, accounts, billing, relay, provisioner?, port?, ... })` returns `listen`, `close`,
-`issueBoxToken(boxId)` and `revokeBoxToken(boxId)`. The default listener is loopback. An HTTPS public origin assumes
-TLS termination outside this Node HTTP listener. Public Host must match that origin. Use `origin:
-"http://127.0.0.1:0"` for a random local port and pass `accounts: actualOrigin => createAccounts({ storage, origin:
-actualOrigin })` so WebAuthn uses the finalized origin. A fixed-origin service can pass an account object directly.
+`createControlPlaneServer({ origin, accounts, billing, relay, provisioner?, boxAttestation?, trustedProxy?, ... })`
+returns `listen`, `close`, `issueBoxToken(boxId)` and `revokeBoxToken(boxId)`. The public Host must equal the origin
+(DNS rebinding is refused). Pass `accounts: origin => createAccounts(...)` for a random-port origin.
 
 | Method | Route | Access |
 |---|---|---|
-| GET | `/healthz` | Public JSON health |
-| POST | `/auth/register/challenge`, `/auth/register/finish` | Same-origin passkey registration |
-| POST | `/auth/login/challenge`, `/auth/login/finish` | Same-origin passkey assertion |
-| GET, DELETE | `/session` | Session; delete also requires Origin/CSRF |
-| POST | `/billing/webhook` | Stripe signature over raw JSON bytes |
-| POST | `/boxes` | Owner browser session, Origin and CSRF; body `{ "name": "..." }` |
-| GET, POST | `/boxes/:boxId/messages` | Owner session or scoped box bearer |
-| POST | `/boxes/:boxId/blobs` | Owner session or scoped box bearer |
-| GET | `/boxes/:boxId/blobs/:blobId` | Owner session or scoped box bearer |
+| GET | `/healthz` | Public |
+| POST | `/auth/register/challenge`, `/auth/register/finish`, `/auth/login/challenge`, `/auth/login/finish` | Same-origin passkey ceremonies |
+| GET, DELETE | `/session` | Session; delete also requires Origin and CSRF |
+| POST | `/billing/webhook` | Stripe signature over the raw bytes |
+| POST | `/boxes` | Owner session, Origin and CSRF; body `{ "name", "deviceKey" }` |
+| GET, POST | `/boxes/:boxId/messages` | Owner session, or that box's attestation token or issued bearer |
+| POST | `/boxes/:boxId/blobs` | Same |
+| GET | `/boxes/:boxId/blobs/:blobId` | Same |
 
-Message GET accepts only the optional `?sessionId=...` query. Browser writes require the session's
-`X-CSRF-Token` and exact Origin. Authentication responses include `csrf`; binary WebAuthn inputs use base64url.
-Bearer capabilities authorize only their named box, are returned only to the trusted embedding runtime, and
-are held as hashes in server memory. Issuing a replacement invalidates the prior capability. The runtime must
-deliver it privately to its injected box and re-enroll after a server restart; it must never put it in instance
-metadata or URLs. Provisioning remains browser-session-only.
+`POST /boxes`: `name` must be a Compute instance name (`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`, not `gcp-`) and
+`deviceKey` the owner's enrollment device public key (Ed25519 SPKI DER, base64, 44 bytes); otherwise 400. Then the
+plan, quota and name are checked and the name reserved (402, 403, 409) before the provisioner is called; a failed
+provision releases the reservation and answers 502.
 
-HTTP requests are JSON only, use the approval server's security headers, enforce streamed/body length limits and
-per-socket-client rate limits, and do not trust `X-Forwarded-For`. Default HTTP body limit is 2 MiB (configurable
-up to 4 MiB), auth 64 KiB and webhook 256 KiB. A larger blob's base64 representation must also fit the HTTP limit.
+Box access: a hosted box presents a Confidential Space token for this server's origin (`relayCredential` in
+`src/box/agent/main.ts`). It is checked by the shared verifier against `boxAttestation`'s JWKS (or the pinned PKI root),
+issuer, audience, time (at most an hour old), secure boot, `dbgstat`, `swname`, `STABLE`, hardware, memory monitoring
+off, no overrides, project, service account and allowed digest; nonces are not involved. `submods.gce.instance_name`
+must name the box in the route, and the box must exist (default: it has an active owner). Verified tokens are cached
+until they expire; a forced JWKS refresh runs at most every five minutes. Issued 43-character bearers remain for the
+emulator and tests; issuing a new one replaces the box's previous bearer.
+
+Rate limits (token buckets, least recently used evicted beyond 10,000): per box credential (120 a minute), per signed-in
+account (120), per client address for anonymous requests and failed credentials (120), and `/billing/webhook` per client
+address (300). The client address is the socket peer, or with `trustedProxy: { header, hops }` the entry `hops` from the
+right of that header (2 behind an external Application Load Balancer); IPv6 addresses count per /64. A request whose
+credential needs a storage read or a signature check is charged to its client address first. Connections: at most 1,024,
+and 64 per socket address without a trusted proxy. A refused or unread request body is not drained; the response closes
+the connection. Bodies are JSON only (2 MiB default, up to 4 MiB; auth 64 KiB; webhook 256 KiB). Logs carry only an
+event name and status code.
+
+## Hosted configuration
+
+`hostedConfigFromEnv(env)` reads, and `infra/terraform/control-plane` sets: `KEYSENTRY_CONTROL_ORIGIN`,
+`KEYSENTRY_CONTROL_BUCKET`, `KEYSENTRY_STRIPE_PRICE_ID`, `KEYSENTRY_BOX_PROJECT_ID`, `KEYSENTRY_BOX_SERVICE_ACCOUNT`,
+`KEYSENTRY_BOX_ALLOWED_DIGESTS` (comma list), `KEYSENTRY_TRUSTED_PROXY_HOPS`, and from Secret Manager
+`KEYSENTRY_STRIPE_WEBHOOK_SECRET` and `KEYSENTRY_STRIPE_API_KEY`; Cloud Run sets `PORT`. Errors name a missing
+variable, never its value. The Terraform service is public (`invoker_iam_disabled`; every route authenticates its own
+caller), one instance, 512 MiB, with object access to the private versioned bucket (old versions deleted after 7 days;
+relay and session objects after 2 days) and read access to the two Stripe secrets only.
 
 ## Emulator and provisioning
 
-`startEmulator({ policy?, now?, startBox? })` starts one server on `127.0.0.1` at a random port, with separate
-attestation, JWKS, STS, KMS and Compute routes. `close()` stops it and clears retained KMS keys/access grants.
-The injected `HttpClient` maps the official Google STS/KMS/Compute URLs to this listener and refuses every other
-destination; it makes no external calls. The local attestation endpoint mirrors the launcher's JSON token request
-and raw JWT response. Keys and a root/intermediate/leaf PKI chain are generated locally in memory.
+`startEmulator({ policy?, now?, startBox? })` serves attestation, JWKS, STS, KMS and Compute on one `127.0.0.1` port.
+Every request must carry the exact loopback Host. Token minting, STS, KMS and Compute also require a random per-start
+secret held only by the emulator's own `http` client; JWKS, the PKI root and health are public. `mintToken` names
+`instanceName` in `submods.gce.instance_name`. Compute accepts only what Confidential Space would run as a keysentry box
+(TDX on C3, secure boot, TERMINATE, the production image family, no external address, the box service account, and
+exactly the five metadata keys below) and calls the injected `startBox(config)`; it never starts a VM.
 
-```typescript
-const emulator = await startEmulator({
-  startBox: async config => { /* Inject the later box agent here; config contains public instance settings. */ },
-});
-const provisioner = createProvisioner({
-  http: emulator.http,
-  emulatorOrigin: emulator.computeOrigin,
-  projectId: emulator.policy.projectId,
-  zone: 'us-central1-a',
-  subnetwork: `projects/${emulator.policy.projectId}/regions/us-central1/subnetworks/box-subnet`,
-  serviceAccount: emulator.policy.serviceAccount,
-  imageReference: `registry.invalid/keysentry/box@${emulator.policy.allowedDigests[0]}`,
-  allowedDigests: emulator.policy.allowedDigests,
-});
-try { await provisioner.provision({ name: 'local-box' }); }
-finally { await emulator.close(); }
-```
+`createProvisioner({ ..., relayOrigin })` creates the Terraform-shaped TDX instance with metadata
+`tee-image-reference`, `tee-restart-policy`, `keysentry-box-id`, `keysentry-relay-origin` and
+`keysentry-enroll-device-key` (non-secret routing, read by `readBoxRoute`). Network, firewall, IAM and KMS are
+prerequisites.
 
-`mintToken({ audience, nonces, tokenType?, switches? })`, `setSwitches` and `updateReleasePolicy` support tests.
-Switches: `debugImage`, `otherProject`, `otherServiceAccount`, `missingStable`, `wrongDigest`, `staleIat`, `replay`.
-Use the emulator's `jwks`/`root` explicitly with the shared verifier; these are local trust anchors, never Google's.
-STS verifies the local RS256 signature, time and release policy. KMS rechecks the current policy on each operation:
-allowed digest, project, service account, Confidential Space, STABLE and production debug status. AES-GCM wrapping,
-AAD, checksums and bearer expiry are enforced. This models release-policy behavior, not Google's hardware or IAM.
-
-Provisioning emits Terraform-matching TDX/c3-standard-4 settings, secure boot, production Confidential Space,
-TERMINATE maintenance, private subnet and no external address or secret metadata. Existing network, firewall,
-IAM and KMS infrastructure are prerequisites. Without a trusted loopback emulator origin, provisioning refuses
-unless `KEYSENTRY_CONTROL_PLANE_LIVE=1` and a live access-token provider are supplied. That flag is never set in
-this project. No resources have been created. Compute invokes only the injected `startBox(config)`; it does not
-start a VM or a watcher by itself.
+`startLocalBox({ bootBox, boxId?, enrollmentDeviceKey? })` runs the emulator, a loopback control plane and one box
+provisioned through emulator Compute. Its relay accepts the box's emulator attestation token exactly as the hosted relay
+does, and `cliToken` is an issued bearer for the CLI. `close()` closes both listeners even if the box fails to stop.

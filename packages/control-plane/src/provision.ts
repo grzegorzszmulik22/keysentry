@@ -10,6 +10,11 @@ export interface ProvisionerOptions {
   imageReference: string;
   /** Digests obtained from the independently verified public allow-list. */
   allowedDigests: readonly string[];
+  /**
+   * The control plane's own public origin, written to `keysentry-relay-origin` so the box finds its relay. HTTPS,
+   * or with an emulator origin also an exact `http://127.0.0.1:<port>` loopback relay.
+   */
+  relayOrigin: string;
   /** Exact origin of a locally started emulator, never a request-provided URL. */
   emulatorOrigin?: string;
   /** Live-only credential provider. The live environment gate is checked first. */
@@ -22,9 +27,30 @@ export interface ProvisionOperation {
   targetId?: string;
 }
 
-export interface Provisioner {
-  provision(input: { name: string }): Promise<ProvisionOperation>;
+export interface ProvisionInput {
+  name: string;
+  /** The owner's enrollment device public key: Ed25519 SPKI DER, base64 (44 bytes). Public, untrusted routing. */
+  deviceKey: string;
 }
+
+export interface Provisioner {
+  provision(input: ProvisionInput): Promise<ProvisionOperation>;
+}
+
+/** Compute instance names (RFC 1035 label), excluding Google's reserved `gcp-` prefix. */
+export const BOX_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+export function isBoxName(value: unknown): value is string {
+  return typeof value === 'string' && BOX_NAME.test(value) && !value.startsWith('gcp-');
+}
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+/** A canonical base64 Ed25519 SPKI DER public key, the form `readBoxRoute` accepts from metadata. */
+export function isDeviceKey(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length !== 60) return false;
+  const bytes = Buffer.from(value, 'base64');
+  return bytes.length === 44 && bytes.toString('base64') === value && bytes.subarray(0, 12).equals(ED25519_SPKI_PREFIX);
+}
+/** Instance metadata keys a box carries: two for the launcher, three non-secret routing attributes for the agent. */
+export const BOX_METADATA_KEYS = ['tee-image-reference', 'tee-restart-policy', 'keysentry-box-id', 'keysentry-relay-origin', 'keysentry-enroll-device-key'] as const;
 
 function configurationError(): never { throw new TypeError('Invalid provisioning configuration.'); }
 function failed(): never { throw new Error('Box provisioning failed.'); }
@@ -37,6 +63,15 @@ function emulatorOrigin(value: string): string {
       || Number(url.port) > 65535 || url.username || url.password) throw new Error();
     return value;
   } catch { throw new TypeError('Invalid emulator origin.'); }
+}
+
+function relay(value: string, local: boolean): string {
+  try {
+    const url = new URL(value);
+    if (url.origin !== value || url.username || url.password || value.length > 255) throw new Error();
+    if (url.protocol === 'https:' || (local && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value))) return value;
+    throw new Error();
+  } catch { configurationError(); }
 }
 
 function validImageReference(value: string): boolean {
@@ -62,13 +97,14 @@ export function createProvisioner(options: ProvisionerOptions): Provisioner {
   const subnetPrefix = `projects/${projectId}/regions/${region}/subnetworks/`;
   if (!subnetwork.startsWith(subnetPrefix) || !/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(subnetwork.slice(subnetPrefix.length))) configurationError();
   const localOrigin = options.emulatorOrigin === undefined ? null : emulatorOrigin(options.emulatorOrigin);
+  const relayOrigin = relay(options.relayOrigin, localOrigin !== null);
   const instanceUrl = `${localOrigin ?? 'https://compute.googleapis.com'}/compute/v1/projects/${projectId}/zones/${zone}/instances`;
 
   return {
-    async provision({ name }): Promise<ProvisionOperation> {
-      if (typeof name !== 'string' || !/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name) || name.startsWith('gcp-')) {
-        throw new TypeError('Invalid box name.');
-      }
+    async provision(input): Promise<ProvisionOperation> {
+      const { name, deviceKey } = input ?? {} as ProvisionInput;
+      if (!isBoxName(name)) throw new TypeError('Invalid box name.');
+      if (!isDeviceKey(deviceKey)) throw new TypeError('Invalid enrollment device key.');
       if (localOrigin === null && process.env.KEYSENTRY_CONTROL_PLANE_LIVE !== '1') {
         throw new Error('Live provisioning is disabled.');
       }
@@ -84,7 +120,12 @@ export function createProvisioner(options: ProvisionerOptions): Provisioner {
         } }],
         networkInterfaces: [{ subnetwork }],
         serviceAccounts: [{ email: serviceAccount, scopes: ['https://www.googleapis.com/auth/cloud-platform'] }],
-        metadata: { items: [{ key: 'tee-image-reference', value: imageReference }, { key: 'tee-restart-policy', value: 'Always' }] },
+        // Only the launcher's two keys and three non-secret routing attributes; never a secret or a tee-env-*.
+        metadata: { items: [
+          { key: 'tee-image-reference', value: imageReference }, { key: 'tee-restart-policy', value: 'Always' },
+          { key: 'keysentry-box-id', value: name }, { key: 'keysentry-relay-origin', value: relayOrigin },
+          { key: 'keysentry-enroll-device-key', value: deviceKey },
+        ] },
       };
       try {
         const headers: Record<string, string> = { 'content-type': 'application/json' };

@@ -55,8 +55,9 @@ describe('passkey accounts', () => {
     expect(ctx.account.plan).toBe('free');
     expect(ctx.account.credential.id).toBe(ctx.auth.id);
     expect(ctx.cookie).toContain('Path=/; HttpOnly; SameSite=Strict; Secure');
-    expect(ctx.accounts.authenticate(ctx.cookie)?.accountId).toBe(ctx.account.id);
-    expect(ctx.accounts.authenticate(ctx.cookie)?.csrf).toHaveLength(43);
+    expect(ctx.cookie).toMatch(/^__Host-ks_control_session=[A-Za-z0-9_-]{43}; /);
+    expect((await ctx.accounts.authenticate(ctx.cookie))?.accountId).toBe(ctx.account.id);
+    expect((await ctx.accounts.authenticate(ctx.cookie))?.csrf).toHaveLength(43);
     expect(await ctx.accounts.get(ctx.account.id)).toEqual(ctx.account);
   });
   test('registration rejects wrong origins and consumes the challenge after a failed attempt', async () => {
@@ -92,7 +93,7 @@ describe('passkey accounts', () => {
     const input = { accountId: ctx.account.id, challengeId: challenge.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(challenge.challenge) };
     const signed = await ctx.accounts.signIn(input);
     expect(signed.account.credential.signCount).toBe(1);
-    expect(ctx.accounts.authenticate(signed.cookie)?.accountId).toBe(ctx.account.id);
+    expect((await ctx.accounts.authenticate(signed.cookie))?.accountId).toBe(ctx.account.id);
     await expect(ctx.accounts.signIn(input)).rejects.toThrow();
     const next = await ctx.accounts.assertionChallenge(ctx.account.id);
     await expect(ctx.accounts.signIn({ ...input, challengeId: next.id, ...ctx.auth.assertion(next.challenge, 1) })).rejects.toThrow();
@@ -115,9 +116,9 @@ describe('passkey accounts', () => {
   });
   test('duplicate cookies, idle expiry and cleared sessions cannot authenticate', async () => {
     const ctx = await signup(); const pair = ctx.cookie.split(';')[0]!;
-    expect(ctx.accounts.authenticate(`${pair}; ${pair}`)).toBeNull();
-    ctx.advance(60_000); expect(ctx.accounts.authenticate(pair)).toBeNull();
-    const second = await signup(ctx); ctx.accounts.clearSession(second.cookie); expect(ctx.accounts.authenticate(second.cookie)).toBeNull();
+    expect(await ctx.accounts.authenticate(`${pair}; ${pair}`)).toBeNull();
+    ctx.advance(60_000); expect(await ctx.accounts.authenticate(pair)).toBeNull();
+    const second = await signup(ctx); await ctx.accounts.clearSession(second.cookie); expect(await ctx.accounts.authenticate(second.cookie)).toBeNull();
   });
   test('account ownership cannot be reassigned or accessed by another account', async () => {
     const ctx = await signup(); const second = await signup(ctx);
@@ -129,6 +130,115 @@ describe('passkey accounts', () => {
   });
   test('HTTP sessions are permitted only on loopback and omit Secure there', () => {
     expect(() => createAccounts({ storage: memory(), origin: 'http://remote.example' })).toThrow();
-    expect(() => createAccounts({ storage: memory(), origin: 'http://127.0.0.1:1234' })).not.toThrow();
+    const local = createAccounts({ storage: memory(), origin: 'http://127.0.0.1:1234' });
+    expect(local.cookieName).toBe('ks_control_session');
+    expect(local.clearCookie).not.toContain('Secure');
+  });
+});
+
+describe('M1 and L4: durable, bounded sessions and challenges', () => {
+  async function signIn(ctx: Awaited<ReturnType<typeof signup>>) {
+    const challenge = await ctx.accounts.assertionChallenge(ctx.account.id);
+    return ctx.accounts.signIn({ accountId: ctx.account.id, challengeId: challenge.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(challenge.challenge, ++counter) });
+  }
+  let counter = 0;
+  test('sessions are stored by hash only and survive a restart on the same storage', async () => {
+    const ctx = await signup();
+    const id = ctx.session.id;
+    for (const key of await ctx.storage.list('')) expect(JSON.stringify(await ctx.storage.get(key))).not.toContain(id);
+    expect(await ctx.storage.list('sessions/')).toEqual([`sessions/${createHash('sha256').update(id).digest('hex')}`]);
+    const restarted = createAccounts({ storage: ctx.storage, origin: 'https://control.example', now: () => 1_000_000 });
+    expect(await restarted.authenticate(ctx.cookie)).toEqual({ id, accountId: ctx.account.id, csrf: ctx.session.csrf });
+    expect(restarted.cachedSession(ctx.cookie)).toBe(true);
+  });
+  test('a sign-in beyond the per-account cap evicts that account\'s oldest session only', async () => {
+    let now = 1_000_000;
+    const storage = memory();
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => now, maxSessionsPerAccount: 2 });
+    const ctx = await signup({ accounts, storage, advance: (ms: number) => { now += ms; } });
+    const other = await signup({ accounts, storage, advance: (ms: number) => { now += ms; } });
+    now += 1; const second = await signIn(ctx);
+    now += 1; const third = await signIn(ctx);
+    expect(await accounts.authenticate(ctx.cookie)).toBeNull();
+    expect(await accounts.authenticate(second.cookie)).not.toBeNull();
+    expect(await accounts.authenticate(third.cookie)).not.toBeNull();
+    expect(await accounts.authenticate(other.cookie)).not.toBeNull();
+    expect((await storage.list('sessions/')).length).toBe(3);
+  });
+  test('activity extends the idle expiry but never the absolute lifetime', async () => {
+    let now = 1_000_000;
+    const storage = memory();
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => now, sessionIdleMs: 120_000, sessionMaxAgeMs: 300_000 });
+    const ctx = await signup({ accounts, storage, advance: (ms: number) => { now += ms; } });
+    for (let i = 0; i < 4; i++) { now += 70_000; expect(await accounts.authenticate(ctx.cookie)).not.toBeNull(); }
+    now += 30_000;
+    expect(await accounts.authenticate(ctx.cookie)).toBeNull();
+    expect(await storage.list('sessions/')).toEqual([]);
+  });
+  test('a full ceremony table evicts that client\'s oldest challenge, not other clients\'', async () => {
+    const ctx = await signup();
+    const first = ctx.accounts.registrationChallenge('203.0.113.9');
+    for (let i = 0; i < 16; i++) ctx.accounts.registrationChallenge('203.0.113.9');
+    const other = await ctx.accounts.assertionChallenge(ctx.account.id, '198.51.100.7');
+    const auth = authenticator();
+    await expect(ctx.accounts.register({ challengeId: first.id, ...auth.registration(first.challenge) })).rejects.toThrow();
+    const signed = await ctx.accounts.signIn({ accountId: ctx.account.id, challengeId: other.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(other.challenge, 5) });
+    expect(signed.session.accountId).toBe(ctx.account.id);
+  });
+  test('a registration whose session cannot be stored writes nothing and the passkey can register later', async () => {
+    const inner = memory();
+    let refuse = true;
+    const storage = { ...inner, async put(key: string, value: unknown) { if (refuse && key.startsWith('account-sessions/')) throw new Error('unavailable'); return inner.put(key, value); } };
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => 1_000_000 });
+    const auth = authenticator();
+    const attempt = () => { const challenge = accounts.registrationChallenge(); return accounts.register({ challengeId: challenge.id, ...auth.registration(challenge.challenge) }); };
+    await expect(attempt()).rejects.toThrow();
+    expect(await inner.list('')).toEqual([]);
+    refuse = false;
+    await expect(attempt()).resolves.toHaveProperty('account');
+  });
+  test('clearing a session removes it from storage and from the account index', async () => {
+    const ctx = await signup();
+    await ctx.accounts.clearSession(ctx.cookie);
+    expect(await ctx.storage.list('sessions/')).toEqual([]);
+    expect(await ctx.storage.get(`account-sessions/${ctx.account.id}`)).toEqual({ v: 1, sessions: [] });
+  });
+});
+
+describe('H1: box reservations', () => {
+  async function paid(ctx: Awaited<ReturnType<typeof signup>>) { await ctx.accounts.setPlan(ctx.account.id, 'paid'); }
+  test('a free account cannot reserve; a paid one reserves, confirms and owns its box', async () => {
+    const ctx = await signup();
+    await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-one')).rejects.toMatchObject({ status: 402 });
+    expect(await ctx.storage.list('box-owners/')).toEqual([]);
+    await paid(ctx);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(false);
+    expect(await ctx.accounts.boxOwner('box-one')).toBeNull();
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-one');
+    expect(await ctx.accounts.ownsBox(ctx.account.id, 'box-one')).toBe(true);
+    expect(await ctx.accounts.boxOwner('box-one')).toBe(ctx.account.id);
+  });
+  test('the quota counts pending and active boxes, a held name is refused to others, and release frees both', async () => {
+    const ctx = await signup(); const other = await signup(ctx);
+    await paid(ctx); await paid(other);
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
+    await expect(ctx.accounts.reserveBox(ctx.account.id, 'box-two')).rejects.toMatchObject({ status: 403 });
+    await expect(ctx.accounts.reserveBox(other.account.id, 'box-one')).rejects.toMatchObject({ status: 409 });
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
+    await ctx.accounts.releaseBox(ctx.account.id, 'box-one');
+    await other.accounts.reserveBox(other.account.id, 'box-one');
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-two');
+    await other.accounts.confirmBox(other.account.id, 'box-one');
+    await other.accounts.releaseBox(other.account.id, 'box-one');
+    expect(await ctx.accounts.ownsBox(other.account.id, 'box-one')).toBe(true);
+  });
+  test('the quota is configurable', async () => {
+    const storage = memory();
+    const accounts = createAccounts({ storage, origin: 'https://control.example', now: () => 1_000_000, boxQuota: 2 });
+    const ctx = await signup({ accounts, storage, advance: () => undefined });
+    await paid(ctx);
+    await accounts.reserveBox(ctx.account.id, 'box-one'); await accounts.reserveBox(ctx.account.id, 'box-two');
+    await expect(accounts.reserveBox(ctx.account.id, 'box-three')).rejects.toMatchObject({ status: 403 });
   });
 });

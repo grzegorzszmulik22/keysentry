@@ -1,8 +1,9 @@
-import { createCipheriv, createDecipheriv, createPublicKey, randomBytes, sign, verify, type JsonWebKey, type X509Certificate } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createPublicKey, randomBytes, sign, timingSafeEqual, verify, type JsonWebKey, type X509Certificate } from 'node:crypto';
 import { createServer, request as nodeRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AttestationClaims, HttpClient, HttpRequest, HttpResponse } from '../../../../src/types.js';
 import { parseJwt } from '../../../../src/box/attestation/jwt.js';
 import { crc32c } from '../../../../src/box/seal/kms.js';
+import { BOX_METADATA_KEYS, isBoxName, isDeviceKey } from '../provision.js';
 import { createEmulatorPki } from './pki.js';
 
 /** Test-only deviations from a production Confidential Space token. */
@@ -39,6 +40,8 @@ export interface EmulatorTokenInput {
   nonces: string[];
   tokenType?: 'OIDC' | 'PKI';
   switches?: EmulatorSwitches;
+  /** `submods.gce.instance_name` (and `sub`): the booted box's Compute name. Default `emulated-box`. */
+  instanceName?: string;
 }
 export interface Emulator {
   baseUrl: string;
@@ -57,6 +60,9 @@ export interface Emulator {
 }
 
 const ISSUER = 'https://confidentialcomputing.googleapis.com';
+/** Per-start caller secret on every route that mints tokens, exchanges them, uses KMS or boots a box. */
+const CALLER_HEADER = 'x-keysentry-emulator-token';
+const PRODUCTION_IMAGE = /^projects\/confidential-space-images\/global\/images\/(?:family\/confidential-space|confidential-space-[0-9]+)$/;
 const MAX_BODY = 512 * 1024;
 type Body = Record<string, unknown>;
 class RequestError extends Error {
@@ -104,6 +110,48 @@ async function readBody(req: IncomingMessage): Promise<Body> {
   catch { throw new RequestError(400); }
 }
 
+/**
+ * Only an instance real Confidential Space would run as a keysentry box: TDX on C3 with secure boot and TERMINATE,
+ * the production image family, no external address, the box service account, and exactly the five metadata keys
+ * the provisioner writes. Anything else is provisioner drift and is refused, as the attestation would be.
+ */
+function validInstance(body: Body, zone: string, serviceAccount: string): boolean {
+  const name = body.name;
+  if (!isBoxName(name)) return false;
+  const confidential = body.confidentialInstanceConfig as Body | undefined;
+  const shielded = body.shieldedInstanceConfig as Body | undefined;
+  const scheduling = body.scheduling as Body | undefined;
+  if (typeof body.machineType !== 'string' || !new RegExp(`^zones/${zone}/machineTypes/c3-standard-[0-9]+$`).test(body.machineType)
+    || confidential?.enableConfidentialCompute !== true || confidential.confidentialInstanceType !== 'TDX'
+    || shielded?.enableSecureBoot !== true || scheduling?.onHostMaintenance !== 'TERMINATE') return false;
+  const disks = body.disks;
+  if (!Array.isArray(disks) || disks.length !== 1) return false;
+  const disk = object(disks[0]);
+  const source = object(disk.initializeParams).sourceImage;
+  if (disk.boot !== true || typeof source !== 'string' || !PRODUCTION_IMAGE.test(source)) return false;
+  const interfaces = body.networkInterfaces;
+  if (!Array.isArray(interfaces) || interfaces.length === 0
+    || interfaces.some(entry => { const nic = object(entry); return 'accessConfigs' in nic || 'ipv6AccessConfigs' in nic; })) return false;
+  const accounts = body.serviceAccounts;
+  if (!Array.isArray(accounts) || accounts.length !== 1 || object(accounts[0]).email !== serviceAccount) return false;
+  const items = object(body.metadata).items;
+  if (!Array.isArray(items) || items.length !== BOX_METADATA_KEYS.length) return false;
+  const values = new Map<string, unknown>();
+  for (const item of items) {
+    const entry = object(item);
+    if (typeof entry.key !== 'string' || values.has(entry.key)) return false;
+    values.set(entry.key, entry.value);
+  }
+  if (!BOX_METADATA_KEYS.every(key => typeof values.get(key) === 'string')) return false;
+  const relay = values.get('keysentry-relay-origin') as string;
+  let relayOk = false;
+  try { const url = new URL(relay); relayOk = url.origin === relay && (url.protocol === 'https:' || /^http:\/\/127\.0\.0\.1:[0-9]{1,5}$/.test(relay)); }
+  catch { relayOk = false; }
+  return /^[a-z0-9.-]+\/[A-Za-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(values.get('tee-image-reference') as string)
+    && values.get('tee-restart-policy') === 'Always' && values.get('keysentry-box-id') === name && relayOk
+    && isDeviceKey(values.get('keysentry-enroll-device-key'));
+}
+
 /** Local REST emulator. It never calls Google, launches processes or persists plaintext. */
 export async function startEmulator(options: EmulatorOptions = {}): Promise<Emulator> {
   const now = options.now ?? Date.now;
@@ -123,12 +171,16 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
   const kmsKeys = new Map<string, Buffer>([[release.keyName, randomBytes(32)]]);
   const instances = new Set<string>();
   let closed = false;
+  const callerToken = randomBytes(32).toString('base64url');
+  let expectedHost = '';
 
   function mintToken(input: EmulatorTokenInput): string {
     if (typeof input.audience !== 'string' || !input.audience || Buffer.byteLength(input.audience) > 512
       || !Array.isArray(input.nonces) || input.nonces.length > 6
       || input.nonces.some(nonce => typeof nonce !== 'string' || Buffer.byteLength(nonce) < 10 || Buffer.byteLength(nonce) > 74)
-      || (input.tokenType !== undefined && input.tokenType !== 'OIDC' && input.tokenType !== 'PKI')) throw new RequestError(400);
+      || (input.tokenType !== undefined && input.tokenType !== 'OIDC' && input.tokenType !== 'PKI')
+      || (input.instanceName !== undefined && !isBoxName(input.instanceName))) throw new RequestError(400);
+    const instanceName = input.instanceName ?? 'emulated-box';
     const controls = { ...switches, ...input.switches };
     if (controls.replay && previousToken) return previousToken;
     const seconds = Math.floor(now() / 1000) - (controls.staleIat ? 7200 : 0);
@@ -136,7 +188,7 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
     const digest = controls.wrongDigest ? `sha256:${'b'.repeat(64)}` : identity.allowedDigests[0]!;
     const claims = {
       iss: ISSUER, aud: input.audience, exp: seconds + 3600, iat: seconds, nbf: seconds,
-      sub: `https://www.googleapis.com/compute/v1/projects/${projectId}/zones/us-central1-a/instances/emulated-box`,
+      sub: `https://www.googleapis.com/compute/v1/projects/${projectId}/zones/us-central1-a/instances/${instanceName}`,
       jti: randomBytes(16).toString('base64url'), eat_profile: 'https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims',
       ...(input.nonces.length ? { eat_nonce: input.nonces.length === 1 ? input.nonces[0] : [...input.nonces] } : {}),
       secboot: true, dbgstat: controls.debugImage ? 'enabled' : 'disabled-since-boot', hwmodel: 'GCP_INTEL_TDX',
@@ -146,7 +198,7 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
         confidential_space: { support_attributes: controls.debugImage ? [] : controls.missingStable ? ['LATEST'] : ['STABLE', 'LATEST'], monitoring_enabled: { memory: false } },
         container: { image_digest: digest, image_reference: `registry.invalid/keysentry/box@${digest}`, image_id: digest,
           restart_policy: 'Always', env: {}, env_override: {}, cmd_override: [], args: [] },
-        gce: { project_id: projectId, project_number: identity.projectNumber, zone: 'us-central1-a', instance_id: '987654321', instance_name: 'emulated-box' },
+        gce: { project_id: projectId, project_number: identity.projectNumber, zone: 'us-central1-a', instance_id: '987654321', instance_name: instanceName },
       },
     };
     const head = { alg: 'RS256', typ: 'JWT', kid: pki.kid, ...(input.tokenType === 'PKI' ? { x5c: pki.chain } : {}) };
@@ -212,10 +264,17 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
   }
   const server = createServer(async (req, res) => {
     try {
+      // DNS rebinding: only the exact loopback host. Public trust anchors need nothing more.
+      const hosts = req.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'host').length;
+      if (hosts !== 1 || req.headers.host !== expectedHost) throw new RequestError(403);
       const path = req.url;
       if (req.method === 'GET' && path === '/health') { send(res, 200, { status: 'ok', emulator: true }); return; }
       if (req.method === 'GET' && path === '/jwks') { send(res, 200, { keys: pki.jwks }); return; }
       if (req.method === 'GET' && path === '/.well-known/confidential_space_root.crt') { send(res, 200, pki.root.toString(), true); return; }
+      // Token minting, STS, KMS and Compute need the per-start secret that only this process's clients hold.
+      const presented = req.headers[CALLER_HEADER];
+      if (typeof presented !== 'string' || presented.length !== callerToken.length
+        || !timingSafeEqual(Buffer.from(presented), Buffer.from(callerToken))) throw new RequestError(403);
       if (path === '/v1/token' && req.method === 'GET') { send(res, 200, mintToken({ audience: 'https://sts.googleapis.com', nonces: [] }), true); return; }
       if (req.method !== 'POST') throw new RequestError(404);
       const body = await readBody(req);
@@ -241,22 +300,13 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
       if (kmsRoute) { send(res, 200, kms(body, req, kmsRoute[1]!, kmsRoute[2]!)); return; }
       const compute = /^\/compute\/v1\/projects\/([A-Za-z0-9_-]+)\/zones\/([A-Za-z0-9_-]+)\/instances$/.exec(path ?? '');
       if (compute) {
-        if (compute[1] !== identity.projectId || typeof body.name !== 'string' || !/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(body.name)) throw new RequestError(400);
-        if (body.metadata !== undefined) {
-          const metadata = object(body.metadata);
-          if (!Array.isArray(metadata.items)) throw new RequestError(400);
-          for (const item of metadata.items) {
-            const entry = object(item);
-            if (entry.key !== 'tee-image-reference' && entry.key !== 'tee-restart-policy') throw new RequestError(400);
-            if (typeof entry.value !== 'string' || (entry.key === 'tee-image-reference' && !/@sha256:[a-f0-9]{64}$/.test(entry.value))
-              || (entry.key === 'tee-restart-policy' && entry.value !== 'Always')) throw new RequestError(400);
-          }
-        }
-        const instanceKey = `${compute[1]}/${compute[2]}/${body.name}`;
+        if (compute[1] !== identity.projectId || !validInstance(body, compute[2]!, identity.serviceAccount)) throw new RequestError(400);
+        const name = body.name as string;
+        const instanceKey = `${compute[1]}/${compute[2]}/${name}`;
         if (instances.has(instanceKey)) throw new RequestError(409);
         instances.add(instanceKey);
         try {
-          await options.startBox?.({ projectId: compute[1]!, zone: compute[2]!, instanceName: body.name, instance: structuredClone(body) });
+          await options.startBox?.({ projectId: compute[1]!, zone: compute[2]!, instanceName: name, instance: structuredClone(body) });
         } catch { instances.delete(instanceKey); throw new RequestError(400); }
         send(res, 200, { name: `operation-${randomBytes(8).toString('hex')}`, status: 'DONE', targetLink: `projects/${instanceKey}`, operationType: 'insert' }); return;
       }
@@ -268,6 +318,7 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Could not start emulator.');
   const baseUrl = `http://127.0.0.1:${address.port}`;
+  expectedHost = `127.0.0.1:${address.port}`;
   const http: HttpClient = {
     request(input: HttpRequest): Promise<HttpResponse> {
       if (closed) return Promise.reject(new Error('Emulator is closed.'));
@@ -283,7 +334,7 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
         }
       } catch { return Promise.reject(new Error('Emulator destination is not supported.')); }
       return new Promise((resolve, reject) => {
-        const request = nodeRequest(target, { method: input.method, headers: input.headers, timeout: 10_000 }, response => {
+        const request = nodeRequest(target, { method: input.method, headers: { ...input.headers, [CALLER_HEADER]: callerToken }, timeout: 10_000 }, response => {
           const chunks: Buffer[] = []; let length = 0;
           response.on('data', (chunk: Buffer) => { length += chunk.length; if (length > 1024 * 1024) response.destroy(new Error('Emulator response is too large.')); else chunks.push(chunk); });
           response.on('error', () => reject(new Error('Emulator request failed.')));
