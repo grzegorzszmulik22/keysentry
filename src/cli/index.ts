@@ -468,7 +468,8 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
 /** npm's bin links resolve to the same module; importing this file does not start the CLI. */
 export function isExecutableEntry(entry: string | undefined, modulePath = fileURLToPath(import.meta.url)): boolean {
   if (!entry) return false;
-  try { return realpathSync(entry) === modulePath; }
+  // Both sides resolved: macOS temp and install paths sit behind /var -> /private/var style links.
+  try { return realpathSync(entry) === realpathSync(modulePath); }
   catch { return ['keysentry', 'keysentry.mjs'].includes(basename(entry)); }
 }
 

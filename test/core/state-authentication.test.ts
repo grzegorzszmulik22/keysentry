@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createStateCipher, createStateStore, StateCorruptError, StateLockedError } from '../../src/core/store.js';
 import { openBytes, sealBytes } from '../../src/security/index.js';
@@ -139,7 +139,7 @@ describe('authenticated saved state (M3)', () => {
   it('binds a project directory to its first project id without changing that binding on mismatch', async () => {
     const { store, options, cwd, vault, projectId } = await fixture();
     await store.loadInventory();
-    const name = `projects/by-path/${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 32)}`;
+    const name = `projects/by-path/${createHash('sha256').update(await realpath(cwd)).digest('hex').slice(0, 32)}`;
     expect((await vault.get(name))?.toString()).toBe(projectId);
     const changedId = '0123456789abcdef';
     await writeFile(join(store.paths.dir, 'project.json'), JSON.stringify({ id: changedId }));
@@ -185,7 +185,7 @@ describe('authenticated saved state (M3)', () => {
 
   it('uses preconfigured binding and marker metadata without writing to a read-only environment vault', async () => {
     const { cwd, projectId, cipher } = await fixture();
-    const pathHash = createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 32).toUpperCase();
+    const pathHash = createHash('sha256').update(await realpath(cwd)).digest('hex').slice(0, 32).toUpperCase();
     const vault = createEnvVault({
       [`KEYSENTRY_VAULT_PROJECTS_BY_PATH_${pathHash}`]: projectId,
       [`KEYSENTRY_VAULT_PROJECT_${projectId.toUpperCase()}_STATE_INITIALIZED`]: '1',
