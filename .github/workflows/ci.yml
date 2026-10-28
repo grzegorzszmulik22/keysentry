@@ -28,6 +28,9 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: node tools/vitest-sandbox.mjs test/
+      - run: npx tsc -p tsconfig.client.json --noEmit
+      - run: npx tsc -p packages/control-plane/tsconfig.json --noEmit
+      - run: node tools/vitest-sandbox.mjs packages/control-plane/test
 
   release-build:
     name: Audit and reproducible release build
@@ -48,6 +51,8 @@ jobs:
       - run: npm audit --audit-level=moderate
       - run: npm run release:build
       - run: npm run release:check
+      - name: Run the bundle inside the Node permission sandbox
+        run: sh scripts/sandbox-smoke.sh dist-release/out/keysentry.mjs
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-preview
