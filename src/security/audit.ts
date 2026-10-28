@@ -46,6 +46,11 @@ function sameFile(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+/** A lock file deleted by another process is "delete pending" on Windows until its handles close: that is contention. */
+function windowsLockContention(error: unknown): boolean {
+  return process.platform === 'win32' && (isCode(error, 'EPERM') || isCode(error, 'EACCES') || isCode(error, 'EBUSY'));
+}
+
 async function withLock<T>(path: string, work: (assertLock: AssertLock) => Promise<T>): Promise<T> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const lockPath = `${path}.lock`;
@@ -58,9 +63,9 @@ async function withLock<T>(path: string, work: (assertLock: AssertLock) => Promi
       lock = await open(lockPath, 'wx', 0o600);
       break;
     } catch (error) {
-      if (!isCode(error, 'EEXIST')) throw new Error('The audit log lock could not be opened.');
+      if (!isCode(error, 'EEXIST') && !windowsLockContention(error)) throw new Error('The audit log lock could not be opened.');
     }
-    try {
+    contended: try {
       const candidate = await stat(lockPath);
       if (Date.now() - candidate.mtimeMs > 30_000) {
         // Another waiter may already have taken over the old lock. Recheck its identity and lease.
@@ -72,6 +77,7 @@ async function withLock<T>(path: string, work: (assertLock: AssertLock) => Promi
       }
     } catch (error) {
       if (isCode(error, 'ENOENT')) continue;
+      if (windowsLockContention(error)) break contended;
       throw new Error('The audit log lock could not be checked.');
     }
     const remaining = deadline - Date.now();

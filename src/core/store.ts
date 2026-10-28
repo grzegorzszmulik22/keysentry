@@ -412,6 +412,14 @@ function stateLockOwnerExited(pid: number): boolean {
   catch (error) { return hasCode(error, 'ESRCH'); }
 }
 
+/**
+ * On Windows a lock file another process has just deleted stays "delete pending" until every handle closes, and
+ * opening, linking or statting it fails with EPERM, EACCES or EBUSY. That is contention, not a broken lock.
+ */
+function windowsLockContention(error: unknown): boolean {
+  return process.platform === 'win32' && (hasCode(error, 'EPERM') || hasCode(error, 'EACCES') || hasCode(error, 'EBUSY'));
+}
+
 /** The filesystem lock also serializes independent modules, processes, and aliases of the same directory. */
 async function withStateLock<T>(dir: string, operation: (assertLock: () => Promise<void>) => Promise<T>): Promise<T> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -438,11 +446,21 @@ async function withStateLock<T>(dir: string, operation: (assertLock: () => Promi
         await link(temporary, path);
         published = true;
         break;
-      } catch (error) { if (!hasCode(error, 'EEXIST')) throw new Error('Unable to open the saved state lock.'); }
-      let current: StateLockSnapshot | null;
+      } catch (error) { if (!hasCode(error, 'EEXIST') && !windowsLockContention(error)) throw new Error('Unable to open the saved state lock.'); }
+      let current: StateLockSnapshot | null | 'contended';
       try { current = await inspectStateLock(path); }
-      catch { throw new Error('Unable to check the saved state lock.'); }
+      catch (error) {
+        if (!windowsLockContention(error)) throw new Error('Unable to check the saved state lock.');
+        current = 'contended';
+      }
       if (current === null) continue;
+      if (current === 'contended') {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw busy();
+        await new Promise<void>(done => setTimeout(done, Math.min(remaining, backoff)));
+        backoff = Math.min(backoff * 2, 200);
+        continue;
+      }
       if (current.pid === null || stateLockOwnerExited(current.pid)) {
         // stat/unlink cannot atomically avoid deleting a new owner during concurrent stale recovery.
         throw new Error('The saved state lock needs attention. Confirm that no keysentry command is running, then remove ".keysentry/.state.lock" and try again.');
