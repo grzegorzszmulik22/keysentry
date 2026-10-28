@@ -12,6 +12,8 @@ const bytes = (value: string) => new TextEncoder().encode(value).buffer;
 const assertion = () => ({ id: b64('credential'), rawId: bytes('credential'), type: 'public-key', response: { clientDataJSON: bytes('client'), authenticatorData: bytes('auth'), signature: bytes('signature'), userHandle: null } });
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 const tick = async () => { await new Promise(resolve => setTimeout(resolve, 0)); };
+// Waits for the reveal to finish instead of a fixed number of ticks, which was too few on slow CI runners.
+const shown = (component: Element) => vi.waitFor(() => expect(component.querySelector('[role="status"]')?.textContent).toBe('Value shown'));
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -219,7 +221,7 @@ describe('dashboard components', () => {
     const fetcher = vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'explicit-reveal-only' })); vi.stubGlobal('fetch', fetcher);
     const component = maskedValue({ route: 'keys/reveal', body: { id: 'key-id' } }); document.body.append(component);
     expect(component.textContent).toContain('Hidden'); expect(fetcher).not.toHaveBeenCalled(); component.querySelector('button')!.click();
-    expect(fetcher).not.toHaveBeenCalled(); [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    expect(fetcher).not.toHaveBeenCalled(); [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     expect(component.textContent).toContain('explicit-reveal-only'); [...component.querySelectorAll('button')].find(b => b.textContent === 'Hide')!.click(); expect(component.textContent).not.toContain('explicit-reveal-only'); expect(component.textContent).toContain('Hidden');
   });
 
@@ -245,7 +247,7 @@ describe('dashboard components', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async value => { clipboard = value; }), readText: vi.fn(async () => clipboard) } });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'copy-only-value' })));
     const component = maskedValue(); document.body.append(component); component.querySelector('button')!.click();
-    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     vi.useFakeTimers(); const copy = [...component.querySelectorAll('button')].find(b => b.textContent === 'Copy')!;
     copy.click(); await vi.waitFor(() => expect(component.textContent).toContain('Copied.')); await vi.advanceTimersByTimeAsync(20_000); copy.click(); await vi.waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(2)); await vi.waitFor(() => expect(component.textContent).toContain('Copied.'));
     await vi.advanceTimersByTimeAsync(10_000); expect(clipboard).toBe('copy-only-value');
@@ -258,7 +260,7 @@ describe('dashboard components', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async value => { clipboard = value; }), readText: vi.fn(async () => clipboard) } });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'copy-only-value' })));
     const component = maskedValue(); document.body.append(component); component.querySelector('button')!.click();
-    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     vi.useFakeTimers(); [...component.querySelectorAll('button')].find(b => b.textContent === 'Copy')!.click(); await vi.waitFor(() => expect(component.textContent).toContain('Copied.')); clipboard = 'another clipboard value';
     await vi.advanceTimersByTimeAsync(30_000); expect(clipboard).toBe('another clipboard value');
   });
@@ -269,7 +271,7 @@ describe('dashboard components', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockImplementationOnce(async value => { clipboard = value; }).mockRejectedValueOnce(new Error('permission')).mockImplementation(async value => { clipboard = value; }), readText: vi.fn(async () => clipboard) } });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'copy-only-value' })));
     const component = maskedValue(); document.body.append(component); component.querySelector('button')!.click();
-    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     vi.useFakeTimers(); const copy = [...component.querySelectorAll('button')].find(b => b.textContent === 'Copy')!;
     copy.click(); await vi.waitFor(() => expect(component.textContent).toContain('Copied.')); await vi.advanceTimersByTimeAsync(20_000); copy.click(); await vi.waitFor(() => expect(component.textContent).toContain('Copy was unavailable.'));
     await vi.advanceTimersByTimeAsync(10_000); await vi.waitFor(() => expect(clipboard).toBe(''));
@@ -280,7 +282,7 @@ describe('dashboard components', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'reveal-value' })));
     const component = maskedValue(); const outlet = document.createElement('main'); document.body.append(outlet);
     const router = createRouter(outlet, { home: { title: 'Home', render: () => component }, other: { title: 'Other', render: () => document.createElement('p') } }); router.start(); await tick(); component.querySelector('button')!.click();
-    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     expect(component.textContent).toContain('reveal-value'); router.navigate('other'); await tick();
     expect(component.textContent).not.toContain('reveal-value'); expect(component.textContent).toContain('Hidden'); router.stop();
   });
@@ -300,7 +302,7 @@ describe('dashboard components', () => {
     Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: vi.fn(async () => assertion()) } });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply({ challenge: b64('challenge'), rpId: 'localhost' })).mockResolvedValueOnce(reply({ value: 'reveal-value' })));
     const component = maskedValue(); document.body.append(component); component.querySelector('button')!.click();
-    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await tick(); await tick();
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === 'Reveal value')!.click(); await shown(component);
     expect(component.textContent).toContain('reveal-value'); window.dispatchEvent(new Event('pagehide'));
     expect(component.textContent).not.toContain('reveal-value'); expect(component.textContent).toContain('Hidden');
   });

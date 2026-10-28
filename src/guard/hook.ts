@@ -122,13 +122,15 @@ async function isOwnHook(path: string, size: number): Promise<boolean> {
 /** Check the executable lookup without running a command or shell. */
 // null: the Node permission model kept keysentry from looking outside its grants, so the answer is unknown.
 async function keysentryOnPath(root: string): Promise<boolean | null> {
-  const pathEntry = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'path');
-  if (pathEntry?.[1] === undefined) return false;
+  // Read by name: the process environment is case-insensitive on Windows, but a copied environment (worker
+  // threads) is a plain object, where scanning entries finds the inherited Path ahead of a PATH set later.
+  const pathValue = process.env.PATH;
+  if (pathValue === undefined) return false;
   // The fixed hook uses POSIX sh, including Git for Windows. Its lookup does
   // not use cmd.exe's PATHEXT expansion for .cmd/.bat wrappers.
   const extensions = process.platform === 'win32' ? ['', '.exe'] : [''];
   let unknown = false;
-  for (const entry of pathEntry[1].split(delimiter)) {
+  for (const entry of pathValue.split(delimiter)) {
     const directory = process.platform === 'win32' ? entry.replace(/^"(.*)"$/, '$1') : entry;
     for (const extension of extensions) {
       const candidate = resolve(root, directory, `keysentry${extension}`);
