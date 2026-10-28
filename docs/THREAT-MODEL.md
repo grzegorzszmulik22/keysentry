@@ -142,7 +142,7 @@ cross the LAN unencrypted to an `http://` proxy. A broken proxy, CA or policy se
 silently going direct; syslog export, which cannot be tunnelled, makes the same proxy decision and refuses a host the
 proxy covers. A deployed watcher receives the CA certificates themselves and, with `network.proxy`, the proxy
 credential inside its encrypted deployment vault (an environment value only with consent); its `/healthz` reports 503
-when its own settings refuse every request. Offline mode stops feed and news polling and removes their hosts from the
+when its own settings refuse every request, and after three connection attempts in a row to its proxy failed. Offline mode stops feed and news polling and removes their hosts from the
 allow-list; it trades early breach warning for fewer outbound contacts, and an autopilot wave can then never start.
 
 **Self-hosted servers (phase 5 and 6).** Coolify, the Kubernetes API server, Vault and a self-hosted Infisical are
@@ -152,7 +152,10 @@ any configured destination, are trusted to answer honestly; a compromised self-h
 keysentry writes to it and fake a successful write. Secret stores do not deploy: unless you declare that consumers
 read at use time (`activation: immediate`), activation stays unconfirmed and the old key is retained until you
 finish. On-write hosts (Heroku, DigitalOcean, Cloudflare Workers) deploy with every write, including writes a
-grace-period undo makes, so `--no-redeploy` cannot stage a change there.
+grace-period undo makes, so `--no-redeploy` cannot stage a change there. Kubernetes Secrets that a controller manages
+(an owner reference or a secret-controller marker) and TLS Secrets are read but never written: a controller would
+restore the old value. Reading them lets a rotation see every copy of a key, so a key also held there is never rolled
+and its old key is never revoked automatically; the user updates the controller's source and revokes it.
 
 **Customer KMS for the state key (phase 5).** With a `kms` section the state key is stored only wrapped, bound to
 the project (encryption context, AAD or a context hash), and unwrapped into memory at start through a client that
@@ -162,7 +165,10 @@ create a new key. The KMS credentials stay outside `CREDENTIAL_NAMES`, and loadC
 deployment exports a KMS credential only where the same name is also a host credential: `VAULT_TOKEN` is the vault-kv
 host's token too, and it is exported when that host is enabled and configured. Supply the other KMS credentials to a
 watcher separately. Two processes that start a new project together create one wrapped key between them (a lock file
-in `.keysentry/` and a re-read after taking it), so neither encrypts state with a key the vault no longer holds.
+in `.keysentry/` and a re-read after taking it), so neither encrypts state with a key the vault no longer holds. The
+lock works like the saved state lock: it waits through Windows "delete pending" lock files, and a lock left by a
+process that stopped is never taken over automatically (two waiters could each remove the other's fresh lock); the
+start stops and says which file to remove once no keysentry command is running.
 
 The binding is authenticated where the KMS authenticates it: an AWS encryption context, Google AAD and Vault Transit
 `context` or `associated_data` all need encrypt permission on your key to produce a record that unwraps. Vault Transit
@@ -359,7 +365,12 @@ requester. The requester's passkey confirmation is their approval; the change ru
 reports the quorum met (operators: `approvals.required` by risk tier; admin changes: `approvals.wideningAdmins`
 admins, or the roster's threshold without a policy), and every runtime entry point it calls re-checks that approved
 request against the current roster and policy before acting, so no route can skip it. Each approved request runs
-once. Request bodies that carry a secret are never stored; the requester submits them again after approval. Reveals
+once: it is claimed in the approvals file before it runs, under a cross-process lock like the saved state lock, so a
+retry, another request handler or another process cannot run it again even when marking it executed later fails or
+the run was interrupted. A dismissal carries the keys of the request it dismisses, so per-tier rules apply to it. An
+arm request that adopts write-only keys names them and binds them into its digest; its approval covers exactly that
+one rotation, and it needs the approvals rotating those keys needs as well as the arming admins. Request bodies that
+carry a secret are never stored; the requester submits them again after approval. Reveals
 and disarms are announced on the team's notification channels with the member's id, and every audit event a dashboard
 request causes records that member (exports carry it as `actor`). Disarm needs the member's passkey but never a quorum
 or governance check: it only reduces automation.
@@ -482,6 +493,7 @@ messages, but a substituted key or an old attestation fails a named check and no
 | Identity provider (team dashboard) | Sign someone in as a member, reassign an email address, or deny sign-in. | The provider can grant reading at a member's role. Changes and disarm need the member's roster passkey, and changes also the team's quorum; roster and policy changes need admins' device keys. Pinned members accept only their exact issuer and subject; email matching folds ASCII case only. It can deny service to every member. |
 | Team member | Approve alone, approve twice, act above their role, or keep acting after removal. | Quorum counts distinct members once each, team dashboard changes are requests that run only under the quorum, viewers cannot approve, operators cannot sign roster or policy changes, widening approvals need admins, and team dashboard sessions, requests and approvals re-check the current roster (approvals again when the action runs). A deployed watcher or cloud box keeps the roster sealed at setup until setup runs again. A member's own host tokens on their own computer stay outside roles; the policy still narrows them there. |
 | Admin, or admins up to the threshold | Change the roster or policy, add an authenticator, lower the threshold. | That is their authority by design; changes are signed, versioned and audited, and joining computers check fingerprints. Fewer admins than the threshold, or than the policy's `wideningAdmins`, cannot make a valid roster or policy change. With one required signature, one admin can add a member whose key they hold; `team add` warns when the policy needs more approvers than that. |
+| Loss of an admin device | Freeze the team: with no spare admin, no later roster or policy change can be signed. | Signing and applying a roster or policy that leaves no spare signing admin (a single admin, or 2-of-2 widening) warns plainly. There is deliberately no bypass, reset or recovery key: anything that could sign for a lost device could also take over the team. Recovery is a spare admin with a device key on another computer, added before it is needed. |
 | Team dashboard host | Use the platform tokens in its vault, or approve as a member whose device key it holds. | It never holds an admin's key (`ui --team` refuses), so it cannot sign roster or policy changes. Anyone with a terminal there can use its tokens outside the dashboard's roles and quorum; protect it like the tokens. |
 | keysentry maintainers | Ship an unsafe implementation or change the release trust list. | Open source, readable release code, explicit trust roots, release signatures, checksums, provenance workflows, and independent rebuilding enable review. Maintainers still control releases; a valid signature identifies the signer, not the safety of the code. There is no external audit yet. |
 

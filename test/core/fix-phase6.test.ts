@@ -26,6 +26,20 @@ describe('public Google API keys (H1)', () => {
     expect(methodForValue(c.provider, googleKey, name)).toBe('guided');
   });
 
+  // Each build tool inlines variables with its prefix into client bundles. Without the prefix, GOOGLE_API_KEY is a
+  // server key and stays automatic, so the prefix alone decides.
+  it.each([
+    'NEXT_PUBLIC_', 'VITE_', 'EXPO_PUBLIC_', 'REACT_APP_', 'PUBLIC_', 'NUXT_PUBLIC_', 'NUXT_ENV_', 'GATSBY_', 'VUE_APP_',
+    'NG_APP_', 'STORYBOOK_', 'NX_PUBLIC_', 'REDWOOD_ENV_', 'PLASMO_PUBLIC_', 'SANITY_STUDIO_', 'WXT_',
+  ])('the client prefix %s makes a Google key public and guided', (prefix) => {
+    expect(methodForValue('google', googleKey, 'GOOGLE_API_KEY')).toBe('auto');
+    const name = `${prefix}GOOGLE_API_KEY`;
+    expect(isPublicGoogleKeyName(name)).toBe(true);
+    expect(classify(name, googleKey)).toMatchObject({ provider: 'google', isSecret: true });
+    expect(methodForValue('google', googleKey, name)).toBe('guided');
+    expect(inventory({ web: { [name]: googleKey } }).clusters[0]).toMatchObject({ provider: 'google', method: 'guided' });
+  });
+
   it.each(['FIREBASE_SERVICE_ACCOUNT', 'FIREBASE_ADMIN_KEY', 'FIREBASE_TOKEN', 'FIREBASE_PRIVATE_KEY', 'GOOGLE_CLIENT_CREDENTIALS'])(
     '%s is a real secret, never public config', (name) => {
       expect(isPublicGoogleKeyName(name)).toBe(false);

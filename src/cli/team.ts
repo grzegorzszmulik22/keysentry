@@ -9,7 +9,7 @@ import type { DeviceKey } from '../security/index.js';
 import type { NotifySeverity, SignedTeamPolicy, SignedTeamRoster, TeamRole, TeamRoster } from '../types.js';
 import {
   adminsNeeded, applyRoster, asciiEmail, candidateCard, candidateFingerprint, checkProposal, createRoster, describeRosterChange, devicePublicKey, exclusiveChannels,
-  foldEmail, INVITE_TTL_MS, listCandidates, loadTeam, memberCardSchema, nextRoster, parseCandidateCard, parseSignedRoster, removeCandidates, rosterFingerprint,
+  foldEmail, INVITE_TTL_MS, listCandidates, loadTeam, memberCardSchema, nextRoster, noSpareAdminWarning, parseCandidateCard, parseSignedRoster, removeCandidates, rosterFingerprint,
   rosterHash, signInvite, signRoster, TeamError, vaultTeamAnchor, verifyFirstUse, verifyRoster,
   type EnrollmentCandidate, type LoadedTeam, type RosterChange, type TeamAnchor,
 } from '../team/index.js';
@@ -228,6 +228,11 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
     if (yes) return true;
     return confirm(word);
   }
+  /** Review M-c: say plainly when a roster or policy leaves no spare signing admin. */
+  function warnNoSpare(roster: TeamRoster, wideningAdmins?: number): void {
+    const warning = noSpareAdminWarning(roster, wideningAdmins);
+    if (warning) options.diagnostic(warning);
+  }
   const governance = (rt: TeamRuntime) => loadGovernance({ store: rt.store, settings: rt.config.settings, cwd: rt.config.cwd,
     env: options.env, anchors: anchors(rt) });
 
@@ -247,6 +252,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
     const proposal = checkProposal(signed, team.roster, { wideningAdmins });
     if (!proposal.ok) throw new TeamError(proposal.reason);
     for (const line of describeRosterChange(team.roster.roster, next)) options.diagnostic(line);
+    warnNoSpare(next, wideningAdmins);
     const required = adminsNeeded(team.roster.roster, wideningAdmins);
     const widens = (change.kind === 'add' && change.member.role !== 'viewer') || (change.kind === 'role' && change.role !== 'viewer');
     if (widens && required <= 1 && policy && Math.max(policy.approvals.required, ...Object.values(policy.approvals.requiredByTier ?? {}).filter((value): value is number => value !== undefined)) > 1) {
@@ -306,6 +312,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       } finally { key.privateKeyDer.fill(0); }
       const result = await applyRoster(rt.store, signed, { anchor: anchors(rt).roster });
       await rt.audit.append({ kind: 'team:init', summary: 'Team roster created.', data: { version: 1 } });
+      warnNoSpare(result.roster.roster);
       let enabledNote = '';
       if (!rt.config.settings.team.enabled) {
         await updateTeamSettings(rt.config.configPath, { enabled: true });
@@ -434,6 +441,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       const proposal = checkProposal(await readTeamFile(path, 'roster proposal'), current.roster, { wideningAdmins });
       if (!proposal.ok) throw new TeamError(proposal.reason);
       for (const line of describeRosterChange(current.roster.roster, proposal.roster.roster)) options.diagnostic(line);
+      warnNoSpare(proposal.roster.roster, wideningAdmins);
       if (!await confirmed(`roster-v${proposal.roster.roster.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not signed. Nothing changed.'); return; }
       const signer = await localAdmin(rt, current.roster.roster);
       let signed: SignedTeamRoster;
@@ -471,6 +479,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       const check = current ? verifyRoster(input, current.roster, { wideningAdmins }) : verifyFirstUse(input, opts.fingerprint!);
       if (!check.ok) throw new TeamError(check.reason);
       for (const line of describeRosterChange(current?.roster.roster ?? null, check.roster.roster)) options.diagnostic(line);
+      warnNoSpare(check.roster.roster, wideningAdmins);
       if (!await confirmed(`roster-v${check.roster.roster.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not applied. Nothing changed.'); return; }
       const result = await applyRoster(rt.store, input, { anchor, wideningAdmins, ...(current ? {} : { trust: { fingerprint: opts.fingerprint! } }) });
       if (result.status === 'unchanged') { options.emit({ status: 'unchanged', version: result.roster.roster.version }, `Roster version ${result.roster.roster.version} is already in use.`); return; }
@@ -607,6 +616,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       if (check.relation === 'same') throw new CliError('This is the policy already in use. Make your changes in a new draft.');
       options.diagnostic(`Policy version ${prepared.policy.version}:`);
       for (const line of describePolicy(prepared.policy)) options.diagnostic(`  ${line}`);
+      warnNoSpare(current.roster.roster, prepared.policy.approvals.wideningAdmins);
       if (!await confirmed(`policy-v${prepared.policy.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not signed. Nothing changed.'); return; }
       const signer = await localAdmin(rt, current.roster.roster);
       let signed: SignedTeamPolicy;
@@ -634,6 +644,7 @@ export function registerTeamCommands(program: Command, options: TeamCommandsOpti
       const check = verifyPolicy(input, current.roster.roster, await loadPolicyHead(rt.store, { anchor }));
       if (!check.ok) throw new CliError(check.reason);
       for (const line of describePolicy(check.policy.policy)) options.diagnostic(line);
+      if (check.relation !== 'same') warnNoSpare(current.roster.roster, check.policy.policy.approvals.wideningAdmins);
       if (check.relation !== 'same' && !await confirmed(`policy-v${check.policy.policy.version}`, opts.yes)) { options.emit({ cancelled: true }, 'Not applied. Nothing changed.'); return; }
       const result = await applyPolicy(rt.store, input, { roster: current.roster.roster, anchor });
       const configured = rt.config.settings.team.policyFile;

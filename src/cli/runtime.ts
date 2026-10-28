@@ -17,6 +17,7 @@ import { auditExportEgressRules } from '../audit-export/index.js';
 import { offlineEgressRules } from '../feeds/index.js';
 import { setupNetwork } from './network-setup.js';
 import { needsManualActivation } from '../hosts/activation.js';
+import { readOnlyServicesOf } from '../hosts/read-only.js';
 import { acceptedCredentialName, VAULT_SET_NAMES } from './credential-names.js';
 import { createGuardedHttp, createFileReceipt, EGRESS_RULES, rulesForUserFeeds, rulesForUserUrls } from '../net/index.js';
 import { createFetchHttp } from '../http.js';
@@ -421,6 +422,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     async redeploy(service) { await automaticGuard?.(); return host.redeploy(service); },
     deploymentStatus: (service, id) => host.deploymentStatus(service, id),
     ...(host.activationFor ? { activationFor: (service: ServiceRef) => host.activationFor!(service) } : {}),
+    ...readOnlyServicesOf(host),
   }));
   const hosts = wrapHosts(options.hosts ?? config.hosts);
   config.hosts = hosts;
@@ -657,7 +659,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   }
 
   async function rotate(rotationPlan: RotationPlan, opts: ExecutionOptions = {}): Promise<RotationReport> {
-    if (opts.execute === true) { assertHuman('rotate keys'); await prepareExecution(); await requireTeamGrant('dashboard:rotate/execute'); }
+    if (opts.execute === true) {
+      assertHuman('rotate keys'); await prepareExecution();
+      // On the team dashboard an approved arm action also covers the adoption rotations it names (review L-b).
+      await requireTeamGrant('dashboard:rotate/execute', { rotating: rotationPlan.steps.map(step => step.clusterId) });
+    }
     const inv = await inventory();
     let interrupted: RotationInterruptedError | undefined;
     let report: RotationReport;
@@ -830,17 +836,24 @@ export async function createRuntime(options: RuntimeOptions = {}) {
    * Review C1: on the team dashboard a change runs only under an approved team request of its own kind
    * (`dashboard:<route>`). Each runtime entry point checks that here, against the current roster and policy, so no route
    * or caller can skip the quorum. Outside the team dashboard (terminal, local dashboard, watcher) it does nothing.
+   * A rotation (`rotating` its clusters) may also run under an approved arm action that names exactly those keys in
+   * `rotates`: arming with adoption rotates them once, and that action's quorum included their rotation's approvals
+   * (review L-b).
    */
-  async function requireTeamGrant(kind: string): Promise<void> {
+  async function requireTeamGrant(kind: string, options: { rotating?: readonly string[] } = {}): Promise<void> {
     const context = dashboardContext.getStore();
     if (!context?.memberId) return;
     const grant = context.grant;
     const refused = 'This change needs the team\'s approvals first. Team members approve it on the team dashboard\'s Approvals screen.';
-    if (!grant || grant.kind !== kind || sealedTeam) throw new CliError(refused);
+    const rotating = options.rotating ?? [];
+    const adoption = kind === 'dashboard:rotate/execute' && rotating.length > 0 && grant?.kind === 'dashboard:autopilot/arm';
+    if (!grant || (grant.kind !== kind && !adoption) || sealedTeam) throw new CliError(refused);
     const service = teamApprovalService();
     try {
       const entry = (await service.approved()).find(item => item.action.id === grant.actionId && item.request.digest === grant.digest);
-      if (!entry || entry.action.kind !== kind) throw new CliError(refused);
+      const covered = (action: { kind: string; rotates?: string[] }) => action.kind === kind
+        || adoption && action.kind === 'dashboard:autopilot/arm' && rotating.every(id => action.rotates?.includes(id) === true);
+      if (!entry || !covered(entry.action)) throw new CliError(refused);
       await service.checkGrant(grant.actionId, grant.digest);
     } catch (error) {
       if (error instanceof ApprovalError) throw new CliError(error.message);
@@ -1072,7 +1085,7 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     /** Proxy, extra CA and offline state (notes/network-enterprise.md); `transport` is only ever wrapped by a guard. */
     // `problem` is the fixed reason the transport refuses every request (watcher health); `ca` feeds syslog over TLS.
     network: { feedMode: network.feedMode, summary: network.summary, transport: rawTransport, problem: network.problem?.message ?? null,
-      ca: network.ca },
+      ca: network.ca, ...(network.proxyUnreachable ? { proxyUnreachable: network.proxyUnreachable } : {}) },
     /** Reads the audit log's MAC key through the same vault view the audit log uses (audit export checks each entry). */
     auditMacKey: () => auditVault.get('audit/mac'),
     freshInventory: async () => rotationInventory(await scan()),

@@ -300,3 +300,69 @@ describe('review fixes: stored quorums, admin quorums, run-time checks and hones
     expect(await approvals.describe(action.id)).toMatchObject({ quorum: { approvals: 0, required: 2 } });
   });
 });
+
+describe('verification review fixes: claims, adoption rotations and the approvals lock', () => {
+  test('L-c: a run claims the approval first; a claimed approval never starts again, while its own checks still pass', async () => {
+    const approvals = service();
+    const request = await approvals.request(action, false);
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(cat, request.challenge))).rejects.toBeInstanceOf(ApprovalPendingError);
+    await approvals.approveWithPasskey(action.id, assertionFor(dan, request.challenge));
+    await expect(approvals.claim(action.id, 'f'.repeat(64))).rejects.toThrow('This action has no approval to run. Request it again.');
+    expect((await approvals.claim(action.id, request.digest)).approvers).toHaveLength(2);
+    expect(events.some(event => event.kind === 'approvals:claimed')).toBe(true);
+    // The change's own entry-point checks still see the grant while it runs.
+    await expect(approvals.checkGrant(action.id, request.digest)).resolves.toBeDefined();
+    expect((await approvals.approved()).map(entry => entry.action.id)).toEqual([action.id]);
+    // Another run (a retry, another request handler or another process) is refused, also by a new service instance.
+    await expect(approvals.claim(action.id, request.digest)).rejects.toThrow('This change has already started with this approval.');
+    await expect(service().claim(action.id, request.digest)).rejects.toThrow('This change has already started with this approval.');
+    await approvals.markExecuted(action.id, request.digest);
+    await expect(approvals.claim(action.id, request.digest)).rejects.toThrow('This action has no approval to run. Request it again.');
+  });
+
+  test('L-c: a claim re-checks the quorum like checkGrant', async () => {
+    const approvals = service();
+    const request = await approvals.request(action, false);
+    await expect(approvals.approveWithPasskey(action.id, assertionFor(cat, request.challenge))).rejects.toBeInstanceOf(ApprovalPendingError);
+    await approvals.approveWithPasskey(action.id, assertionFor(dan, request.challenge));
+    roster = rosterOf([ana, ben, cat, vic]);
+    await expect(approvals.claim(action.id, request.digest)).rejects.toThrow(/\(1 of 2 still count\)/);
+    roster = rosterOf([ana, ben, cat, dan, vic]);
+    await expect(approvals.claim(action.id, request.digest)).resolves.toBeDefined();
+  });
+
+  test('L-b: an admin request that also rotates keys needs those keys\' rotation approvals, and binds them into its digest', async () => {
+    policy = policyWith({ required: 1, requiredByTier: { ai: 3 }, wideningAdmins: 1 });
+    tiers = (input) => input.clusterIds.includes('cluster-ai') ? ['ai'] : ['app'];
+    const approvals = service();
+    const arm = { id: 'arm-one', kind: 'dashboard:autopilot/arm', clusterIds: ['cluster-a', 'cluster-ai'] };
+    await approvals.request(arm, false, { admins: true });
+    expect(await approvals.describe('arm-one')).toMatchObject({ quorum: { required: 1 } });
+    const adopting = { ...arm, id: 'arm-two', rotates: ['cluster-ai'] };
+    const request = await approvals.request(adopting, false, { admins: true });
+    expect(await approvals.describe('arm-two')).toMatchObject({ quorum: { required: 3 } });
+    expect(request.digest).not.toBe((await approvals.request({ ...adopting, id: 'arm-three', rotates: ['cluster-a'] }, false, { admins: true })).digest);
+    // Only admins approve it.
+    await expect(approvals.approveAsMember('arm-two', { memberId: 'cat', credentialId: cat.credential.id }, request.digest)).rejects.toThrow('This change needs approval from team admins.');
+    await expect(approvals.request({ ...adopting, id: 'arm-bad', rotates: [] }, false, { admins: true })).rejects.toThrow('This action description is not valid.');
+    await expect(approvals.request({ ...adopting, id: 'arm-dup', rotates: ['cluster-ai', 'cluster-ai'] }, false, { admins: true })).rejects.toThrow('This action description is not valid.');
+  });
+
+  test('L-c: transactions wait for another process\'s approvals lock and refuse one left by a process that exited', async () => {
+    const approvals = service();
+    const lock = join(dir, '.keysentry', '.approvals.lock');
+    const { mkdir, writeFile, unlink } = await import('node:fs/promises');
+    await mkdir(join(dir, '.keysentry'), { recursive: true });
+    await writeFile(lock, JSON.stringify({ pid: process.pid, token: 'other' }));
+    let done = false;
+    const waiting = approvals.request(action, false).then(result => { done = true; return result; });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(done).toBe(false);
+    await unlink(lock);
+    await expect(waiting).resolves.toMatchObject({ actionId: action.id });
+    await writeFile(lock, JSON.stringify({ pid: 2_147_483_646, token: 'gone' }));
+    await expect(approvals.status(action.id)).rejects.toThrow('The approvals lock needs attention. Confirm that no keysentry command is running, then remove ".keysentry/.approvals.lock" and try again.');
+    await unlink(lock);
+    expect(await approvals.status(action.id)).toBe('pending');
+  });
+});

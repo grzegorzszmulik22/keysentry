@@ -1,11 +1,13 @@
 import type { DeployState, HostAdapter, HttpClient, HttpRequest, HttpResponse, Logger, RawVariable, ServiceRef } from '../types.js';
+import type { ReadOnlyServices } from './read-only.js';
 
 /**
  * Kubernetes Secrets as a keysentry host (notes/secret-stores.md).
  *
  * One Secret (namespace + name) is one ServiceRef; each `data` key is one variable. Values are base64 in the API and
  * are decoded as UTF-8; bytes that are not valid UTF-8 are reported as sealed because a string write would change
- * them. Writes re-read the Secret and send it back with PUT and its unchanged `metadata.resourceVersion`, so labels,
+ * them. Secrets that a controller manages and TLS Secrets are listed and read but never written (see
+ * kubernetesReadOnlyReason), so a rotation sees the copies they hold and keeps the old key until their source changes. Writes re-read the Secret and send it back with PUT and its unchanged `metadata.resourceVersion`, so labels,
  * annotations, `type`, owner references and every other key are preserved and a concurrent change fails with 409.
  *
  * Writes never restart pods. `redeploy` is opt-in: only Deployments listed in `restartDeployments` for that Secret
@@ -32,16 +34,15 @@ export interface KubernetesHostOptions {
   now?: () => Date;
 }
 
-/**
- * Controller-managed or tool-state Secrets: rotating them by editing data would break their owner. A TLS Secret holds a
- * certificate and its private key as a pair: replacing one of them breaks it, so it is renewed by its issuer.
- */
+/** Tool-state Secrets that hold no application keys: never listed, read or written. */
 export const DEFAULT_EXCLUDED_SECRET_TYPES: readonly string[] = [
   'kubernetes.io/service-account-token',
   'bootstrap.kubernetes.io/token',
   'helm.sh/release.v1',
-  'kubernetes.io/tls',
 ];
+
+/** A TLS Secret holds a certificate and its private key as a pair renewed by their issuer: read, never written. */
+const TLS_SECRET_TYPE = 'kubernetes.io/tls';
 
 /**
  * Annotation and label key prefixes set by controllers that write a Secret from another source. Such a controller
@@ -112,6 +113,18 @@ export function kubernetesSecretManager(secret: Record<string, unknown>): string
       return known ?? 'the resource that owns it';
     }
   }
+  return null;
+}
+
+/**
+ * Why keysentry reads this Secret but never writes it, as fixed text completing "keysentry does not write it: it is
+ * …", or null. A controller restores a managed Secret from its own source at the next reconcile, so a write would
+ * silently revert; a TLS pair is renewed by its issuer.
+ */
+export function kubernetesReadOnlyReason(secret: Record<string, unknown>): string | null {
+  const manager = kubernetesSecretManager(secret);
+  if (manager !== null) return `a Kubernetes Secret managed by ${manager}, which restores its value from its own source`;
+  if (secret.type === TLS_SECRET_TYPE) return 'a Kubernetes TLS Secret, whose certificate and key are renewed together by their issuer';
   return null;
 }
 
@@ -201,7 +214,7 @@ function decodeRestartId(id: string): RestartRecord[] {
   });
 }
 
-export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
+export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter & ReadOnlyServices {
   const origin = kubernetesServerOrigin(opts.server);
   if (!opts.token) throw new Error('Kubernetes token is missing');
   const namespaces = [...new Set(opts.namespaces.map(namespaceName))];
@@ -210,6 +223,8 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
   const cluster = opts.cluster ?? '';
   const now = opts.now ?? (() => new Date());
   const restarts = new Map<string, string[]>();
+  /** Read-only reasons by "<namespace>/<name>", from the latest list or read of that Secret. */
+  const readOnly = new Map<string, string | null>();
   for (const [key, deployments] of Object.entries(opts.restartDeployments ?? {})) {
     const [namespace, name, extra] = key.split('/');
     if (namespace === undefined || name === undefined || extra !== undefined) throw new Error('Kubernetes restart key must be <namespace>/<secret>');
@@ -277,11 +292,12 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
         const type = secret.type ?? 'Opaque';
         if (typeof type !== 'string') invalidResponse();
         if (excluded.has(type)) continue;
+        const reason = kubernetesReadOnlyReason(secret);
+        readOnly.set(`${namespace}/${name}`, reason);
         const manager = kubernetesSecretManager(secret);
         if (manager !== null) {
-          opts.log.info(`Kubernetes Secret skipped: ${manager} manages it and would restore its value. Rotate the key in its source store.`,
+          opts.log.info(`Kubernetes Secret is read-only: ${manager} manages it and would restore its value. keysentry reads it to find every copy of a key but never writes it. Rotate the key in its source store.`,
             { namespace, secret: name });
-          continue;
         }
         refs.push(ref(namespace, name));
       }
@@ -308,7 +324,9 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
 
     async readVariables(service): Promise<RawVariable[]> {
       const secret = await readSecret(service);
-      if (excluded.has((secret.type as string | undefined) ?? 'Opaque') || kubernetesSecretManager(secret) !== null) return [];
+      if (excluded.has((secret.type as string | undefined) ?? 'Opaque')) return [];
+      // A managed or TLS Secret is read for fingerprints (so a rotation sees its copies) and never written.
+      readOnly.set(`${service.projectId}/${service.serviceId}`, kubernetesReadOnlyReason(secret));
       const data = optionalObject(secret.data);
       const variables: RawVariable[] = [];
       let binary = 0;
@@ -337,6 +355,9 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
       if (manager !== null) {
         throw new Error(`Kubernetes Secret is managed by ${manager}, which would restore the old value; keysentry does not write it. Rotate the key in its source store.`);
       }
+      if (secret.type === TLS_SECRET_TYPE) {
+        throw new Error('Kubernetes TLS Secret holds a certificate and its private key as a pair renewed by their issuer; keysentry does not write it.');
+      }
       if (secret.immutable === true) throw new Error('Kubernetes Secret is immutable; create a replacement Secret instead');
       nonempty(object(secret.metadata).resourceVersion);
       const existing = optionalObject(secret.data);
@@ -351,6 +372,16 @@ export function createKubernetesHost(opts: KubernetesHostOptions): HostAdapter {
       }
       parse(response);
       // Pods only see new environment values after a restart; that is redeploy's job, so skipDeploy needs no action.
+    },
+
+    async readOnlyReason(service) {
+      const key = `${service.projectId}/${service.serviceId}`;
+      if (readOnly.has(key)) return readOnly.get(key)!;
+      const secret = await readSecret(service);
+      const reason = excluded.has((secret.type as string | undefined) ?? 'Opaque')
+        ? 'a Kubernetes Secret of a type keysentry never writes' : kubernetesReadOnlyReason(secret);
+      readOnly.set(key, reason);
+      return reason;
     },
 
     async redeploy(service) {

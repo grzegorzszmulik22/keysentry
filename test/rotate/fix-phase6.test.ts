@@ -294,4 +294,94 @@ describe('Upstash resets cover every form of the credential (H2)', () => {
     expect(step.status).toBe('skipped');
     expect(step.warnings.join(' ')).toMatch(/left this form of the credential unchanged/);
   });
+
+  // fix-verify P6 H2: the adapter lists every form; keysentry looks for their fingerprints across the whole inventory.
+  it('finds a bare password under a neutral name in another service by fingerprint and does not reset', async () => {
+    const u = upstash();
+    u.host.addService('api', { UPSTASH_REDIS_REST_URL: `https://${dbHost}`, UPSTASH_REDIS_REST_TOKEN: u.state.token });
+    u.host.addService('worker', { CACHE_HOST: dbHost, CACHE_PASSWORD: u.state.password });
+    const inv = await inventoryOf(u.host);
+    expect(clusterOf(inv, 'CACHE_PASSWORD').provider).toBe('unknown');
+    const h = harness(u.host, upstashProvider, { http: u.http, credentials: u.credentials });
+
+    const report = await executePlan(buildPlan(inv, { clusterIds: [clusterOf(inv, 'UPSTASH_REDIS_REST_TOKEN').id] }), inv, h.deps, options);
+
+    expect(u.state.resets).toBe(0);
+    expect(report.steps[0]).toMatchObject({ status: 'skipped' });
+    expect(report.steps[0]!.warnings.join(' ')).toMatch(/Not reset: an Upstash reset also changes the same credential at railway\/worker:CACHE_PASSWORD \(cluster /);
+    expect(JSON.stringify(report)).not.toContain(u.state.password);
+    expect(u.host.writes).toEqual([]);
+  });
+
+  it('finds a REST token under a neutral name on another host and does not reset', async () => {
+    const u = upstash();
+    u.host.addService('api', { UPSTASH_REDIS_REST_URL: `https://${dbHost}`, UPSTASH_REDIS_REST_TOKEN: u.state.token });
+    const render = new FakeHost('render');
+    render.pendingPolls = 0;
+    render.addService('jobs', { CACHE_TOKEN: u.state.readOnly });
+    const inv = buildInventory(await Promise.all([u.host, render].map(async host => ({ host: host.id, services: await Promise.all((await host.listServices())
+      .map(async service => ({ service, vars: await host.readVariables(service) }))) }))), key);
+    const h = harness(u.host, upstashProvider, { http: u.http, credentials: u.credentials, hosts: { railway: u.host, render } });
+
+    const report = await executePlan(buildPlan(inv, { clusterIds: [clusterOf(inv, 'UPSTASH_REDIS_REST_TOKEN').id] }), inv, h.deps, options);
+
+    expect(u.state.resets).toBe(0);
+    expect(report.steps[0]!.warnings.join(' ')).toMatch(/render\/jobs:CACHE_TOKEN/);
+  });
+
+  it('makes the reset guided for a sealed value in a service that holds a form, not for one elsewhere', async () => {
+    const sealedHere = upstash();
+    sealedHere.host.addService('api', { UPSTASH_REDIS_REST_URL: `https://${dbHost}`, UPSTASH_REDIS_REST_TOKEN: sealedHere.state.token, SESSION_SECRET: 'x' }, ['SESSION_SECRET']);
+    let inv = await inventoryOf(sealedHere.host);
+    let h = harness(sealedHere.host, upstashProvider, { http: sealedHere.http, credentials: sealedHere.credentials });
+    let report = await executePlan(buildPlan(inv, { clusterIds: [clusterOf(inv, 'UPSTASH_REDIS_REST_TOKEN').id] }), inv, h.deps, options);
+    expect(sealedHere.state.resets).toBe(0);
+    expect(h.prompts).toHaveLength(1);
+    expect(report.steps[0]!.warnings.join(' ')).toMatch(/Guided reset: .*cannot read every place that may hold one: railway\/api:SESSION_SECRET/);
+
+    const sealedElsewhere = upstash();
+    sealedElsewhere.host.addService('api', { UPSTASH_REDIS_REST_URL: `https://${dbHost}`, UPSTASH_REDIS_REST_TOKEN: sealedElsewhere.state.token });
+    sealedElsewhere.host.addService('billing', { STRIPE_SECRET_KEY: 'x' }, ['STRIPE_SECRET_KEY']);
+    inv = await inventoryOf(sealedElsewhere.host);
+    h = harness(sealedElsewhere.host, upstashProvider, { http: sealedElsewhere.http, credentials: sealedElsewhere.credentials });
+    report = await executePlan(buildPlan(inv, { clusterIds: [clusterOf(inv, 'UPSTASH_REDIS_REST_TOKEN').id] }), inv, h.deps, options);
+    expect(sealedElsewhere.state.resets).toBe(1);
+    expect(report.status).toBe('complete');
+  });
+
+  it('makes the reset guided when the adapter cannot list the forms', async () => {
+    for (const provider of [{ ...upstashProvider, credentialForms: async () => { throw new Error('Upstash request failed'); } },
+      { ...upstashProvider, credentialForms: undefined } as unknown as ProviderAdapter]) {
+      const u = upstash();
+      u.host.addService('api', { UPSTASH_REDIS_REST_URL: `https://${dbHost}`, UPSTASH_REDIS_REST_TOKEN: u.state.token });
+      const inv = await inventoryOf(u.host);
+      const h = harness(u.host, provider, { http: u.http, credentials: u.credentials });
+      const report = await executePlan(buildPlan(inv), inv, h.deps, options);
+      expect(u.state.resets).toBe(0);
+      expect(h.prompts).toHaveLength(1);
+      expect(report.steps[0]!.warnings.join(' ')).toMatch(/Guided reset: .*could not list those forms/);
+    }
+  });
+
+  it('QStash: a read-only token under a neutral name in another service stops the token reset', async () => {
+    const user = { id: 'user-1', token: `eyJ${'a'.repeat(20)}Q7rT9vW2yZ4bD6fH8jL0nP3sU5wX`, read_only_token: `eyR${'b'.repeat(20)}Z9yX8wV7uT6sR5qP4oN3mL2kJ` };
+    let rotations = 0;
+    const http = new FakeHttp()
+      .on('GET', /^https:\/\/api\.upstash\.com\/v2\/redis\/databases$/, () => json(200, []))
+      .on('GET', /^https:\/\/api\.upstash\.com\/v2\/qstash\/users$/, () => json(200, [user]))
+      .on('POST', /^https:\/\/api\.upstash\.com\/v2\/qstash\/rotate-token\/user-1$/, () => { rotations += 1; return json(200, { ...user, token: 'eyN-new' }); })
+      .on('GET', /^https:\/\/qstash\.upstash\.io\/v2\/queues$/, () => json(200, []));
+    const host = new FakeHost('railway');
+    host.pendingPolls = 0;
+    host.addService('api', { QSTASH_URL: 'https://qstash.upstash.io', QSTASH_TOKEN: user.token });
+    host.addService('reports', { JOBS_READ_TOKEN: user.read_only_token });
+    const inv = await inventoryOf(host);
+    expect(clusterOf(inv, 'QSTASH_TOKEN').provider).toBe('upstash');
+    const h = harness(host, upstashProvider, { http, credentials: { UPSTASH_ADMIN_EMAIL: 'ops@example.com', UPSTASH_ADMIN_KEY: '0f9e8d7c-6b5a-4938-2716-05f4e3d2c1b0' } });
+
+    const report = await executePlan(buildPlan(inv, { clusterIds: [clusterOf(inv, 'QSTASH_TOKEN').id] }), inv, h.deps, options);
+
+    expect(rotations).toBe(0);
+    expect(report.steps[0]!.warnings.join(' ')).toMatch(/Not reset: .*railway\/reports:JOBS_READ_TOKEN/);
+  });
 });

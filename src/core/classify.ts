@@ -38,9 +38,13 @@ export function methodForValue(provider: ProviderId, value: string | undefined, 
   return methodFor(provider);
 }
 
-// Build tools put these variables into browser bundles or app binaries (Next.js, Vite, Expo, Create React App,
-// SvelteKit/Astro, Nuxt, Gatsby, Vue CLI).
-const CLIENT_PREFIX = /^(?:NEXT_PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|PUBLIC_|NUXT_PUBLIC_|NUXT_ENV_|GATSBY_|VUE_APP_)/;
+// Build tools put these variables into browser bundles, browser extensions or app binaries (Next.js, Vite, Expo,
+// Create React App, SvelteKit/Astro, Nuxt, Gatsby, Vue CLI, Angular with @ngx-env, Storybook, Nx, RedwoodJS, Plasmo,
+// Sanity Studio, WXT).
+const CLIENT_PREFIX = new RegExp(`^(?:${[
+  'NEXT_PUBLIC_', 'VITE_', 'EXPO_PUBLIC_', 'REACT_APP_', 'PUBLIC_', 'NUXT_PUBLIC_', 'NUXT_ENV_', 'GATSBY_', 'VUE_APP_',
+  'NG_APP_', 'STORYBOOK_', 'NX_PUBLIC_', 'REDWOOD_ENV_', 'PLASMO_PUBLIC_', 'SANITY_STUDIO_', 'WXT_',
+].join('|')})`);
 const CLIENT_WORDS = new Set(['BROWSER', 'CLIENT', 'FRONTEND', 'ANDROID', 'IOS', 'MOBILE']);
 const MAPS_CLIENT_WORDS = new Set(['WEB', 'JS', 'JAVASCRIPT', 'EMBED', 'PUBLIC']);
 

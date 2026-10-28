@@ -1,11 +1,18 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
-import type { StateStore } from '../core/store.js';
+import { withDirectoryLock, type StateStore } from '../core/store.js';
 import type { ApprovalApprover, ApprovalGrant, ApprovalRequest, AuditEvent } from '../types.js';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'expired' | 'rejected' | 'superseded' | 'executed';
 export interface ApprovalCluster { clusterId: string; hint: string | null }
-export interface ApprovalAction { id: string; kind: string; clusterIds: string[]; clusters?: ApprovalCluster[]; planHash?: string }
+export interface ApprovalAction {
+  id: string; kind: string; clusterIds: string[]; clusters?: ApprovalCluster[]; planHash?: string;
+  /**
+   * Keys this action also rotates at once (arming with adoption on the team dashboard). Bound into the digest; the
+   * request then needs the rotation's approvals as well (see the approval service's requirement).
+   */
+  rotates?: string[];
+}
 /** Team quorum progress (phase 5). Absent without a team. */
 export interface ApprovalQuorumState { required: number; admins: boolean; approvers: ApprovalApprover[] }
 export interface StoredApproval extends ApprovalRequest {
@@ -18,6 +25,8 @@ export interface StoredApproval extends ApprovalRequest {
   action?: ApprovalAction;
   clusters?: ApprovalCluster[];
   executedAt?: string;
+  /** When a run of the approved change started (`claim`): a claimed approval never starts another run. */
+  claimedAt?: string;
   quorum?: ApprovalQuorumState;
 }
 export interface ApprovalState {
@@ -32,7 +41,8 @@ export interface ApprovalState {
 const date = z.string().datetime();
 const cluster = z.object({ clusterId: z.string().min(1).max(512), hint: z.string().max(80).nullable() }).strict();
 const action = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), kind: z.string().min(1).max(80),
-  clusterIds: z.array(z.string().min(1).max(512)).max(10000), clusters: z.array(cluster).max(10000).optional(), planHash: z.string().max(512).optional() }).strict();
+  clusterIds: z.array(z.string().min(1).max(512)).max(10000), clusters: z.array(cluster).max(10000).optional(), planHash: z.string().max(512).optional(),
+  rotates: z.array(z.string().min(1).max(512)).max(10000).optional() }).strict();
 const memberId = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
 const approver = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('passkey'), credentialId: z.string(), memberId: memberId.optional(), at: date.optional() }).strict(),
@@ -49,7 +59,7 @@ const stateSchema = z.object({
     challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/), widening: z.boolean(), kind: z.string().min(1).max(80),
     keyCount: z.number().int().min(0).max(10000), status: z.enum(['pending', 'approved', 'expired', 'rejected', 'superseded', 'executed']),
     attempts: z.number().int().min(0).max(5), grant: grant.optional(),
-    action: action.optional(), clusters: z.array(cluster).max(10000).optional(), executedAt: date.optional(), quorum: quorum.optional(),
+    action: action.optional(), clusters: z.array(cluster).max(10000).optional(), executedAt: date.optional(), claimedAt: date.optional(), quorum: quorum.optional(),
   }).strict()),
   usedChallenges: z.array(z.string().regex(/^[A-Za-z0-9_-]{43}$/)),
   usedDeviceApprovals: z.array(z.string().regex(/^[a-f0-9]{64}$/)),
@@ -57,12 +67,17 @@ const stateSchema = z.object({
   auditPending: z.array(z.object({ kind: z.string(), summary: z.string(), data: z.record(z.string(), z.unknown()).optional() }).strict()).default([]),
 }).strict();
 
-// Serialize complete read/modify/write transactions, including different service instances.
+/** The approvals file's cross-process lock (review L-c), like the saved state lock. */
+const APPROVALS_LOCK = { file: '.approvals.lock', temporaryPrefix: '.approvals-lock', what: 'approvals lock',
+  busy: "keysentry's approvals are busy. Try again when the other operation finishes." };
+
+// Serialize complete read/modify/write transactions: in this process (different service instances share the queue),
+// and across processes with the approvals lock, held from the read to the last write of each transaction.
 const queues = new Map<string, Promise<unknown>>();
 export function transactApprovals<T>(store: StateStore, operation: (state: ApprovalState, commit: () => Promise<void>) => Promise<T>): Promise<T> {
   const path = resolve(store.paths.dir, 'approvals.json');
   const previous = queues.get(path) ?? Promise.resolve();
-  const current = previous.catch(() => undefined).then(async () => {
+  const current = previous.catch(() => undefined).then(() => withDirectoryLock(store.paths.dir, APPROVALS_LOCK, async assertLock => {
     const raw = await store.readJson('pending', path);
     let state: ApprovalState;
     if (raw === null) state = { v: 1, requests: [], usedChallenges: [], usedDeviceApprovals: [], counters: [], auditPending: [] };
@@ -75,8 +90,8 @@ export function transactApprovals<T>(store: StateStore, operation: (state: Appro
         throw new Error('Saved approval state could not be read.');
       }
     }
-    return operation(state, () => store.writeJson('pending', path, state));
-  });
+    return operation(state, async () => { await assertLock(); await store.writeJson('pending', path, state); });
+  }));
   queues.set(path, current);
   return current.finally(() => { if (queues.get(path) === current) queues.delete(path); });
 }

@@ -52,11 +52,27 @@ export function isTeamQuorumRoute(route: string): boolean {
   return Object.hasOwn(TEAM_QUORUM_ROUTES, route);
 }
 
-interface Description { summary: string; changes: string[]; clusterIds: string[] }
+interface Description {
+  summary: string; changes: string[]; clusterIds: string[];
+  /** Keys the change also rotates at once (arming with adoption): bound into the request, which then needs their rotation's approvals too. */
+  rotates?: string[];
+}
 type Body = Record<string, unknown>;
 
 const count = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+
+/**
+ * The keys a dismissal concerns (review L-a): the clusters of the pending request or monitor action it dismisses, so
+ * the policy's per-tier rule applies to dismissing as it does to running it.
+ */
+async function dismissedClusters(rt: KeysentryRuntime, id: unknown): Promise<string[]> {
+  if (typeof id !== 'string') return [];
+  const request = await transactApprovals(rt.store, async state => state.requests.find(item => item.actionId === id && item.status === 'pending'));
+  if (request) return [...new Set(request.action?.clusterIds ?? request.clusters?.map(cluster => cluster.clusterId) ?? [])];
+  const action = (await rt.pendingActions()).find(item => item.id === id);
+  return [...new Set(action?.clusterIds ?? [])];
+}
 
 async function planOf(rt: KeysentryRuntime, planId: unknown): Promise<RotationPlan | null> {
   if (typeof planId !== 'string') return null;
@@ -92,15 +108,18 @@ async function describe(rt: KeysentryRuntime, route: string, body: Body): Promis
       return { summary: `Apply spending limits to ${count(ids.length, 'key')}`, clusterIds: ids,
         changes: ['Set provider spending limits from the configured caps. A key that reaches its limit stops working until the limit is raised.'] };
     }
-    case 'approvals/dismiss':
-      return { summary: 'Dismiss a pending request', clusterIds: [], changes: [`Dismiss request ${String(body.id)}; it will not run.`] };
+    case 'approvals/dismiss': {
+      const clusterIds = await dismissedClusters(rt, body.id);
+      return { summary: 'Dismiss a pending request', clusterIds, changes: [`Dismiss request ${String(body.id)}; it will not run.`,
+        ...(clusterIds.length ? [`It concerns ${count(clusterIds.length, 'key')}, so dismissing it needs the approvals a change of ${clusterIds.length === 1 ? 'that key' : 'those keys'} needs.`] : [])] };
+    }
     case 'autopilot/arm': {
       const ids = strings(body.clusterIds);
       const adopt = strings(body.adopt);
-      return { summary: `Arm autopilot for ${count(ids.length, 'key')}`, clusterIds: ids, changes: [
+      return { summary: `Arm autopilot for ${count(ids.length, 'key')}`, clusterIds: ids, ...(adopt.length ? { rotates: [...new Set(adopt)] } : {}), changes: [
         `Let autopilot rotate ${count(ids.length, 'key')} automatically when a breach is confirmed, for ${String(body.validDays)} days.`,
         `Grace period ${String(body.graceMinutes)} minutes; at most ${String(body.maxServices)} services per wave.`,
-        ...(adopt.length ? [`Rotate ${count(adopt.length, 'write-only key')} once now so autopilot knows ${adopt.length === 1 ? 'its value' : 'their values'}.`] : [])] };
+        ...(adopt.length ? [`Rotate ${count(adopt.length, 'write-only key')} once now so autopilot knows ${adopt.length === 1 ? 'its value' : 'their values'}; this approval covers that rotation, so it also needs the approvals rotating ${adopt.length === 1 ? 'that key' : 'those keys'} needs.`] : [])] };
     }
     case 'settings/update':
       return { summary: 'Change dashboard settings', clusterIds: [],
@@ -171,8 +190,9 @@ export function createTeamChanges(rt: KeysentryRuntime, routes: { run(route: str
   }
   const contentKeyOf = (route: string, body: unknown, requestedBy: string) =>
     createHmac('sha256', rt.fingerprintKey).update(`keysentry-team-change:v1\n${canonicalJson({ route, body, requestedBy })}`).digest('hex');
-  const actionOf = (entry: Pick<ChangeDetails, 'actionId' | 'route' | 'contentKey'>, clusterIds: string[]): ApprovalAction =>
-    ({ id: entry.actionId, kind: `dashboard:${entry.route}`, clusterIds: [...new Set(clusterIds)], planHash: entry.contentKey });
+  const actionOf = (entry: Pick<ChangeDetails, 'actionId' | 'route' | 'contentKey'>, description: Pick<Description, 'clusterIds' | 'rotates'>): ApprovalAction =>
+    ({ id: entry.actionId, kind: `dashboard:${entry.route}`, clusterIds: [...new Set(description.clusterIds)], planHash: entry.contentKey,
+      ...(description.rotates?.length ? { rotates: [...new Set(description.rotates)] } : {}) });
 
   async function team(): Promise<TeamRoster | null> {
     try { return (await rt.teamQuorum()?.team())?.roster ?? null; } catch { return null; }
@@ -189,17 +209,24 @@ export function createTeamChanges(rt: KeysentryRuntime, routes: { run(route: str
       : ' It runs when the last of them approves it on the Approvals screen.';
   }
 
-  /** Run an approved change once: the runtime entry points re-check the grant, and it is used up whatever the outcome. */
+  /**
+   * Run an approved change once. The approval is claimed before the change runs (review L-c): the claim is saved under
+   * the approvals file's cross-process lock, so no other request, process or retry can start the same approved change
+   * again, even if marking it executed afterwards fails. The runtime entry points re-check the grant while it runs.
+   */
   async function execute(service: ApprovalService, grant: TeamGrantRef, run: (grant: TeamGrantRef) => Promise<unknown>): Promise<unknown> {
     if (running.has(grant.actionId)) throw new DashboardError(409, 'This change is already running.');
     running.add(grant.actionId);
     try {
-      try { await service.checkGrant(grant.actionId, grant.digest); }
+      try { await service.claim(grant.actionId, grant.digest); }
       catch (error) { if (error instanceof ApprovalError) throw new DashboardError(409, error.message); throw error; }
-      return await run(grant);
+      try { return await run(grant); }
+      finally {
+        await service.markExecuted(grant.actionId, grant.digest)
+          .catch(() => rt.log.warn('A team approval could not be marked as used. It was claimed before the change ran, so it cannot run again.'));
+      }
     } finally {
       running.delete(grant.actionId);
-      await service.markExecuted(grant.actionId, grant.digest).catch(() => rt.log.warn('A team approval could not be marked as used. It expires on its own.'));
     }
   }
 
@@ -215,9 +242,11 @@ export function createTeamChanges(rt: KeysentryRuntime, routes: { run(route: str
     const contentKey = contentKeyOf(route, body, member);
     const service = rt.teamApprovalService();
     const current = await requests();
-    // The same change by the same member continues its open request (pending, or approved and not yet run).
+    // The same change by the same member continues its open request (pending, or approved and not yet started). An
+    // approval whose run already started (claimed) is never run again: the same change opens a new request.
     const known = await details(async entries => entries.filter(entry => entry.contentKey === contentKey).map(entry => ({ ...entry })));
-    const open = known.map(entry => ({ entry, request: current.find(request => request.actionId === entry.actionId && (request.status === 'pending' || request.status === 'approved')) }))
+    const open = known.map(entry => ({ entry, request: current.find(request => request.actionId === entry.actionId
+      && (request.status === 'pending' || request.status === 'approved' && request.claimedAt === undefined)) }))
       .find(item => item.request !== undefined && Date.parse(item.request.expiresAt) > rt.now().getTime());
     if (open?.request?.status === 'approved') {
       return execute(service, { actionId: open.entry.actionId, digest: open.request.digest, kind: `dashboard:${route}` }, run);
@@ -236,7 +265,7 @@ export function createTeamChanges(rt: KeysentryRuntime, routes: { run(route: str
     } else {
       const description = await describe(rt, route, (body ?? {}) as Body);
       actionId = `team-${randomBytes(16).toString('hex')}`;
-      const action = actionOf({ actionId, route, contentKey }, description.clusterIds);
+      const action = actionOf({ actionId, route, contentKey }, description);
       digest = actionDigest(action);
       try { await service.request(action, false, { admins: rule.admins }); }
       catch (error) { if (error instanceof ApprovalError) throw new DashboardError(409, error.message); throw error; }

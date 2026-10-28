@@ -131,6 +131,42 @@ describe('the policy\'s wideningAdmins binds roster and policy changes (H1)', ()
     expect(added.exit).toBe(0);
     expect(added.diagnostics).toMatch(/Warning: this change needs one admin signature, but the team policy needs more than one approver/);
   });
+
+  // fix-verify M-c: a 2-of-2 widening rule (the README example) or a single admin leaves no spare signing admin.
+  test('warns when signing or applying leaves no spare admin, and not when a spare remains', async () => {
+    const { ana, bea } = await twoAdmins();
+    const noSpare = /Warning: no spare admin\. Every later roster or policy change needs 2 admin signatures and only 2 admins have a device key, so if one admin device is lost, no roster or policy change can be signed again; keysentry has no bypass\. Keep a spare/;
+    await writeFile(ana.path('policy.json'), JSON.stringify({ approvals: { required: 2, wideningAdmins: 2 } }));
+    expect((await run(ana, ['policy', 'sign', 'policy.json'])).diagnostics).toMatch(noSpare);
+    await copyFile(ana.path('policy.json'), bea.path('policy.json'));
+    expect((await run(bea, ['policy', 'sign', 'policy.json'])).diagnostics).toMatch(noSpare);
+    await copyFile(bea.path('policy.json'), ana.path('policy.json'));
+    const applied = await run(ana, ['policy', 'apply', 'policy.json']);
+    expect(applied.exit).toBe(0);
+    expect(applied.diagnostics).toMatch(noSpare);
+    // Adding a third admin restores a spare: that change says nothing about it.
+    const cy = await computer('cy');
+    await run(cy, ['team', 'card', '-o', 'cy.json']);
+    await copyFile(cy.path('cy.json'), ana.path('cy.json'));
+    const proposed = await run(ana, ['team', 'add', 'cy', '--role', 'admin', '--card', 'cy.json', '-o', 'add-cy.json']);
+    expect(proposed.exit).toBe(0);
+    expect(proposed.diagnostics).not.toMatch(/no spare admin/);
+    // Removing an admin from a 2-of-3 team leaves none: the removal proposal warns before anyone signs it.
+    await copyFile(ana.path('add-cy.json'), bea.path('add-cy.json'));
+    await run(bea, ['team', 'sign', 'add-cy.json']);
+    await copyFile(bea.path('add-cy.json'), ana.path('add-cy.json'));
+    expect((await run(ana, ['team', 'apply', 'add-cy.json'])).exit).toBe(0);
+    const removal = await run(ana, ['team', 'remove', 'cy', '-o', 'remove-cy.json']);
+    expect(removal.exit).toBe(0);
+    expect(removal.diagnostics).toMatch(noSpare);
+  });
+
+  test('a team of one admin is told on creation that it has no spare admin', async () => {
+    const solo = await computer('solo');
+    const created = await run(solo, ['team', 'init', '--id', 'solo']);
+    expect(created.exit).toBe(0);
+    expect(created.diagnostics).toMatch(/Warning: no spare admin\. Every later roster or policy change needs 1 admin signature and only 1 admin has a device key/);
+  });
 });
 
 describe('enrollment with no admin key on the team server (H3)', () => {

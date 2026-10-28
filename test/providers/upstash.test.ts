@@ -310,6 +310,27 @@ describe('upstashProvider rotate (QStash) and references', () => {
     expect(await upstashProvider.resolveKeyRef!(token(), s.ctx)).toBeNull();
   });
 
+  it('lists every current form of a database or QStash user by reference, for the engine to look for', async () => {
+    const user = { id: randomUUID(), token: token('eyJ'), read_only_token: token('eyR') };
+    const other = database();
+    const s = setup();
+    listRoutes(s, [other]);
+    s.http.on('GET', usersUrl, () => json(200, [user]));
+    const forms = (await upstashProvider.credentialForms(s.db.database_id, s.ctx))!;
+    expect(forms.values).toEqual(expect.arrayContaining([s.db.password, s.db.rest_token, s.db.read_only_rest_token, redisUrl(s.db)]));
+    for (const value of [s.db.password, `${s.db.rest_token}\n`, s.db.read_only_rest_token, redisUrl(s.db),
+      `redis://:${s.db.password}@${s.db.endpoint}.upstash.io:6380/0?ssl=true`]) expect(forms.holds(value)).toBe(true);
+    for (const value of [other.password, other.rest_token, redisUrl(other), `rediss://default:${s.db.password}@elsewhere.example.com:6379`, user.token]) {
+      expect(forms.holds(value)).toBe(false);
+    }
+    const qstash = (await upstashProvider.credentialForms(user.id, s.ctx))!;
+    expect(qstash.values.sort()).toEqual([user.token, user.read_only_token].sort());
+    expect(qstash.holds(user.read_only_token)).toBe(true);
+    expect(qstash.holds(s.db.password)).toBe(false);
+    expect(await upstashProvider.credentialForms(randomUUID(), s.ctx)).toBeNull();
+    expect(mutations(s.http.calls)).toEqual([]);
+  });
+
   it('never rotates by reference', async () => {
     const s = setup();
     expect(await rejection(upstashProvider.rotateByRef!(s.db.database_id, s.ctx))).toMatchObject({ code: 'GUIDED_ROTATION_REQUIRED' });

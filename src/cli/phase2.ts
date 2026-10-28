@@ -9,7 +9,7 @@ import { createNotificationChannels, registerNotificationCommands } from './noti
 import { saveNotificationSettings, saveNotificationRelay } from './config.js';
 import { createPasskeyLauncher, createPasskeyManager, listPasskeys, openPasskeyBrowser } from './passkeys.js';
 import { buildWatcherSetupConfig, createWatchRuntime, runWatch, setupWatcher, watcherStatus, type WatcherPlatform } from './watcher.js';
-import { WATCHER_NETWORK_PROBLEM } from './watcher-setup.js';
+import { WATCHER_NETWORK_PROBLEM, watcherNetworkHealth } from './watcher-setup.js';
 import { createWatcherStateStore } from './watcher-state.js';
 import { prepareWatcherDeployment } from './watcher-bootstrap.js';
 import { promptVaultValue, type PromptIO } from './prompts.js';
@@ -290,8 +290,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
             if (target.status === 'failed' || target.status === 'refused') rt.log.warn(`Audit export to ${target.id} did not complete: ${target.error ?? 'delivery failed'}`);
           }
         },
-        health: () => ({ problem: rt.network.problem ? { code: 'network' as const, reason: WATCHER_NETWORK_PROBLEM } : null,
-          feedsOffline: rt.network.feedMode.offline }),
+        // A refusing transport, or a carried proxy that keeps failing to connect (review EA H1), makes /healthz unhealthy.
+        health: () => ({ problem: watcherNetworkHealth(rt.network), feedsOffline: rt.network.feedMode.offline }),
         // Team mode: the sealed roster and policy, or this computer's (whose quorum re-reads the saved roster each time).
         ...(sealed ? { team: sealed.team ?? null } : { team: governanceBundle(rt.governance), quorum: rt.teamQuorum() }),
       }, { ...options, ...(opts.signal ? { signal: opts.signal } : {}) }));

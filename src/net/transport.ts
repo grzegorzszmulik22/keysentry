@@ -45,6 +45,27 @@ export interface NodeTransportOptions {
   maxBytes?: number;
   /** A signed team policy can require that every request goes through the proxy. */
   requireProxy?: boolean;
+  /**
+   * Called once per request that goes through the proxy: true when the connection to the proxy opened, false when it
+   * failed or the request timed out before it opened. A deployed watcher counts these for its health (see
+   * createProxyHealth).
+   */
+  onProxyResult?: (reached: boolean) => void;
+}
+
+/** How many failed connections to the proxy in a row make a deployed watcher report itself unhealthy. */
+export const PROXY_FAILURES_UNHEALTHY = 3;
+
+/**
+ * Consecutive failed connections to the proxy (review EA H1). Pass `record` as `onProxyResult`; `unreachable()`
+ * is true after `PROXY_FAILURES_UNHEALTHY` failures in a row, until a connection to the proxy opens again.
+ */
+export function createProxyHealth(threshold = PROXY_FAILURES_UNHEALTHY): { record(reached: boolean): void; unreachable(): boolean } {
+  let failures = 0;
+  return {
+    record(reached) { failures = reached ? 0 : failures + 1; },
+    unreachable: () => failures >= threshold,
+  };
 }
 
 export type TransportErrorCode =
@@ -432,6 +453,12 @@ export function createNodeTransport(options: NodeTransportOptions = {}): HttpCli
       if (req.method === 'GET' && req.body !== undefined) throw new TransportError('INVALID_REQUEST', 'A GET request cannot have a body.');
       const port = url.port ? Number(url.port) : 443;
       const viaProxy = proxy !== null && !bypassesProxy(host, port, bypass);
+      let proxyReported = false;
+      const reportProxy = (reached: boolean) => {
+        if (!viaProxy || proxyReported) return;
+        proxyReported = true;
+        try { options.onProxyResult?.(reached); } catch { /* health bookkeeping never fails a request */ }
+      };
       if (options.requireProxy && !viaProxy) {
         throw new TransportError('PROXY_REQUIRED', `The team policy requires the proxy, but ${shown} is on the no-proxy list. Remove it from NO_PROXY or network.noProxy.`);
       }
@@ -453,6 +480,8 @@ export function createNodeTransport(options: NodeTransportOptions = {}): HttpCli
       const deadline = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           timedOut = true;
+          // A request that timed out before the proxy connection opened counts as a failed connection to the proxy.
+          reportProxy(false);
           for (const stream of streams) stream.destroy();
           reject(new TransportTimeoutError(shown, timeoutMs));
         }, timeoutMs);
@@ -478,18 +507,21 @@ export function createNodeTransport(options: NodeTransportOptions = {}): HttpCli
           }));
           try { await settled(socket, 'secureConnect'); }
           catch (error) {
+            reportProxy(false);
             const code = errorCode(error);
             if (code && VERIFY_CODES.test(code)) {
               throw new TransportError('PROXY_TLS_FAILED', "The proxy's certificate could not be verified. If it is issued by your own certificate authority, add it with network.caFile.", code);
             }
             throw new TransportError('PROXY_UNREACHABLE', 'Could not connect to the proxy.', code);
           }
-          if (!socket.authorized) throw new TransportError('PROXY_TLS_FAILED', "The proxy's certificate could not be verified.");
+          if (!socket.authorized) { reportProxy(false); throw new TransportError('PROXY_TLS_FAILED', "The proxy's certificate could not be verified."); }
+          reportProxy(true);
           return socket;
         }
         const socket = track(netConnect({ host: target.host, port: target.port }));
         try { await settled(socket, 'connect'); }
-        catch (error) { throw new TransportError('PROXY_UNREACHABLE', 'Could not connect to the proxy.', errorCode(error)); }
+        catch (error) { reportProxy(false); throw new TransportError('PROXY_UNREACHABLE', 'Could not connect to the proxy.', errorCode(error)); }
+        reportProxy(true);
         return socket;
       }
 

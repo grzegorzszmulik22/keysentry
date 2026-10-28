@@ -67,7 +67,7 @@ describe('Kubernetes host', () => {
     expect(() => hostFor(new FakeHttp(), { restartDeployments: { 'api-env': ['api'] } })).toThrow(/restart key/);
   });
 
-  it('lists Secrets across continue pages, skips managed types and sends the selector', async () => {
+  it('lists Secrets across continue pages, skips tool-state types and sends the selector', async () => {
     const http = new FakeHttp()
       .on('GET', /\/namespaces\/apps\/secrets\?limit=100&labelSelector=team%3Dpay$/, () => json(200, {
         metadata: { continue: 'next/token' },
@@ -79,7 +79,7 @@ describe('Kubernetes host', () => {
       }))
       .on('GET', /\/namespaces\/apps\/secrets\?limit=100&labelSelector=team%3Dpay&continue=next%2Ftoken$/, () => json(200, {
         metadata: { continue: '' },
-        // A TLS pair is renewed by its issuer (skipped since fix-phase6); an ordinary Secret on this page is listed.
+        // A TLS pair is renewed by its issuer: listed and read as a read-only consumer (fix-verify M-b), never written.
         items: [{ ...secret(), type: 'kubernetes.io/tls', metadata: { name: 'tls-cert' } }, { ...secret(), metadata: { name: 'billing' } }],
       }))
       .on('GET', /\/namespaces\/jobs\/secrets\?limit=100&labelSelector=team%3Dpay$/, () => json(200, {
@@ -89,6 +89,7 @@ describe('Kubernetes host', () => {
     const refs = await hostFor(http, { namespaces: ['apps', 'jobs'], labelSelector: 'team=pay', cluster: 'prod-eu' }).listServices();
     expect(refs).toEqual([
       { ...service, environmentId: 'prod-eu', environmentName: 'prod-eu' },
+      { ...service, serviceId: 'tls-cert', serviceName: 'tls-cert', environmentId: 'prod-eu', environmentName: 'prod-eu' },
       { ...service, serviceId: 'billing', serviceName: 'billing', environmentId: 'prod-eu', environmentName: 'prod-eu' },
       { ...service, projectId: 'jobs', projectName: 'jobs', serviceId: 'worker', serviceName: 'worker', environmentId: 'prod-eu', environmentName: 'prod-eu' },
     ]);

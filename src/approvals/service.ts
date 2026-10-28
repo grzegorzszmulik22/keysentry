@@ -70,6 +70,12 @@ export interface ApprovalService {
    * counting, a raised requirement applies). Returns the grant, or refuses.
    */
   checkGrant(actionId: string, expectedDigest?: string): Promise<ApprovalGrant>;
+  /**
+   * `checkGrant`, then record that a run of this approved change has started, before it runs (review L-c). A claimed
+   * approval is refused here ever after, so a change runs at most once even when marking it executed later fails or
+   * the process stops; `checkGrant` (the run's own entry-point checks) still accepts it until it is executed.
+   */
+  claim(actionId: string, expectedDigest?: string): Promise<ApprovalGrant>;
   markExecuted(actionId: string, expectedDigest?: string): Promise<void>;
 }
 
@@ -118,14 +124,17 @@ function sha256(value: string): string { return createHash('sha256').update(valu
 function actionCopy(action: ApprovalAction): ApprovalAction {
   if (!action || typeof action.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(action.id) || typeof action.kind !== 'string' || !action.kind.length || action.kind.length > 80 || /[\u0000-\u001f\u007f]/.test(action.kind) ||
       !Array.isArray(action.clusterIds) || action.clusterIds.length > 10000 || action.clusterIds.some((id) => typeof id !== 'string' || !id.length || id.length > 512) ||
-      (action.planHash !== undefined && (typeof action.planHash !== 'string' || action.planHash.length > 512))) reject('This action description is not valid.');
+      (action.planHash !== undefined && (typeof action.planHash !== 'string' || action.planHash.length > 512)) ||
+      (action.rotates !== undefined && (!Array.isArray(action.rotates) || !action.rotates.length || action.rotates.length > 10000
+        || action.rotates.some((id) => typeof id !== 'string' || !id.length || id.length > 512) || new Set(action.rotates).size !== action.rotates.length))) reject('This action description is not valid.');
   if (new Set(action.clusterIds).size !== action.clusterIds.length || (action.clusters !== undefined &&
       (!Array.isArray(action.clusters) || action.clusters.length !== action.clusterIds.length || action.clusters.some((cluster, index) =>
         !cluster || cluster.clusterId !== action.clusterIds[index] || (cluster.hint !== null &&
           (typeof cluster.hint !== 'string' || cluster.hint.length > 80 || /[\u0000-\u001f\u007f]/.test(cluster.hint))))))) reject('This action description is not valid.');
   return { id: action.id, kind: action.kind, clusterIds: [...action.clusterIds],
     ...(action.clusters === undefined ? {} : { clusters: action.clusters.map(cluster => ({ clusterId: cluster.clusterId, hint: cluster.hint })) }),
-    ...(action.planHash === undefined ? {} : { planHash: action.planHash }) };
+    ...(action.planHash === undefined ? {} : { planHash: action.planHash }),
+    ...(action.rotates === undefined ? {} : { rotates: [...action.rotates] }) };
 }
 export function actionDigest(action: ApprovalAction): string { return sha256(canonicalJson(actionCopy(action))); }
 function requestCopy(request: StoredApproval): ApprovalRequestDetails {
@@ -230,8 +239,17 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
     }
     // An admin-quorum request (created with `admins`) keeps the widening rule's count and role.
     const rule = approvalsRequired({ widening: request.widening || request.quorum?.admins === true, tiers }, team.policy, team.roster);
+    // Keys the action also rotates at once (arming with adoption) need the rotation's count too, by their tiers.
+    let rotation = 0;
+    if (request.action?.rotates?.length) {
+      let rotated: RiskTier[] | null = null;
+      if (opts.quorum?.tiers) {
+        try { rotated = (await opts.quorum.tiers({ id: request.action.id, kind: request.action.kind, clusterIds: [...request.action.rotates] })) ?? null; } catch { rotated = null; }
+      }
+      rotation = approvalsRequired({ widening: false, tiers: rotated }, team.policy, team.roster).count;
+    }
     // A rule that changes while a request is pending can only make it stricter.
-    return { required: Math.max(rule.count, request.quorum?.required ?? 0), admins: rule.role === 'admin' || request.quorum?.admins === true };
+    return { required: Math.max(rule.count, rotation, request.quorum?.required ?? 0), admins: rule.role === 'admin' || request.quorum?.admins === true };
   }
   /** An earlier approver still counts only while the same credential belongs to a member with the needed role. */
   function stillEligible(team: Team, approver: ApprovalApprover, admins: boolean): boolean {
@@ -277,6 +295,27 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       return { ...passkey, origins: [...passkey.origins], signCount: Math.max(passkey.signCount, saved?.signCount ?? 0) };
     }
     return undefined;
+  }
+
+  /** The approved grant of `actionId`, if its approvers still meet the current roster's and policy's quorum. */
+  async function grantInForce(state: ApprovalState, events: AuditEvent[], actionId: string, expectedDigest?: string): Promise<ApprovalGrant> {
+    const request = currentRequest(state, actionId);
+    if (!request || request.status !== 'approved' || !request.grant || (expectedDigest !== undefined && request.digest !== expectedDigest)) {
+      events.push(event('rejected', request?.actionId)); return reject('This action has no approval to run. Request it again.');
+    }
+    const team = await teamNow();
+    if (!team) {
+      if (request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
+      return structuredClone(request.grant);
+    }
+    const need = await requirement(team, request);
+    const approvers = request.grant.approvers ?? request.quorum?.approvers ?? [];
+    const counted = new Set(approvers.filter(approver => stillEligible(team, approver, need.admins)).map(approver => approver.memberId));
+    if (counted.size < need.required) {
+      events.push(event('quorum-lapsed', actionId));
+      return reject(`The approvals for this action no longer meet the team policy (${counted.size} of ${need.required} still count). Ask team members to approve it again.`);
+    }
+    return structuredClone(request.grant);
   }
 
   return {
@@ -463,24 +502,19 @@ export function createApprovalService(opts: ApprovalServiceOptions): ApprovalSer
       });
     },
     checkGrant(actionId, expectedDigest) {
-      return transaction(async (state, events) => {
+      return transaction(async (state, events) => grantInForce(state, events, actionId, expectedDigest));
+    },
+    claim(actionId, expectedDigest) {
+      return transaction(async (state, events, at) => {
         const request = currentRequest(state, actionId);
-        if (!request || request.status !== 'approved' || !request.grant || (expectedDigest !== undefined && request.digest !== expectedDigest)) {
-          events.push(event('rejected', request?.actionId)); return reject('This action has no approval to run. Request it again.');
+        if (request?.claimedAt !== undefined && request.status === 'approved') {
+          events.push(event('replay', actionId));
+          return reject('This change has already started with this approval. Make the change again to request a new approval.');
         }
-        const team = await teamNow();
-        if (!team) {
-          if (request.quorum) { events.push(event('team-unavailable', actionId)); return reject(TEAM_GONE); }
-          return structuredClone(request.grant);
-        }
-        const need = await requirement(team, request);
-        const approvers = request.grant.approvers ?? request.quorum?.approvers ?? [];
-        const counted = new Set(approvers.filter(approver => stillEligible(team, approver, need.admins)).map(approver => approver.memberId));
-        if (counted.size < need.required) {
-          events.push(event('quorum-lapsed', actionId));
-          return reject(`The approvals for this action no longer meet the team policy (${counted.size} of ${need.required} still count). Ask team members to approve it again.`);
-        }
-        return structuredClone(request.grant);
+        const grant = await grantInForce(state, events, actionId, expectedDigest);
+        request!.claimedAt = at.toISOString();
+        events.push(event('claimed', actionId));
+        return grant;
       });
     },
     markExecuted(actionId, expectedDigest) {

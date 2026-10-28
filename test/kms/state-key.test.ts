@@ -293,12 +293,17 @@ describe('first start of a new project is serialized (review M1)', () => {
       expect((await start).equals(otherKey!)).toBe(true);
       await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
 
-      // A lock left by a crashed process (its time no longer renewed) is taken over instead of blocking forever.
-      await writeFile(lockPath, '{"pid":1}');
-      const { utimes } = await import('node:fs/promises');
-      const old = new Date(Date.now() - 120_000);
-      await utimes(lockPath, old, old);
+      // fix-verify L-d: a lock left by a process that stopped is never taken over automatically (stat and unlink
+      // cannot do that atomically): the start stops with an instruction, and works once the file is removed.
+      await writeFile(lockPath, JSON.stringify({ pid: 2_147_483_646, token: 'stopped' }));
       const fresh = setup();
+      const stopped = await failure(loadProjectStateKey({ vault: createFakeVault(), projectId: PROJECT, wrapper: fresh.wrapper, now, lockPath }));
+      expect(stopped).toBeInstanceOf(KmsError);
+      expect(stopped.code).toBe('config');
+      expect(stopped.message).toContain('The state key lock needs attention. Confirm that no keysentry command is running, then remove ".keysentry/state-key.lock" and try again.');
+      expect(fresh.fake.http.callsTo('POST', /encrypt/)).toHaveLength(0);
+      const { unlink } = await import('node:fs/promises');
+      await unlink(lockPath);
       const key = await loadProjectStateKey({ vault: createFakeVault(), projectId: PROJECT, wrapper: fresh.wrapper, now, lockPath });
       expect(key).toHaveLength(32);
     } finally { await rm(dir, { recursive: true, force: true }); }
@@ -312,7 +317,7 @@ describe('first start of a new project is serialized (review M1)', () => {
     const dir = await mkdtemp(join(tmpdir(), 'ks-kms-lock-'));
     try {
       const lockPath = join(dir, 'state-key.lock');
-      await writeFile(lockPath, '{"pid":1}');
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid, token: 'live' }));
       const error = await failure(withStateKeyLock({ key: 'waiting', lockPath, waitMs: 100 }, async () => 'never'));
       expect(error).toBeInstanceOf(KmsError);
       expect(error.code).toBe('busy');

@@ -1,7 +1,7 @@
 export {
   TeamError, rosterHash, rosterFingerprint, hasRole, devicePublicKey, createRoster, nextRoster, signRoster, verifyRoster, verifyFirstUse,
   memberForPasskey, memberForDeviceKey, memberForEmail, memberForSso, teamPasskeys, teamDeviceKeys, vaultTeamAnchor, loadTeam, applyRoster,
-  describeRosterChange, rosterPath, checkProposal, exclusiveChannels, adminsNeeded,
+  describeRosterChange, rosterPath, checkProposal, exclusiveChannels, adminsNeeded, noSpareAdminWarning,
 } from './roster.js';
 export type { NewMember, RosterChange, RosterVerification, RosterRules, TeamAnchor, LoadedTeam, ApplyRosterOptions } from './roster.js';
 export { TEAM_SIGNATURE_PREFIX, documentHash, fingerprint, fingerprintMatches, signTeamDocument, verifyTeamSignatures } from './signature.js';

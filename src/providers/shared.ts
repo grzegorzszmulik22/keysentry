@@ -36,6 +36,29 @@ export async function request(ctx: ProviderContext, req: HttpRequest, provider: 
 export const PLANNED_FORM_PREFIX = 'keysentry:planned-form:';
 
 /**
+ * Every form of one shared credential that a single provider call changes (an Upstash database's password, REST
+ * tokens and Redis URLs, or a QStash user's tokens), as the provider's management API returns them right now.
+ */
+export interface CredentialForms {
+  /** The exact current values: the engine fingerprints them and looks for them across the whole inventory. */
+  values: string[];
+  /** True when a value is a form of this credential, including a Redis URL spelled in any way. */
+  holds(value: string): boolean;
+}
+
+/**
+ * An optional adapter extension beside the fixed ProviderAdapter contract: list every form of the credential a reset
+ * by reference `ref` (from resolveKeyRef) would change. null when the provider does not list that credential.
+ */
+export interface CredentialFormsSource {
+  credentialForms(ref: string, ctx: ProviderContext): Promise<CredentialForms | null>;
+}
+
+export function hasCredentialForms(adapter: object): adapter is CredentialFormsSource {
+  return 'credentialForms' in adapter && typeof (adapter as { credentialForms?: unknown }).credentialForms === 'function';
+}
+
+/**
  * A provider change (a key creation, reset or roll) may have happened, but its outcome is unknown: the request got no
  * answer, the provider failed with a server error, or it answered without a usable result. The rotation engine then
  * records a possible stray key (or, for an atomic roll, a possibly dead old credential) and reports the step as needing

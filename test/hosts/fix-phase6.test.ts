@@ -30,7 +30,8 @@ describe('Kubernetes Secrets managed by a controller (M2)', () => {
     ['a legacy service account token', { annotations: { 'kubernetes.io/service-account.name': 'deployer' } }, /service account token/],
   ];
 
-  it.each(managed)('skips a Secret with %s when listing, reading and writing', async (_label, metadata, manager) => {
+  // fix-verify M-b: listed and read as read-only consumers (so a rotation sees their copies), never written.
+  it.each(managed)('lists and reads a Secret with %s as read-only and refuses to write it', async (_label, metadata, manager) => {
     const logs: string[] = [];
     const http = new FakeHttp()
       .on('GET', /\/namespaces\/apps\/secrets\?/, () => json(200, { metadata: {}, items: [secret(metadata), { ...secret({}), metadata: { name: 'plain' } }] }))
@@ -39,14 +40,28 @@ describe('Kubernetes Secrets managed by a controller (M2)', () => {
     const host = createKubernetesHost({ server, token: 'kube-token', namespaces: ['apps'], http,
       log: { ...silentLogger, info: (message: string) => logs.push(message) } });
 
-    expect((await host.listServices()).map(ref => ref.serviceId)).toEqual(['plain']);
+    expect((await host.listServices()).map(ref => ref.serviceId)).toEqual(['api-env', 'plain']);
     expect(logs.join('\n')).toMatch(manager);
-    expect(logs.join('\n')).toMatch(/Rotate the key in its source store/);
-    expect(await host.readVariables(service)).toEqual([]);
+    expect(logs.join('\n')).toMatch(/never writes it\. Rotate the key in its source store/);
+    expect(await host.readVariables(service)).toEqual([{ name: 'OPENAI_API_KEY', value: 'sk-old-value-from-the-source-store', sealed: false }]);
+    expect(await host.readOnlyReason(service)).toMatch(manager);
+    expect(await host.readOnlyReason({ ...service, serviceId: 'plain', serviceName: 'plain' })).toBeNull();
     const error = await failure(host.writeVariables(service, { OPENAI_API_KEY: 'sk-new-value' }, { skipDeploy: true }));
     expect(error).toMatch(manager);
     expect(error).not.toContain('sk-');
     expect(http.callsTo('PUT', /secrets\/api-env$/)).toHaveLength(0);
+  });
+
+  it('reads a TLS Secret as read-only and refuses to write it', async () => {
+    const tls = { ...secret({}), type: 'kubernetes.io/tls', data: { 'tls.crt': b64('certificate'), 'tls.key': b64('private key') } };
+    const http = new FakeHttp()
+      .on('GET', /\/namespaces\/apps\/secrets\/api-env$/, () => json(200, tls))
+      .on('PUT', /./, () => json(200, {}));
+    const host = createKubernetesHost({ server, token: 'kube-token', namespaces: ['apps'], http, log: silentLogger });
+    expect(await host.readOnlyReason(service)).toMatch(/TLS Secret.*renewed together by their issuer/);
+    expect((await host.readVariables(service)).map(variable => variable.name)).toEqual(['tls.crt', 'tls.key']);
+    expect(await failure(host.writeVariables(service, { 'tls.key': 'other' }, { skipDeploy: true }))).toMatch(/TLS Secret .*does not write it/);
+    expect(http.callsTo('PUT', /./)).toHaveLength(0);
   });
 
   it('leaves ordinary Secrets alone and describes owners only with fixed text', () => {

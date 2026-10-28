@@ -15,6 +15,7 @@ import {
 } from '../hosts/index.js';
 import { NON_SECRET_CREDENTIALS, PROVIDER_CREDENTIALS } from '../providers/index.js';
 import { HOST_CREDENTIALS } from '../hosts/credentials.js';
+import { readOnlyServicesOf } from '../hosts/read-only.js';
 import { rulesForUserUrls } from '../net/allowlist.js';
 import { CREDENTIAL_NAMES, createCredentialSource, createEnvVault } from '../vault/index.js';
 import {
@@ -430,6 +431,7 @@ function withStoreActivation(host: HostAdapter, activation: 'manual' | 'immediat
     listServices: () => host.listServices(), readVariables: service => host.readVariables(service),
     writeVariables: (service, vars, opts) => host.writeVariables(service, vars, opts),
     redeploy: service => host.redeploy(service), deploymentStatus: (service, id) => host.deploymentStatus(service, id),
+    ...readOnlyServicesOf(host),
   };
 }
 

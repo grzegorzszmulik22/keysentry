@@ -6,6 +6,7 @@ import { CREDENTIAL_NAMES } from '../vault/credentials.js';
 import { canonicalJson } from '../security/index.js';
 import { executePlan, finishRotation, resumeRotation, type EngineDeps, type RotateOptions } from '../rotate/index.js';
 import { StopRequestedError } from '../rotate/stop.js';
+import { readOnlyServicesOf } from '../hosts/read-only.js';
 import type {
   ApprovalGrant, ArmedPlan, AuditLog, Cluster, HostAdapter, HostId, Incident, Inventory, JournalEntry, NotifyMessage,
   ProviderAdapter, RotationPlan, RotationReport,
@@ -223,6 +224,7 @@ function engineDeps(deps: AutopilotDeps, armed: WavePolicy, state: AutopilotStat
       async redeploy(service) { await active(); return host.redeploy(service); },
       deploymentStatus: (service, id) => host.deploymentStatus(service, id),
       ...(host.activationFor ? { activationFor: (service: Parameters<NonNullable<HostAdapter['activationFor']>>[0]) => host.activationFor!(service) } : {}),
+      ...readOnlyServicesOf(host),
     };
   }
   const providers: EngineDeps['providers'] = id => {

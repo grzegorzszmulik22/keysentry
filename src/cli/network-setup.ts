@@ -1,7 +1,7 @@
 import { createFetchHttp } from '../http.js';
 import { resolveFeedMode, type FeedMode } from '../feeds/index.js';
 import {
-  CaBundleError, TransportConfigError, createNodeTransport, createUnavailableTransport, loadCaBundle, parseCaBundle, resolveProxySettings,
+  CaBundleError, TransportConfigError, createNodeTransport, createProxyHealth, createUnavailableTransport, loadCaBundle, parseCaBundle, resolveProxySettings,
   summarizeNetwork, type CaBundle, type NetworkSummary, type ResolvedProxy,
 } from '../net/transport.js';
 import type { HttpClient, Redactor, TeamPolicy, Vault } from '../types.js';
@@ -27,6 +27,11 @@ export interface RuntimeNetwork {
   problem: Error | null;
   /** The extra trusted certificates (PEM), for connections that do not use `transport` (syslog over TLS). */
   ca: string[] | null;
+  /**
+   * True after repeated failed connections to the configured proxy, until one opens again (review EA H1): a deployed
+   * watcher then reports itself unhealthy on /healthz. Absent when no proxy carries requests.
+   */
+  proxyUnreachable?: () => boolean;
 }
 
 async function readCa(caFile: string, cwd: string, vault?: Pick<Vault, 'get'>): Promise<CaBundle> {
@@ -81,10 +86,12 @@ export async function setupNetwork(input: {
   const summary = summarizeNetwork({ proxy, requireProxy, ca, feeds: feedMode, env: input.env });
   // Fail closed: a broken proxy/CA/policy setting refuses every request instead of silently going direct. Node's fetch
   // honours NODE_TLS_REJECT_UNAUTHORIZED=0; keysentry's own transport pins certificate checks, so it is used then.
+  const proxyHealth = !input.injected && !problem && proxy?.settings ? createProxyHealth() : null;
   const transport = input.injected ?? (problem ? createUnavailableTransport(problem)
     : proxy?.settings || bundle || requireProxy || summary.nodeTrust?.tlsChecksOff
       ? createNodeTransport({ ...(proxy?.settings ? { proxy: proxy.settings } : {}), ...(proxy ? { noProxy: proxy.noProxy } : {}),
-        ...(bundle ? { ca: bundle.pems } : {}), requireProxy })
+        ...(bundle ? { ca: bundle.pems } : {}), requireProxy, ...(proxyHealth ? { onProxyResult: proxyHealth.record } : {}) })
       : createFetchHttp());
-  return { feedMode, summary, transport, problem, ca: bundle ? [...bundle.pems] : null };
+  return { feedMode, summary, transport, problem, ca: bundle ? [...bundle.pems] : null,
+    ...(proxyHealth ? { proxyUnreachable: proxyHealth.unreachable } : {}) };
 }

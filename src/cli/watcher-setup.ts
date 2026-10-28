@@ -147,6 +147,16 @@ export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencie
 /** The fixed reason a watcher's /healthz gives when its network transport refuses every request (review H1). */
 export const WATCHER_NETWORK_PROBLEM = 'The watcher\'s proxy or certificate settings cannot be used, so it refuses every outbound request.';
 
+/** The fixed reason a watcher's /healthz gives after repeated failed connections to its proxy (review EA H1). */
+export const WATCHER_PROXY_UNREACHABLE = 'The watcher cannot reach its proxy: its last connection attempts to the proxy all failed, so no outbound request can be made.';
+
+/** The deployed watcher's /healthz problem: a transport that refuses every request, or a proxy it keeps failing to reach. */
+export function watcherNetworkHealth(network: { problem: string | null; proxyUnreachable?: () => boolean }): { code: 'network'; reason: string } | null {
+  if (network.problem) return { code: 'network', reason: WATCHER_NETWORK_PROBLEM };
+  if (network.proxyUnreachable?.()) return { code: 'network', reason: WATCHER_PROXY_UNREACHABLE };
+  return null;
+}
+
 /** The supplied client must be the runtime's guarded client, including a user rule for this origin. */
 export async function watcherStatus(http: HttpClient, value: string, localVersion: string): Promise<{
   healthy: true; version: string; localVersion: string; versionMatches: boolean;

@@ -1,5 +1,6 @@
 import type { HttpResponse, ProviderAdapter, ProviderContext, RotationResult, VerifyResult } from '../types.js';
 import { credential, ensureOk, PLANNED_FORM_PREFIX, ProviderMutationUncertainError, readJson, request, verifyRead } from './shared.js';
+import type { CredentialForms, CredentialFormsSource } from './shared.js';
 
 // Docs (accessed 2026-10-28): https://upstash.com/docs/devops/developer-api/authentication.md,
 // .../developer-api/redis/list_databases.md, .../developer-api/redis/reset_password.md,
@@ -26,6 +27,7 @@ type Row = Record<string, unknown>;
 interface Database {
   id: string;
   host: string;
+  port?: number;
   state?: string;
   password?: string;
   restToken?: string;
@@ -91,6 +93,7 @@ async function listDatabases(ctx: ProviderContext): Promise<Database[]> {
     }
     const db: Database = { id: row.database_id, host: databaseHost(row.endpoint) };
     if (typeof row.state === 'string') db.state = row.state;
+    if (typeof row.port === 'number' && Number.isInteger(row.port) && row.port > 0 && row.port < 65536) db.port = row.port;
     const password = optionalString(row.password);
     const restToken = optionalString(row.rest_token);
     const readOnlyToken = optionalString(row.read_only_rest_token);
@@ -141,6 +144,39 @@ async function identify(value: string, ctx: ProviderContext): Promise<Target | n
     if (user.readOnlyToken === value) matches.push({ kind: 'qstash-read-only', user });
   }
   return matches.length > 1 ? 'ambiguous' : matches[0] ?? null;
+}
+
+/** The Redis URLs the Upstash console and integrations write for a database (TLS and plain, with or without a user). */
+function canonicalUrls(db: Database, password: string): string[] {
+  const ports = [...new Set([db.port ?? 6379, 6379])].map(port => `:${port}`);
+  const encoded = encodeURIComponent(password);
+  return ['rediss://', 'redis://'].flatMap(scheme => ['default', ''].flatMap(user =>
+    [...ports, ''].map(port => `${scheme}${user}:${encoded}@${db.host}${port}`)));
+}
+
+/**
+ * Every form a reset by `ref` changes, as the management API lists it now: for a database the password, the REST
+ * token, the read-only REST token and its Redis URLs; for a QStash user its token and read-only token. Matching is
+ * exact (a Redis URL by host and password), so no other credential can be mistaken for a form.
+ */
+async function credentialForms(ref: string, ctx: ProviderContext): Promise<CredentialForms | null> {
+  const db = (await listDatabases(ctx)).find(candidate => candidate.id === ref);
+  if (db) {
+    const values = [db.password, db.restToken, db.readOnlyToken].filter((value): value is string => value !== undefined);
+    if (db.password !== undefined) values.push(...canonicalUrls(db, db.password));
+    return {
+      values,
+      holds(value) {
+        if (values.includes(value) || values.includes(value.trim())) return true;
+        const url = parseRedisUrl(value.trim());
+        return url !== null && db.password !== undefined && url.host === db.host && url.password === db.password;
+      },
+    };
+  }
+  const user = (await listQStashUsers(ctx)).find(candidate => candidate.id === ref);
+  if (!user) return null;
+  const values = [user.token, user.readOnlyToken].filter((value): value is string => value !== undefined);
+  return { values, holds: value => values.includes(value) || values.includes(value.trim()) };
 }
 
 const ROLLED_UNKNOWN = 'Upstash completed the reset but did not return usable new credentials; the old credentials may already be invalid. Copy the new values from the Upstash console and update every consumer now.';
@@ -289,7 +325,7 @@ async function verifyQStash(value: string, siblings: Record<string, string>, ctx
  * no way to create a second credential alongside the old one. Read-only tokens, QStash signing keys and management
  * API keys stay guided.
  */
-export const upstashProvider: ProviderAdapter = {
+export const upstashProvider: ProviderAdapter & CredentialFormsSource = {
   id: 'upstash',
   method: 'atomic-roll',
 
@@ -314,6 +350,8 @@ export const upstashProvider: ProviderAdapter = {
     if (target === null || target === 'ambiguous') return null;
     return 'db' in target ? target.db.id : target.user.id;
   },
+
+  credentialForms,
 
   async rotate(oldValue, ctx): Promise<RotationResult> {
     mgmtHeaders(ctx);

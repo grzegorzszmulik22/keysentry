@@ -9,7 +9,7 @@ import * as tls from 'node:tls';
 import { gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, test } from 'vitest';
 import {
-  bypassesProxy, CaBundleError, createNodeTransport, createUnavailableTransport, loadCaBundle, networkStatusLines,
+  bypassesProxy, CaBundleError, createNodeTransport, createProxyHealth, createUnavailableTransport, loadCaBundle, networkStatusLines, PROXY_FAILURES_UNHEALTHY,
   parseCaBundle, parseNoProxy, PROXY_AUTH_VAULT_NAME, resolveProxySettings, summarizeNetwork, TransportConfigError,
   TransportError, trustedCertificates, usesProxy,
 } from '../../src/net/transport.js';
@@ -296,6 +296,34 @@ describe('createNodeTransport through a CONNECT proxy', () => {
     expect(error).toMatchObject({ code: 'PROXY_TLS_FAILED' });
     expect(untrustedProxy.connects).toHaveLength(0);
     expect(destination.requests).toHaveLength(1);
+  });
+
+  // fix-verify EA H1: a deployed watcher whose proxy keeps refusing connections reports itself unhealthy.
+  test('reports each proxy connection, and three failures in a row mark the proxy unreachable until one opens', async () => {
+    const closed = createNetServer();
+    const deadPort = await new Promise<number>(resolve => closed.listen(0, '127.0.0.1', () => resolve((closed.address() as AddressInfo).port)));
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    const health = createProxyHealth();
+    const results: boolean[] = [];
+    const record = (reached: boolean) => { results.push(reached); health.record(reached); };
+    const dead = createNodeTransport({ proxy: { url: `http://127.0.0.1:${deadPort}` }, onProxyResult: record });
+    for (let attempt = 1; attempt <= PROXY_FAILURES_UNHEALTHY; attempt += 1) {
+      expect(health.unreachable()).toBe(false);
+      await expect(dead.request({ method: 'GET', url: 'https://api.example.test/' })).rejects.toMatchObject({ code: 'PROXY_UNREACHABLE' });
+    }
+    expect(results).toEqual([false, false, false]);
+    expect(health.unreachable()).toBe(true);
+    // A proxy that answers (even with a refusal) was reached: the count starts again.
+    const refusing = await startProxy({ reply: 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n' });
+    const live = createNodeTransport({ proxy: { url: `http://127.0.0.1:${refusing.port}` }, onProxyResult: record });
+    await expect(live.request({ method: 'GET', url: 'https://api.example.test/' })).rejects.toMatchObject({ code: 'PROXY_TUNNEL_REFUSED' });
+    expect(results.at(-1)).toBe(true);
+    expect(health.unreachable()).toBe(false);
+    // Requests that bypass the proxy are not counted.
+    const bypass = createNodeTransport({ proxy: { url: `http://127.0.0.1:${deadPort}` }, noProxy: ['127.0.0.1'], onProxyResult: record });
+    const destination = await startDestination();
+    await bypass.request({ method: 'GET', url: `https://127.0.0.1:${destination.port}/` }).catch(() => undefined);
+    expect(results).toHaveLength(4);
   });
 
   test('NO_PROXY hosts connect directly and the proxy is never contacted', async () => {

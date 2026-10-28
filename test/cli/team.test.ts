@@ -182,7 +182,9 @@ describe('a team across three computers', () => {
     expect((await run(ana, ['team', 'sso', 'ben', '--issuer', 'http://idp.example.com', '--subject', 's'])).message).toMatch(/^Use --issuer with the provider/);
     expect((await run(ana, ['team', 'sso', 'ben', '--issuer', 'https://idp.example.com'])).message).toMatch(/^Use --issuer with the provider/);
     expect((await run(ana, ['team', 'sso', 'ben'])).message).toBe('Use --issuer with --subject, or --clear.');
-    expect(await run(ana, ['team', 'sso', 'ben', '--clear'])).toMatchObject({ exit: 0, diagnostics: 'Remove the pinned single sign-on identity of ben.' });
+    // A one-admin team has no spare admin: every roster change also says so (fix-verify M-c).
+    expect(await run(ana, ['team', 'sso', 'ben', '--clear'])).toMatchObject({ exit: 0,
+      diagnostics: expect.stringMatching(/^Remove the pinned single sign-on identity of ben\.\nWarning: no spare admin\./) });
 
     const invite = await run(ana, ['team', 'invite', 'ben', '--origin', 'https://keysentry.example.com']);
     expect(invite.exit).toBe(0);

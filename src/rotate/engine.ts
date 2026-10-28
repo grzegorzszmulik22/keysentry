@@ -4,11 +4,12 @@ import { crash, isCrash, unresolvedOrphans } from './recovery.js';
 import { undoRotation } from './undo.js';
 import { StopRequestedError, withStopChecks } from './stop.js';
 import { activationMode, needsManualActivation } from '../hosts/activation.js';
+import { hasReadOnlyServices } from '../hosts/read-only.js';
 import { hasPublicKeyIds, isPublicKeyId } from './public-refs.js';
 import { secretCredentialValues } from '../providers/credential-kinds.js';
 import { twilioKeySidFor } from '../providers/twilio.js';
 import { publicGoogleKeyGuidance } from '../providers/google.js';
-import { PLANNED_FORM_PREFIX } from '../providers/shared.js';
+import { hasCredentialForms, PLANNED_FORM_PREFIX, type CredentialForms } from '../providers/shared.js';
 import type {
   ArmedPlan, Consumer, CrashPoint, GraceDecision, GraceInfo, GuidedPrompt, HostAdapter, HostId, InFlightStore, Inventory, Journal, JournalEntry, Logger, PlanStep,
   ProviderAdapter, ProviderContext, ProviderId, RawVariable, Redactor, RotationPlan,
@@ -66,6 +67,8 @@ interface ServiceWork {
   host?: HostAdapter;
   variables: RawVariable[];
   readFailed: boolean;
+  /** Why keysentry reads but never writes this service (a controller-managed Kubernetes Secret), else null. */
+  readOnly: string | null;
   vars: Record<string, string>;
   steps: Set<StepWork>;
   written: boolean;
@@ -109,6 +112,8 @@ interface StepWork {
   groupForms?: Map<string, string>;
   /** The provider call may have changed something without a known result (see uncertainMutation). */
   uncertain?: boolean;
+  /** Consumers in services keysentry reads but never writes: they keep the old key, so it is never revoked here. */
+  readOnlyHolders?: string[];
 }
 
 /** Variables that may hold a form of an Upstash credential (REST token, password, Redis URL, QStash token). */
@@ -256,6 +261,19 @@ export async function runRotation(
       .map(f => `${f.service.host}/${f.service.serviceName}:${f.varName}`))];
     if (locations.length === 0) return false;
     warn(work, `Old key retained: unplanned sealed consumers may still use it: ${locations.join(', ')}.`);
+    return true;
+  }
+  /**
+   * A consumer in a service keysentry reads but never writes (a Kubernetes Secret that a controller restores from its
+   * own source) keeps the old key: never roll it (that ends the old key at once) and never revoke it automatically.
+   */
+  function heldByReadOnly(work: StepWork, atomic = false): boolean {
+    if (!work.readOnlyHolders?.length) return false;
+    const holders = work.readOnlyHolders.join('; ');
+    const message = atomic
+      ? `Not rolled: a roll ends the old key at once, but ${holders} also holds it and keysentry does not write there. Roll it by hand in the provider console and update that controller's source (the store it syncs from) at the same time.`
+      : `Old key kept: ${holders} also holds this key, and keysentry does not write there. Update the key in that controller's source (the store it syncs from), let it sync and restart what uses it, then revoke the old key yourself in the provider console.`;
+    if (!work.report.warnings.includes(clean(message))) warn(work, message);
     return true;
   }
   async function journal(event: JournalEntry['event'], fields: Omit<JournalEntry, 'event' | 'at' | 'planId'> = {}): Promise<void> {
@@ -419,10 +437,12 @@ export async function runRotation(
   /**
    * An Upstash reset changes every form of the credential at once: the password, the REST token, every Redis URL and
    * possibly the read-only token. Each form has a different value, so each is its own inventory cluster. Before any
-   * reset, find every place that holds a form of the same database (or QStash user):
+   * reset, the adapter lists every current form of the same database (or QStash user), and keysentry looks for each
+   * one across the whole inventory by fingerprint, whatever the value was classified as and whatever its name:
    * - forms in this plan become one group, rolled by one provider call that returns each form's new value;
    * - forms the plan does not update (and that the primary's companions will not rewrite) stop that reset;
-   * - places keysentry cannot read (sealed, unreadable, an incomplete scan) make every Upstash reset guided.
+   * - places keysentry cannot read (an Upstash-like variable that is sealed or unreadable, any sealed or unreadable
+   *   value in a service that holds a form, an incomplete scan, forms the adapter cannot list) make the reset guided.
    */
   async function groupUpstashForms(): Promise<void> {
     const rolls = works.filter(work => work.ready && work.atomicRoll && !work.guided && work.step.provider === 'upstash'
@@ -430,10 +450,11 @@ export async function runRotation(
     if (rolls.length === 0) return;
     const provider = rolls[0]!.provider!;
     const ctx = rolls[0]!.ctx!;
+    const passOn = (error: unknown) => isCrash(error) || error instanceof RotationAbortedError;
     async function resolve(value: string): Promise<string | null | undefined> {
       if (typeof provider.resolveKeyRef !== 'function') return undefined;
       try { return await provider.resolveKeyRef(value, ctx); }
-      catch (error) { if (isCrash(error) || error instanceof RotationAbortedError) throw error; return undefined; }
+      catch (error) { if (passOn(error)) throw error; return undefined; }
     }
     const refs = new Map<StepWork, string>();
     // A value the adapter cannot identify is refused by rotate() before any reset, so it needs no grouping.
@@ -441,12 +462,43 @@ export async function runRotation(
     if (refs.size === 0) return;
     const groups = new Map<string, StepWork[]>();
     for (const [work, ref] of refs) groups.set(ref, [...(groups.get(ref) ?? []), work]);
+    // Every current form of each credential, from the management API. Without that list nothing can be checked, so
+    // that reset is guided.
+    const forms = new Map<string, CredentialForms>();
+    for (const [ref, group] of [...groups]) {
+      let listed: CredentialForms | null = null;
+      if (hasCredentialForms(provider)) {
+        try { listed = await provider.credentialForms(ref, ctx); }
+        catch (error) { if (passOn(error)) throw error; listed = null; }
+      }
+      if (listed) {
+        for (const value of listed.values) register(value);
+        forms.set(ref, listed);
+        continue;
+      }
+      groups.delete(ref);
+      for (const work of group) {
+        refs.delete(work);
+        work.guided = true;
+        work.atomicRoll = false;
+        warn(work, 'Guided reset: an Upstash reset changes every form of this credential (password, REST token, Redis URLs), and keysentry could not list those forms with UPSTASH_ADMIN_KEY to look for every place that holds one. Reset it in the Upstash console and update every form yourself.');
+      }
+    }
+    if (groups.size === 0) return;
     // A read-only form cannot drive the reset (the adapter refuses it), so a writable form goes first.
     const readOnly = (work: StepWork) => work.step.consumers.some(consumer => /READ_?ONLY/i.test(consumer.varName));
     const primaries = new Map([...groups].map(([ref, group]) => [ref, [...group].sort((a, b) => Number(readOnly(a)) - Number(readOnly(b)))[0]!]));
+    const owner = (value: string): string | undefined => [...forms].find(([, listed]) => listed.holds(value))?.[0];
+    const byFingerprint = new Map<string, string>();
+    for (const listed of forms.values()) for (const value of listed.values) byFingerprint.set(fingerprint(value, deps.fingerprintKey), value);
     const label = (service: ServiceRef, name: string) => `${service.host}/${service.serviceName || service.serviceId || 'shared'}:${name}`;
+    const where = (key: string, name: string) => `${key}\0${name}`;
     const unseen = new Set<string>();
     const outside = new Map<string, Set<string>>();
+    /** Services that hold some form of a credential being reset: a sealed or unreadable value there may be another. */
+    const holders = new Map<string, ServiceRef>();
+    /** Locations already accounted for: planned in a group, or checked with their inventoried cluster. */
+    const handled = new Set<string>();
     // The primary's companions rewrite a form only where companionsFor delivers them: a consumer service of the
     // primary that holds the same value under the same name as the primary's context service.
     function covered(primary: StepWork, value: string, locations: { service: ServiceRef; varName: string; reference?: boolean }[]): boolean {
@@ -458,22 +510,29 @@ export async function runRotation(
           && siblingValues(context)[location.varName] === value && siblingValues(holder)[location.varName] === value;
       });
     }
-    async function check(value: string, locations: { service: ServiceRef; varName: string; reference?: boolean }[], name: string): Promise<void> {
-      const ref = await resolve(value);
-      if (ref === undefined) { for (const location of locations) unseen.add(label(location.service, location.varName)); return; }
-      const primary = ref === null ? undefined : primaries.get(ref);
-      if (!primary || covered(primary, value, locations)) return;
-      const places = outside.get(ref!) ?? new Set<string>();
+    function check(value: string, locations: { service: ServiceRef; varName: string; reference?: boolean }[], name: string): void {
+      for (const location of locations) handled.add(where(serviceKey(location.service), location.varName));
+      const ref = owner(value);
+      if (ref === undefined) return;
+      for (const location of locations) holders.set(serviceKey(location.service), location.service);
+      if (covered(primaries.get(ref)!, value, locations)) return;
+      const places = outside.get(ref) ?? new Set<string>();
       for (const location of locations) places.add(`${label(location.service, location.varName)}${name}`);
-      outside.set(ref!, places);
+      outside.set(ref, places);
     }
     for (const error of inv.errors) unseen.add(`services on ${error.host} (its last scan was incomplete)`);
     const grouped = new Set([...refs.keys()].map(work => work.step.clusterId));
-    const inventoried = new Set([...inv.findings, ...inv.clusters.flatMap(cluster => cluster.consumers)]
-      .map(consumer => `${serviceKey(consumer.service)}\0${consumer.varName}`));
-    // Every other inventoried form: a cluster with an Upstash classification or an Upstash/Redis-like name.
+    for (const work of refs.keys()) for (const consumer of work.step.consumers) {
+      handled.add(where(serviceKey(consumer.service), consumer.varName));
+      holders.set(serviceKey(consumer.service), consumer.service);
+    }
     for (const cluster of inv.clusters) {
       if (grouped.has(cluster.id)) continue;
+      // A form found by fingerprint, whatever the value was classified as and whatever its name (CACHE_PASSWORD).
+      const match = cluster.fingerprint === null ? undefined : byFingerprint.get(cluster.fingerprint);
+      if (match !== undefined) { check(match, cluster.consumers, ` (cluster ${cluster.id})`); continue; }
+      // A form may also be spelled differently (a Redis URL with another port or path): read every cluster with an
+      // Upstash classification or an Upstash/Redis-like name, and treat one that cannot be read as a possible form.
       if (cluster.provider !== 'upstash' && !cluster.consumers.some(consumer => UPSTASH_FORM_NAME.test(consumer.varName))) continue;
       let value: string | undefined;
       for (const consumer of cluster.consumers.filter(candidate => !candidate.reference && !candidate.sealed)) {
@@ -482,19 +541,24 @@ export async function runRotation(
         if (variable && !variable.sealed && variable.value !== undefined
           && (cluster.fingerprint === null || fingerprint(variable.value, deps.fingerprintKey) === cluster.fingerprint)) { value = variable.value; break; }
       }
-      if (value === undefined) { for (const consumer of cluster.consumers) unseen.add(label(consumer.service, consumer.varName)); continue; }
-      await check(value, cluster.consumers, ` (cluster ${cluster.id})`);
+      if (value === undefined) {
+        for (const consumer of cluster.consumers) {
+          unseen.add(label(consumer.service, consumer.varName));
+          handled.add(where(serviceKey(consumer.service), consumer.varName));
+        }
+        continue;
+      }
+      check(value, cluster.consumers, ` (cluster ${cluster.id})`);
     }
-    // Values keysentry did not inventory (for example a password under REDIS_PW) in the services this reset touches.
-    for (const work of refs.keys()) for (const key of work.services) {
-      const service = services.get(key);
-      if (!service || service.readFailed) continue;
+    // Every service that holds a form: a value keysentry did not inventory (a password under REDIS_PW) may be one more
+    // form, and so may any value it cannot read there.
+    for (const [key, ref] of [...holders].sort(([a], [b]) => a.localeCompare(b))) {
+      const service = services.get(key) ?? await readService(ref);
+      if (service.readFailed) { unseen.add(`${label(service.service, '*')} (its variables could not be read)`); continue; }
       for (const variable of service.variables) {
-        if (!UPSTASH_FORM_NAME.test(variable.name) || inventoried.has(`${key}\0${variable.name}`)) continue;
+        if (handled.has(where(key, variable.name))) continue;
         if (variable.sealed || variable.value === undefined) { unseen.add(label(service.service, variable.name)); continue; }
-        const text = variable.value.trim();
-        if (text.length < 16 || /^https?:\/\//i.test(text)) continue;
-        await check(variable.value, [{ service: service.service, varName: variable.name }], '');
+        check(variable.value, [{ service: service.service, varName: variable.name }], '');
       }
     }
     if (unseen.size > 0) {
@@ -513,7 +577,7 @@ export async function runRotation(
         for (const work of group) {
           work.ready = false;
           work.report.status = 'skipped';
-          warn(work, `Not reset: an Upstash reset also changes the same credential at ${list}, which this plan does not update. Plan those clusters together with this one (keysentry rotate --cluster for each) so one reset updates every form.`);
+          warn(work, `Not reset: an Upstash reset also changes the same credential at ${list}, which this plan does not update. Plan those clusters together with this one (keysentry rotate --cluster for each) so one reset updates every form, or reset it in the Upstash console and update every form yourself.`);
         }
         continue;
       }
@@ -582,13 +646,15 @@ export async function runRotation(
     const cached = services.get(key);
     if (cached) return cached;
     const service: ServiceWork = {
-      service: ref, host: deps.hosts[ref.host], variables: [], readFailed: false,
+      service: ref, host: deps.hosts[ref.host], variables: [], readFailed: false, readOnly: null,
       vars: Object.create(null) as Record<string, string>, steps: new Set(), written: false, activation: 'pending',
     };
     services.set(key, service);
     try {
       if (!service.host) throw new Error('Host unavailable.');
       service.variables = await service.host.readVariables(ref);
+      // A service the host only reads (a controller-managed Kubernetes Secret) is a consumer that is never written.
+      if (hasReadOnlyServices(service.host)) service.readOnly = await service.host.readOnlyReason(ref);
       const secretNames = new Set(inv.findings.filter(finding => serviceKey(finding.service) === key).map(finding => finding.varName));
       for (const variable of service.variables) {
         if (!variable.sealed && variable.value !== undefined && (secretNames.has(variable.name) || classify(variable.name, variable.value).isSecret)) register(variable.value);
@@ -911,6 +977,18 @@ export async function runRotation(
         if (stale) warn(work, 'Stale inventory: a consumer value changed or is missing; scan again before rotating.');
         continue;
       }
+      // Copies in services keysentry never writes stay as they are, and they hold the old key's revocation.
+      const readOnlyKeys = [...work.services].filter(key => typeof services.get(key)?.readOnly === 'string');
+      if (readOnlyKeys.length > 0) {
+        work.readOnlyHolders = work.step.consumers.filter(consumer => readOnlyKeys.includes(serviceKey(consumer.service)))
+          .map(consumer => `${consumer.service.host}/${consumer.service.projectName ? `${consumer.service.projectName}/` : ''}${consumer.service.serviceName}:${consumer.varName} (${services.get(serviceKey(consumer.service))!.readOnly})`);
+        for (const key of readOnlyKeys) work.services.delete(key);
+        if (work.services.size === 0) {
+          work.report.status = 'skipped';
+          warn(work, `Not rotated: every copy of this key is in a place keysentry reads but does not write: ${work.readOnlyHolders.join('; ')}. Rotate it in that controller's source (the store it syncs from).`);
+          continue;
+        }
+      }
       if (work.step.provider === 'aws') {
         const writable = work.step.consumers.filter(consumer => !consumer.reference);
         const names = new Set(writable.map(consumer => consumer.varName));
@@ -977,6 +1055,10 @@ export async function runRotation(
       }
       work.ready = true;
       for (const consumer of work.step.consumers) {
+        if (!work.services.has(serviceKey(consumer.service))) {
+          report.diff.push(`${serviceKey(consumer.service)}: ${consumer.varName}: kept (keysentry does not write it; the old key is not revoked)`);
+          continue;
+        }
         if (consumer.reference) {
           report.diff.push(`Redeploy reference ${serviceKey(consumer.service)}: ${consumer.varName}`);
           continue;
@@ -1014,6 +1096,7 @@ export async function runRotation(
           work.atomicRoll = !work.guided && (work.step.method === 'atomic-roll' || provider.method === 'atomic-roll');
           if (work.atomicRoll) {
             let blocked = blockedBySealed(work);
+            if (heldByReadOnly(work, true)) blocked = true;
             if (!deps.reveal) { warn(work, 'atomic roll needs an interactive run'); blocked = true; }
             if (revoke === 'never') { warn(work, 'Atomic roll skipped: revoke is never, but rolling would immediately revoke the old key.'); blocked = true; }
             const unconfirmed = [...work.services].filter(key => cannotConfirmActivation(work, key));
@@ -1462,6 +1545,7 @@ export async function runRotation(
           warn(work, 'Cancellation blocks old-key revocation; the old key is retained.');
           return;
         }
+        if (heldByReadOnly(work)) return;
         if (blockedBySealed(work)) return;
         if (work.retainOldKey) {
           const message = 'The old key was kept because it ships inside web pages or mobile apps: delete it yourself in the provider console once every shipped client uses the replacement.';
@@ -1633,7 +1717,7 @@ export async function runRotation(
       if (!aborted && !waveFailure && revoke === 'after-deploy' && (deps.grace || graceMs > 0 || opts.nextDeployAcceptance?.length
         || history.some(entry => entry.event === 'grace-start'))) {
         const eligible = works.filter(work => work.ready && !work.oldRevoked && work.report.status !== 'failed'
-          && [...work.services].every(key => acceptedActivation(work, key)) && !blockedBySealed(work));
+          && [...work.services].every(key => acceptedActivation(work, key)) && !heldByReadOnly(work) && !blockedBySealed(work));
         // Each cluster may have a different signed next-deploy maximum.
         const groups = new Map<string, { works: StepWork[]; deadline: string; nextDeploy: ArmedPlan['nextDeployAcceptance'] }>();
         for (const work of eligible) {

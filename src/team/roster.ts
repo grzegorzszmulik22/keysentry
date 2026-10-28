@@ -156,6 +156,19 @@ function signingAdmins(roster: TeamRoster): number {
   return roster.members.filter(entry => entry.role === 'admin' && entry.deviceKeys.length > 0).length;
 }
 
+/**
+ * A plain warning when `roster`, under a policy with `wideningAdmins`, leaves no spare signing admin: every admin with
+ * a device key is needed to sign the next roster or policy change (a 2-of-2 widening rule, or a single admin), so losing
+ * one admin device blocks every later change. There is no bypass; the recovery is to keep a spare admin. Null otherwise.
+ */
+export function noSpareAdminWarning(roster: Pick<TeamRoster, 'adminThreshold' | 'members'>, wideningAdmins?: number): string | null {
+  const signing = signingAdmins(roster as TeamRoster);
+  const needed = adminsNeeded(roster, wideningAdmins);
+  if (signing > needed) return null;
+  const admins = signing === 1 ? 'only 1 admin has' : `only ${signing} admins have`;
+  return `Warning: no spare admin. Every later roster or policy change needs ${needed} admin signature${needed === 1 ? '' : 's'} and ${admins} a device key, so if one admin device is lost, no roster or policy change can be signed again; keysentry has no bypass. Keep a spare: add another admin with a device key (keysentry team add <id> --role admin --card <file>).`;
+}
+
 /** Add this admin's signature. Signing never changes the document; a second signature by the same key is refused. */
 export function signRoster(input: SignedTeamRoster | TeamRoster, memberId: string, key: DeviceKey): SignedTeamRoster {
   const signed: SignedTeamRoster = 'roster' in input ? clone(input) : { roster: clone(input), signatures: [] };

@@ -421,23 +421,55 @@ function windowsLockContention(error: unknown): boolean {
 }
 
 /** The filesystem lock also serializes independent modules, processes, and aliases of the same directory. */
-async function withStateLock<T>(dir: string, operation: (assertLock: () => Promise<void>) => Promise<T>): Promise<T> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, '.state.lock');
+function withStateLock<T>(dir: string, operation: (assertLock: () => Promise<void>) => Promise<T>): Promise<T> {
+  return withDirectoryLock(dir, { file: '.state.lock', temporaryPrefix: '.state-lock', what: 'saved state lock',
+    busy: 'keysentry\'s saved state is busy. Try again when the other operation finishes.' }, operation);
+}
+
+/** A named lock file in a keysentry directory (see withDirectoryLock). */
+export interface DirectoryLock {
+  /** Lock file name, such as ".state.lock". */
+  file: string;
+  /** Prefix of the owner's temporary file. */
+  temporaryPrefix: string;
+  /** What the messages call it, such as "saved state lock". */
+  what: string;
+  /** The message when another live process holds it for the whole wait. */
+  busy: string;
+  /** How long to wait for a live holder; default 10 seconds. */
+  waitMs?: number;
+  /** The lock's path in the "remove it by hand" instruction; default ".keysentry/<file>". */
+  shownPath?: string;
+  /** Wraps each failure in the caller's own error type; default a plain Error with the message. */
+  failure?: (kind: 'busy' | 'unusable' | 'attention' | 'changed', message: string) => Error;
+}
+
+/**
+ * A cross-process lock file in `dir`: published atomically with its owner's pid (a hard link, so there is no empty-lock
+ * window), waited for while a live process holds it (`waitMs`, default 10 seconds) and through Windows "delete pending"
+ * contention. A lock left by a process that exited is never taken over automatically, because stat and unlink cannot do
+ * that atomically: the caller is told to remove it by hand. The state lock, the approvals lock and the KMS state key
+ * lock use it.
+ */
+export async function withDirectoryLock<T>(dir: string, lock: DirectoryLock, operation: (assertLock: () => Promise<void>) => Promise<T>): Promise<T> {
+  const fail = (kind: 'busy' | 'unusable' | 'attention' | 'changed', message: string) => lock.failure ? lock.failure(kind, message) : new Error(message);
+  try { await mkdir(dir, { recursive: true, mode: 0o700 }); }
+  catch (error) { if (lock.failure) throw fail('unusable', `Unable to open the ${lock.what}.`); throw error; }
+  const path = join(dir, lock.file);
   const token = randomBytes(16).toString('hex');
-  const temporary = join(dir, `.state-lock-${process.pid}-${token}.tmp`);
+  const temporary = join(dir, `${lock.temporaryPrefix}-${process.pid}-${token}.tmp`);
   const metadata = JSON.stringify({ pid: process.pid, token });
-  const busy = () => new Error('keysentry\'s saved state is busy. Try again when the other operation finishes.');
+  const busy = () => fail('busy', lock.busy);
   let handle: FileHandle;
   try { handle = await open(temporary, 'wx', 0o600); }
-  catch { throw new Error('Unable to open the saved state lock.'); }
+  catch { throw fail('unusable', `Unable to open the ${lock.what}.`); }
   let temporaryExists = true;
   let published = false;
   let identity: Stats | undefined;
   try {
     // Metadata is coordination data, not durable state; journal appends retain their single write/fsync.
     await handle.writeFile(metadata, 'utf8');
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + (lock.waitMs ?? 10_000);
     let backoff = 10;
     for (;;) {
       if (Date.now() >= deadline) throw busy();
@@ -446,11 +478,11 @@ async function withStateLock<T>(dir: string, operation: (assertLock: () => Promi
         await link(temporary, path);
         published = true;
         break;
-      } catch (error) { if (!hasCode(error, 'EEXIST') && !windowsLockContention(error)) throw new Error('Unable to open the saved state lock.'); }
+      } catch (error) { if (!hasCode(error, 'EEXIST') && !windowsLockContention(error)) throw fail('unusable', `Unable to open the ${lock.what}.`); }
       let current: StateLockSnapshot | null | 'contended';
       try { current = await inspectStateLock(path); }
       catch (error) {
-        if (!windowsLockContention(error)) throw new Error('Unable to check the saved state lock.');
+        if (!windowsLockContention(error)) throw fail('unusable', `Unable to check the ${lock.what}.`);
         current = 'contended';
       }
       if (current === null) continue;
@@ -463,7 +495,7 @@ async function withStateLock<T>(dir: string, operation: (assertLock: () => Promi
       }
       if (current.pid === null || stateLockOwnerExited(current.pid)) {
         // stat/unlink cannot atomically avoid deleting a new owner during concurrent stale recovery.
-        throw new Error('The saved state lock needs attention. Confirm that no keysentry command is running, then remove ".keysentry/.state.lock" and try again.');
+        throw fail('attention', `The ${lock.what} needs attention. Confirm that no keysentry command is running, then remove "${lock.shownPath ?? `.keysentry/${lock.file}`}" and try again.`);
       }
       // Never expire a live PID, even during a long vault call or a suspended event loop.
       const remaining = deadline - Date.now();
@@ -477,7 +509,7 @@ async function withStateLock<T>(dir: string, operation: (assertLock: () => Promi
     async function assertLock(): Promise<void> {
       const current = await inspectStateLock(path);
       if (!current || !identity || !sameStateLock(identity, current.identity) || current.content !== metadata) {
-        throw new Error('The saved state lock changed. Try the operation again.');
+        throw fail('changed', `The ${lock.what} changed. Try the operation again.`);
       }
     }
     await assertLock();
