@@ -1,3 +1,4 @@
+import { createPublicKey } from 'node:crypto';
 import { z } from 'zod';
 import { MAX_BOX_BUNDLE_BYTES } from '../seal/index.js';
 import type { BoxSealMode } from '../../types.js';
@@ -15,6 +16,11 @@ export class BoxPayloadError extends Error {
 }
 
 const BOX_ID = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** An Ed25519 public key in SPKI DER. An X25519 key has the same length and must not pass. */
+export function isEd25519Spki(der: Buffer): boolean {
+  try { return createPublicKey({ key: der, format: 'der', type: 'spki' }).asymmetricKeyType === 'ed25519'; } catch { return false; }
+}
 const base64 = (min: number, max: number) => z.string().max(Math.ceil(max / 3) * 4).refine(value => {
   const bytes = Buffer.from(value, 'base64');
   return bytes.length >= min && bytes.length <= max && bytes.toString('base64') === value;
@@ -24,7 +30,8 @@ const settingsSchema = z.object({
   audience: z.string().regex(/^\/\/iam\.googleapis\.com\/projects\/\d+\/locations\/global\/workloadIdentityPools\/[A-Za-z0-9_-]+\/providers\/[A-Za-z0-9_-]+$/),
   keyName: z.string().regex(/^projects\/[A-Za-z0-9_-]+\/locations\/[A-Za-z0-9_-]+\/keyRings\/[A-Za-z0-9_-]+\/cryptoKeys\/[A-Za-z0-9_-]+$/),
   // Ed25519 SPKI DER is 44 bytes. These devices may open later sessions (unlock, replacing the tokens).
-  deviceKeys: z.array(base64(44, 44)).min(1).max(8).refine(keys => new Set(keys).size === keys.length, 'duplicate device key'),
+  deviceKeys: z.array(base64(44, 44).refine(key => isEd25519Spki(Buffer.from(key, 'base64')), 'not an Ed25519 key')).min(1).max(8)
+    .refine(keys => new Set(keys).size === keys.length, 'duplicate device key'),
 }).strict();
 const channelSchema = z.object({
   id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),

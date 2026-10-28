@@ -28,6 +28,7 @@ import { listPasskeys } from './passkeys.js';
 import { bootstrapWatcher } from './watcher-bootstrap.js';
 import { registerBoxCommands, type BoxCommandsOptions } from './box.js';
 import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
+import { trustedWatcherKeys } from './watcher-keys.js';
 
 export { createRuntime } from './runtime.js';
 export type { KeysentryRuntime, RuntimeOptions } from './runtime.js';
@@ -296,7 +297,7 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
     const approved = await approveAutopilot(id, opts, { store: rt.store, audit: rt.audit,
       http: relay ? rt.httpForUrls([relay.server], 'approval relay you configured') : rt.http,
       deviceKey: rt.signingKey, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
-      watcherPublicKeys: async () => { const key = await rt.vault.get('watcher/signing/public'); return key ? [key] : []; },
+      watcherPublicKeys: () => trustedWatcherKeys(rt.vault),
       now: options.now, relay, assertHuman: human,
       review: request => diagnostic([`Autopilot action ${request.actionId}:`,
         ...request.clusters.map(cluster => `  ${cluster.clusterId}${cluster.hint ? ` (${cluster.hint})` : ''}`)].join('\n')),

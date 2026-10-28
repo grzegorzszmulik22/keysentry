@@ -4,7 +4,7 @@ import { EGRESS_RULES, createGuardedHttp } from '../../net/index.js';
 import type { HttpClient, Logger, SignedNotifyMessage } from '../../types.js';
 import { BoxAgentError, startBoxAgent, type BoxAgent } from './agent.js';
 import { createNoticeSender } from './notice.js';
-import { isBoxId, type BoxNoticeKit } from './payload.js';
+import { isBoxId, isEd25519Spki, type BoxNoticeKit } from './payload.js';
 import { createHttpBoxRelay } from './relay.js';
 import { createTeeTokenSource, type TeeTokenSource } from './tee.js';
 
@@ -46,7 +46,7 @@ export async function readBoxRoute(read: (name: string) => Promise<string> = nam
   try { origin = new URL(relayOrigin); } catch { throw new BoxAgentError('The relay address in the instance metadata is invalid.'); }
   if (origin.protocol !== 'https:' || origin.origin !== relayOrigin) throw new BoxAgentError('The relay address in the instance metadata is invalid.');
   const key = Buffer.from(device, 'base64');
-  if (key.length !== 44 || key.toString('base64') !== device) throw new BoxAgentError('The enrollment device key in the instance metadata is invalid.');
+  if (key.length !== 44 || key.toString('base64') !== device || !isEd25519Spki(key)) throw new BoxAgentError('The enrollment device key in the instance metadata is invalid.');
   return { boxId, relayOrigin, enrollmentDeviceKey: key };
 }
 
@@ -79,7 +79,7 @@ export async function startProductionBoxAgent(options: ProductionBoxOptions): Pr
   const transport = options.transport ?? createFetchHttp();
   const tee = options.tee ?? createTeeTokenSource();
   const relayHost = new URL(route.relayOrigin).hostname;
-  const boxRules = EGRESS_RULES.filter(rule => rule.owner === 'box');
+  const boxRules = EGRESS_RULES.filter(rule => rule.owner === 'box' && (rule.host === 'sts.googleapis.com' || rule.host === 'cloudkms.googleapis.com'));
   const http = createGuardedHttp(transport, { rules: boxRules, log: options.log });
   const relayHttp = createGuardedHttp(transport, { rules: [{ host: relayHost, owner: 'box', purpose: 'Cloud box relay' }], log: options.log });
   return startBoxAgent({

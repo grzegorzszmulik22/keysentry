@@ -2,7 +2,7 @@
 
 Find the same secret across deployment hosts, plan its rotation, update every known consumer, redeploy each affected service once, and revoke the old key after successful deployment. keysentry is a local CLI and dashboard for routine rotation and monitoring.
 
-> **Status: keysentry 1.0 phase 3: local dashboard, token-free first run and everyday checks.** Adapters and native vault helpers are tested against fakes, not yet against live accounts or real credential stores. Try dry runs and a drill on a staging project before relying on provider writes. Real-browser passkey ceremonies, packed-package onboarding and deployed watcher operation still need integration checks. Cloud boxes and team features are later phases. Release signing keys are not published yet.
+> **Status: keysentry 1.0 phase 3: local dashboard, token-free first run and everyday checks.** Adapters and native vault helpers are tested against fakes, not yet against live accounts or real credential stores. Try dry runs and a drill on a staging project before relying on provider writes. Real-browser passkey ceremonies, packed-package onboarding and deployed watcher operation still need integration checks. The cloud box is built and tested against a local emulator but not launched; team features are being built. Release signing keys are not published yet.
 
 ## Try it in 30 seconds
 
@@ -363,8 +363,10 @@ keysentry box allowlist verify                          # the signed public log 
 
 `box check` prints every check by name: the attestation token's signature and issuer, both nonces (the box's key
 and your fresh challenge), production debug status, supported hardware, `STABLE` support, memory monitoring off,
-no environment or command override, the box's project and service account, and the image digest against the signed
-allow-list. `send-tokens` and `unlock` refuse with the failed check named and send nothing. The box receives the same
+no environment or command override, the box's project and service account, and the image digest. In the emulator the
+digest is checked against the emulator's own test digests, and the output says so. For the hosted box the allowed
+digests will come from the signed public allow-list (`keysentry box allowlist verify` checks it today); that wiring
+ships with the launch. `send-tokens` and `unlock` refuse with the failed check named and send nothing. The box receives the same
 deployment `watcher setup` creates, sealed to its attested key, and runs the same watcher. In the emulator, the checks
 use the emulator's test keys and digests, and the output says so.
 

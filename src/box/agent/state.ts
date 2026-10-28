@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { syncFile } from '../../security/index.js';
@@ -62,12 +62,30 @@ export async function sealedRecordHash(dir: string): Promise<string | null> {
   const bytes = await readFile(join(dir, TOKENS_DIR, 'sealed-bundle.json')).catch(() => null);
   return bytes ? createHash('sha256').update(bytes).digest('hex') : null;
 }
-export async function noticeAlreadySent(dir: string, record: string): Promise<boolean> {
+/**
+ * The flag carries a MAC under a key derived from the KMS-sealed notice record, which only the box can open, so
+ * someone with the disk alone cannot write a flag that silences the notice.
+ */
+function noticeMac(key: Buffer, record: string): Buffer { return createHmac('sha256', key).update(`keysentry-box-notice:v1\n${record}`).digest(); }
+export async function noticeAlreadySent(dir: string, record: string, key: Buffer): Promise<boolean> {
   const bytes = await readSmall(join(dir, LOCKED_NOTICE_FILE)).catch(() => null);
-  try { return !!bytes && (JSON.parse(bytes.toString('utf8')) as { record?: unknown }).record === record; } catch { return false; }
+  try {
+    const flag = JSON.parse(bytes?.toString('utf8') ?? '') as { record?: unknown; mac?: unknown };
+    if (flag.record !== record || typeof flag.mac !== 'string') return false;
+    const mac = Buffer.from(flag.mac, 'base64url'), expected = noticeMac(key, record);
+    return mac.length === expected.length && timingSafeEqual(mac, expected);
+  } catch { return false; }
 }
-export async function markNoticeSent(dir: string, record: string): Promise<void> {
-  await writeStateFile(dir, LOCKED_NOTICE_FILE, { v: 1, record });
+export async function markNoticeSent(dir: string, record: string, key: Buffer): Promise<void> {
+  await writeStateFile(dir, LOCKED_NOTICE_FILE, { v: 1, record, mac: noticeMac(key, record).toString('base64url') });
+}
+/** A sealed record without its routing file means the state was damaged or tampered with; the box must not re-enroll. */
+export async function hasSealedRecord(dir: string): Promise<boolean> {
+  for (const sub of [TOKENS_DIR, NOTICE_DIR]) {
+    try { await lstat(join(dir, sub, 'sealed-bundle.json')); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true; }
+  }
+  return false;
 }
 export async function clearNotice(dir: string): Promise<void> {
   await unlink(join(dir, LOCKED_NOTICE_FILE)).catch(() => undefined);

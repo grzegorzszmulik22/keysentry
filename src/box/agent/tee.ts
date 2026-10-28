@@ -94,6 +94,10 @@ export function createTeeTokenSource(options: TeeTokenSourceOptions = {}): TeeTo
         });
       });
       req.on('timeout', () => { req.destroy(); finish(new TeeTokenError('The launcher did not return an attestation token in time.')); });
+      // The socket timeout only measures idle time; this bounds the whole request.
+      const deadline = setTimeout(() => { req.destroy(); finish(new TeeTokenError('The launcher did not return an attestation token in time.')); }, timeoutMs);
+      deadline.unref();
+      req.on('close', () => clearTimeout(deadline));
       req.on('error', () => finish(new TeeTokenError()));
       req.end(body);
     });

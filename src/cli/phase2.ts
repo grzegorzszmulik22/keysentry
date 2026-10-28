@@ -17,6 +17,7 @@ import { DEFAULT_SOURCES, verifyArmedPlan } from '../autopilot/index.js';
 import { CliError } from './errors.js';
 import { assertHumanForMutation } from '../safety/index.js';
 import { providerName } from './display.js';
+import { trustedWatcherKeys } from './watcher-keys.js';
 
 export interface Phase2CommandsOptions {
   getRuntime(watcher?: boolean): Promise<KeysentryRuntime>;
@@ -154,7 +155,7 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
       const rt = await opts.getRuntime();
       return { settings: rt.config.settings.notify.channels, vault: rt.vault, http: rt.http, redactor: rt.redactor,
         log: rt.log, store: rt.store, deviceKey: rt.signingKey, audit: rt.audit, receipt: rt.receipt, now: opts.now, write: opts.diagnostic,
-        watcherPublicKeys: async () => { const key = await rt.vault.get('watcher/signing/public'); return key ? [key] : []; },
+        watcherPublicKeys: () => trustedWatcherKeys(rt.vault),
         saveSettings: async settings => { await saveNotificationSettings(rt.config.configPath, settings); rt.config.settings.notify.channels = settings; },
       };
     } });

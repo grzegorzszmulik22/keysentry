@@ -266,10 +266,13 @@ bring-your-own-KMS, only you control it."
 **What the CLI checks before anything is sent.** The box makes fresh X25519 and Ed25519 keys at every boot and asks
 the Confidential Space launcher for an attestation token whose nonces are a hash of both public keys and the CLI's
 fresh challenge. The CLI verifies the RS256 signature against Google's published keys (or the certificate chain to
-the pinned Confidential Space root), issuer, audience, time with 60 seconds of skew, both nonces, secure boot,
+the pinned Confidential Space root), issuer, audience, time with 60 seconds of skew (the handshake allows the same skew
+between the two machines), both nonces, secure boot,
 `dbgstat == disabled-since-boot`, `swname == CONFIDENTIAL_SPACE`, TDX or SEV hardware, `STABLE` support, memory
-monitoring off, no environment or command override, the project and service account, and the image digest against
-the signed allow-list. It also checks that the attestation is signed by the key the box announced. The bundle is
+monitoring off, no environment or command override, the project and service account, and the image digest. For the
+hosted box the allowed digests are meant to come from the signed allow-list; this build checks that list only in
+`keysentry box allowlist verify`, and the emulator uses its own test digests, so wiring the list into `box check` is a
+launch requirement. It also checks that the attestation is signed by the key the box announced. The bundle is
 encrypted to the attested key, bound to the session, and signed by the user's device key; the box acknowledges only
 after sealing it at rest. Every exchange passes through the relay, which is untrusted: it can delay, drop or reorder
 messages, but a substituted key or an old attestation fails a named check and no token is sent.
@@ -300,7 +303,9 @@ messages, but a substituted key or an old attestation fails a named check and no
 - In unlock-on-restart mode, notification settings for the one restart notice are sealed under KMS alone, so a
   locked box can still reach the user. Those channel secrets have the standard option's protection, not the device
   share's. The notice is signed by the box's per-boot key, which the user cannot check; it grants nothing and only
-  asks the user to run `keysentry box unlock`, which verifies the box again.
+  asks the user to run `keysentry box unlock`, which verifies the box again. The "notice sent" flag on disk carries a
+  MAC under a key derived from the sealed notice record, so writing that file alone cannot silence the notice; a disk
+  owner can still delete records, which stops the box (it never re-enrolls over a record whose routing file vanished).
 - Plaintext lives in the box process's memory while the watcher runs. Buffers the box owns are cleared; JavaScript
   strings cannot be, and garbage collection decides when they disappear.
 - Unverified on real infrastructure: whether a non-root container user can reach the launcher socket, whether

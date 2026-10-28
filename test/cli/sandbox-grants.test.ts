@@ -222,8 +222,8 @@ test('the box agent can write only its state directory and read the launcher tok
   const result = await permissionOptionsForBin(f.argv('box', 'agent', '--state-dir', state), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle, { userDir: f.userDir });
   expect(result.writePaths).toEqual([directory(join(f.cwd, '.keysentry')), directory(f.userDir), directory(state)]);
   expect(result.readPaths).toEqual(expect.arrayContaining([directory(state), directory(resolve('/run/container_launcher'))]));
-  expect(result.allowChildProcess).toBe(true);
-  const check = await permissionOptionsForBin(f.argv('box', 'check', 'local-box'), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle, { userDir: f.userDir });
+  expect(result.allowChildProcess).toBe(false);
+  const check = await permissionOptionsForBin(f.argv('box', 'check', 'agent'), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle, { userDir: f.userDir });
   expect(check.writePaths).toEqual([directory(join(f.cwd, '.keysentry')), directory(f.userDir)]);
   expect(check.allowChildProcess).toBe(false);
 });

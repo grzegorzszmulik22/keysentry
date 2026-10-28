@@ -92,11 +92,13 @@ export interface WatcherDeploymentValues {
   deployment: { vaultBlob: string; exportedCredentialNames?: string[] } | undefined;
   sealedConfigPath: string;
   watcherKeyId: string;
+  /** The new watcher's public key, for callers that record it themselves once the deployment is confirmed. */
+  watcherPublicKeyDer: Buffer;
 }
 
 /** New deploy, state and watcher keys, the sealed config and the portable vault. Shared by watcher setup and the cloud box. */
 export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencies, 'vault' | 'audit' | 'config' | 'outputDir' | 'prepareDeployment'>,
-  platform: WatcherPlatform | 'cloud-box'): Promise<WatcherDeploymentValues> {
+  platform: WatcherPlatform | 'cloud-box', options: { persistSigningKey?: boolean } = {}): Promise<WatcherDeploymentValues> {
   const config: WatcherConfig = { ...deps.config, notify: { channels: deps.config.notify.channels.filter(channel => channel.kind !== 'console') } };
   const deployKey = randomBytes(32), stateKey = randomBytes(32), vaultPassphrase = randomBytes(32);
   const watcherKey = generateDeviceKey();
@@ -109,10 +111,14 @@ export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencie
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     await writeFile(sealedConfigPath, `${sealed}\n`, { mode: 0o600, flag: 'wx' });
     const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config });
-    await deps.vault.set('watcher/signing/private', watcherKey.privateKeyDer);
-    await deps.vault.set('watcher/signing/public', watcherKey.publicKeyDer);
-    await deps.audit.append({ kind: 'watcher:setup', summary: 'Watcher deployment prepared.', data: { platform, watcherKeyId: watcherKey.keyId } });
-    return { sealedConfigPath, watcherKeyId: watcherKey.keyId, deployment: deployment ?? undefined,
+    // A cloud box records its watcher key only after the box confirms it sealed the deployment, and never in the
+    // self-hosted watcher's slot, which would stop this computer trusting a watcher that is still running.
+    if (options.persistSigningKey !== false) {
+      await deps.vault.set('watcher/signing/private', watcherKey.privateKeyDer);
+      await deps.vault.set('watcher/signing/public', watcherKey.publicKeyDer);
+      await deps.audit.append({ kind: 'watcher:setup', summary: 'Watcher deployment prepared.', data: { platform, watcherKeyId: watcherKey.keyId } });
+    }
+    return { sealedConfigPath, watcherKeyId: watcherKey.keyId, deployment: deployment ?? undefined, watcherPublicKeyDer: Buffer.from(watcherKey.publicKeyDer),
       values: { KEYSENTRY_WATCHER_KEY: deployKey.toString('base64'), KEYSENTRY_STATE_KEY: stateKey.toString('base64'),
         KEYSENTRY_VAULT_PASSPHRASE: printablePassphrase.toString(), KEYSENTRY_WATCHER_CONFIG: sealed } };
   } catch (error) {

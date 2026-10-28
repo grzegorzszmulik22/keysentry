@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import { randomBytes } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import {
   BOX_DEPLOYMENT_VARIABLES, BOX_STATE_DIR, createHttpBoxRelay, createNoticeSender, encodeBoxPayload, isAllowed, isBoxId, startBoxAgent,
@@ -63,10 +63,13 @@ export interface BoxCommandsOptions {
 }
 
 const MODES: readonly BoxSealMode[] = ['standard', 'byo-kms', 'unlock-on-restart'];
+const EMULATOR_NOTE = 'Local emulator: the checks used the emulator\'s test signing keys and test digests, not Google\'s.';
 const NOT_LAUNCHED = 'The hosted cloud box is not launched yet, so nothing was created. Try the whole flow on this computer with: keysentry box provision --emulator';
 const registryPath = (rt: KeysentryRuntime) => join(rt.paths.dir, 'boxes.json');
 const shareName = (boxId: string) => `box/${boxId}/share-b`;
 const tokenName = (boxId: string) => `box/${boxId}/relay-token`;
+/** The public key of the watcher a box runs; trusted for its signed approval requests and notices. */
+export const boxWatcherKeyName = (boxId: string) => `box/${boxId}/watcher-public`;
 
 async function registry(rt: KeysentryRuntime): Promise<BoxRegistry> {
   return await rt.store.readJson<BoxRegistry>('plan', registryPath(rt)) ?? { v: 1, boxes: [] };
@@ -131,7 +134,7 @@ async function noticeKit(rt: KeysentryRuntime): Promise<BoxNoticeKit> {
 }
 
 /** The same deployment `watcher setup` makes, held in memory for the bundle instead of printed. */
-async function deploymentFor(rt: KeysentryRuntime, opts: BoxCommandsOptions): Promise<{ values: BoxEnrollPayload['deployment']; exported: string[] }> {
+async function deploymentFor(rt: KeysentryRuntime, opts: BoxCommandsOptions): Promise<{ values: BoxEnrollPayload['deployment']; exported: string[]; watcherPublicKeyDer: Buffer; watcherKeyId: string }> {
   const outputDir = join(rt.paths.dir, `box-deploy-${randomBytes(8).toString('hex')}`);
   try {
     const config = await buildWatcherSetupConfig({ projectId: rt.projectId, store: rt.store, vault: rt.vault,
@@ -142,11 +145,11 @@ async function deploymentFor(rt: KeysentryRuntime, opts: BoxCommandsOptions): Pr
         confirmEnvironmentCredential: async name => {
           opts.diagnostic(`Copy ${name} from your environment into the cloud box? [y/N]`);
           return /^(?:y|yes)$/i.test(await promptVaultValue(`y to copy ${name}`, opts.diagnostic, opts.promptIO) ?? '');
-        } }, secrets) }, 'cloud-box');
+        } }, secrets) }, 'cloud-box', { persistSigningKey: false });
     if (!prepared.deployment) throw new CliError('The deployment vault could not be prepared, so nothing was sent.');
     const values = { ...prepared.values, KEYSENTRY_WATCHER_VAULT: prepared.deployment.vaultBlob };
     if (BOX_DEPLOYMENT_VARIABLES.some(name => !values[name])) throw new CliError('The deployment is incomplete, so nothing was sent.');
-    return { values, exported: prepared.deployment.exportedCredentialNames ?? [] };
+    return { values, exported: prepared.deployment.exportedCredentialNames ?? [], watcherPublicKeyDer: prepared.watcherPublicKeyDer, watcherKeyId: prepared.watcherKeyId };
   } finally { await rm(outputDir, { recursive: true, force: true }); }
 }
 
@@ -199,10 +202,10 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
       const entry: BoxRecord = { boxId: local.boxId, emulator: true, mode: options.mode as BoxSealMode, relayOrigin: local.origin,
         emulatorOrigin: local.emulator.baseUrl, policy: { projectId: local.emulator.policy.projectId, serviceAccount: local.emulator.policy.serviceAccount,
           allowedDigests: [...local.emulator.policy.allowedDigests], audience: local.emulator.policy.audience, keyName: local.emulator.policy.keyName } };
-      const saved = await registry(rt);
-      await rt.store.writeJson('plan', registryPath(rt), { v: 1, boxes: [...saved.boxes.filter(item => item.boxId !== entry.boxId), entry] });
-      await rt.vault.set(tokenName(entry.boxId), Buffer.from(local.cliToken, 'utf8'));
       try {
+        const saved = await registry(rt);
+        await rt.store.writeJson('plan', registryPath(rt), { v: 1, boxes: [...saved.boxes.filter(item => item.boxId !== entry.boxId), entry] });
+        await rt.vault.set(tokenName(entry.boxId), Buffer.from(local.cliToken, 'utf8'));
         opts.emit({ boxId: entry.boxId, mode: entry.mode, emulator: true, running: true }, [
           `Local emulated box ${entry.boxId} is running (${entry.mode}). Nothing here reaches Google and nothing is spent.`,
           'In another terminal in this project:',
@@ -217,7 +220,8 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
         });
       } finally {
         await local.close();
-        await rt.vault.delete(tokenName(entry.boxId));
+        // The emulated box is gone with its state, so its relay token, device share and watcher key go too.
+        for (const name of [tokenName(entry.boxId), shareName(entry.boxId), boxWatcherKeyName(entry.boxId)]) await rt.vault.delete(name);
         const after = await registry(rt);
         await rt.store.writeJson('plan', registryPath(rt), { v: 1, boxes: after.boxes.filter(item => item.boxId !== entry.boxId) });
         await rm(stateDir, { recursive: true, force: true });
@@ -244,24 +248,31 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
           opts.diagnostic(renderBoxVerification(boxId, session.verification, entry.emulator));
           throw new CliError(`Nothing was sent. The box failed these checks: ${session.verification.failed.join(', ')}.`);
         }
-        const { values, exported } = await deploymentFor(rt, opts);
+        const { values, exported, watcherPublicKeyDer, watcherKeyId } = await deploymentFor(rt, opts);
         const settings: BoxSettings = { mode: entry.mode, audience: entry.policy.audience, keyName: entry.policy.keyName,
           deviceKeys: [deviceKey.publicKeyDer.toString('base64')] };
-        let share: Buffer | undefined;
-        if (entry.mode === 'unlock-on-restart') {
-          share = randomBytes(32);
-          // Kept before sending: a box sealed with a share this computer lost could never be unlocked.
-          await rt.vault.set(shareName(boxId), share);
-        }
-        const bytes = encodeBoxPayload({ v: 1, kind: 'enroll', boxId, settings, deployment: values, notice: await noticeKit(rt),
-          ...(share ? { shareB: share.toString('base64') } : {}) });
-        try { await session.send(bytes); } finally { bytes.fill(0); share?.fill(0); }
+        let share: Buffer | null = null;
+        try {
+          if (entry.mode === 'unlock-on-restart') {
+            // The box's sealed record needs the share it was sealed with, so an existing share is reused: replacing it
+            // before the box confirms would lock the box for good if this send never lands. A first share is kept
+            // before sending: a box sealed with a share this computer lost could never be unlocked.
+            share = await rt.vault.get(shareName(boxId));
+            if (!share || share.length !== 32) { share?.fill(0); share = randomBytes(32); await rt.vault.set(shareName(boxId), share); }
+          }
+          const bytes = encodeBoxPayload({ v: 1, kind: 'enroll', boxId, settings, deployment: values, notice: await noticeKit(rt),
+            ...(share ? { shareB: share.toString('base64') } : {}) });
+          try { await session.send(bytes); } finally { bytes.fill(0); }
+        } finally { share?.fill(0); }
+        // Only now, after the box confirmed it sealed this deployment, does this computer trust its watcher key.
+        await rt.vault.set(boxWatcherKeyName(boxId), watcherPublicKeyDer);
         await rt.audit.append({ kind: 'box:send-tokens', summary: 'Watcher deployment sealed to a verified cloud box.',
-          data: { boxId, mode: entry.mode, digest: session.verification.digest, emulator: entry.emulator } });
-        opts.emit({ boxId, sent: true, mode: entry.mode, digest: session.verification.digest, exportedCredentialNames: exported },
+          data: { boxId, mode: entry.mode, digest: session.verification.digest, emulator: entry.emulator, watcherKeyId } });
+        opts.emit({ boxId, sent: true, mode: entry.mode, digest: session.verification.digest, emulator: entry.emulator, exportedCredentialNames: exported },
           [`Box ${boxId} verified every check and confirmed it sealed the tokens (${entry.mode}).`,
             `Exported credential names: ${exported.length ? exported.join(', ') : 'none'}.`,
-            ...(entry.mode === 'unlock-on-restart' ? ['The device share stays in this computer\'s vault. After a box restart, run keysentry box unlock ' + boxId + '.'] : [])].join('\n'));
+            ...(entry.mode === 'unlock-on-restart' ? ['The device share stays in this computer\'s vault. After a box restart, run keysentry box unlock ' + boxId + '.'] : []),
+            ...(entry.emulator ? [EMULATOR_NOTE] : [])].join('\n'));
       } finally { deviceKey.privateKeyDer.fill(0); }
     });
 
@@ -283,7 +294,8 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
         const bytes = encodeBoxPayload({ v: 1, kind: 'unlock', boxId, shareB: share.toString('base64') });
         try { await session.send(bytes); } finally { bytes.fill(0); }
         await rt.audit.append({ kind: 'box:unlock', summary: 'Device share sent to a verified cloud box.', data: { boxId, digest: session.verification.digest } });
-        opts.emit({ boxId, unlocked: true }, `Box ${boxId} verified every check and received the device share. Autopilot resumes on its next check.`);
+        opts.emit({ boxId, unlocked: true, emulator: entry.emulator }, [`Box ${boxId} verified every check and received the device share. Autopilot resumes on its next check.`,
+          ...(entry.emulator ? [EMULATOR_NOTE] : [])].join('\n'));
       } finally { share.fill(0); }
     });
 
@@ -296,8 +308,8 @@ export function registerBoxCommands(program: Command, opts: BoxCommandsOptions):
       if (keys.length === 0) throw new CliError('This build has no pinned release signing key yet, so the allow-list cannot be verified. The key is pinned with the first signed release.');
       let log: string, head: string;
       try {
-        log = await readFile(join(rt.config.cwd, options.log), 'utf8');
-        head = await readFile(join(rt.config.cwd, options.head), 'utf8');
+        log = await readFile(resolve(rt.config.cwd, options.log), 'utf8');
+        head = await readFile(resolve(rt.config.cwd, options.head), 'utf8');
       } catch { throw new CliError('Could not read the allow-list log and signed head. Download both from the release, or pass --log and --head.'); }
       const checkpointPath = join(rt.paths.dir, 'box-allowlist-head.json');
       const previous = await rt.store.readJson<{ seq: number; hash: string }>('plan', checkpointPath);

@@ -5,7 +5,7 @@ export { BOX_STATE_DIR, METADATA_ATTRIBUTES, readBoxRoute, readMetadataAttribute
 export type { BoxRouteMetadata, ProductionBoxOptions } from './main.js';
 export { createNoticeSender } from './notice.js';
 export {
-  BOX_DEPLOYMENT_VARIABLES, BoxPayloadError, decodeBoxPayload, encodeBoxPayload, isBoxId,
+  BOX_DEPLOYMENT_VARIABLES, BoxPayloadError, decodeBoxPayload, encodeBoxPayload, isBoxId, isEd25519Spki,
 } from './payload.js';
 export type { BoxDeploymentVariable, BoxEnrollPayload, BoxNoticeKit, BoxNoticeRecord, BoxPayload, BoxSettings, BoxUnlockPayload } from './payload.js';
 export { BoxRelayError, createHttpBoxRelay } from './relay.js';

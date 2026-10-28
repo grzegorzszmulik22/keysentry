@@ -10,6 +10,7 @@ import type { BoxKeyPair } from './hpke.js';
 
 export const HANDSHAKE_SIGNATURE_PREFIX = 'keysentry-box-handshake:v1\n';
 export const HANDSHAKE_TTL_MS = 600_000;
+export const HANDSHAKE_CLOCK_SKEW_MS = 60_000;
 const MAX_BUNDLE_BYTES = 1024 * 1024;
 const MAX_WIRE_BYTES = 2 * 1024 * 1024;
 
@@ -242,9 +243,10 @@ function advance(config: Config, current: Context, input: HandshakeInput): Hands
   if (current.stage !== 'ready') {
     incoming = parseHandshakeMessage(input.message);
     if (c.seenIds.includes(incoming.id)) fail('replayed message');
-    if (millis >= Date.parse(incoming.expiresAt)) fail('message expired');
-    if (millis < Date.parse(incoming.sentAt)) fail('message is from the future');
-    if (c.deadline !== undefined && millis >= c.deadline) fail('session expired');
+    // The two ends are different machines: allow the same clock skew as the attestation verifier and the relay.
+    if (millis >= Date.parse(incoming.expiresAt) + HANDSHAKE_CLOCK_SKEW_MS) fail('message expired');
+    if (millis + HANDSHAKE_CLOCK_SKEW_MS < Date.parse(incoming.sentAt)) fail('message is from the future');
+    if (c.deadline !== undefined && millis >= c.deadline + HANDSHAKE_CLOCK_SKEW_MS) fail('session expired');
     const expected = { 'awaiting-hello': 0, 'awaiting-challenge': 1, 'awaiting-attestation': 2, 'awaiting-bundle': 3, 'awaiting-ack': 4 };
     if (incoming.seq !== expected[current.stage]) fail('message is out of order');
     if (c.sessionId !== null && incoming.sessionId !== c.sessionId) fail('session does not match');

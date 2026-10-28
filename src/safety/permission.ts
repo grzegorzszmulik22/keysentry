@@ -140,16 +140,24 @@ export async function maybeReexecWithPermissions(opts: PermissionOptions & {
   if (env.NODE_OPTIONS !== undefined) env.NODE_OPTIONS = sanitizedNodeOptions(env.NODE_OPTIONS);
   const spawnImpl: SpawnLike = opts.spawnImpl ?? ((command, argv, options) => spawn(command, argv, options));
   return new Promise(resolve => {
-    let child: Pick<ChildProcess, 'once'>;
+    let child: Pick<ChildProcess, 'once'> & Partial<Pick<ChildProcess, 'kill'>>;
     try {
       child = spawnImpl(opts.execPath, args, { env, stdio: 'inherit', shell: false });
     } catch {
       resolve({ reexeced: true, exitCode: 1 });
       return;
     }
+    // A container stops PID 1 (this parent) with SIGTERM; pass it on so the sandboxed command can shut down cleanly.
+    // A terminal's Ctrl+C already reaches the whole process group, so the parent only keeps waiting for the child.
+    const forwardTerm = (): void => { try { child.kill?.('SIGTERM'); } catch { /* the child already exited */ } };
+    const waitOnInterrupt = (): void => {};
+    process.on('SIGTERM', forwardTerm);
+    process.on('SIGINT', waitOnInterrupt);
+    const release = (): void => { process.removeListener('SIGTERM', forwardTerm); process.removeListener('SIGINT', waitOnInterrupt); };
     // Child error messages can contain environment values; only return a status.
-    child.once('error', () => resolve({ reexeced: true, exitCode: 1 }));
+    child.once('error', () => { release(); resolve({ reexeced: true, exitCode: 1 }); });
     const ended = (code: number | null, signal: NodeJS.Signals | null): void => {
+      release();
       resolve({ reexeced: true, exitCode: signal || code === null ? 1 : code });
     };
     child.once('exit', ended);

@@ -158,14 +158,14 @@ describe('ordered immutable handshake', () => {
     expect(() => s.h.handshake.next({ now, message: b.message! })).toThrow(/order/i);
   });
 
-  it('rejects an expired challenge at the exact expiry boundary', () => {
+  it('rejects an expired challenge once the clock-skew allowance after expiry has passed', () => {
     const s = setup();
-    expect(() => s.h.handshake.next({ now: later, message: s.c.message!, attestationToken: 'unused' })).toThrow(/expir/i);
+    expect(() => s.h.handshake.next({ now: new Date(later.getTime() + 60_000), message: s.c.message!, attestationToken: 'unused' })).toThrow(/expir/i);
   });
 
   it('rejects future messages and keeps the original state usable after rejection', () => {
     const s = setup();
-    expect(() => s.h.handshake.next({ now: new Date(now.getTime() - 1), message: s.c.message!, attestationToken: 'unused' })).toThrow(/future/i);
+    expect(() => s.h.handshake.next({ now: new Date(now.getTime() - 60_001), message: s.c.message!, attestationToken: 'unused' })).toThrow(/future/i);
     expect(s.h.handshake.next({ now, message: s.c.message!, attestationToken: 'local-token' }).message?.type).toBe('box-attest');
   });
 

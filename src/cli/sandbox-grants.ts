@@ -49,14 +49,16 @@ async function readExistingInventory(metadata: ConfigMetadata, env: NodeJS.Proce
   } finally { key.fill(0); }
 }
 
-function commandName(args: string[]): string | undefined {
+function positionals(args: string[]): string[] {
+  const found: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const value = args[index]!;
-    if (value === '--cwd' || value === '--config') { index++; continue; }
-    if (!value.startsWith('-')) return value;
+    if (value === '--cwd' || value === '--config' || value === '--state-dir') { index++; continue; }
+    if (!value.startsWith('-')) found.push(value);
   }
-  return undefined;
+  return found;
 }
+function commandName(args: string[]): string | undefined { return positionals(args)[0]; }
 
 function consumerFiles(inventory: Inventory, roots: string[]): string[] {
   const consumers = [...inventory.findings, ...inventory.clusters.flatMap(cluster => cluster.consumers)];
@@ -150,7 +152,8 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
     writePaths.push(directory(stateDir)); extraReads.push(directory(stateDir));
     if (env.KEYSENTRY_WATCHER_CONFIG_FILE) extraReads.push(resolve(metadata.cwd, env.KEYSENTRY_WATCHER_CONFIG_FILE));
   }
-  const boxAgent = command === 'box' && args.includes('agent');
+  // Exactly `box agent`: a box named "agent" in `box check agent` must not get the agent's grants.
+  const boxAgent = command === 'box' && positionals(args)[1] === 'agent';
   if (boxAgent) {
     // The sealed record and the watcher's encrypted state, and the launcher's default attestation token.
     const boxState = directory(resolve(metadata.cwd, argument('--state-dir') ?? BOX_STATE_DIR));
@@ -178,10 +181,13 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
       }
     } else writePaths.push(...metadata.dotenvRoots.map(directory));
   }
+  // Phase 5: the extra certificate authority bundle may live outside the project (resolved like the runtime does).
+  if (metadata.settings.network.caFile) extraReads.push(resolve(metadata.cwd, metadata.settings.network.caFile));
   return {
     readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), metadata.configPath, ...metadata.dotenvRoots.map(directory), ...extraReads],
     writePaths: [...new Set(writePaths)],
-    allowChildProcess: command === undefined || ['guard', 'ui', 'watch'].includes(command) || boxAgent
+    // The box agent spawns nothing (encrypted-file vault, no git); a child process would be a way out of the sandbox.
+    allowChildProcess: command === undefined || ['guard', 'ui', 'watch'].includes(command)
       || command === 'passkey' && args.includes('register') || await needsVaultHelper(env, userDir),
   };
 }

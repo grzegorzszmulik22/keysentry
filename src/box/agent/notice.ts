@@ -12,6 +12,8 @@ import type { BoxNoticeKit } from './payload.js';
  */
 export function createNoticeSender(options: { transport: HttpClient; log: Logger }): (kit: BoxNoticeKit, message: SignedNotifyMessage) => Promise<void> {
   return async (kit, message) => {
+    // Without channels there is no one to tell; retrying every minute would only fill the log.
+    if (kit.channels.length === 0) { options.log.warn('The box has no notification channel for its restart notice.'); return; }
     const vault = createMemoryVault();
     for (const secret of kit.secrets) await vault.set(secret.name, Buffer.from(secret.value, 'utf8'));
     const egress = await notificationEgress(kit.channels, vault);

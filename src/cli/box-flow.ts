@@ -85,7 +85,7 @@ export async function openVerifiedBoxSession(options: BoxSessionOptions): Promis
   const { relay } = options;
   const deadline = now().getTime() + (options.timeoutMs ?? 120_000);
   const tried = new Set<string>();
-  let hello: { raw: unknown; message: BoxHello }, handshake: Handshake, challenge: Extract<HandshakeMessage, { type: 'cli-challenge' }>;
+  let hello: { raw: unknown; message: BoxHello }, handshake: Handshake, challenge!: Extract<HandshakeMessage, { type: 'cli-challenge' }>;
   let attest: { raw: unknown; message: BoxAttest } | undefined;
   do {
     hello = await until(options, async () => {
@@ -97,16 +97,21 @@ export async function openVerifiedBoxSession(options: BoxSessionOptions): Promis
       return open.sort((a, b) => Date.parse(b.message.sentAt) - Date.parse(a.message.sentAt))[0];
     }, NOT_ANSWERING, deadline);
     tried.add(hello.message.sessionId);
-    handshake = createHandshake('cli', { deviceKey: options.deviceKey });
-    const challengeStep = handshake.next({ now: now(), message: hello.raw });
+    let challengeStep;
+    // A hello the handshake refuses (expired, malformed, or dated beyond the allowed clock skew) is skipped.
+    try { challengeStep = createHandshake('cli', { deviceKey: options.deviceKey }).next({ now: now(), message: hello.raw }); }
+    catch { attest = undefined; continue; }
     handshake = challengeStep.handshake;
+    const helloSigner = signingDer(hello.message.boxSigningPublicKey);
     challenge = challengeStep.message as Extract<HandshakeMessage, { type: 'cli-challenge' }>;
     await relay.publish(challenge);
     const sessionId = hello.message.sessionId;
     // A box that abandoned this session (it restarted, or its device list changed) never answers: try a newer one.
+    // Only an attest signed by the key the box announced is considered: anyone can post to the relay.
     attest = await until(options, async () => (await relay.poll(sessionId))
       .map(raw => ({ raw, message: parse(raw) }))
-      .find((item): item is { raw: unknown; message: BoxAttest } => item.message?.type === 'box-attest' && item.message.sessionId === sessionId),
+      .find((item): item is { raw: unknown; message: BoxAttest } => item.message?.type === 'box-attest' && item.message.sessionId === sessionId
+        && verifyHandshakeMessage(item.message, helloSigner)),
     NOT_ANSWERING, Math.min(deadline, now().getTime() + (options.answerMs ?? 20_000))).catch(error => {
       if (now().getTime() >= deadline) throw error;
       return undefined;
@@ -126,7 +131,9 @@ export async function openVerifiedBoxSession(options: BoxSessionOptions): Promis
     hardwareModels: options.trust.hardwareModels ?? ['GCP_INTEL_TDX', 'GCP_AMD_SEV'], maxTokenAgeSeconds: 300, clockSkewSeconds: 60 };
   const result: AttestationResult = await verifyAttestation({ token: attest.message.attestationToken, jwks: options.trust.jwks,
     ...(options.trust.root ? { root: options.trust.root } : {}), policy, expectedNonces, now: now() });
-  const checks = [...own, ...result.checks];
+  // The emulator's digests are its own test values, not entries of the signed public allow-list.
+  const checks = [...own, ...result.checks.map(check => !options.trust.emulator || check.name !== 'image-digest' ? check
+    : { ...check, detail: check.ok ? 'One of the emulator\x27s test image digests.' : 'Not one of the emulator\x27s test image digests.' })];
   const ok = result.ok && own.every(check => check.ok);
   const verification: BoxVerification = { ok, checks, failed: checks.filter(check => !check.ok).map(check => check.name),
     digest: ok ? result.claims?.submods?.container?.image_digest ?? null : null };

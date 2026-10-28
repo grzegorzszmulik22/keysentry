@@ -27,6 +27,7 @@ import { saveNotificationSettings } from './config.js';
 import { addNotificationChannel, removeNotificationChannel, testNotificationChannels, verifyNotification, notificationEgress, type NotificationContext, type NotifyChannelSettings } from './notifications.js';
 import { approveAutopilot } from './autopilot-approvals.js';
 import { createCliAutopilotManager } from './phase2.js';
+import { trustedWatcherKeys } from './watcher-keys.js';
 
 const text = z.string().min(1).max(1024).refine(value => !/[\x00-\x1f\x7f]/.test(value));
 const id = text;
@@ -297,7 +298,7 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     const http = runtime.httpForUrls(egress.trustedUrls, 'notification channel you configured');
     return { settings: runtime.config.settings.notify.channels, vault: runtime.vault, http, redactor: runtime.redactor,
       log: runtime.log, store: runtime.store, deviceKey: runtime.signingKey, now: runtime.now, receipt: runtime.receipt, audit: runtime.audit,
-      watcherPublicKeys: async () => { const key = await runtime.vault.get('watcher/signing/public'); return key ? [key] : []; },
+      watcherPublicKeys: () => trustedWatcherKeys(runtime.vault),
       saveSettings: async settings => { await saveNotificationSettings(runtime.config.configPath, settings); runtime.config.settings.notify.channels = settings; },
     };
   }

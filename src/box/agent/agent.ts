@@ -9,10 +9,10 @@ import { createBoxSealer, type BoxSealer } from '../seal/index.js';
 import { generateDeviceKey, type DeviceKey } from '../../security/index.js';
 import { signMessage } from '../../notify/index.js';
 import type { HttpClient, Logger, NotifyMessage, SignedNotifyMessage } from '../../types.js';
-import { BoxPayloadError, decodeBoxPayload, encodeBoxPayload, isBoxId, type BoxEnrollPayload, type BoxNoticeKit } from './payload.js';
+import { BoxPayloadError, decodeBoxPayload, encodeBoxPayload, isBoxId, isEd25519Spki, type BoxEnrollPayload, type BoxNoticeKit } from './payload.js';
 import type { BoxRelay } from './relay.js';
 import {
-  NOTICE_DIR, ROUTING_FILE, TOKENS_DIR, clearNotice, markNoticeSent, noticeAlreadySent, readRouting, routingFrom,
+  NOTICE_DIR, ROUTING_FILE, TOKENS_DIR, clearNotice, hasSealedRecord, markNoticeSent, noticeAlreadySent, readRouting, routingFrom,
   sameRouting, sealedRecordHash, writeStateFile, type BoxRouting,
 } from './state.js';
 import type { TeeTokenSource } from './tee.js';
@@ -68,7 +68,7 @@ export interface BoxAgent {
 }
 
 interface Candidate { handshake: Handshake; deviceKey: Buffer }
-interface Session { id: string; deadline: number; candidates: Candidate[]; rejected: Set<string>; done: boolean }
+interface Session { id: string; deadline: number; candidates: Candidate[]; rejected: Set<string>; done: boolean; hello: HandshakeMessage; published: boolean }
 
 const SEQ: Partial<Record<Handshake['state'], number>> = { 'awaiting-challenge': 1, 'awaiting-bundle': 3 };
 const silent: Pick<Logger, 'info' | 'warn'> = { info() {}, warn() {} };
@@ -95,8 +95,15 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
   let state: BoxAgentState = 'unavailable';
   let routing = await readRouting(stateDir);
   if (routing && routing.boxId !== deps.boxId) throw new BoxAgentError('This state directory belongs to another box.');
-  let deviceKeys: Buffer[] = routing ? [] : deps.enrollmentDeviceKeys.map(key => Buffer.from(key));
-  if (!routing) state = 'enrolling';
+  // Keys that are not Ed25519 are skipped, so one bad entry cannot stop sessions for the others.
+  const usable = (keys: readonly Buffer[]) => keys.filter(isEd25519Spki).map(key => Buffer.from(key));
+  let deviceKeys: Buffer[] = routing ? [] : usable(deps.enrollmentDeviceKeys);
+  // A sealed record without its routing file: never re-enroll over it (that would discard the user's tokens and
+  // change fixed seal settings). The box stays unavailable until it is provisioned again.
+  const orphaned = !routing && await hasSealedRecord(stateDir);
+  if (!routing && !orphaned) state = 'enrolling';
+  if (orphaned) log.warn('The box state is incomplete: a sealed record exists without its routing file. Provision a new box.');
+  let noticeFlagKey: Buffer | undefined;
   let tokens: BoxSealer | undefined;
   let env: Record<string, string> | undefined;
   let noticeKit: BoxNoticeKit | undefined;
@@ -120,7 +127,7 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
   }
 
   function run(payload: BoxEnrollPayload): void {
-    deviceKeys = payload.settings.deviceKeys.map(key => Buffer.from(key, 'base64'));
+    deviceKeys = usable(payload.settings.deviceKeys.map(key => Buffer.from(key, 'base64')));
     // A directory per deployment: new tokens from setup come with a new state key and project binding.
     const deployment = createHash('sha256').update(payload.deployment.KEYSENTRY_WATCHER_CONFIG).digest('hex').slice(0, 16);
     env = { ...payload.deployment, KEYSENTRY_STATE_DIR: join(stateDir, `watcher-${deployment}`) };
@@ -131,6 +138,8 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
 
   async function restore(): Promise<void> {
     const route = routing!;
+    // Routing is written before the first seal, so routing without any sealed record means enrollment never finished.
+    if (!await hasSealedRecord(stateDir)) { deviceKeys = usable(deps.enrollmentDeviceKeys); state = 'enrolling'; return; }
     tokens = sealer(route);
     if (route.mode !== 'unlock-on-restart') {
       const opened = await tokens.openSealed();
@@ -146,18 +155,20 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
       if (record.kind !== 'notice' || record.boxId !== route.boxId || !sameRouting(routingFrom(record.boxId, record.settings), route)) {
         throw new BoxAgentError('The sealed notice record does not match this box.');
       }
-      deviceKeys = record.settings.deviceKeys.map(key => Buffer.from(key, 'base64'));
+      deviceKeys = usable(record.settings.deviceKeys.map(key => Buffer.from(key, 'base64')));
       noticeKit = record.notice;
+      noticeFlagKey?.fill(0);
+      noticeFlagKey = createHash('sha256').update('keysentry-box-notice-flag:v1\n').update(notice.bundle).digest();
     } finally { notice.bundle.fill(0); }
     if ((await tokens.openSealed()).status !== 'locked') throw new BoxAgentError('The sealed record could not be checked.');
     const record = await sealedRecordHash(stateDir);
-    noticeSent = record !== null && await noticeAlreadySent(stateDir, record);
+    noticeSent = record !== null && await noticeAlreadySent(stateDir, record, noticeFlagKey!);
     state = 'locked';
     log.info('Box restarted locked. Autopilot is paused until the device share arrives.');
   }
 
   async function deliverNotice(): Promise<void> {
-    if (noticeSent || !noticeKit || now().getTime() < retryAt) return;
+    if (noticeSent || !noticeKit || !noticeFlagKey || now().getTime() < retryAt) return;
     const record = await sealedRecordHash(stateDir);
     if (!record) return;
     const message: NotifyMessage = { id: randomUUID(), at: now().toISOString(), kind: 'box-locked', severity: 'warning',
@@ -166,7 +177,7 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
         `On your computer, run: keysentry box unlock ${deps.boxId}`] };
     try {
       await deps.sendNotice(noticeKit, signMessage(message, signingKey));
-      await markNoticeSent(stateDir, record);
+      await markNoticeSent(stateDir, record, noticeFlagKey);
       noticeSent = true;
     } catch {
       retryAt = now().getTime() + retryMs;
@@ -195,6 +206,11 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
   async function openSession(): Promise<void> {
     const at = now();
     sessions = sessions.filter(session => !session.done && session.deadline > at.getTime());
+    // A hello the relay refused is published again; it is never re-minted, so a relay outage costs no tokens.
+    for (const session of sessions.filter(item => !item.published)) {
+      await deps.relay.publish(session.hello);
+      session.published = true;
+    }
     if (sessions.some(session => session.candidates[0]?.handshake.state === 'awaiting-challenge') || deviceKeys.length === 0) return;
     while (sessions.length >= maxSessions) sessions.shift();
     const id = randomBytes(16).toString('base64url'), messageId = randomBytes(16).toString('base64url');
@@ -205,9 +221,11 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
       step: createHandshake('box', { devicePublicKeyDer: deviceKey, signingKey, boxKey, sessionId: id }).next({ now: at, attestationToken: token, id: messageId }) }));
     const hello = transitions[0]!.step.message!;
     if (transitions.some(item => serializeHandshakeMessage(item.step.message!) !== serializeHandshakeMessage(hello))) throw new BoxAgentError('Handshake candidates disagree.');
+    const session: Session = { id, deadline: at.getTime() + HANDSHAKE_TTL_MS, rejected: new Set(), done: false, hello, published: false,
+      candidates: transitions.map(item => ({ handshake: item.step.handshake, deviceKey: item.deviceKey })) };
+    sessions.push(session);
     await deps.relay.publish(hello);
-    sessions.push({ id, deadline: at.getTime() + HANDSHAKE_TTL_MS, rejected: new Set(), done: false,
-      candidates: transitions.map(item => ({ handshake: item.step.handshake, deviceKey: item.deviceKey })) });
+    session.published = true;
   }
 
   async function onChallenge(session: Session, raw: unknown, message: HandshakeMessage): Promise<boolean> {
@@ -256,7 +274,8 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
     if (payload.boxId !== deps.boxId) throw new BoxAgentError('A token bundle for another box was refused.');
     if (payload.kind === 'notice') throw new BoxPayloadError();
     if (payload.kind === 'unlock') {
-      if (state !== 'locked') return;
+      // Acknowledging an unlock the box did not need would tell the user autopilot resumed when nothing changed.
+      if (state !== 'locked') throw new BoxAgentError('This box is not waiting for a device share.');
       const share = Buffer.from(payload.shareB, 'base64');
       try {
         const opened = await tokens!.openSealed(share);
@@ -277,12 +296,12 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
     const share = shareB === undefined ? undefined : Buffer.from(shareB, 'base64');
     const target = sealer(next);
     try {
+      if (!routing) { await writeStateFile(stateDir, ROUTING_FILE, next); routing = next; }
       await target.sealBundle(stored, share);
       if (next.mode === 'unlock-on-restart') {
         const notice = encodeBoxPayload({ v: 1, kind: 'notice', boxId: deps.boxId, settings: payload.settings, notice: payload.notice });
         try { await sealer(next, true).sealBundle(notice); } finally { notice.fill(0); }
       }
-      if (!routing) { await writeStateFile(stateDir, ROUTING_FILE, next); routing = next; }
       await clearNotice(stateDir); noticeSent = false;
     } finally { stored.fill(0); share?.fill(0); }
     tokens = target;
@@ -313,7 +332,7 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
   }
 
   async function cycle(): Promise<void> {
-    if (state === 'stopped') return;
+    if (state === 'stopped' || orphaned) return;
     if (state === 'unavailable' && now().getTime() >= retryAt) {
       try { await restore(); }
       catch {
@@ -352,6 +371,7 @@ export async function startBoxAgent(deps: BoxAgentDependencies): Promise<BoxAgen
       state = 'stopped';
       await stopWatcher();
       await tokens?.lock();
+      noticeFlagKey?.fill(0);
       env = undefined;
       sessions = [];
     },
