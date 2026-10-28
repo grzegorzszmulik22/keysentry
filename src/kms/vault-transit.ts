@@ -13,6 +13,9 @@ const CIPHERTEXT = /^vault:v(\d{1,10}):[A-Za-z0-9+/]+={0,2}$/;
 
 type Binding = 'context' | 'associated_data';
 
+const unbound = () => new KmsError('unsupported', 'Vault Transit did not apply keysentry\'s context binding to this key, so it was not used. '
+  + 'Use a Vault version that supports associated_data for this key type, or a derived key.');
+
 /**
  * Vault Transit `encrypt`/`decrypt`. The key is read first (needs `read` on `<mount>/keys/<name>`): a derived key gets
  * the context as `context`; a non-derived AEAD key gets it as `associated_data`; any other key type is refused, since
@@ -28,19 +31,45 @@ export function createVaultTransitWrapper(settings: VaultTransitSettings, deps: 
   const paths = (action: 'keys' | 'encrypt' | 'decrypt') => `${base}/v1/${mount}/${action}/${settings.keyName}`;
   const bindings = new Map<TokenRole, Binding>();
 
-  async function call(operation: KmsOperation | 'describe', role: TokenRole, request: Omit<HttpRequest, 'headers'>): Promise<Record<string, unknown>> {
+  async function request(role: TokenRole, input: Omit<HttpRequest, 'headers'>) {
     const token = await credential(deps.credentials, 'VAULT_TOKEN', role);
     if (!token) throw missingCredentials(PROVIDER, 'VAULT_TOKEN');
     if (!/^[\x21-\x7e]{1,4096}$/.test(token)) throw new KmsError('credentials', 'VAULT_TOKEN is not in a valid format.');
-    const response = await send(PROVIDER, deps.http, { ...request, headers: {
+    return send(PROVIDER, deps.http, { ...input, headers: {
       'X-Vault-Token': token, ...(settings.namespace ? { 'X-Vault-Namespace': settings.namespace } : {}),
-      ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...(input.body === undefined ? {} : { 'Content-Type': 'application/json' }),
     } });
+  }
+
+  async function call(operation: KmsOperation | 'describe', role: TokenRole, input: Omit<HttpRequest, 'headers'>, field?: Binding): Promise<Record<string, unknown>> {
+    const response = await request(role, input);
     if (response.status !== 200) throw failureFor(PROVIDER, response.status, operation === 'describe' ? 'describe' : operation);
     const parsed = jsonObject(response);
+    // Vault answers 200 with a warning when it ignores a request parameter (review L5). An ignored binding parameter
+    // would silently drop the context binding, so it is refused. Only the parameter name is inspected, never echoed.
+    if (field && Array.isArray(parsed?.warnings) && parsed.warnings.some(warning => typeof warning === 'string'
+      && (warning.includes(field) || /ignor/i.test(warning)))) throw unbound();
     const data = parsed?.data;
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw invalidResponse(PROVIDER);
     return data as Record<string, unknown>;
+  }
+
+  /**
+   * Once per wrapper, after the first wrap: decrypting with a different context must fail. A Vault (or something in
+   * front of it) that drops the binding parameter without a warning is caught here instead of producing records whose
+   * binding was never applied. Any non-200 answer counts as "bound"; the real unwrap check that follows a wrap still
+   * proves the record opens with the right context.
+   */
+  let bindingChecked = false;
+  async function checkBinding(ciphertext: string, context: string): Promise<void> {
+    if (bindingChecked) return;
+    const role = roleFor('unwrap');
+    const field = await binding(role);
+    const other = `${context}:binding-check`;
+    const response = await request(role, { method: 'POST', url: paths('decrypt'),
+      body: JSON.stringify({ ciphertext, [field]: Buffer.from(other, 'utf8').toString('base64') }) });
+    if (response.status === 200) throw unbound();
+    bindingChecked = true;
   }
 
   async function binding(role: TokenRole): Promise<Binding> {
@@ -64,8 +93,9 @@ export function createVaultTransitWrapper(settings: VaultTransitSettings, deps: 
       const role = roleFor('wrap');
       const field = await binding(role);
       const data = await call('wrap', role, { method: 'POST', url: paths('encrypt'),
-        body: JSON.stringify({ plaintext: dataKey.toString('base64'), [field]: Buffer.from(context, 'utf8').toString('base64') }) });
+        body: JSON.stringify({ plaintext: dataKey.toString('base64'), [field]: Buffer.from(context, 'utf8').toString('base64') }) }, field);
       if (typeof data.ciphertext !== 'string' || data.ciphertext.length > 64 * 1024 || !CIPHERTEXT.test(data.ciphertext)) throw invalidResponse(PROVIDER);
+      await checkBinding(data.ciphertext, context);
       return encodeEnvelope({ ciphertext: data.ciphertext });
     },
     async unwrap(wrapped, context) {
@@ -75,7 +105,7 @@ export function createVaultTransitWrapper(settings: VaultTransitSettings, deps: 
       const role = roleFor('unwrap');
       const field = await binding(role);
       const data = await call('unwrap', role, { method: 'POST', url: paths('decrypt'),
-        body: JSON.stringify({ ciphertext: envelope.ciphertext, [field]: Buffer.from(context, 'utf8').toString('base64') }) });
+        body: JSON.stringify({ ciphertext: envelope.ciphertext, [field]: Buffer.from(context, 'utf8').toString('base64') }) }, field);
       const plaintext = decodeBase64(data.plaintext, 32 * 1024);
       if (!plaintext) throw invalidResponse(PROVIDER);
       return plaintext;

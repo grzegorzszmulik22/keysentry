@@ -1,6 +1,7 @@
 import { EgressBlockedError } from '../net/index.js';
+import { CaBundleError, TransportConfigError } from '../net/transport.js';
 import type { CredentialSource, HttpClient, HttpRequest, HttpResponse, KmsProviderId, TokenRole } from '../types.js';
-import { blocked, damaged, invalidResponse, unreachable } from './errors.js';
+import { blocked, damaged, invalidResponse, networkRefused, unreachable } from './errors.js';
 
 export interface KeyWrapperDeps {
   /** The egress-guarded client; see `createKmsHttp`. */
@@ -47,6 +48,8 @@ export async function send(provider: KmsProviderId, http: HttpClient, request: H
   try { return await http.request(request); }
   catch (error) {
     if (error instanceof EgressBlockedError) throw blocked(provider);
+    // A refusing transport (a broken proxy, CA or policy setting) is not a connection problem: name the setting.
+    if (error instanceof TransportConfigError || error instanceof CaBundleError) throw networkRefused(provider, error.message);
     throw unreachable(provider);
   }
 }

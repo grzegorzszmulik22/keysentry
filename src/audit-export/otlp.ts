@@ -81,6 +81,22 @@ function rejectedRecords(text: string): number {
 }
 
 /**
+ * The stored custom header line, `Name: value`, as the sink sends it (name lower-cased), or null when it cannot be sent.
+ * `keysentry audit export secret <id> header` checks with this same function (review L3). With `singleHost` (the
+ * runtime's per-target client, which follows no redirect) any ordinary header name works; on a shared client the name
+ * must look like a credential header, which the egress guard strips on a cross-host redirect. Transport and framing
+ * headers are never accepted.
+ */
+export function parseOtlpHeader(line: string, opts: { singleHost: boolean }): { name: string; value: string } | null {
+  const colon = line.indexOf(':');
+  const name = colon > 0 ? line.slice(0, colon).trim() : '';
+  const value = colon > 0 ? line.slice(colon + 1).trim() : '';
+  if (!HEADER_NAME.test(name) || RESERVED_HEADERS.has(name.toLowerCase())
+    || (!opts.singleHost && !CREDENTIAL_HEADER.test(name)) || !/^[\x20-\x7e]{1,4096}$/.test(value)) return null;
+  return { name: name.toLowerCase(), value };
+}
+
+/**
  * `singleHost: true` says `http` reaches only this target's host and follows no redirect elsewhere (the runtime's
  * per-target client), so the custom header may have any name. On a shared client its name must look like a credential
  * header, which the egress guard strips on a cross-host redirect.
@@ -102,16 +118,12 @@ export function createOtlpSink(target: OtlpTarget, deps: { http: HttpClient; vau
         result.authorization = `Bearer ${token}`;
       }
       if (header) {
-        const line = header.toString('utf8');
-        const colon = line.indexOf(':');
-        const name = colon > 0 ? line.slice(0, colon).trim() : '';
-        const value = colon > 0 ? line.slice(colon + 1).trim() : '';
-        if (!HEADER_NAME.test(name) || RESERVED_HEADERS.has(name.toLowerCase()) || name.toLowerCase() in result
-          || (!deps.singleHost && !CREDENTIAL_HEADER.test(name)) || !/^[\x20-\x7e]{1,4096}$/.test(value)) {
+        const parsed = parseOtlpHeader(header.toString('utf8'), { singleHost: deps.singleHost === true });
+        if (!parsed || parsed.name in result) {
           throw new AuditExportError(deps.singleHost ? 'The stored OTLP header must be "Name: value" with an ordinary header name.'
             : 'The stored OTLP header must be "Name: value", with a name containing token, secret, key or auth.', false);
         }
-        result[name.toLowerCase()] = value;
+        result[parsed.name] = parsed.value;
       }
     } finally { bearer?.fill(0); header?.fill(0); }
     headers = result;

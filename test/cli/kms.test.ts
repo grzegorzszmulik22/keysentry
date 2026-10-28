@@ -205,3 +205,18 @@ describe('watcher with KEYSENTRY_STATE_KEY_WRAPPED', () => {
     expect(missing.message).toContain('needs the kms settings from watcher setup');
   });
 });
+
+describe('kms rotate and a deployed watcher (review L6)', () => {
+  it('says the deployed watcher keeps its own wrapped key under the old version', async () => {
+    const f = await fixture();
+    const rt = await f.runtime();
+    expect((await run(rt, ['kms', 'migrate', '--yes'], { transport: f.fake.http })).error).toBeUndefined();
+    f.fake.state.versions.push(randomBytes(32));
+    const quiet = await run(rt, ['kms', 'rotate'], { transport: f.fake.http });
+    expect(quiet.output.join('\n')).not.toContain('KEYSENTRY_STATE_KEY_WRAPPED');
+    await f.vault.set('watcher/signing/public', generateDeviceKey().publicKeyDer);
+    const noted = await run(rt, ['kms', 'rotate'], { transport: f.fake.http });
+    expect(noted.output.join('\n')).toContain('Your deployed watcher keeps its own KEYSENTRY_STATE_KEY_WRAPPED');
+    expect(noted.output.join('\n')).toContain('Keep that version enabled, or run watcher setup again');
+  });
+});

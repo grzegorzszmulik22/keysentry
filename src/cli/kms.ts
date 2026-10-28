@@ -8,6 +8,11 @@ import type { HttpClient, KeyWrapper } from '../types.js';
 import { CliError } from './errors.js';
 import { confirmAction, type PromptIO } from './prompts.js';
 import type { KeysentryRuntime } from './runtime.js';
+import { knownWatcherKeys } from './watcher-keys.js';
+
+/** Shown by `kms rotate` when this computer set up a watcher or a cloud box. */
+export const WATCHER_ROTATION_NOTE = 'Your deployed watcher keeps its own KEYSENTRY_STATE_KEY_WRAPPED, wrapped under the key version current at '
+  + 'watcher setup; this rotation does not change it. Keep that version enabled, or run watcher setup again and redeploy before you disable it.';
 
 export interface KmsCommandsOptions {
   getRuntime(): Promise<KeysentryRuntime>;
@@ -107,7 +112,10 @@ export function registerKmsCommands(program: Command, options: KmsCommandsOption
         : outcome.before && outcome.after && outcome.before === outcome.after
           ? `Rewrapped. The key version is unchanged (${outcome.after}); rotate the key in ${PROVIDER_LABELS[wrapper.provider]} first to move to a new version.`
           : `Rewrapped under the current key version${outcome.after ? ` (${outcome.after})` : ''}.`;
+      // A deployed watcher's KEYSENTRY_STATE_KEY_WRAPPED is a separate wrap made at watcher setup; this rotation does not
+      // touch it, so disabling the old key version would stop that watcher (review L6).
+      const watcherNote = (await knownWatcherKeys(rt.vault)).length ? WATCHER_ROTATION_NOTE : null;
       options.emit({ provider: wrapper.provider, keyRef: wrapper.keyRef, before: outcome.before ?? null, after: outcome.after ?? null,
-        wrappedAt: outcome.record.wrappedAt }, text);
+        wrappedAt: outcome.record.wrappedAt, watcherNote }, watcherNote ? `${text}\n${watcherNote}` : text);
     });
 }

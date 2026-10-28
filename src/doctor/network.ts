@@ -1,5 +1,5 @@
 import { offlineNotice } from '../feeds/offline.js';
-import { PROXY_AUTH_CREDENTIAL, type NetworkSummary } from '../net/transport.js';
+import { defaultRootsText, PROXY_AUTH_CREDENTIAL, type NetworkSummary } from '../net/transport.js';
 import type { DoctorItem } from './doctor.js';
 
 const MAX_LISTED_CERTIFICATES = 50;
@@ -50,7 +50,7 @@ export function networkDoctorItems(summary: NetworkSummary, now: Date = new Date
     const count = summary.ca.certificates.length;
     items.push({
       area: 'network', status: 'ok', title: 'Extra certificate authorities',
-      detail: `${count} extra ${count === 1 ? 'certificate is' : 'certificates are'} trusted from ${summary.ca.path}, in addition to the system roots.`,
+      detail: `${count} extra ${count === 1 ? 'certificate is' : 'certificates are'} trusted from ${summary.ca.path}, in addition to ${defaultRootsText(summary.nodeTrust)}.`,
     });
     for (const certificate of summary.ca.certificates.slice(0, MAX_LISTED_CERTIFICATES)) {
       const expiry = Date.parse(certificate.validTo);
@@ -66,7 +66,22 @@ export function networkDoctorItems(summary: NetworkSummary, now: Date = new Date
       items.push({ area: 'network', status: 'info', title: 'More trusted certificates', detail: `${count - MAX_LISTED_CERTIFICATES} more certificates are not listed here.` });
     }
   } else {
-    items.push({ area: 'network', status: 'info', title: 'Certificate authorities', detail: 'Only the system roots are trusted; no network.caFile is configured.' });
+    items.push({ area: 'network', status: 'info', title: 'Certificate authorities',
+      detail: `keysentry trusts ${defaultRootsText(summary.nodeTrust)}; no network.caFile is configured.`
+        + (summary.nodeTrust?.systemCa ? '' : ' The operating system\'s certificate store is used only when Node runs with --use-system-ca.') });
+  }
+  if (summary.nodeTrust?.extraCaCerts) {
+    items.push({
+      area: 'network', status: 'info', title: 'NODE_EXTRA_CA_CERTS',
+      detail: 'NODE_EXTRA_CA_CERTS adds certificates that Node trusts for every connection, keysentry\'s included. Keep it to your organization\'s own roots.',
+    });
+  }
+  if (summary.nodeTrust?.tlsChecksOff) {
+    items.push({
+      area: 'network', status: 'warn', title: 'Certificate checks turned off',
+      detail: 'NODE_TLS_REJECT_UNAUTHORIZED=0 is set, which turns off certificate checks for Node programs. keysentry\'s own connections ignore it and still check certificates, but other Node tools in this environment do not.',
+      fix: 'Unset NODE_TLS_REJECT_UNAUTHORIZED, and add a private CA with network.caFile instead.',
+    });
   }
 
   const offline = offlineNotice(summary.feeds);

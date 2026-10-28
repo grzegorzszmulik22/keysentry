@@ -2,6 +2,9 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
+import { request as httpRequest } from 'node:http';
+import { createServer as createNetServer, type AddressInfo } from 'node:net';
+import type { ServerHealth } from '../../src/approvals/server.js';
 import { APPROVAL_REQUEST_PREFIX, approvalProxyHops, createWatchRuntime, passkeysForWatcherOrigin, runWatch, type WatchRuntimeDependencies } from '../../src/cli/watcher.js';
 import { buildInventory, createStateCipher, createStateStore } from '../../src/core/index.js';
 import { buildArmedPlan, planHashFor, signArmedPlan } from '../../src/autopilot/index.js';
@@ -500,4 +503,53 @@ test('watch runs the audit export hook after each cycle, and a failing hook only
   expect(calls).toBe(1);
   expect(warnings).toContain('Audit export did not finish after this cycle. Run keysentry audit export status.');
   expect(warnings.join(' ')).not.toContain('secret-value');
+});
+
+test('a slow audit export runs beside the loop, one at a time, and never delays the next cycle (review L10)', async () => {
+  const f = await fixture();
+  let calls = 0, cycles = 0;
+  let release!: () => void;
+  const hung = new Promise<void>(resolve => { release = resolve; });
+  const controller = new AbortController();
+  const deps: WatchRuntimeDependencies = { ...f.deps,
+    afterCycle: async () => { calls++; await hung; },
+    sleep: async () => { cycles++; if (cycles >= 3) controller.abort(); } };
+  let finished = false;
+  const run = runWatch(deps, { signal: controller.signal }).then(code => { finished = true; return code; });
+  for (let wait = 0; wait < 200 && !controller.signal.aborted; wait++) await new Promise(resolve => setTimeout(resolve, 5));
+  // Three cycles ran while the first export was still hanging, and no second export started beside it.
+  expect(cycles).toBe(3);
+  expect(calls).toBe(1);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(finished).toBe(false); // stopping waits for the export in progress
+  release();
+  expect(await run).toBe(0);
+});
+
+test('the approval server reports a watcher whose network settings refuse every request as unhealthy (review H1)', async () => {
+  const f = await fixture();
+  const reason = "The watcher's proxy or certificate settings cannot be used, so it refuses every outbound request.";
+  let health: ServerHealth = { problem: { code: 'network', reason } };
+  const watcher = await createWatchRuntime({ ...f.deps, health: () => health });
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createNetServer().listen(0, '127.0.0.1', () => { const bound = probe.address() as AddressInfo; probe.close(() => resolve(bound.port)); });
+    probe.on('error', reject);
+  });
+  const server = await watcher.server(port);
+  try {
+    const get = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port, path: '/healthz', agent: false, headers: { Host: `localhost:${port}` } }, res => {
+        const chunks: Buffer[] = []; res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject); req.end();
+    });
+    const unhealthy = await get();
+    expect(unhealthy.status).toBe(503);
+    expect(JSON.parse(unhealthy.body)).toMatchObject({ ok: false, problem: 'network', reason });
+    health = { feedsOffline: true };
+    const offline = await get();
+    expect(offline.status).toBe(200);
+    expect(JSON.parse(offline.body)).toMatchObject({ ok: true, feeds: 'offline' });
+  } finally { await server.close(); }
 });

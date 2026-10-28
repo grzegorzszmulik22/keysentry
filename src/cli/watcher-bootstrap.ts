@@ -2,7 +2,11 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { CredentialSource, HostId, HttpClient, TokenRole, Vault } from '../types.js';
 import { HOST_CREDENTIALS } from '../hosts/credentials.js';
-import { setupNetwork } from './network-setup.js';
+import { DEPLOYMENT_CA_VAULT_NAME, setupNetwork } from './network-setup.js';
+import {
+  CaBundleError, PROXY_AUTH_CREDENTIAL, PROXY_AUTH_VAULT_NAME, TransportConfigError, loadCaBundle, parseCaBundle, resolveProxySettings,
+  type ResolvedProxy,
+} from '../net/transport.js';
 import { credentialVaultName, createCredentialSource, createEncryptedFileVault } from '../vault/index.js';
 import { createFetchHttp } from '../http.js';
 import { unwrapDeploymentStateKey } from '../kms/index.js';
@@ -26,11 +30,20 @@ export interface WatcherDeploymentOptions {
   confirmEnvironmentCredential?: (name: string) => Promise<boolean>;
   /** Vault factory injection keeps native stores and expensive KDF parameters out of unit tests. */
   openVault?: VaultFactory;
+  /**
+   * The project directory `network.caFile` is relative to. Required when the settings name a CA file: the watcher
+   * receives the certificates themselves, because the path names a file on this computer (review H1).
+   */
+  cwd?: string;
+  /** This terminal's environment: proxy credentials in HTTPS_PROXY for the configured network.proxy (with consent). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Build the encrypted, portable vault without exporting the local device or state key. */
 export async function prepareWatcherDeployment(options: WatcherDeploymentOptions, input: WatcherDeploymentSecrets): Promise<{
   vaultPath: string; vaultBlob: string; exportedCredentialNames: string[];
+  /** Plain lines for the person running setup: what the watcher's network settings will be. */
+  notes: string[];
 }> {
   const dir = resolve(options.outputDir);
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -85,6 +98,8 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
     async function exportCredential(name: string): Promise<void> {
       for (const role of ['read', 'write'] as const) await exportRole(name, role);
     }
+    const notes = await carryNetworkSettings({ settings, sourceVault: options.sourceVault, vault, consent, exported,
+      ...(options.cwd ? { cwd: options.cwd } : {}), env: options.env ?? {} });
     if (settings.hosts.railway.enabled !== false) {
       const names = settings.hosts.railway.tokenType === 'project' ? ['RAILWAY_PROJECT_TOKEN']
         : settings.hosts.railway.tokenType === 'account' ? ['RAILWAY_TOKEN'] : ['RAILWAY_TOKEN', 'RAILWAY_PROJECT_TOKEN'];
@@ -136,9 +151,57 @@ export async function prepareWatcherDeployment(options: WatcherDeploymentOptions
     const encrypted = await readFile(vaultPath);
     try {
       if (encrypted.length > MAX_VAULT_BYTES) throw new CliError('The encrypted deployment vault is too large.');
-      return { vaultPath, vaultBlob: encrypted.toString('base64'), exportedCredentialNames: [...exported].sort() };
+      return { vaultPath, vaultBlob: encrypted.toString('base64'), exportedCredentialNames: [...exported].sort(), notes };
     } finally { encrypted.fill(0); }
   } finally { fp.fill(0); }
+}
+
+/**
+ * The deployment's network settings must work where the watcher runs (review H1). The CA bundle travels as PEM text in
+ * the encrypted deployment vault, and the proxy credential the configured proxy needs travels there too (an
+ * environment value only with consent for its exact variable name). Settings that cannot be carried stop setup.
+ */
+async function carryNetworkSettings(input: {
+  settings: ConfigSettings; sourceVault: Vault; vault: Vault; consent: (name: string) => Promise<boolean>; exported: Set<string>;
+  cwd?: string; env: NodeJS.ProcessEnv;
+}): Promise<string[]> {
+  const { network } = input.settings;
+  const notes: string[] = [];
+  if (network.caFile) {
+    if (!input.cwd) throw new CliError('Watcher setup needs the project directory to carry the certificates in network.caFile.');
+    let pems: string[];
+    try { pems = (await loadCaBundle(network.caFile, { cwd: input.cwd })).pems; }
+    catch (error) {
+      if (error instanceof CaBundleError) throw new CliError(`The watcher cannot be given the certificates in network.caFile, so nothing was deployed: ${error.message}`);
+      throw error;
+    }
+    await input.vault.set(DEPLOYMENT_CA_VAULT_NAME, Buffer.from(pems.join('\n'), 'utf8'));
+    notes.push(`The watcher trusts the ${pems.length === 1 ? 'certificate' : `${pems.length} certificates`} from network.caFile, carried in its encrypted vault.`);
+  }
+  if (network.proxy) {
+    let resolved: ResolvedProxy;
+    try {
+      resolved = await resolveProxySettings({ configProxy: network.proxy, configNoProxy: network.noProxy, env: input.env, vault: input.sourceVault });
+    } catch (error) {
+      if (error instanceof TransportConfigError) throw new CliError(`The watcher cannot use network.proxy, so nothing was deployed: ${error.message}`);
+      throw error;
+    }
+    const credentials = resolved.settings?.credentials;
+    if (credentials) {
+      // The proxy credential follows the proxy: from the vault as stored, from an environment source only with consent.
+      const fromEnvironment = resolved.credentialSource === 'env' ? 'HTTPS_PROXY' : input.sourceVault.backend === 'env' ? PROXY_AUTH_CREDENTIAL : null;
+      if (fromEnvironment === null || await input.consent(fromEnvironment)) {
+        const value = Buffer.from(`${credentials.username}:${credentials.password}`, 'utf8');
+        try { await input.vault.set(PROXY_AUTH_VAULT_NAME, value); input.exported.add(PROXY_AUTH_CREDENTIAL); } finally { value.fill(0); }
+      } else {
+        notes.push(`The proxy credential was not copied, so the proxy may refuse the watcher. Store it in the watcher with ${PROXY_AUTH_CREDENTIAL} or run setup again.`);
+      }
+    }
+    notes.push(`The watcher sends its requests through the proxy at ${resolved.settings!.url} (network.proxy), so it must be able to reach that proxy where it runs. For a hosted platform outside your network, remove network.proxy before watcher setup.`);
+  } else if (input.env.HTTPS_PROXY?.trim() || input.env.https_proxy?.trim()) {
+    notes.push('HTTPS_PROXY from this terminal is not carried. Set it in the watcher\'s environment if the watcher needs a proxy.');
+  }
+  return notes;
 }
 
 export interface WatcherBootstrapOptions {
@@ -256,13 +319,29 @@ export async function bootstrapWatcher(env: NodeJS.ProcessEnv, options: WatcherB
     try { if (!signer) throw new Error(); const key = deviceKeyFromPrivate(signer); key.privateKeyDer.fill(0); }
     catch { throw new CliError('The watcher signing key could not be opened. Restore its encrypted deployment vault.'); }
     finally { signer?.fill(0); }
+    // network.caFile names a file on the computer that ran setup; the deployment carries the certificates themselves
+    // (review H1), and setupNetwork reads them from this vault. A deployment made before that cannot verify servers.
+    if (settings.network.caFile) {
+      const carried = await vault.get(DEPLOYMENT_CA_VAULT_NAME);
+      if (!carried) throw new CliError('This watcher deployment does not carry the certificates from network.caFile, so it could not verify any server. Run watcher setup again with this version of keysentry.');
+      try { parseCaBundle(carried, settings.network.caFile); }
+      catch (error) {
+        if (error instanceof CaBundleError) throw new CliError(`The certificates carried for network.caFile cannot be used: ${error.message} Run watcher setup again.`);
+        throw error;
+      } finally { carried.fill(0); }
+    }
     await bindIdentity(loaded.stateDir, loaded.config.projectId);
     if (wrappedState) {
-      stateKey = await unwrapDeploymentStateKey({ encoded: wrappedState, kms: settings.kms, projectId: loaded.config.projectId,
-        credentials: createCredentialSource(vault, env),
+      let transport = options.http;
+      if (!transport) {
         // The deployment's proxy and CA settings apply to the KMS call too, with the sealed team policy's network rules.
-        transport: options.http ?? (await setupNetwork({ settings: settings.network, cwd: loaded.stateDir, env, vault,
-          policy: loaded.config.team?.policy?.policy ?? null })).transport,
+        const network = await setupNetwork({ settings: settings.network, cwd: loaded.stateDir, env, vault,
+          policy: loaded.config.team?.policy?.policy ?? null });
+        if (network.problem) throw new CliError(`The watcher's network settings cannot be used, so the KMS key was not contacted: ${network.problem.message}`);
+        transport = network.transport;
+      }
+      stateKey = await unwrapDeploymentStateKey({ encoded: wrappedState, kms: settings.kms, projectId: loaded.config.projectId,
+        credentials: createCredentialSource(vault, env), transport,
         receiptPath: join(loaded.stateDir, '.keysentry', 'network.jsonl'), ...(options.now ? { now: options.now } : {}) });
     }
     // The state key now comes from the environment in either form, so the runtime does not unwrap it again.

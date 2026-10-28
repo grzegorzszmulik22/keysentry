@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { offlineNotice } from '../feeds/index.js';
 import { WatcherConfigError } from '../watcher/index.js';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
@@ -308,6 +309,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
       if ((policy?.autoExecute ?? settings.monitor.autoExecute) || (policy?.autoContain ?? settings.monitor.autoContain)) human('run automatic monitor actions');
       const rt = await getRuntime();
       if (rt.config.monitor.policy.autoExecute || rt.config.monitor.policy.autoContain) await rt.prepareExecution(diagnostic);
+      // Offline mode: say that breach feeds are not polled, as `watch` and doctor do (review L9).
+      const offline = offlineNotice(rt.network.feedMode);
+      if (offline) diagnostic(offline);
       if (opts.once) { const result = await rt.monitorOnce(); emit(result, `Monitor: ${result.signals.length} signals, ${result.decisions.length} decisions. Guided steps require human remediation.`); return; }
       const controller = new AbortController(); const stop = () => controller.abort();
       process.once('SIGINT', stop); process.once('SIGTERM', stop);

@@ -141,7 +141,7 @@ async function deploymentFor(rt: KeysentryRuntime, opts: BoxCommandsOptions): Pr
       notifications: rt.config.settings.notify.channels, deviceKeys: () => localDeviceKeys(rt), passkeys: () => listPasskeys(rt.store, rt.vault),
       intervalSeconds: rt.config.monitor.intervalMs / 1000, relayServer: rt.config.settings.notify.relay?.server });
     const prepared = await createWatcherDeployment({ vault: rt.vault, audit: rt.audit, config, outputDir,
-      prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir,
+      prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir, cwd: rt.config.cwd, env: opts.env,
         confirmEnvironmentCredential: async name => {
           opts.diagnostic(`Copy ${name} from your environment into the cloud box? [y/N]`);
           return /^(?:y|yes)$/i.test(await promptVaultValue(`y to copy ${name}`, opts.diagnostic, opts.promptIO) ?? '');

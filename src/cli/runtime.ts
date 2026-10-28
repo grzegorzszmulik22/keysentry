@@ -177,6 +177,8 @@ export async function createRuntime(options: RuntimeOptions = {}) {
   const kmsTransport = stateKms ? (await setupNetwork({ settings: metadata.settings.network, cwd: metadata.cwd, env, vault, redactor,
     policy: null, ...(options.http ? { injected: options.http } : {}) })).transport : undefined;
   const key = await loadProjectStateKey({ vault, projectId, log, now: options.now,
+    // Two processes starting a new project together create one wrapped key between them (review M1).
+    lockPath: join(paths.dir, 'state-key.lock'),
     envWrapped: vault.backend === 'env' ? env.KEYSENTRY_STATE_KEY_WRAPPED || undefined : undefined,
     ...(stateKms && kmsTransport ? { wrapper: createKeyWrapper(stateKms, { http: createKmsHttp(kmsTransport, stateKms, { receipt, log }),
       credentials: createCredentialSource(vault, env), now: options.now }) } : {}) });
@@ -995,7 +997,11 @@ export async function createRuntime(options: RuntimeOptions = {}) {
     withHiddenChannels: (channels: NotifyChannelSettings[]): NotifyChannelSettings[] => [...channels,
       ...rawSettings.notify.channels.filter(channel => !visibleChannelIds.has(channel.id) && !channels.some(item => item.id === channel.id))],
     /** Proxy, extra CA and offline state (notes/network-enterprise.md); `transport` is only ever wrapped by a guard. */
-    network: { feedMode: network.feedMode, summary: network.summary, transport: rawTransport },
+    // `problem` is the fixed reason the transport refuses every request (watcher health); `ca` feeds syslog over TLS.
+    network: { feedMode: network.feedMode, summary: network.summary, transport: rawTransport, problem: network.problem?.message ?? null,
+      ca: network.ca },
+    /** Reads the audit log's MAC key through the same vault view the audit log uses (audit export checks each entry). */
+    auditMacKey: () => auditVault.get('audit/mac'),
     freshInventory: async () => rotationInventory(await scan()),
     async watcherMonitor(context: import('../watcher/index.js').WatcherActionContext, notifier: import('../types.js').Notifier,
       assertActive?: () => Promise<void>) {

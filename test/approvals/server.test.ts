@@ -430,3 +430,16 @@ test('static approval script performs the passkey ceremony and shows the result 
   expect(JSON.parse(fetches[1]!.options.body)).toEqual({ digest, credentialId: 'Y3JlZA', clientDataJSON: 'Y2xpZW50', authenticatorData: 'YXV0aA', signature: 'c2ln' });
   expect(result.textContent).toBe('Approved.');
 });
+
+test('healthz answers 503 with a fixed problem code while the watcher cannot work, and reports offline mode (review H1, L9)', async () => {
+  let health: import('../../src/approvals/server.js').ServerHealth = { problem: { code: 'network', reason: 'Fixed reason.' } };
+  const { port } = await start({ health: () => health });
+  const sick = await call(port, '/healthz');
+  expect(sick.status).toBe(503);
+  expect(JSON.parse(sick.body)).toEqual({ ok: false, version: '0.0.0-dev', problem: 'network', reason: 'Fixed reason.' });
+  expect(sick.headers['cache-control']).toBe('no-store');
+  health = { feedsOffline: true };
+  expect(JSON.parse((await call(port, '/healthz')).body)).toEqual({ ok: true, version: '0.0.0-dev', feeds: 'offline' });
+  health = {};
+  expect(JSON.parse((await call(port, '/healthz')).body)).toEqual({ ok: true, version: '0.0.0-dev' });
+});

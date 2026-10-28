@@ -1,22 +1,23 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type * as tls from 'node:tls';
 import type { Command } from 'commander';
 import {
   AUDIT_EXPORT_PURPOSE, AuditExportRefusedError, EXPORT_SECRET_FIELDS, auditExportSyslogAllowance, auditExportUrls, createAuditExporter,
-  createAuditFileReader, createStoreExportState, createTlsSyslogConnector, decodeWebhookSecret, exportSecretName, parseCaBundle,
+  createAuditFileReader, createStoreExportState, createTlsSyslogConnector, decodeWebhookSecret, exportSecretName, parseOtlpHeader,
   proxyAppliesTo, type AuditExporter, type AuditExportDryRun, type AuditExportRunResult, type AuditExportStatus, type AuditExportTarget,
   type ExportSecretField,
 } from '../audit-export/index.js';
+import { CaBundleError, loadCaBundle } from '../net/transport.js';
 import type { ConfigSettings } from './config.js';
 import { CliError } from './errors.js';
 import { promptVaultValue, type PromptIO } from './prompts.js';
 import type { KeysentryRuntime } from './runtime.js';
+import { knownWatcherKeys } from './watcher-keys.js';
 
 /** The runtime members audit export needs; the full KeysentryRuntime satisfies it. */
 export type AuditExportRuntime = Pick<KeysentryRuntime, 'config' | 'paths' | 'audit' | 'store' | 'vault' | 'receipt' | 'redactor' | 'now'
-  | 'signingKey' | 'httpForUrls' | 'projectId'> & Partial<Pick<KeysentryRuntime, 'singleHostHttp'>>;
+  | 'signingKey' | 'httpForUrls' | 'projectId'> & Partial<Pick<KeysentryRuntime, 'singleHostHttp' | 'network' | 'auditMacKey'>>;
 
 export interface AuditExportCommandsOptions {
   getRuntime(): Promise<AuditExportRuntime>;
@@ -45,14 +46,16 @@ export function auditExportSourceId(projectId: string): string {
 export async function createRuntimeAuditExporter(rt: AuditExportRuntime, opts: Pick<AuditExportCommandsOptions, 'env' | 'connect' | 'sleep'> = {}): Promise<AuditExporter> {
   const settings = rt.config.settings;
   const targets = settings.audit.export.map(sameShape);
+  // Syslog over TLS trusts exactly what the HTTPS transport trusts (review L1): the runtime's loaded bundle (from the
+  // project file, or from a deployed watcher's encrypted vault), and it is refused whenever the transport refuses.
   let ca: string[] | undefined;
-  if (settings.network.caFile && targets.some(target => target.kind === 'syslog')) {
-    let pem: string;
-    try { pem = await readFile(resolve(rt.config.cwd, settings.network.caFile), 'utf8'); }
-    catch { throw new CliError('network.caFile could not be read. Check the path in keysentry.yaml.'); }
-    try { ca = parseCaBundle(pem); } catch (error) { throw new CliError((error as Error).message); }
+  if (rt.network) ca = rt.network.ca ?? undefined;
+  else if (settings.network.caFile && targets.some(target => target.kind === 'syslog')) {
+    try { ca = (await loadCaBundle(settings.network.caFile, { cwd: rt.config.cwd })).pems; }
+    catch (error) { if (error instanceof CaBundleError) throw new CliError(error.message); throw error; }
   }
   const env = opts.env ?? process.env;
+  const requireProxy = rt.network?.summary.requireProxy === true;
   // Like notification webhooks, a configured URL may carry a token in its path: never print it whole.
   for (const target of targets) if (target.kind === 'webhook' || target.kind === 'otlp') rt.redactor.register(target.url);
   return createAuditExporter({
@@ -64,10 +67,16 @@ export async function createRuntimeAuditExporter(rt: AuditExportRuntime, opts: P
     // Each target also gets its own client limited to its one host, from the runtime's raw (proxy-aware) transport.
     ...(rt.singleHostHttp ? { httpFor: singleHostClients(targets, rt.singleHostHttp) } : {}),
     tls: createTlsSyslogConnector({ allow: auditExportSyslogAllowance(targets), ...(ca ? { ca } : {}), receipt: rt.receipt, now: rt.now,
-      proxied: host => proxyAppliesTo(host, { ...(settings.network.proxy ? { proxy: settings.network.proxy } : {}), noProxy: settings.network.noProxy, env }),
+      unavailable: rt.network?.problem ?? null,
+      proxied: (host, port) => proxyAppliesTo(host, { ...(settings.network.proxy ? { proxy: settings.network.proxy } : {}),
+        noProxy: requireProxy ? [] : settings.network.noProxy, env, port, requireProxy }),
       ...(opts.connect ? { connect: opts.connect } : {}) }),
     vault: rt.vault,
     signingKey: rt.signingKey,
+    // The audit log's own vault view (the environment vault keeps its MAC key in memory), for the per-entry check.
+    ...(rt.auditMacKey ? { macKey: rt.auditMacKey } : {}),
+    // A deployed watcher or cloud box signs its webhook batches with its own key: status lists those too (review M3).
+    otherSigningKeys: () => knownWatcherKeys(rt.vault),
     state: createStoreExportState(rt.store, join(rt.paths.dir, STATE_FILE)),
     now: rt.now,
     ...(opts.sleep ? { sleep: opts.sleep } : {}),
@@ -144,7 +153,10 @@ function renderStatus(result: AuditExportStatus): string {
     if (target.lastError) lines.push(`  Last problem (${plural(target.failures, 'failed attempt')}): ${target.lastError}`);
     if (target.nextAttemptAt) lines.push(`  The watcher tries again after ${target.nextAttemptAt}; keysentry audit export tries now.`);
     if (target.warning) lines.push(`  Note: ${target.warning}`);
-    if (target.publicKey) lines.push(`  Receivers verify signatures with ${target.publicKey.whpk} (key id ${target.publicKey.keyId}).`);
+    if (target.publicKeys?.length) {
+      lines.push('  Receivers trust exactly these keys and pick one by the keysentry-key-id header:');
+      for (const key of target.publicKeys) lines.push(`    ${key.whpk} (key id ${key.keyId}, ${key.signer})`);
+    } else if (target.publicKey) lines.push(`  Receivers verify signatures with ${target.publicKey.whpk} (key id ${target.publicKey.keyId}).`);
   }
   return lines.join('\n');
 }
@@ -164,14 +176,17 @@ async function readPiped(io?: PromptIO): Promise<string> {
   return value;
 }
 
-function checkCredential(field: ExportSecretField, value: string): void {
+function checkCredential(field: ExportSecretField, value: string, singleHost: boolean): void {
   if (field === 'hmac-secret') {
     const key = decodeWebhookSecret(Buffer.from(value, 'utf8'));
     if (!key) throw new CliError('The webhook secret must be whsec_ followed by base64 of 24 to 64 random bytes, for example from: openssl rand -base64 32');
     key.fill(0);
   } else if (field === 'header') {
-    const match = /^([A-Za-z0-9-]{1,64}):\s*([\x20-\x7e]{1,4096})$/.exec(value);
-    if (!match || !/token|secret|key|auth/i.test(match[1]!)) throw new CliError('Enter the header as "Name: value"; the name must contain token, secret, key or auth.');
+    // Exactly what the export sends (review L3): any ordinary name on the per-target client the runtime provides.
+    if (!parseOtlpHeader(value, { singleHost })) {
+      throw new CliError(singleHost ? 'Enter the header as "Name: value" with an ordinary header name (letters, digits and "-"), not a transport header such as Host or Content-Type.'
+        : 'Enter the header as "Name: value"; the name must contain token, secret, key or auth.');
+    }
   } else if (!/^[\x21-\x7e]{1,8192}$/.test(value)) throw new CliError('The credential must be printable ASCII without spaces.');
 }
 
@@ -248,7 +263,7 @@ export function registerAuditExportCommands(program: Command, options: AuditExpo
       const value = opts.stdin ? await readPiped(options.promptIO) : await promptVaultValue(`${id} ${field}`, options.diagnostic, options.promptIO);
       if (value === null) { options.emit({ cancelled: true }, 'Credential entry cancelled.'); return; }
       rt.redactor.register(value);
-      checkCredential(field as ExportSecretField, value);
+      checkCredential(field as ExportSecretField, value, rt.singleHostHttp !== undefined);
       const bytes = Buffer.from(value, 'utf8');
       try { await rt.vault.set(name, bytes); } finally { bytes.fill(0); }
       await rt.audit.append({ kind: 'audit-export:credential-set', summary: 'Audit export credential stored.', data: { target: id, field } });

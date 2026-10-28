@@ -238,7 +238,8 @@ describe('audit exporter', () => {
     expect(plan.entries).toBe(3);
     expect(plan.targets.map(target => [target.id, target.credentials, target.pending, target.batches.map(batch => `${batch.firstSeq}-${batch.lastSeq}`)]))
       .toEqual([['siem', 'not needed', 3, ['1-2', '3-3']], ['lake', 'missing', 3, ['1-2', '3-3']], ['hook', 'device key', 3, ['1-2', '3-3']]]);
-    expect(plan.targets[1]!.batches[0]!.location).toBe('audit-bucket/k/2026/10/28/1-2.jsonl');
+    // The object name carries the source and the log identity (review M2).
+    expect(plan.targets[1]!.batches[0]!.location).toMatch(/^audit-bucket\/k\/2026\/10\/28\/[A-Za-z0-9_-]{1,64}\/[0-9a-f]{16}\/1-2\.jsonl$/);
     expect(plan.targets[0]!.preview.map(record => record.seq)).toEqual([1, 2]);
     expect(reads.filter(name => name.startsWith('audit-export/'))).toEqual([]);
     expect(signed).toBe(false);

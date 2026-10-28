@@ -132,12 +132,18 @@ STARTTLS with certificate checks and writes one `smtp:<host>` metadata entry to 
 through HTTP CONNECT and TLS still runs end to end, with the destination name verified, so the proxy learns host
 names and timing but not request content. A TLS-inspecting proxy only works if you add its CA, and then it can read
 and alter everything, including tokens: treat adding a CA as trusting that party with all keysentry traffic.
-`network.caFile` adds certificates to the system roots for every host keysentry contacts; it never replaces them
-and refuses files that contain anything but certificates. Proxy credentials come from the vault
-(`KEYSENTRY_PROXY_AUTH`) or `HTTPS_PROXY`, are sent only on the CONNECT request, and cross the LAN unencrypted to an
-`http://` proxy. A broken proxy, CA or policy setting refuses every request instead of silently going direct.
-Offline mode stops feed and news polling and removes their hosts from the allow-list; it trades early breach
-warning for fewer outbound contacts, and an autopilot wave can then never start.
+`network.caFile` adds certificates to Node's default roots for every host keysentry contacts; it never replaces them
+and refuses files that contain anything but certificates. Node's defaults are its bundled Mozilla list plus the
+certificates in `NODE_EXTRA_CA_CERTS`, and the operating system's store only when Node runs with `--use-system-ca`;
+whoever controls the environment controls those too. `NODE_TLS_REJECT_UNAUTHORIZED=0` would turn certificate checks
+off for Node's own fetch, so keysentry then uses its own transport, which keeps them on, and doctor warns. Proxy
+credentials come from the vault (`KEYSENTRY_PROXY_AUTH`) or `HTTPS_PROXY`, are sent only on the CONNECT request, and
+cross the LAN unencrypted to an `http://` proxy. A broken proxy, CA or policy setting refuses every request instead of
+silently going direct; syslog export, which cannot be tunnelled, makes the same proxy decision and refuses a host the
+proxy covers. A deployed watcher receives the CA certificates themselves and, with `network.proxy`, the proxy
+credential inside its encrypted deployment vault (an environment value only with consent); its `/healthz` reports 503
+when its own settings refuse every request. Offline mode stops feed and news polling and removes their hosts from the
+allow-list; it trades early breach warning for fewer outbound contacts, and an autopilot wave can then never start.
 
 **Self-hosted servers (phase 5 and 6).** Coolify, the Kubernetes API server, Vault and a self-hosted Infisical are
 reached at exactly the host and explicit port you configured; rules without a port allow only 443, built-in rules
@@ -152,13 +158,35 @@ grace-period undo makes, so `--no-redeploy` cannot stage a change there.
 the project (encryption context, AAD or a context hash), and unwrapped into memory at start through a client that
 reaches only the KMS hosts. Whoever controls the KMS key and its credentials can unwrap the state key, and can also
 make saved state permanently unreadable by disabling or deleting the key; keysentry refuses to start rather than
-create a new key. The KMS credentials stay outside `CREDENTIAL_NAMES`: loadConfig does not read them and the watcher
-deployment does not export them, so they must be supplied to a watcher separately.
+create a new key. The KMS credentials stay outside `CREDENTIAL_NAMES`, and loadConfig does not read them. The watcher
+deployment exports a KMS credential only where the same name is also a host credential: `VAULT_TOKEN` is the vault-kv
+host's token too, and it is exported when that host is enabled and configured. Supply the other KMS credentials to a
+watcher separately. Two processes that start a new project together create one wrapped key between them (a lock file
+in `.keysentry/` and a re-read after taking it), so neither encrypts state with a key the vault no longer holds.
 
-**Audit export (phase 5).** Exported records are value-free metadata from the verified prefix of the audit chain;
-each HTTPS target gets a single-host client that follows no redirect, syslog connects only to the configured
-host:port over TLS, and webhook batches are signed. A receiver or anyone on its path learns event kinds, timing and
-names such as variable names. Duplicates are possible after a crash; gaps are not.
+The binding is authenticated where the KMS authenticates it: an AWS encryption context, Google AAD and Vault Transit
+`context` or `associated_data` all need encrypt permission on your key to produce a record that unwraps. Vault Transit
+answers 200 when it ignores a parameter, so keysentry refuses a response that warns about it and checks once per
+process that decrypting with another context fails. Azure Key Vault is different: it wraps with RSA-OAEP, which is
+public-key encryption, and has no additional authenticated data. keysentry binds the context by wrapping
+`sha256(context) || key` and checking that prefix after unwrapping, which stops honest records being reused for
+another project or key, but it is not authentication: anyone who has the key's RSA public key (readable with
+`keys/get`, and not secret) and write access to the keysentry vault can build a wrapped record for a data key of their
+choice. keysentry would then unwrap and use that key for state it writes from then on (state already written under
+the real key does not open with it, so a planted key shows up as locked saved state). With Azure, the vault's own
+protection (an OS keychain or the encrypted file) is therefore what keeps the state key yours; use AWS KMS, Google
+Cloud KMS or Vault Transit when that is not enough. `kms rotate` rewraps this computer's record only; a deployed
+watcher's `KEYSENTRY_STATE_KEY_WRAPPED` stays under the key version current at watcher setup.
+
+**Audit export (phase 5).** Exported records are value-free metadata from the verified prefix of the audit chain,
+and each entry's MAC is checked again on the bytes read for sending, so a file swapped between the verification and
+the read is refused rather than exported. Each HTTPS target gets a single-host client that follows no redirect, syslog
+connects only to the configured host:port over TLS, and webhook batches are signed: by this computer's device key, or
+by a deployed watcher's own key for the batches it sends; `audit export status` lists every such public key. S3
+object names carry the source and log identity, so a recreated log cannot overwrite or block an earlier log's
+objects. A receiver or anyone on its path learns event kinds, timing and names such as variable names. Duplicates are
+possible after a crash; gaps are not. Syslog has no acknowledgement, so a batch is counted when every byte left this
+computer, and a server that does not close the session gets an "unconfirmed" note.
 
 **The CLI to the operating system.** The optional Node permission model limits file access and
 child-process use on supported patched versions. On Node 22 it is enabled only at **22.23.4 or
@@ -400,7 +428,7 @@ messages, but a substituted key or an old attestation fails a named check and no
 | Malicious package or build tool | Read credentials or change released code. | Locked source dependencies, ignored install scripts, bundled releases with no install hooks/dependencies, reviewable code, and reproducibility checks. A bundled malicious dependency still runs with the CLI's effective access; a compromised toolchain can produce consistently bad output. |
 | Breached hosting platform | Read values it already hosts, lie about state, or undo an update. | Scope credentials narrowly, track every known consumer, verify and revoke in order. A platform can expose keys it holds and fake a successful deployment; keysentry cannot repair that trust boundary. The same holds for secret stores and self-hosted servers. |
 | Proxy operator or added CA | Observe destinations and timing; with a CA you trusted, read or alter all traffic including tokens. | CONNECT tunnelling keeps end-to-end TLS when no extra CA is configured; a broken setting fails closed. A CA you add for TLS inspection is fully trusted. |
-| KMS operator | Unwrap the state key, or disable or delete the KMS key. | Context binding stops a wrapped key being reused for another project; a KMS failure refuses to start. Disabling the key makes saved state unreadable by design. |
+| KMS operator | Unwrap the state key, or disable or delete the KMS key. | Context binding stops a wrapped key being reused for another project; a KMS failure refuses to start. Disabling the key makes saved state unreadable by design. With Azure Key Vault the binding is an unauthenticated hash prefix, so vault write access plus the key's public key is enough to plant a known state key for new state. |
 | Breached notification channel | Read, suppress, alter or replay alerts; lure the user into taking action. | Signed watcher messages contain no values, hints are opt-in, and trusted-key verification detects edits. A message grants no approval. The operator can suppress delivery or retain metadata; legacy monitor webhook messages do not gain signature guarantees merely by using the same channel. |
 | News feed author | Publish a misleading story, replay an old item or abuse a platform mention to provoke changes. | Bounded parsing, first-read baselines, freshness checks, platform-subject exposure rules, publisher-owner corroboration and incident cooldowns limit triggers. Uncorroborated news alerts; automatic rotation requires signed-plan scope. Incorrect official evidence or colluding independent owners remain possible. |
 | Relay operator | Read metadata, inject messages, replay approvals, delay or suppress disarm. | Trusted-device signatures, exact action digests, freshness and single-use approval state reject forged or replayed authorization. The operator still controls availability and can observe topic/timing metadata. A public ntfy topic is not confidential. |

@@ -144,8 +144,9 @@ describe('state key migration', () => {
     const result = await migrateStateKey({ vault: f.vault, projectId: PROJECT, wrapper: f.wrapper, now });
     expect(result.result).toBe('migrated');
     expect([...f.vault.dump().keys()]).toEqual([WRAPPED]);
-    // encrypt, decrypt (verify the wrap), decrypt (verify the saved copy)
-    expect(f.fake.http.calls.map(call => call.url.split('/').slice(-2).join('/'))).toEqual(['keys/state', 'encrypt/state', 'keys/state', 'decrypt/state', 'decrypt/state']);
+    // encrypt, decrypt with another context (the one-time binding self-test, review L5), decrypt (verify the wrap),
+    // decrypt (verify the saved copy)
+    expect(f.fake.http.calls.map(call => call.url.split('/').slice(-2).join('/'))).toEqual(['keys/state', 'encrypt/state', 'keys/state', 'decrypt/state', 'decrypt/state', 'decrypt/state']);
     expect((await migrateStateKey({ vault: f.vault, projectId: PROJECT, wrapper: f.wrapper, now })).result).toBe('already-wrapped');
     expect((await loadProjectStateKey({ vault: f.vault, projectId: PROJECT, wrapper: f.wrapper })).equals(original)).toBe(true);
   });
@@ -228,5 +229,93 @@ describe('watcher wrapped state key', () => {
     expect((await failure(unwrapWatcherStateKey({ wrapper: f.wrapper, projectId: '1111111111111111', encoded }))).code).toBe('rejected');
     expect((await failure(unwrapWatcherStateKey({ wrapper: f.wrapper, projectId: PROJECT, encoded: `${encoded.slice(0, -4)}!!!!` }))).code).toBe('damaged');
     expect(stateKeyContext(PROJECT)).toBe('keysentry-state:v1:0123456789abcdef');
+  });
+});
+
+describe('first start of a new project is serialized (review M1)', () => {
+  /** Two views of one store, so the in-process vault identity cannot serialize anything by itself. */
+  function sharedViews() {
+    const store = createFakeVault();
+    const view = (): typeof store => ({ ...store, get: name => store.get(name), set: (name, value) => store.set(name, value),
+      delete: name => store.delete(name), list: prefix => store.list(prefix) });
+    return { store, a: view(), b: view() };
+  }
+  /** The fake Vault Transit answers at once; add a round-trip delay so the two starts really overlap. */
+  function slow(wrapper: KeyWrapper, ms = 25): KeyWrapper {
+    const wait = () => new Promise(resolve => setTimeout(resolve, ms));
+    return { provider: wrapper.provider, keyRef: wrapper.keyRef,
+      async wrap(key, context) { await wait(); return wrapper.wrap(key, context); },
+      async unwrap(blob, context) { await wait(); return wrapper.unwrap(blob, context); } };
+  }
+
+  it('two overlapping starts in one process end with one wrapped key that both use', async () => {
+    const f = setup();
+    const views = sharedViews();
+    const wrapper = slow(f.wrapper);
+    const first = loadProjectStateKey({ vault: views.a, projectId: PROJECT, wrapper, now });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const second = loadProjectStateKey({ vault: views.b, projectId: PROJECT, wrapper, now });
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.equals(b)).toBe(true);
+    const kept = await loadProjectStateKey({ vault: views.store, projectId: PROJECT, wrapper: f.wrapper, now });
+    expect(kept.equals(a)).toBe(true);
+    // Only one key was ever created and wrapped.
+    expect(f.fake.http.callsTo('POST', /encrypt/)).toHaveLength(1);
+  });
+
+  it('a lock file held by another process makes a start wait, then use the key that process saved', async () => {
+    const { mkdtemp, rm, writeFile, stat } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { withStateKeyLock } = await import('../../src/kms/lock.js');
+    const dir = await mkdtemp(join(tmpdir(), 'ks-kms-lock-'));
+    try {
+      const lockPath = join(dir, 'state-key.lock');
+      const f = setup();
+      const views = sharedViews();
+      // "Another process": a different in-process key, so only the lock file can serialize the two.
+      let releaseOther!: () => void;
+      const otherHolds = new Promise<void>(resolve => { releaseOther = resolve; });
+      let otherKey: Buffer | undefined;
+      const other = withStateKeyLock({ key: 'another-process', lockPath }, async () => {
+        await otherHolds;
+        otherKey = randomBytes(32);
+        const record = await (await import('../../src/kms/index.js')).wrapStateKey(f.wrapper, otherKey, PROJECT, now);
+        await views.a.set(WRAPPED, encodeWrappedStateKey(record));
+      });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect((await stat(lockPath)).isFile()).toBe(true);
+      const start = loadProjectStateKey({ vault: views.b, projectId: PROJECT, wrapper: f.wrapper, now, lockPath });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(await views.store.get(WRAPPED)).toBeNull(); // the start is waiting, not creating its own key
+      releaseOther();
+      await other;
+      expect((await start).equals(otherKey!)).toBe(true);
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+      // A lock left by a crashed process (its time no longer renewed) is taken over instead of blocking forever.
+      await writeFile(lockPath, '{"pid":1}');
+      const { utimes } = await import('node:fs/promises');
+      const old = new Date(Date.now() - 120_000);
+      await utimes(lockPath, old, old);
+      const fresh = setup();
+      const key = await loadProjectStateKey({ vault: createFakeVault(), projectId: PROJECT, wrapper: fresh.wrapper, now, lockPath });
+      expect(key).toHaveLength(32);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('gives up with a calm message while another live process keeps the lock', async () => {
+    const { mkdtemp, rm, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { withStateKeyLock } = await import('../../src/kms/lock.js');
+    const dir = await mkdtemp(join(tmpdir(), 'ks-kms-lock-'));
+    try {
+      const lockPath = join(dir, 'state-key.lock');
+      await writeFile(lockPath, '{"pid":1}');
+      const error = await failure(withStateKeyLock({ key: 'waiting', lockPath, waitMs: 100 }, async () => 'never'));
+      expect(error).toBeInstanceOf(KmsError);
+      expect(error.code).toBe('busy');
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });

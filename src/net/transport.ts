@@ -246,6 +246,30 @@ function envValue(env: Readonly<Record<string, string | undefined>>, ...names: s
   return undefined;
 }
 
+/** The union of network.noProxy and NO_PROXY (or no_proxy, when NO_PROXY is unset or empty). */
+export function noProxyList(configNoProxy: readonly string[] | undefined, env: Readonly<Record<string, string | undefined>>): string[] {
+  return [...new Set([...(configNoProxy ?? []),
+    ...(envValue(env, 'NO_PROXY', 'no_proxy') ?? '').split(/[\s,]+/)].map(entry => entry.trim()).filter(Boolean))];
+}
+
+/**
+ * Whether a connection to host:port goes through the proxy, decided exactly as the transport decides it: the same proxy
+ * selection (network.proxy, then a non-empty HTTPS_PROXY or https_proxy), the same no-proxy list and matching. For
+ * connections that cannot be tunnelled (syslog over TLS), which must then be refused rather than made directly. A proxy
+ * setting that cannot be parsed still counts (the transport refuses everything then), and a policy that requires the
+ * proxy covers every connection.
+ */
+export function usesProxy(host: string, port: number, input: {
+  configProxy?: string;
+  configNoProxy?: readonly string[];
+  env: Readonly<Record<string, string | undefined>>;
+  requireProxy?: boolean;
+}): boolean {
+  if (input.requireProxy) return true;
+  if (!input.configProxy && !envValue(input.env, 'HTTPS_PROXY', 'https_proxy')) return false;
+  return !bypassesProxy(host, port, parseNoProxy(noProxyList(input.configNoProxy, input.env)).entries);
+}
+
 /**
  * keysentry.yaml's network.proxy wins; otherwise HTTPS_PROXY (or https_proxy). Credentials come from that
  * environment URL's userinfo only when it names the same proxy, otherwise from the vault; never from keysentry.yaml.
@@ -270,8 +294,7 @@ export async function resolveProxySettings(input: {
   if (fromConfig?.credentials) {
     throw new TransportConfigError(`network.proxy must not contain credentials. Store them with keysentry vault set ${PROXY_AUTH_CREDENTIAL} instead.`);
   }
-  const noProxy = [...new Set([...(input.configNoProxy ?? []),
-    ...(envValue(input.env, 'NO_PROXY', 'no_proxy') ?? '').split(/[\s,]+/)].map(entry => entry.trim()).filter(Boolean))];
+  const noProxy = noProxyList(input.configNoProxy, input.env);
   const chosen = fromConfig ?? fromEnv;
   if (!chosen) return { settings: null, noProxy, source: null, credentialSource: null };
 
@@ -660,6 +683,32 @@ export interface NetworkSummary {
   requireProxy: boolean;
   ca: { path: string; certificates: CaCertificateInfo[] } | { path: string; error: string } | null;
   feeds: FeedMode;
+  /** What Node itself trusts besides network.caFile (present when the environment was given to summarizeNetwork). */
+  nodeTrust?: NodeTrust;
+}
+
+/**
+ * Node's default roots are its bundled Mozilla list, plus the certificates in NODE_EXTRA_CA_CERTS, plus the operating
+ * system's store only when Node runs with --use-system-ca (or NODE_USE_SYSTEM_CA=1). NODE_TLS_REJECT_UNAUTHORIZED=0
+ * turns certificate checks off for Node's own clients; keysentry then uses its own transport, which keeps them on.
+ */
+export interface NodeTrust { extraCaCerts: boolean; systemCa: boolean; tlsChecksOff: boolean }
+
+export function nodeTrustFrom(env: Readonly<Record<string, string | undefined>>, execArgv: readonly string[] = process.execArgv): NodeTrust {
+  const options = env.NODE_OPTIONS ?? '';
+  return {
+    extraCaCerts: !!env.NODE_EXTRA_CA_CERTS?.trim(),
+    systemCa: execArgv.includes('--use-system-ca') || /(?:^|\s)--use-system-ca(?:\s|$)/.test(options) || env.NODE_USE_SYSTEM_CA === '1',
+    tlsChecksOff: env.NODE_TLS_REJECT_UNAUTHORIZED === '0',
+  };
+}
+
+/** "Node's default roots" in words, for status lines and doctor. */
+export function defaultRootsText(trust?: NodeTrust): string {
+  const parts = ['Node\'s bundled roots'];
+  if (trust?.extraCaCerts) parts.push('the certificates in NODE_EXTRA_CA_CERTS');
+  if (trust?.systemCa) parts.push('the operating system\'s certificate store (--use-system-ca)');
+  return parts.length === 1 ? parts[0]! : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}`;
 }
 
 /** Secret-free description of the network settings. `caError` is the fixed message of a CaBundleError. */
@@ -668,10 +717,12 @@ export function summarizeNetwork(input: {
   requireProxy?: boolean;
   ca?: CaBundle | { path: string; error: string } | null;
   feeds: FeedMode;
+  env?: Readonly<Record<string, string | undefined>>;
 }): NetworkSummary {
   const settings = input.proxy?.settings ?? null;
   const parsed = parseNoProxy(input.proxy?.noProxy ?? []);
   return {
+    ...(input.env ? { nodeTrust: nodeTrustFrom(input.env) } : {}),
     proxy: settings && input.proxy?.source ? {
       origin: settings.url, source: input.proxy.source, credentials: input.proxy.credentialSource ?? 'none',
     } : null,
@@ -698,9 +749,12 @@ export function networkStatusLines(summary: NetworkSummary): string[] {
   }
   if (summary.ca && 'certificates' in summary.ca) {
     const count = summary.ca.certificates.length;
-    lines.push(`${count} extra ${count === 1 ? 'certificate is' : 'certificates are'} trusted in addition to the system roots.`);
+    lines.push(`${count} extra ${count === 1 ? 'certificate is' : 'certificates are'} trusted in addition to Node's default roots.`);
   } else if (summary.ca) {
     lines.push('network.caFile could not be used, so outbound requests are refused until it is fixed.');
+  }
+  if (summary.nodeTrust?.tlsChecksOff) {
+    lines.push('NODE_TLS_REJECT_UNAUTHORIZED=0 is set; keysentry\'s own connections ignore it and still check certificates.');
   }
   return lines;
 }

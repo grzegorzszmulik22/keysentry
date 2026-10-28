@@ -15,6 +15,11 @@ export interface AuditSnapshot {
   readonly records: readonly AuditExportRecord[];
   /** Chain hash of the entry with this sequence number; lets the exporter notice a replaced log. */
   hashAt(seq: number): string | undefined;
+  /**
+   * The entry's MAC as read (HMAC-SHA256 of its chain hash under the vault's audit key). The exporter checks it, so the
+   * records it sends are the bytes it read, authenticated, and not only the bytes an earlier verify() saw (review L2).
+   */
+  macAt?(seq: number): string | undefined;
 }
 
 export interface AuditRecordReader {
@@ -75,6 +80,7 @@ export function parseAuditLines(text: string, entries: number, redactor?: Redact
   const clean = redactor ?? createRedactor();
   const records: AuditExportRecord[] = [];
   const hashes: string[] = [];
+  const macs: (string | undefined)[] = [];
   let previous = ZERO_HASH;
   for (let index = 0; index < entries; index++) {
     let line: unknown;
@@ -88,9 +94,10 @@ export function parseAuditLines(text: string, entries: number, redactor?: Redact
     records.push(toExportRecord({ seq: index + 1, at: line.at, kind: line.kind, summary: line.summary,
       ...(line.data === undefined ? {} : { data: line.data as Record<string, unknown> }) }, clean));
     hashes.push(hash);
+    macs.push(typeof line.mac === 'string' && HASH.test(line.mac) ? line.mac : undefined);
     previous = hash;
   }
-  return { entries, records, hashAt: seq => hashes[seq - 1] };
+  return { entries, records, hashAt: seq => hashes[seq - 1], macAt: seq => macs[seq - 1] };
 }
 
 export function createAuditFileReader(path: string, opts: { redactor?: Redactor } = {}): AuditRecordReader {

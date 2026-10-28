@@ -1,10 +1,13 @@
-import { X509Certificate } from 'node:crypto';
 import { rulesForUserUrls, type SourcedEgressRule } from '../net/allowlist.js';
+import { parseCaBundle as parseTransportCaBundle, usesProxy } from '../net/transport.js';
 import { otlpLogsUrl } from './otlp.js';
 import { s3RequestOrigin } from './s3.js';
 import type { AuditExportTarget } from './types.js';
 
 export const AUDIT_EXPORT_PURPOSE = 'audit export you configured';
+
+/** RFC 5425: syslog over TLS uses port 6514. */
+const SYSLOG_TLS_PORT = 6514;
 
 /** Every HTTPS URL audit export contacts. Each authorizes only its own host (rulesForUserUrls). */
 export function auditExportUrls(targets: readonly AuditExportTarget[]): string[] {
@@ -28,26 +31,25 @@ export function auditExportSyslogAllowance(targets: readonly AuditExportTarget[]
 }
 
 /**
- * Whether a configured HTTP(S) proxy covers a host. Syslog over TLS is not tunnelled, so such a host is refused
- * rather than contacted directly. NO_PROXY entries match exactly or as a dot-suffix; "*" disables the proxy.
+ * Whether the configured proxy covers a syslog host. Syslog over TLS is not tunnelled, so such a host is refused rather
+ * than contacted directly. The decision is the HTTPS transport's own (src/net/transport.ts usesProxy, review L1): the
+ * same proxy selection (network.proxy, then a non-empty HTTPS_PROXY or https_proxy), the same no-proxy list and the same
+ * matching (a bare entry is one exact host; `.example.com` covers subdomains; `*` covers everything). A team policy that
+ * requires the proxy covers every host.
  */
-export function proxyAppliesTo(host: string, opts: { proxy?: string; noProxy?: readonly string[]; env?: NodeJS.ProcessEnv }): boolean {
-  const env = opts.env ?? {};
-  const proxy = opts.proxy ?? env.HTTPS_PROXY ?? env.https_proxy;
-  if (!proxy?.trim()) return false;
-  const name = host.toLowerCase().replace(/\.$/, '');
-  const exclusions = [...opts.noProxy ?? [], ...`${env.NO_PROXY ?? env.no_proxy ?? ''}`.split(',')]
-    .map(entry => entry.trim().toLowerCase().replace(/:\d+$/, '').replace(/^\*?\./, '.')).filter(Boolean);
-  return !exclusions.some(entry => entry === '*' || entry === name || (entry.startsWith('.') ? name.endsWith(entry) : name.endsWith(`.${entry}`)));
+export function proxyAppliesTo(host: string, opts: {
+  proxy?: string; noProxy?: readonly string[]; env?: NodeJS.ProcessEnv; port?: number; requireProxy?: boolean;
+}): boolean {
+  return usesProxy(host, opts.port ?? SYSLOG_TLS_PORT, {
+    ...(opts.proxy ? { configProxy: opts.proxy } : {}), ...(opts.noProxy ? { configNoProxy: opts.noProxy } : {}),
+    env: opts.env ?? {}, ...(opts.requireProxy ? { requireProxy: true } : {}),
+  });
 }
 
-/** Splits a PEM bundle into certificates; anything else in the file is refused. */
+/**
+ * Splits a PEM bundle into certificates with the transport's parser (review L1), so a bundle that works for HTTPS
+ * (including `#` comment lines) works for syslog, and anything else in the file is refused the same way.
+ */
 export function parseCaBundle(pem: string): string[] {
-  const blocks = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
-  const rest = pem.replace(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g, '').trim();
-  if (!blocks.length || rest) throw new Error('network.caFile must contain only PEM certificates.');
-  for (const block of blocks) {
-    try { new X509Certificate(block); } catch { throw new Error('network.caFile contains a certificate that could not be read.'); }
-  }
-  return blocks;
+  return parseTransportCaBundle(pem).pems;
 }

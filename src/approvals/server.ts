@@ -19,6 +19,17 @@ export interface ApprovalServerOptions {
   trustProxyHops?: 0 | 1;
   watcherCheckMinutes?: number;
   version?: string;
+  /**
+   * The watcher's health for `/healthz`, read on each request. A problem answers 503 with its fixed code and reason, so
+   * `watcher status` and platform health checks see a watcher that cannot work (review H1). Offline mode is reported
+   * so status can say that feeds are not polled (review L9). Reasons are fixed text and never carry a value.
+   */
+  health?: () => ServerHealth;
+}
+
+export interface ServerHealth {
+  problem?: { code: 'network'; reason: string } | null;
+  feedsOffline?: boolean;
 }
 
 class HttpError extends Error {
@@ -185,7 +196,12 @@ export function createApprovalServer(opts: ApprovalServerOptions): { listen(): P
       }
       if (req.method === 'POST' && req.headers.origin !== publicOrigin) throw new HttpError(403, 'Request origin is not allowed.');
       if (req.method === 'GET') {
-        if (path === '/healthz') { json(res, 200, { ok: true, version }); return; }
+        if (path === '/healthz') {
+          const health = opts.health?.() ?? {};
+          if (health.problem) { json(res, 503, { ok: false, version, problem: health.problem.code, reason: health.problem.reason }); return; }
+          json(res, 200, { ok: true, version, ...(health.feedsOffline ? { feeds: 'offline' } : {}) });
+          return;
+        }
         if (path === '/static/approve.js') { send(res, 200, APPROVE_JS, 'text/javascript; charset=utf-8'); return; }
         if (path === '/disarm') { send(res, 200, disarmPage(), 'text/html; charset=utf-8'); return; }
         const details = await service.describe(action![1]!);

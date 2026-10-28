@@ -27,7 +27,7 @@ export interface WatcherSetupDependencies {
   /** Dedicated terminal sink: never a logger, JSON writer, or captured command result. */
   writeTerminal(text: string): void;
   /** Initialize the portable encrypted vault/state before any deploy secrets are shown. */
-  prepareDeployment(input: WatcherDeploymentSecrets): Promise<void | { vaultBlob: string; exportedCredentialNames?: string[] }>;
+  prepareDeployment(input: WatcherDeploymentSecrets): Promise<void | { vaultBlob: string; exportedCredentialNames?: string[]; notes?: string[] }>;
   /**
    * With a kms section (notes/kms.md): wrap the new deployment state key with the configured KMS key. The watcher then
    * receives KEYSENTRY_STATE_KEY_WRAPPED instead of the plain KEYSENTRY_STATE_KEY.
@@ -56,6 +56,8 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
     const { values, deployment } = prepared;
     const write = deps.writeTerminal;
     write(deployment?.exportedCredentialNames?.length ? `Exported credential names: ${deployment.exportedCredentialNames.join(', ')}.` : 'Exported credential names: none.');
+    // What the watcher's network settings will be (proxy, carried certificates): fixed text, no values.
+    for (const note of deployment?.notes ?? []) write(note);
     write('Store the following values in the platform\'s secret settings only. They are shown once. Keep a separate secure backup.');
     write(`KEYSENTRY_WATCHER_KEY=${values.KEYSENTRY_WATCHER_KEY}`);
     if (values.KEYSENTRY_STATE_KEY_WRAPPED) write(`KEYSENTRY_STATE_KEY_WRAPPED=${values.KEYSENTRY_STATE_KEY_WRAPPED}`);
@@ -98,7 +100,7 @@ export interface WatcherDeploymentValues {
   values: { KEYSENTRY_WATCHER_KEY: string; KEYSENTRY_STATE_KEY: string; KEYSENTRY_VAULT_PASSPHRASE: string; KEYSENTRY_WATCHER_CONFIG: string;
     /** Present when the setup wrapped the state key with the configured KMS; the plain KEYSENTRY_STATE_KEY is then not shown. */
     KEYSENTRY_STATE_KEY_WRAPPED?: string };
-  deployment: { vaultBlob: string; exportedCredentialNames?: string[] } | undefined;
+  deployment: { vaultBlob: string; exportedCredentialNames?: string[]; notes?: string[] } | undefined;
   sealedConfigPath: string;
   watcherKeyId: string;
   /** The new watcher's public key, for callers that record it themselves once the deployment is confirmed. */
@@ -142,20 +144,35 @@ export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencie
   }
 }
 
+/** The fixed reason a watcher's /healthz gives when its network transport refuses every request (review H1). */
+export const WATCHER_NETWORK_PROBLEM = 'The watcher\'s proxy or certificate settings cannot be used, so it refuses every outbound request.';
+
 /** The supplied client must be the runtime's guarded client, including a user rule for this origin. */
 export async function watcherStatus(http: HttpClient, value: string, localVersion: string): Promise<{
   healthy: true; version: string; localVersion: string; versionMatches: boolean;
+  /** Offline mode in the watcher: breach feeds and security news are not polled (review L9). */
+  feeds: 'polled' | 'offline';
 }> {
   let url: URL;
   try {
     url = new URL(value);
     if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/' || url.port) throw new Error();
   } catch { throw new CliError('Use an HTTPS watcher origin without credentials.'); }
+  let unhealthy = false;
   try {
     const response = await http.request({ method: 'GET', url: `${url.origin}/healthz` });
-    if (response.status !== 200 || response.text.length > 4096) throw new Error();
-    const body = response.json<{ ok?: unknown; version?: unknown }>();
+    if (response.text.length > 4096) throw new Error();
+    const body = response.json<{ ok?: unknown; version?: unknown; problem?: unknown; feeds?: unknown }>();
+    // Only the known problem code is read; the remote reason text is never printed.
+    if (response.status === 503 && body?.ok === false && body.problem === 'network') { unhealthy = true; throw new Error(); }
+    if (response.status !== 200) throw new Error();
     if (body?.ok !== true || typeof body.version !== 'string' || !/^[A-Za-z0-9.+-]{1,80}$/.test(body.version)) throw new Error();
-    return { healthy: true, version: body.version, localVersion, versionMatches: body.version === localVersion };
-  } catch { throw new CliError('The watcher health check did not succeed.'); }
+    return { healthy: true, version: body.version, localVersion, versionMatches: body.version === localVersion,
+      feeds: body.feeds === 'offline' ? 'offline' : 'polled' };
+  } catch {
+    if (unhealthy) {
+      throw new CliError(`The watcher is running but unhealthy. ${WATCHER_NETWORK_PROBLEM} Check network.proxy and network.caFile, then run watcher setup again.`);
+    }
+    throw new CliError('The watcher health check did not succeed.');
+  }
 }

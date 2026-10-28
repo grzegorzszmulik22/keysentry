@@ -1,3 +1,4 @@
+import { createHash, createHmac, createPublicKey, timingSafeEqual } from 'node:crypto';
 import { canonicalJson } from '../security/index.js';
 import type { DeviceKey } from '../security/index.js';
 import type { AuditExportKind, AuditExportRecord, AuditLog, HttpClient, Vault } from '../types.js';
@@ -49,6 +50,16 @@ export interface AuditExporterOptions {
   vault: Vault;
   /** The watcher/device Ed25519 key that signs webhook batches; the caller's buffer is cleared after each use. */
   signingKey: () => Promise<DeviceKey>;
+  /**
+   * The audit log's MAC key (vault entry `audit/mac`), read through the same vault view the audit log uses. Every entry
+   * read for export is checked against it (review L2). Defaults to `vault.get('audit/mac')`.
+   */
+  macKey?: () => Promise<Buffer | null>;
+  /**
+   * Further public keys that sign this project's webhook batches (a deployed watcher's or cloud box's key), listed by
+   * `status()` next to this device's key so receivers can trust exactly those (review M3).
+   */
+  otherSigningKeys?: () => Promise<{ signer: string; publicKeyDer: Buffer }[]>;
   state: AuditExportStateStore;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
@@ -96,6 +107,11 @@ export interface TargetStatus {
   failures: number; lastAttemptAt?: string; lastSuccessAt?: string; lastError?: string; warning?: string; nextAttemptAt?: string;
   /** Ed25519 webhook targets: the key receivers check signatures with. */
   publicKey?: { keyId: string; whpk: string; spkiDerBase64: string };
+  /**
+   * Ed25519 webhook targets: every key that may sign this project's batches (this device, and each deployed watcher
+   * and cloud box this computer knows). Receivers trust exactly these and pick one by the keysentry-key-id header.
+   */
+  publicKeys?: { signer: string; keyId: string; whpk: string; spkiDerBase64: string }[];
 }
 export interface AuditExportStatus { entries: number; verified: boolean; problem?: string; targets: TargetStatus[] }
 
@@ -141,24 +157,55 @@ export function createAuditExporter(options: AuditExporterOptions): AuditExporte
       case 'syslog': return createSyslogSink(target, { connector: options.tls, ...(options.hostname ? { hostname: options.hostname } : {}), ...log });
       case 'otlp': return createOtlpSink(target, { http: options.httpFor?.(target) ?? options.http, vault: options.vault, now, sourceId,
         singleHost: options.httpFor !== undefined, ...log });
-      case 's3': return createS3Sink(target, { http: options.httpFor?.(target) ?? options.http, vault: options.vault, now });
+      case 's3': return createS3Sink(target, { http: options.httpFor?.(target) ?? options.http, vault: options.vault, now, sourceId, ...log });
       case 'webhook': return createWebhookSink(target, { http: options.httpFor?.(target) ?? options.http, vault: options.vault, now, sourceId,
         signingKey: options.signingKey, ...log });
     }
   }
 
-  /** Verify, read the verified prefix (re-checking its chain), then verify again: nothing unverified is ever sent. */
+  const macKey = options.macKey ?? (() => options.vault.get('audit/mac'));
+  const CHANGED = 'The audit log changed while it was being read for export, so nothing was exported. Run keysentry audit verify.';
+
+  /**
+   * Whether every entry read carries a valid MAC under the audit key. verify() and the read are two reads of the file,
+   * and the reader's unkeyed hash chain can be recomputed by anyone, so the bytes about to be sent are authenticated
+   * themselves (review L2). Same MAC as src/security/audit.ts: HMAC-SHA256(key, chain hash as hex text).
+   */
+  async function authenticated(snapshot: AuditSnapshot): Promise<boolean> {
+    if (snapshot.entries === 0) return true;
+    if (!snapshot.macAt) return false;
+    const key = await macKey();
+    if (!key || key.length !== 32) {
+      key?.fill(0);
+      throw new AuditExportRefusedError('The audit log key is not available here, so the entries read for export could not be checked and nothing was exported. Run keysentry audit verify.');
+    }
+    try {
+      for (let seq = 1; seq <= snapshot.entries; seq++) {
+        const hash = snapshot.hashAt(seq), mac = snapshot.macAt(seq);
+        if (!hash || !mac || !/^[0-9a-f]{64}$/.test(mac)) return false;
+        if (!timingSafeEqual(Buffer.from(mac, 'hex'), createHmac('sha256', key).update(hash, 'utf8').digest())) return false;
+      }
+      return true;
+    } finally { key.fill(0); }
+  }
+
+  /**
+   * Verify, read the verified prefix (re-checking its chain and every entry's MAC), then verify again: nothing
+   * unverified is ever sent. Entries that fail their MAC mean the file changed between the reads: try again a few
+   * times, then refuse.
+   */
   async function verifiedSnapshot(): Promise<AuditSnapshot> {
-    const first = await options.audit.verify();
-    if (!first.ok) {
-      throw new AuditExportRefusedError(`The audit log did not verify, so nothing was exported${first.problem ? `: ${first.problem}` : '.'} Run keysentry audit verify.`);
+    for (let attempt = 1; ; attempt++) {
+      const first = await options.audit.verify();
+      if (!first.ok) {
+        throw new AuditExportRefusedError(`The audit log did not verify, so nothing was exported${first.problem ? `: ${first.problem}` : '.'} Run keysentry audit verify.`);
+      }
+      const snapshot = await options.reader.load(first.entries);
+      const second = await options.audit.verify();
+      if (!second.ok || second.entries < first.entries) throw new AuditExportRefusedError(CHANGED);
+      if (await authenticated(snapshot)) return snapshot;
+      if (attempt >= 3) throw new AuditExportRefusedError(CHANGED);
     }
-    const snapshot = await options.reader.load(first.entries);
-    const second = await options.audit.verify();
-    if (!second.ok || second.entries < first.entries) {
-      throw new AuditExportRefusedError('The audit log changed while it was being read for export, so nothing was exported. Run keysentry audit verify.');
-    }
-    return snapshot;
   }
 
   function batches(records: readonly AuditExportRecord[], from: number, maxBatches: number): AuditExportRecord[][] {
@@ -353,11 +400,28 @@ export function createAuditExporter(options: AuditExporterOptions): AuditExporte
           ...(cursor.warning ? { warning: cursor.warning } : {}),
           ...(until !== undefined && until > now().getTime() ? { nextAttemptAt: new Date(until).toISOString() } : {}) };
         if (target.kind === 'webhook' && target.signing === 'ed25519') {
+          // Every key that may sign this project's batches (review M3): this device's, then each deployed watcher's
+          // and cloud box's that this computer knows. A deployed watcher signs with its own key, never this one.
+          const keys: NonNullable<TargetStatus['publicKeys']> = [];
+          const add = (signer: string, publicKeyDer: Buffer) => {
+            let whpk: string;
+            try {
+              if (createPublicKey({ key: publicKeyDer, format: 'der', type: 'spki' }).asymmetricKeyType !== 'ed25519') return;
+              whpk = webhookPublicKey(publicKeyDer);
+            } catch { return; }
+            const keyId = createHash('sha256').update(publicKeyDer).digest('hex').slice(0, 16);
+            if (!keys.some(key => key.keyId === keyId)) keys.push({ signer, keyId, whpk, spkiDerBase64: publicKeyDer.toString('base64') });
+          };
           try {
             const key = await options.signingKey();
-            try { entry.publicKey = { keyId: key.keyId, whpk: webhookPublicKey(key.publicKeyDer), spkiDerBase64: key.publicKeyDer.toString('base64') }; }
-            finally { key.privateKeyDer.fill(0); }
+            try {
+              entry.publicKey = { keyId: key.keyId, whpk: webhookPublicKey(key.publicKeyDer), spkiDerBase64: key.publicKeyDer.toString('base64') };
+              add('this computer', key.publicKeyDer);
+            } finally { key.privateKeyDer.fill(0); }
           } catch { entry.warning ??= 'The device signing key is unavailable, so its public key cannot be shown.'; }
+          try { for (const other of await options.otherSigningKeys?.() ?? []) add(other.signer, other.publicKeyDer); }
+          catch { entry.warning ??= 'The public keys of deployed watchers could not be read, so only this computer\'s key is shown.'; }
+          if (keys.length) entry.publicKeys = keys;
         }
         targets.push(entry);
       }

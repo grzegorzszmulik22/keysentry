@@ -115,8 +115,18 @@ test('watcher setup names exported credentials without exposing their values', a
 
 test('watcher status reads health through the injected HTTP client and compares versions', async () => {
   const http = new FakeHttp().on('GET', /^https:\/\/watcher\.example\/healthz$/, () => json(200, { ok: true, version: '1.0.0' }));
-  expect(await watcherStatus(http, 'https://watcher.example', '1.0.0')).toEqual({ healthy: true, version: '1.0.0', localVersion: '1.0.0', versionMatches: true });
+  expect(await watcherStatus(http, 'https://watcher.example', '1.0.0')).toEqual({ healthy: true, version: '1.0.0', localVersion: '1.0.0', versionMatches: true, feeds: 'polled' });
   expect(http.calls).toHaveLength(1);
+});
+
+test('watcher status reports a watcher whose network settings refuse every request, and offline mode (review H1, L9)', async () => {
+  const sick = new FakeHttp().on('GET', /^https:\/\/watcher\.example\/healthz$/, () => json(503, { ok: false, version: '1.0.0', problem: 'network', reason: 'planted-remote-text' }));
+  const error = await watcherStatus(sick, 'https://watcher.example', '1.0.0').then(() => null, (failure: Error) => failure);
+  expect(error?.message).toContain('The watcher is running but unhealthy.');
+  expect(error?.message).toContain('proxy or certificate settings');
+  expect(error?.message).not.toContain('planted-remote-text');
+  const offline = new FakeHttp().on('GET', /^https:\/\/watcher\.example\/healthz$/, () => json(200, { ok: true, version: '1.0.0', feeds: 'offline' }));
+  expect((await watcherStatus(offline, 'https://watcher.example', '1.0.0')).feeds).toBe('offline');
 });
 
 test('watcher status never reflects a response body or URL secrets in errors', async () => {

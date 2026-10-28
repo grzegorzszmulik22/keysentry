@@ -10,17 +10,28 @@ const RETRYABLE = (status: number) => status === 409 || status === 429 || status
 const AWS_ENDPOINT = /^s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com$/;
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 
-/** `<prefix><yyyy>/<mm>/<dd>/<firstSeq>-<lastSeq>.jsonl`, dated by the first record so a retry names the same object. */
-export function s3ObjectKey(prefix: string, batch: readonly AuditExportRecord[]): string {
+const LABEL = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Which log a batch belongs to: the exporter's source id and the log identity every other envelope carries. */
+export interface S3LogIdentity { source: string; log: string }
+
+/**
+ * `<prefix><yyyy>/<mm>/<dd>/<source>/<log>/<firstSeq>-<lastSeq>.jsonl`, dated by the first record so a retry names the
+ * same object. The source and the log identity (the first entry's hash prefix, as in syslog, OTLP and webhooks) keep two
+ * logs apart: a recreated log restarts at seq 1 and must never meet the earlier log's objects (review M2). The date
+ * stays first after the prefix, so lifecycle rules can still select by date.
+ */
+export function s3ObjectKey(prefix: string, batch: readonly AuditExportRecord[], identity: S3LogIdentity): string {
   const first = batch[0];
   const last = batch.at(-1);
   if (!first || !last) throw new AuditExportError('An empty batch cannot be stored.', false);
+  if (!LABEL.test(identity.source) || !LABEL.test(identity.log)) throw new AuditExportError('The audit log has no usable identity, so it cannot be stored.', false);
   const date = new Date(first.at);
   if (!Number.isFinite(date.getTime())) throw new AuditExportError('An audit entry has an unreadable time.', false);
   const yyyy = String(date.getUTCFullYear()).padStart(4, '0');
   const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
   const dd = String(date.getUTCDate()).padStart(2, '0');
-  return `${prefix}${yyyy}/${mm}/${dd}/${first.seq}-${last.seq}.jsonl`;
+  return `${prefix}${yyyy}/${mm}/${dd}/${identity.source}/${identity.log}/${first.seq}-${last.seq}.jsonl`;
 }
 
 /**
@@ -47,9 +58,13 @@ export function s3BatchBody(batch: readonly AuditExportRecord[]): string {
   return batch.map(record => `${canonicalJson(record)}\n`).join('');
 }
 
-export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: Vault; now: () => Date }): ExportSink {
+export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: Vault; now: () => Date; sourceId?: string; logId?: string }): ExportSink {
   let credentials: AwsCredentials | undefined;
   let conditional = true;
+  const identity = (): S3LogIdentity => {
+    if (!deps.logId) throw new AuditExportError('The audit log has no usable identity, so it cannot be stored.', false);
+    return { source: deps.sourceId ?? 'keysentry', log: deps.logId };
+  };
 
   async function load(): Promise<AwsCredentials> {
     if (credentials) return credentials;
@@ -77,7 +92,7 @@ export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: 
     const response = await sendRequest(deps.http, signed({ method: 'GET', url, headers: { 'x-amz-content-sha256': sha256('') } }, creds), RECEIVER);
     if (response.status === 200) {
       if (response.text === body) return;
-      throw new AuditExportError('An object with this batch\'s name already holds different records (another project, or an earlier copy of this log). Give each project its own S3 prefix.', false);
+      throw new AuditExportError('An object with this batch\'s name already holds different records. Nothing was overwritten. Check that no other writer uses this S3 prefix.', false);
     }
     if (response.status === 404) throw new AuditExportError('The storage service reported the object both present and missing; it will be sent again.', true);
     throw new AuditExportError('An object with this batch\'s name already exists, and keysentry could not read it to confirm it holds this batch. Give each project its own prefix, or allow s3:GetObject on it.', false);
@@ -87,7 +102,7 @@ export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: 
     target,
     destination: `S3 bucket ${target.bucket} at ${new URL(target.endpoint).host}, prefix "${target.prefix}"`,
     async deliver(batch) {
-      const key = s3ObjectKey(target.prefix, batch);
+      const key = s3ObjectKey(target.prefix, batch, identity());
       const url = s3ObjectUrl(target, key);
       const body = s3BatchBody(batch);
       const creds = await load();
@@ -99,8 +114,9 @@ export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: 
         if (response.status === 200) return warnings.length ? { warnings } : {};
         if (response.status === 412 && conditional) { await confirmExisting(url, body, creds); return {}; }
         if (response.status === 501 && conditional) {
-          // The service rejects conditional writes. Object names are fixed by sequence numbers and the log is
-          // append-only, so a resent batch can only rewrite an object with identical records. Say so.
+          // The service rejects conditional writes. Object names are fixed by the source, the log identity and the
+          // sequence numbers, and the log is append-only, so a resent batch can only rewrite an object with identical
+          // records, never another log's (review M2). Say so.
           conditional = false;
           warnings.push('This storage service does not support conditional writes (If-None-Match), so a resent batch may rewrite its object with identical records.');
           continue;
@@ -109,7 +125,7 @@ export function createS3Sink(target: S3Target, deps: { http: HttpClient; vault: 
       }
     },
     preview(batch) {
-      const key = s3ObjectKey(target.prefix, batch);
+      const key = s3ObjectKey(target.prefix, batch, identity());
       return { location: `${target.bucket}/${key}`, bytes: Buffer.byteLength(s3BatchBody(batch)) };
     },
     dispose() { credentials = undefined; },

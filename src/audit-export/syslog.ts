@@ -81,8 +81,11 @@ export function frameSyslogMessage(message: string): Buffer {
 
 export interface SyslogConnection {
   write(data: Buffer): Promise<void>;
-  /** Ends the TLS session cleanly; resolves once every byte was flushed and the session closed. */
-  close(): Promise<void>;
+  /**
+   * Ends the TLS session cleanly; resolves once every byte was flushed. `confirmed: false` means the server did not close
+   * its side in time, so only the local flush is known (review L8). Nothing (undefined) counts as confirmed.
+   */
+  close(): Promise<void | { confirmed: boolean }>;
   destroy(): void;
 }
 
@@ -100,6 +103,7 @@ export function defaultCaCertificates(): string[] {
 const CONNECT_FAILED = 'Could not connect to the syslog server over TLS.';
 const CERTIFICATE_FAILED = 'The syslog server certificate could not be verified. Check the server name and network.caFile.';
 const SEND_FAILED = 'The syslog connection closed before every record was sent.';
+const UNCONFIRMED = 'The syslog server did not close the connection after the batch, so keysentry knows only that every record left this computer. Check that the server received it.';
 
 function certificateError(error: unknown): boolean {
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code: unknown }).code) : '';
@@ -112,8 +116,13 @@ export function createTlsSyslogConnector(opts: {
   /** Extra PEM certificates (network.caFile), trusted in addition to the defaults, never instead of them. */
   ca?: readonly string[];
   receipt?: NetworkReceipt;
-  /** True when a configured proxy applies to the host: a direct connection is then refused, not made silently. */
-  proxied?: (host: string) => boolean;
+  /** True when a configured proxy applies to host:port: a direct connection is then refused, not made silently. */
+  proxied?: (host: string, port: number) => boolean;
+  /**
+   * The fixed reason the network settings cannot be used (a broken proxy, CA or policy setting). Every connection is
+   * then refused, as the HTTPS transport refuses every request.
+   */
+  unavailable?: string | null;
   timeoutMs?: number;
   now?: () => Date;
   /** Test seam over `tls.connect`. */
@@ -136,7 +145,10 @@ export function createTlsSyslogConnector(opts: {
         await record({ host: label, method: 'SYSLOG', purpose: 'not on the allowed list', allowed: false });
         throw new AuditExportError('Blocked a syslog connection: that host and port are not an audit export target in keysentry.yaml.', false);
       }
-      if (opts.proxied?.(name)) {
+      if (opts.unavailable) {
+        throw new AuditExportError(`Syslog export was not attempted because the network settings cannot be used: ${opts.unavailable}`, false);
+      }
+      if (opts.proxied?.(name, port)) {
         throw new AuditExportError(`A proxy is configured for ${name}, and syslog export connects directly. Add ${name} to network.noProxy to allow a direct TLS connection, or export through OTLP or a webhook.`, false);
       }
       await record({ host: label, method: 'SYSLOG', purpose: 'audit export you configured', allowed: true });
@@ -170,18 +182,19 @@ export function createTlsSyslogConnector(opts: {
           });
         },
         close() {
-          return new Promise<void>((resolve, reject) => {
+          return new Promise<{ confirmed: boolean }>((resolve, reject) => {
             if (failure || socket.destroyed) { reject(failure ?? new AuditExportError(SEND_FAILED, true)); return; }
             let finished = false;
             const timer = setTimeout(() => {
               socket.destroy();
-              // The server kept its side open: every byte was flushed, so the batch counts as sent.
-              if (finished && !failure) resolve(); else reject(failure ?? new AuditExportError(SEND_FAILED, true));
+              // The server kept its side open. Every byte left this computer, but RFC 5425 has no acknowledgement and
+              // the server did not close the session either, so delivery is reported as unconfirmed (review L8).
+              if (finished && !failure) resolve({ confirmed: false }); else reject(failure ?? new AuditExportError(SEND_FAILED, true));
             }, Math.min(timeoutMs, 5_000));
             socket.once('finish', () => { finished = true; });
             socket.once('close', () => {
               clearTimeout(timer);
-              if (finished && !failure) resolve(); else reject(failure ?? new AuditExportError(SEND_FAILED, true));
+              if (finished && !failure) resolve({ confirmed: true }); else reject(failure ?? new AuditExportError(SEND_FAILED, true));
             });
             socket.end();
           });
@@ -202,14 +215,15 @@ export function createSyslogSink(target: SyslogTarget, deps: { connector: Syslog
     async deliver(batch) {
       const frames = encode(batch);
       const connection = await deps.connector.connect({ host: target.host, port: target.port });
+      let closed: void | { confirmed: boolean };
       try {
         await connection.write(frames);
-        await connection.close();
+        closed = await connection.close();
       } catch (error) {
         connection.destroy();
         throw error instanceof AuditExportError ? error : new AuditExportError(SEND_FAILED, true);
       }
-      return {};
+      return closed && closed.confirmed === false ? { warnings: [UNCONFIRMED] } : {};
     },
     preview: batch => ({ location: `${target.host}:${target.port}`, bytes: encode(batch).length }),
     dispose() {},

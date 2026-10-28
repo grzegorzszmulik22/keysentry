@@ -7,6 +7,7 @@ import type { AutopilotDeps, AutopilotState, PendingAutopilotAction } from '../a
 import { filterNewItems, type IncidentsState } from '../autopilot/incidents.js';
 import { ApprovalError, createApprovalServer, createApprovalService, createRelay, verifyDisarm } from '../approvals/index.js';
 import type { ApprovalQuorum, SignedDeviceApproval, SignedDisarm } from '../approvals/index.js';
+import type { ServerHealth } from '../approvals/server.js';
 import { checkArmedPlan, narrowRotationOptions, type TeamBundle } from '../policy/index.js';
 import { createRoutedDispatcher, teamDeviceKeys, teamPasskeys } from '../team/index.js';
 import { bundleQuorum, bundleRules } from './team-governance.js';
@@ -53,8 +54,14 @@ export interface WatchRuntimeDependencies {
   saveRotationReport?: (report: RotationReport) => Promise<void>;
   /** Re-evaluated at each automatic-action boundary, including sealed/container execution. */
   integrityCheck?: () => Promise<{ ok: boolean; reasons: string[] }>;
-  /** Runs after every watcher cycle (audit export). Failures are logged with fixed text and never stop the watcher. */
+  /**
+   * Runs after every watcher cycle (audit export). It runs beside the loop, at most one at a time, so a slow or hung
+   * target never delays the next cycle (review L10); a cycle that ends while it still runs skips it. Failures are logged
+   * with fixed text and never stop the watcher. Stopping waits for a run in progress.
+   */
   afterCycle?: () => Promise<void>;
+  /** Health for the approval server's /healthz (a refusing network transport, offline mode). */
+  health?: () => ServerHealth;
   /**
    * Phase 5 team governance: the verified roster and policy (sealed config, or this computer's applied ones). The
    * roster routes notifications and lists members' passkeys and device keys; the policy narrows rotation options,
@@ -489,7 +496,7 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
         deviceKeys: deps.deviceKeys, rpId: new URL(approvalOrigin).hostname, origins: [approvalOrigin], now, mode: actions ? 'actions' : 'interactive',
         ...(quorum ? { quorum } : {}) });
       const server = createApprovalServer({ service, port, host: deps.publicOrigin ? '0.0.0.0' : '127.0.0.1', publicOrigin: approvalOrigin, disarm,
-        watcherCheckMinutes, trustProxyHops: approvalProxyHops(deps.publicOrigin, env) });
+        watcherCheckMinutes, trustProxyHops: approvalProxyHops(deps.publicOrigin, env), ...(deps.health ? { health: deps.health } : {}) });
       await server.listen(); return server;
     },
   };
@@ -498,12 +505,16 @@ export async function createWatchRuntime(deps: WatchRuntimeDependencies) {
 export async function runWatch(deps: WatchRuntimeDependencies, options: { once?: boolean; port?: number; signal?: AbortSignal } = {}): Promise<number> {
   if (!deps.sealed) deps.assertHuman('run the watcher');
   const watcher = await createWatchRuntime(deps);
+  let afterCycleRun: Promise<void> | null = null;
+  const startAfterCycle = (after: () => Promise<void>) => {
+    if (afterCycleRun) return;
+    afterCycleRun = after()
+      .catch(() => { deps.log.warn('Audit export did not finish after this cycle. Run keysentry audit export status.'); })
+      .finally(() => { afterCycleRun = null; });
+  };
   const tick: typeof watcher.tick = async (...args) => {
     const result = await watcher.tick(...args);
-    if (deps.afterCycle) {
-      try { await deps.afterCycle(); }
-      catch { deps.log.warn('Audit export did not finish after this cycle. Run keysentry audit export status.'); }
-    }
+    if (deps.afterCycle) startAfterCycle(deps.afterCycle);
     return result;
   };
   const controller = new AbortController();
@@ -516,6 +527,7 @@ export async function runWatch(deps: WatchRuntimeDependencies, options: { once?:
     await runWatcherLoop({ tick, intervalMs: (deps.intervalSeconds ?? 300) * 1000, signal: options.signal ?? controller.signal, sleep: deps.sleep });
     return 0;
   } finally {
+    await afterCycleRun;
     await server?.close(); await deps.audit.checkpoint();
     if (!options.signal) { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
   }

@@ -1,11 +1,18 @@
 import { createFetchHttp } from '../http.js';
 import { resolveFeedMode, type FeedMode } from '../feeds/index.js';
 import {
-  CaBundleError, TransportConfigError, createNodeTransport, createUnavailableTransport, loadCaBundle, resolveProxySettings,
+  CaBundleError, TransportConfigError, createNodeTransport, createUnavailableTransport, loadCaBundle, parseCaBundle, resolveProxySettings,
   summarizeNetwork, type CaBundle, type NetworkSummary, type ResolvedProxy,
 } from '../net/transport.js';
 import type { HttpClient, Redactor, TeamPolicy, Vault } from '../types.js';
 import type { ConfigSettings } from './config.js';
+
+/**
+ * The certificates from `network.caFile`, carried in a deployed watcher's encrypted vault by `watcher setup` (PEM text,
+ * not a path: the path names a file on the computer that ran setup). When the vault holds it, it is used instead of
+ * reading `network.caFile` from disk. A workstation's own vault never holds this entry.
+ */
+export const DEPLOYMENT_CA_VAULT_NAME = 'deployment/network/ca-bundle';
 
 export interface RuntimeNetwork {
   feedMode: FeedMode;
@@ -18,6 +25,16 @@ export interface RuntimeNetwork {
   transport: HttpClient;
   /** The fixed-text reason requests are refused, or null. */
   problem: Error | null;
+  /** The extra trusted certificates (PEM), for connections that do not use `transport` (syslog over TLS). */
+  ca: string[] | null;
+}
+
+async function readCa(caFile: string, cwd: string, vault?: Pick<Vault, 'get'>): Promise<CaBundle> {
+  const carried = await vault?.get(DEPLOYMENT_CA_VAULT_NAME);
+  if (carried) {
+    try { return parseCaBundle(carried, caFile); } finally { carried.fill(0); }
+  }
+  return loadCaBundle(caFile, { cwd });
 }
 
 /**
@@ -50,7 +67,7 @@ export async function setupNetwork(input: {
   }
   let ca: CaBundle | { path: string; error: string } | null = null;
   if (settings.caFile) {
-    try { ca = await loadCaBundle(settings.caFile, { cwd: input.cwd }); }
+    try { ca = await readCa(settings.caFile, input.cwd, input.vault); }
     catch (error) {
       if (!(error instanceof CaBundleError)) throw error;
       ca = { path: settings.caFile, error: error.message };
@@ -61,12 +78,13 @@ export async function setupNetwork(input: {
   if (!problem && requireProxy && !proxy?.settings) {
     problem = new TransportConfigError('The team policy requires a proxy, but none is configured. Set network.proxy in keysentry.yaml or HTTPS_PROXY.');
   }
-  const summary = summarizeNetwork({ proxy, requireProxy, ca, feeds: feedMode });
-  // Fail closed: a broken proxy/CA/policy setting refuses every request instead of silently going direct.
+  const summary = summarizeNetwork({ proxy, requireProxy, ca, feeds: feedMode, env: input.env });
+  // Fail closed: a broken proxy/CA/policy setting refuses every request instead of silently going direct. Node's fetch
+  // honours NODE_TLS_REJECT_UNAUTHORIZED=0; keysentry's own transport pins certificate checks, so it is used then.
   const transport = input.injected ?? (problem ? createUnavailableTransport(problem)
-    : proxy?.settings || bundle || requireProxy
+    : proxy?.settings || bundle || requireProxy || summary.nodeTrust?.tlsChecksOff
       ? createNodeTransport({ ...(proxy?.settings ? { proxy: proxy.settings } : {}), ...(proxy ? { noProxy: proxy.noProxy } : {}),
         ...(bundle ? { ca: bundle.pems } : {}), requireProxy })
       : createFetchHttp());
-  return { feedMode, summary, transport, problem };
+  return { feedMode, summary, transport, problem, ca: bundle ? [...bundle.pems] : null };
 }

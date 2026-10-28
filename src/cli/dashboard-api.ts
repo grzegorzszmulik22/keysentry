@@ -1,3 +1,4 @@
+import { networkStatusLines } from '../net/transport.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -135,7 +136,9 @@ export function createDashboardApi(runtime: KeysentryRuntime): DashboardApi {
     return { platforms };
   });
   read('access', async () => ({ items: (await runtime.doctor()).items }));
-  read('network', async () => ({ allowed: runtime.rules.map(rule => ({ host: rule.host, purpose: rule.purpose, source: describeRuleSource(rule) })), receipt: await runtime.receipt.summarize() }));
+  // `status`: the proxy, CA and offline-mode lines `keysentry network` prints (review L9: offline mode visible here too).
+  read('network', async () => ({ allowed: runtime.rules.map(rule => ({ host: rule.host, purpose: rule.purpose, source: describeRuleSource(rule) })), receipt: await runtime.receipt.summarize(),
+    status: networkStatusLines(runtime.network.summary), feeds: runtime.network.feedMode.offline ? 'offline' : 'polled' }));
   read('rotations', async () => {
     const entries = await runtime.store.journal().read();
     const inv = await runtime.inventory(); const active = [];

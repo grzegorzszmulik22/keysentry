@@ -7,7 +7,8 @@ import type { KmsProviderId } from '../types.js';
  */
 export type KmsFailure =
   | 'config' | 'credentials' | 'blocked' | 'unreachable' | 'unavailable' | 'denied' | 'key-unavailable'
-  | 'unsupported' | 'rejected' | 'invalid-response' | 'damaged' | 'wrong-key' | 'mismatch' | 'not-wrapped' | 'read-only';
+  | 'unsupported' | 'rejected' | 'invalid-response' | 'damaged' | 'wrong-key' | 'mismatch' | 'not-wrapped' | 'read-only'
+  | 'network' | 'busy';
 
 /** Extends CliError so its fixed message crosses the CLI error boundary unchanged. */
 export class KmsError extends CliError {
@@ -26,6 +27,14 @@ export const PROVIDER_LABELS: Readonly<Record<KmsProviderId, string>> = Object.f
 
 export function unreachable(provider: KmsProviderId): KmsError {
   return new KmsError('unreachable', `Could not reach ${PROVIDER_LABELS[provider]}. Check the connection and any proxy settings.`);
+}
+
+/**
+ * The proxy, CA or team-policy network settings refuse every request (a fail-closed transport), so the KMS was never
+ * contacted. `reason` is the transport's own fixed message, which names the setting and never its value.
+ */
+export function networkRefused(provider: KmsProviderId, reason: string): KmsError {
+  return new KmsError('network', `${PROVIDER_LABELS[provider]} was not contacted because the network settings cannot be used: ${reason}`);
 }
 
 export function blocked(provider: KmsProviderId): KmsError {

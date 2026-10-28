@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { KeyWrapper, KmsProviderId, Logger, Vault } from '../types.js';
 import { stateKey as plainStateKey, VaultLockedError, VaultReadOnlyError } from '../vault/index.js';
 import { KmsError, PROVIDER_LABELS } from './errors.js';
+import { withStateKeyLock } from './lock.js';
 import { decodeBase64 } from './shared.js';
 import { wrappedKeyVersion } from './wrapper.js';
 
@@ -129,6 +130,38 @@ export interface LoadStateKeyOptions {
   envWrapped?: string;
   log?: Pick<Logger, 'warn'>;
   now?: () => Date;
+  /**
+   * Lock file in the project's state directory (`.keysentry/state-key.lock`). Creating a new project's first wrapped
+   * key holds it, so two processes that start together (for example `ui` and `watch`) end with one key. Without it,
+   * only starts in this process are serialized.
+   */
+  lockPath?: string;
+}
+
+/** The key an existing wrapped or plain copy gives, or null when neither exists. */
+async function existingStateKey(options: LoadStateKeyOptions & { wrapper: KeyWrapper }): Promise<Buffer | null> {
+  const { vault, projectId, wrapper } = options;
+  const record = await readRecord(vault, projectId, options.envWrapped);
+  const plain = await vault.get(plainStateKeyName(projectId));
+  try {
+    if (record) {
+      const key = await unwrapStateKey(wrapper, record, projectId);
+      if (plain) {
+        if (!sameKey(plain, key)) {
+          key.fill(0);
+          throw new KmsError('mismatch', 'The wrapped state key and the plain state key in the vault are different keys. Run "keysentry kms status", then restore the vault entry that matches your saved state.');
+        }
+        options.log?.warn('The state key is wrapped, but its plain copy is still in the vault. Run "keysentry kms migrate" to finish removing it.');
+      }
+      return key;
+    }
+    if (plain) {
+      if (plain.length !== 32) throw new VaultLockedError('A saved vault key has an unexpected length. Restore the matching vault key before continuing.');
+      options.log?.warn('keysentry.yaml names a KMS key, but this project\'s state key is not wrapped yet. Run "keysentry kms migrate" to wrap it.');
+      return Buffer.from(plain);
+    }
+    return null;
+  } finally { plain?.fill(0); }
 }
 
 /**
@@ -150,40 +183,29 @@ export async function loadProjectStateKey(options: LoadStateKeyOptions): Promise
     }
     return plainStateKey(vault, projectId);
   }
-  let record: WrappedStateKey | null;
-  let plain: Buffer | null = null;
+  const withWrapper = { ...options, wrapper };
   try {
-    record = await readRecord(vault, projectId, options.envWrapped);
-    plain = await vault.get(plainStateKeyName(projectId));
-    if (record) {
-      const key = await unwrapStateKey(wrapper, record, projectId);
-      if (plain) {
-        if (!sameKey(plain, key)) {
-          key.fill(0);
-          throw new KmsError('mismatch', 'The wrapped state key and the plain state key in the vault are different keys. Run "keysentry kms status", then restore the vault entry that matches your saved state.');
-        }
-        options.log?.warn('The state key is wrapped, but its plain copy is still in the vault. Run "keysentry kms migrate" to finish removing it.');
-      }
-      return key;
-    }
-    if (plain) {
-      if (plain.length !== 32) throw new VaultLockedError('A saved vault key has an unexpected length. Restore the matching vault key before continuing.');
-      options.log?.warn('keysentry.yaml names a KMS key, but this project\'s state key is not wrapped yet. Run "keysentry kms migrate" to wrap it.');
-      return Buffer.from(plain);
-    }
+    const existing = await existingStateKey(withWrapper);
+    if (existing) return existing;
     // Neither copy exists: a new project. Its first state key is created wrapped and is never stored in plain.
     if (vault.backend === 'env') {
       throw new KmsError('read-only', 'The environment vault cannot save a new wrapped state key. Set KEYSENTRY_STATE_KEY_WRAPPED (or KEYSENTRY_STATE_KEY) to the value from watcher setup.');
     }
-    const key = randomBytes(32);
-    try {
-      const created = await wrapStateKey(wrapper, key, projectId, options.now);
-      await writeVerified(vault, wrapper, projectId, created, key);
-      return key;
-    } catch (error) { key.fill(0); throw error; }
+    // Creation is serialized (review M1): a start that waited here re-reads and uses the key the first one saved,
+    // instead of saving its own over it while the first process already encrypts state with the first key.
+    return await withStateKeyLock({ key: `state-key:${projectId}`, ...(options.lockPath ? { lockPath: options.lockPath } : {}) }, async () => {
+      const saved = await existingStateKey(withWrapper);
+      if (saved) return saved;
+      const key = randomBytes(32);
+      try {
+        const created = await wrapStateKey(wrapper, key, projectId, options.now);
+        await writeVerified(vault, wrapper, projectId, created, key);
+        return key;
+      } catch (error) { key.fill(0); throw error; }
+    });
   } catch (error) {
     throw keptLocked(error);
-  } finally { plain?.fill(0); }
+  }
 }
 
 export type MigrationPoint = 'wrapped-saved' | 'plain-deleted';

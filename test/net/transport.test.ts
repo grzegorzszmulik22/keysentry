@@ -11,7 +11,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import {
   bypassesProxy, CaBundleError, createNodeTransport, createUnavailableTransport, loadCaBundle, networkStatusLines,
   parseCaBundle, parseNoProxy, PROXY_AUTH_VAULT_NAME, resolveProxySettings, summarizeNetwork, TransportConfigError,
-  TransportError, trustedCertificates,
+  TransportError, trustedCertificates, usesProxy,
 } from '../../src/net/transport.js';
 import { offlineEgressRules, offlineNotice, resolveFeedMode, selectFeedSources } from '../../src/feeds/offline.js';
 import { fetchFeed } from '../../src/feeds/index.js';
@@ -623,9 +623,33 @@ describe('doctor and status reporting', () => {
       'Offline mode is on (required by the signed team policy): breach feeds and security news are not contacted.',
       'Requests go through the proxy at http://proxy.corp.test:3128 (from HTTPS_PROXY).',
       'Direct connections, without the proxy: localhost.',
-      '2 extra certificates are trusted in addition to the system roots.',
+      '2 extra certificates are trusted in addition to Node\'s default roots.',
     ]);
     expect(lines.join('\n')).not.toContain('p-123456');
     expect(networkStatusLines(summarizeNetwork({ proxy: null, feeds: { offline: false, source: null } }))).toEqual([]);
+  });
+
+  test('describes what Node itself trusts, and flags certificate checks turned off (review L7)', () => {
+    const none = networkDoctorItems(summarizeNetwork({ proxy: null, feeds: { offline: false, source: null }, env: {} }));
+    expect(none.find(item => item.title === 'Certificate authorities')!.detail)
+      .toBe('keysentry trusts Node\'s bundled roots; no network.caFile is configured. The operating system\'s certificate store is used only when Node runs with --use-system-ca.');
+    const env = { NODE_EXTRA_CA_CERTS: '/etc/corp.pem', NODE_OPTIONS: '--use-system-ca', NODE_TLS_REJECT_UNAUTHORIZED: '0' };
+    const summary = summarizeNetwork({ proxy: null, feeds: { offline: false, source: null }, env });
+    expect(summary.nodeTrust).toEqual({ extraCaCerts: true, systemCa: true, tlsChecksOff: true });
+    const items = networkDoctorItems(summary);
+    expect(items.find(item => item.title === 'Certificate authorities')!.detail).toContain('the certificates in NODE_EXTRA_CA_CERTS and the operating system');
+    expect(items.find(item => item.title === 'Certificate checks turned off')).toMatchObject({ status: 'warn' });
+    expect(networkStatusLines(summary)).toContain('NODE_TLS_REJECT_UNAUTHORIZED=0 is set; keysentry\'s own connections ignore it and still check certificates.');
+  });
+
+  test('usesProxy makes the transport\'s own decision for connections that cannot be tunnelled (review L1)', () => {
+    const env = { HTTPS_PROXY: '', https_proxy: 'http://proxy.corp.test:3128', NO_PROXY: 'corp.test,.internal.test,logs.corp.test:6514' };
+    expect(usesProxy('corp.test', 443, { env })).toBe(false);
+    expect(usesProxy('logs.corp.test', 443, { env })).toBe(true); // a bare entry is one exact host
+    expect(usesProxy('logs.corp.test', 6514, { env })).toBe(false);
+    expect(usesProxy('a.internal.test', 443, { env })).toBe(false);
+    expect(usesProxy('corp.test', 443, { env, requireProxy: true })).toBe(true);
+    expect(usesProxy('corp.test', 443, { env: {} })).toBe(false);
+    expect(usesProxy('corp.test', 443, { env: {}, configProxy: 'http://proxy.corp.test:3128' })).toBe(true);
   });
 });

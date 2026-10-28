@@ -9,6 +9,7 @@ import { createNotificationChannels, registerNotificationCommands } from './noti
 import { saveNotificationSettings, saveNotificationRelay } from './config.js';
 import { createPasskeyLauncher, createPasskeyManager, listPasskeys, openPasskeyBrowser } from './passkeys.js';
 import { buildWatcherSetupConfig, createWatchRuntime, runWatch, setupWatcher, watcherStatus, type WatcherPlatform } from './watcher.js';
+import { WATCHER_NETWORK_PROBLEM } from './watcher-setup.js';
 import { createWatcherStateStore } from './watcher-state.js';
 import { prepareWatcherDeployment } from './watcher-bootstrap.js';
 import { promptVaultValue, type PromptIO } from './prompts.js';
@@ -216,6 +217,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
           wrapper: createKeyWrapper(kms, { http: createKmsHttp(rt.network.transport, kms, { receipt: rt.receipt, log: rt.log }),
             credentials: rt.credentials, now: rt.now }) }) } : {}),
         prepareDeployment: secrets => prepareWatcherDeployment({ sourceVault: rt.vault, credentials: rt.credentials, settings: rt.config.settings, outputDir,
+          // network.caFile is relative to the project; its certificates and the proxy credential travel with the deployment.
+          cwd: rt.config.cwd, env: opts.env,
           confirmEnvironmentCredential: async name => {
             opts.diagnostic(`Copy ${name} from your environment into the hosted watcher? [y/N]`);
             const answer = await promptVaultValue(`y to copy ${name}`, opts.diagnostic, opts.promptIO);
@@ -227,7 +230,9 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
   watcher.command('status <url>').action(async url => {
     const rt = await opts.getRuntime();
     const http = rt.httpForUrls([url], 'watcher status you requested');
-    opts.emit(await watcherStatus(http, url, BUILD_VERSION));
+    const status = await watcherStatus(http, url, BUILD_VERSION);
+    opts.emit(status, [`The watcher is healthy (version ${status.version}${status.versionMatches ? ', the same as this computer' : `; this computer runs ${status.localVersion}`}).`,
+      ...(status.feeds === 'offline' ? ['Offline mode is on in the watcher: it does not poll breach feeds or security news.'] : [])].join('\n'));
   });
   program.command('watch').description('Run the armed watcher with local or sealed deployment state')
     .option('--once', 'Poll once and settle eligible waves').option('--port <n>', 'Serve approval pages on this port', number)
@@ -258,6 +263,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
         ...sealed?.sources.extra ?? []], rt.network.feedMode);
       const offline = offlineNotice(rt.network.feedMode);
       if (offline) rt.log.info(offline);
+      // A refusing transport (broken proxy or CA settings) makes every request fail: say so once, and in /healthz.
+      if (rt.network.problem) rt.log.error(`${WATCHER_NETWORK_PROBLEM} ${rt.network.problem}`);
       opts.setExit(await runWatch({ store: watchStore, audit: rt.audit, http: rt.http, log: rt.log, rotation: rt.config.rotation, projectId: rt.projectId,
         saveRotationReport: rt.saveRotationReport,
         signingKey: rt.signingKey, fingerprintKey: rt.fingerprintKey, deviceKeys: publicKeys,
@@ -283,6 +290,8 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
             if (target.status === 'failed' || target.status === 'refused') rt.log.warn(`Audit export to ${target.id} did not complete: ${target.error ?? 'delivery failed'}`);
           }
         },
+        health: () => ({ problem: rt.network.problem ? { code: 'network' as const, reason: WATCHER_NETWORK_PROBLEM } : null,
+          feedsOffline: rt.network.feedMode.offline }),
         // Team mode: the sealed roster and policy, or this computer's (whose quorum re-reads the saved roster each time).
         ...(sealed ? { team: sealed.team ?? null } : { team: governanceBundle(rt.governance), quorum: rt.teamQuorum() }),
       }, { ...options, ...(opts.signal ? { signal: opts.signal } : {}) }));
