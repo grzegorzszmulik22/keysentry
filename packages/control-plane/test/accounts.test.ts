@@ -242,3 +242,47 @@ describe('H1: box reservations', () => {
     await expect(accounts.reserveBox(ctx.account.id, 'box-three')).rejects.toMatchObject({ status: 403 });
   });
 });
+
+describe('web page sign-in and overview', () => {
+  test('registration uses the user handle the challenge announced as the account id', async () => {
+    const ctx = setup(); const auth = authenticator();
+    const challenge = ctx.accounts.registrationChallenge();
+    expect(challenge.userId).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const result = await ctx.accounts.register({ challengeId: challenge.id, ...auth.registration(challenge.challenge) });
+    expect(result.account.id).toMatch(/^[a-f0-9]{64}$/);
+    expect(Buffer.from(challenge.userId, 'base64url').toString('hex')).toBe(result.account.id);
+  });
+  test('a discoverable passkey signs in without an account id; the credential names the account', async () => {
+    const ctx = await signup(); await signup(ctx);
+    const challenge = await ctx.accounts.assertionChallenge(undefined, '203.0.113.9');
+    expect(challenge).not.toHaveProperty('credentialId');
+    const signed = await ctx.accounts.signIn({ challengeId: challenge.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(challenge.challenge) });
+    expect(signed.account.id).toBe(ctx.account.id);
+    expect((await ctx.accounts.authenticate(signed.cookie))?.accountId).toBe(ctx.account.id);
+  });
+  test('a discoverable sign-in refuses an unknown credential, a wrong key and a challenge bound to another mode', async () => {
+    const ctx = await signup(); const stranger = authenticator();
+    let challenge = await ctx.accounts.assertionChallenge(undefined);
+    await expect(ctx.accounts.signIn({ challengeId: challenge.id, credentialId: stranger.id, ...stranger.assertion(challenge.challenge) })).rejects.toThrow('Account request could not be verified.');
+    challenge = await ctx.accounts.assertionChallenge(undefined);
+    await expect(ctx.accounts.signIn({ challengeId: challenge.id, credentialId: ctx.auth.id, ...stranger.assertion(challenge.challenge) })).rejects.toThrow();
+    // A discoverable challenge cannot finish an account-bound sign-in, and the reverse.
+    challenge = await ctx.accounts.assertionChallenge(undefined);
+    await expect(ctx.accounts.signIn({ accountId: ctx.account.id, challengeId: challenge.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(challenge.challenge, 2) })).rejects.toThrow();
+    const bound = await ctx.accounts.assertionChallenge(ctx.account.id);
+    await expect(ctx.accounts.signIn({ challengeId: bound.id, credentialId: ctx.auth.id, ...ctx.auth.assertion(bound.challenge, 3) })).rejects.toThrow();
+    expect(await ctx.storage.list('sessions/')).toHaveLength(1);
+  });
+  test('the overview shows the plan, the quota and the boxes with their state, and nothing about billing', async () => {
+    const ctx = await signup();
+    expect(await ctx.accounts.overview(ctx.account.id)).toEqual({ accountId: ctx.account.id, plan: 'free', boxes: [], boxQuota: 1 });
+    await ctx.accounts.setPlan(ctx.account.id, 'paid', { customerId: 'cus_one', subscriptionId: 'sub_one' });
+    await ctx.accounts.reserveBox(ctx.account.id, 'box-one');
+    const overview = await ctx.accounts.overview(ctx.account.id);
+    expect(overview).toEqual({ accountId: ctx.account.id, plan: 'paid', boxes: [{ name: 'box-one', state: 'pending' }], boxQuota: 1 });
+    expect(JSON.stringify(overview)).not.toMatch(/cus_|sub_/);
+    await ctx.accounts.confirmBox(ctx.account.id, 'box-one');
+    expect((await ctx.accounts.overview(ctx.account.id)).boxes).toEqual([{ name: 'box-one', state: 'active' }]);
+    await expect(ctx.accounts.overview('missing-account')).rejects.toThrow('Account request could not be verified.');
+  });
+});

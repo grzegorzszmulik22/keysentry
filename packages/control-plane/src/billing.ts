@@ -13,8 +13,9 @@ export interface BillingOptions {
   /** The one Stripe price that buys the paid plan (`price_...`). */
   priceId: string;
   /**
-   * Stripe API access used to confirm a completed checkout's subscription (status and price) before granting the
-   * plan. `apiKey` should be a restricted key that can only read subscriptions; it never appears in errors or logs.
+   * Stripe API access: creating Checkout Sessions for the web page and confirming a completed checkout's
+   * subscription (status and price) before granting the plan. `apiKey` should be a restricted key with Checkout
+   * Sessions write and Subscriptions read only; it never appears in errors or logs.
    */
   stripe: { http: HttpClient; apiKey: string };
   now?: () => number;
@@ -25,6 +26,34 @@ export class BillingUnavailableError extends Error {
   constructor() { super('Billing could not be confirmed. Stripe will retry.'); this.name = 'BillingUnavailableError'; }
 }
 interface SubscriptionRef { accountId: string; eventCreated?: number }
+
+const CHECKOUT_TEXT = {
+  403: 'Sign in again to start checkout.',
+  409: 'This account already has the paid plan.',
+  502: 'Checkout could not be started.',
+  503: 'Billing is temporarily unavailable.',
+} as const;
+/** Checkout creation refused or failed. Fixed text only: Stripe's own error body is never passed on. */
+export class CheckoutError extends Error {
+  constructor(readonly status: keyof typeof CHECKOUT_TEXT) { super(CHECKOUT_TEXT[status]); this.name = 'CheckoutError'; }
+}
+const STRIPE_CHECKOUT_HOST = 'checkout.stripe.com';
+/** The hosted Checkout page Stripe returns; anything else is refused rather than sent to the browser. */
+export function isStripeCheckoutUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 4096) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === STRIPE_CHECKOUT_HOST && url.port === '' && !url.username && !url.password;
+  } catch { return false; }
+}
+function returnOrigin(value: unknown): string {
+  try {
+    const url = new URL(value as string);
+    const loopback = url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+    if (url.origin !== value || (url.protocol !== 'https:' && !loopback)) throw new Error();
+    return url.origin;
+  } catch { throw new TypeError('Invalid checkout return origin.'); }
+}
 
 function fail(): never { throw new Error('Billing webhook could not be verified.'); }
 function identifier(value: unknown): string | undefined { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined; }
@@ -142,6 +171,43 @@ export function createBilling(opts: BillingOptions) {
   }
 
   return {
+    /**
+     * Creates a Stripe Checkout Session in subscription mode for the configured price, with `client_reference_id`
+     * set to the account, and returns its hosted URL. The plan itself changes only through the verified webhook.
+     */
+    async checkout(input: { accountId: string; origin: string }): Promise<{ url: string }> {
+      const origin = returnOrigin(input?.origin);
+      const accountId = identifier(input?.accountId);
+      if (!accountId) throw new CheckoutError(403);
+      const account = await opts.accounts.get(accountId);
+      if (!account) throw new CheckoutError(403);
+      if (account.plan === 'paid') throw new CheckoutError(409);
+      const form = new URLSearchParams();
+      form.set('mode', 'subscription');
+      form.set('line_items[0][price]', opts.priceId);
+      form.set('line_items[0][quantity]', '1');
+      form.set('client_reference_id', accountId);
+      form.set('metadata[accountId]', accountId);
+      form.set('subscription_data[metadata][accountId]', accountId);
+      form.set('success_url', `${origin}/?checkout=done`);
+      form.set('cancel_url', `${origin}/?checkout=cancelled`);
+      // A returning customer keeps one Stripe customer record.
+      const customer = identifier(account.customerId);
+      if (customer?.startsWith('cus_')) form.set('customer', customer);
+      let response: Awaited<ReturnType<HttpClient['request']>>;
+      try {
+        response = await opts.stripe.http.request({ method: 'POST', url: 'https://api.stripe.com/v1/checkout/sessions', body: form.toString(),
+          headers: { authorization: `Bearer ${opts.stripe.apiKey}`, 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' } });
+      } catch { throw new CheckoutError(503); }
+      if (response.status === 429 || response.status >= 500) throw new CheckoutError(503);
+      if (response.status !== 200 || Buffer.byteLength(response.text) > 256 * 1024) throw new CheckoutError(502);
+      let session: Record<string, unknown> | null;
+      try { session = object(response.json<unknown>()); } catch { session = null; }
+      if (!session || session.mode !== 'subscription' || session.client_reference_id !== accountId || !isStripeCheckoutUrl(session.url)) {
+        throw new CheckoutError(502);
+      }
+      return { url: session.url };
+    },
     async handle(rawBody: Buffer, signatureHeader: string): Promise<{ received: true; applied: boolean; replayed: boolean }> {
       verifyStripeSignature(rawBody, signatureHeader, opts.endpointSecret, now());
       let event: Record<string, unknown> | null;

@@ -9,6 +9,8 @@ import { createMemoryStorage } from '../src/storage.js';
 import { encode } from '../../../test/approvals/webauthn/helpers.js';
 import type { HttpClient } from '../../../src/types.js';
 
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; "
+  + "frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 const servers: ReturnType<typeof createControlPlaneServer>[] = [];
 afterEach(async () => { await Promise.all(servers.splice(0).map(server => server.close())); });
 const deviceKey = generateKeyPairSync('ed25519').publicKey.export({format:'der',type:'spki'}).toString('base64');
@@ -113,11 +115,14 @@ describe('control plane HTTP server', () => {
     expect(response.status).toBe(200);
     expect(response.json()).toEqual({ok:true});
     expect(response.headers['content-type']).toMatch(/^application\/json/);
-    expect(response.headers['content-security-policy']).toBe("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    expect(response.headers['content-security-policy']).toBe(CSP);
     expect(response.headers['x-content-type-options']).toBe('nosniff');
     expect(response.headers['cache-control']).toBe('no-store');
     expect(response.headers['referrer-policy']).toBe('no-referrer');
-    expect(response.headers['permissions-policy']).toBe('publickey-credentials-get=(self)');
+    expect(response.headers['permissions-policy']).toBe('publickey-credentials-get=(self), publickey-credentials-create=(self)');
+    expect(response.headers['x-frame-options']).toBe('DENY');
+    // Cloud Run reserves some paths ending in z; /health is the hosted spelling.
+    expect((await call('/health')).json()).toEqual({ok:true});
   });
 
   it('requires an owner session to read boxes and enforces ownership', async () => {
@@ -421,5 +426,22 @@ describe('M5: boxes authenticate with an attestation token for the relay origin'
     expect((await call('/boxes/gamma/messages','GET',undefined,bearer(token('gamma')))).status).toBe(200);
     const plain = await setup();
     expect((await plain.call('/boxes/alpha/messages','GET',undefined,bearer(token('alpha')))).status).toBe(401);
+  });
+});
+
+describe('graceful shutdown', () => {
+  it('lets the deadline close a connection whose request never finishes', async () => {
+    const {server,origin} = await setup();
+    const url = new URL(origin);
+    const socket = connect(Number(url.port), '127.0.0.1');
+    await new Promise<void>(resolve => socket.once('connect', () => resolve()));
+    // A body that never arrives keeps the request open.
+    socket.write(`POST /billing/webhook HTTP/1.1\r\nHost: ${url.host}\r\nContent-Type: application/json\r\nStripe-Signature: t=1,v1=00\r\nContent-Length: 100\r\n\r\n{`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()));
+    const started = Date.now();
+    await server.close({deadlineMs: 100});
+    await closed;
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });

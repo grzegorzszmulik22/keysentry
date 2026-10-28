@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
-import { hostedConfigFromEnv } from '../../packages/control-plane/src/hosted.js';
+import { HOSTED_SETTINGS, hostedConfigFromEnv } from '../../packages/control-plane/src/hosted.js';
 
 const root = new URL('../../infra/terraform/', import.meta.url);
 const modules = ['box', 'byo-kms', 'control-plane'] as const;
@@ -199,22 +199,39 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(image).not.toMatch(/\bdefault\s*=/);
   });
 
-  test('control plane passes the hosted configuration, with Stripe credentials only by Secret Manager reference', () => {
-    const service = resource(source('control-plane'), 'google_cloud_run_v2_service');
+  test('control plane runs the image entry and passes the hosted configuration, with Stripe credentials only by Secret Manager reference', () => {
+    const tf = source('control-plane');
+    const service = resource(tf, 'google_cloud_run_v2_service');
+    // The same entry as Dockerfile.control-plane's ENTRYPOINT.
+    const entry = readFileSync(new URL('../../Dockerfile.control-plane', import.meta.url), 'utf8').match(/^ENTRYPOINT (\[.*\])$/m)![1]!;
+    const [command, ...args] = JSON.parse(entry) as string[];
+    expect(service).toMatch(new RegExp(`command\\s*=\\s*\\["${command}"\\]`));
+    expect(service).toMatch(new RegExp(`args\\s*=\\s*\\[${args.map(arg => `"${arg}"`).join(',\\s*')}\\]`));
     const names = [...service.matchAll(/name\s*=\s*"(KEYSENTRY_[A-Z_]+)"/g)].map(match => match[1]!).sort();
     expect(names).toEqual(['KEYSENTRY_BOX_ALLOWED_DIGESTS', 'KEYSENTRY_BOX_PROJECT_ID', 'KEYSENTRY_BOX_SERVICE_ACCOUNT', 'KEYSENTRY_CONTROL_BUCKET',
-      'KEYSENTRY_CONTROL_ORIGIN', 'KEYSENTRY_STRIPE_API_KEY', 'KEYSENTRY_STRIPE_PRICE_ID', 'KEYSENTRY_STRIPE_WEBHOOK_SECRET', 'KEYSENTRY_TRUSTED_PROXY_HOPS']);
+      'KEYSENTRY_CONTROL_ORIGIN', 'KEYSENTRY_STRIPE_API_KEY_REF', 'KEYSENTRY_STRIPE_PRICE_ID', 'KEYSENTRY_STRIPE_WEBHOOK_SECRET_REF', 'KEYSENTRY_TRUSTED_PROXY_HOPS']);
     expect(service).toMatch(/name\s*=\s*"KEYSENTRY_CONTROL_BUCKET"\s*value\s*=\s*google_storage_bucket\.ciphertext\.name/);
-    for (const [name, variable] of [['KEYSENTRY_STRIPE_WEBHOOK_SECRET', 'stripe_webhook_secret_id'], ['KEYSENTRY_STRIPE_API_KEY', 'stripe_api_key_secret_id']]) {
-      expect(service).toMatch(new RegExp(`name\\s*=\\s*"${name}"\\s*value_source\\s*\\{\\s*secret_key_ref\\s*\\{\\s*secret\\s*=\\s*var\\.${variable}`));
-    }
-    expect(service).not.toMatch(/whsec_|[sr]k_(?:live|test)_/);
-    // Exactly the variables the hosted composition reads (Cloud Run sets PORT itself).
+    // References only: no secret value reaches the environment, not even through Cloud Run's secret variables.
+    expect(service).not.toMatch(/secret_key_ref|value_source/);
+    expect(service).toMatch(/name\s*=\s*"KEYSENTRY_STRIPE_WEBHOOK_SECRET_REF"\s*value\s*=\s*local\.stripe_webhook_secret_ref/);
+    expect(service).toMatch(/name\s*=\s*"KEYSENTRY_STRIPE_API_KEY_REF"\s*value\s*=\s*local\.stripe_api_key_secret_ref/);
+    expect(tf).toContain('stripe_webhook_secret_ref = "projects/${var.project_id}/secrets/${var.stripe_webhook_secret_id}/versions/latest"');
+    expect(tf).toContain('stripe_api_key_secret_ref = "projects/${var.project_id}/secrets/${var.stripe_api_key_secret_id}/versions/latest"');
+    expect(tf).not.toMatch(/whsec_|[sr]k_(?:live|test)_/);
+    // Live provisioning variables come only from the live_provisioning switch.
+    expect(service).toMatch(/dynamic "env" \{\s*for_each = local\.live_env/);
+    const live = tf.match(/live_env = var\.live_provisioning \? \{([\s\S]*?)\} : \{\}/)![1]!;
+    const liveNames = [...live.matchAll(/(KEYSENTRY_[A-Z_]+)\s*=/g)].map(match => match[1]!).sort();
+    expect(liveNames).toEqual(['KEYSENTRY_BOX_IMAGE_REFERENCE', 'KEYSENTRY_BOX_SUBNETWORK', 'KEYSENTRY_BOX_ZONE', 'KEYSENTRY_CONTROL_PLANE_LIVE']);
+    expect(live).toMatch(/KEYSENTRY_CONTROL_PLANE_LIVE\s*=\s*"1"/);
+    // Exactly the variables the hosted entry reads (Cloud Run sets PORT; the quota keeps its default).
+    expect([...names, ...liveNames, 'PORT', 'KEYSENTRY_BOX_QUOTA'].sort()).toEqual([...HOSTED_SETTINGS].sort());
     const sample: Record<string, string> = {
       KEYSENTRY_BOX_ALLOWED_DIGESTS: `sha256:${'a'.repeat(64)}`, KEYSENTRY_BOX_PROJECT_ID: 'keysentry-box',
       KEYSENTRY_BOX_SERVICE_ACCOUNT: 'keysentry-box@keysentry-box.iam.gserviceaccount.com', KEYSENTRY_CONTROL_BUCKET: 'ks-control-state',
-      KEYSENTRY_CONTROL_ORIGIN: 'https://control.example', KEYSENTRY_STRIPE_API_KEY: 'rk_live_sampleonly', KEYSENTRY_STRIPE_PRICE_ID: 'price_sample',
-      KEYSENTRY_STRIPE_WEBHOOK_SECRET: 'whsec_sampleonly', KEYSENTRY_TRUSTED_PROXY_HOPS: '1',
+      KEYSENTRY_CONTROL_ORIGIN: 'https://control.example', KEYSENTRY_STRIPE_API_KEY_REF: 'projects/keysentry-control/secrets/stripe-api-key/versions/latest',
+      KEYSENTRY_STRIPE_PRICE_ID: 'price_sample', KEYSENTRY_STRIPE_WEBHOOK_SECRET_REF: 'projects/keysentry-control/secrets/stripe-webhook/versions/latest',
+      KEYSENTRY_TRUSTED_PROXY_HOPS: '1',
     };
     expect(Object.keys(sample).sort()).toEqual(names);
     expect(() => hostedConfigFromEnv(sample)).not.toThrow();
@@ -222,6 +239,12 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
       const { [name]: _removed, ...rest } = sample;
       expect(() => hostedConfigFromEnv(rest)).toThrow(name);
     }
+    expect(hostedConfigFromEnv({ ...sample, KEYSENTRY_CONTROL_PLANE_LIVE: '1', KEYSENTRY_BOX_ZONE: 'us-central1-a',
+      KEYSENTRY_BOX_SUBNETWORK: 'projects/keysentry-box/regions/us-central1/subnetworks/keysentry-box-subnet',
+      KEYSENTRY_BOX_IMAGE_REFERENCE: `us-docker.pkg.dev/keysentry-box/box/keysentry@sha256:${'a'.repeat(64)}` }).live).not.toBeNull();
+    // Live settings are checked before anything is created.
+    expect(service).toContain('!var.live_provisioning || (var.box_zone != "" && var.box_subnetwork != "" && var.box_image_reference != "")');
+    expect(service).toContain('contains(var.allowed_image_digests, element(concat(split("@", var.box_image_reference), [""]), 1))');
   });
 
   test('control plane stores ciphertext in a private versioned bucket and cannot destroy it implicitly', () => {
@@ -235,7 +258,7 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(bucket).toMatch(/days_since_noncurrent_time\s*=\s*7/);
   });
 
-  test('control plane has bucket object access and two Stripe secret reads only, without key release or provisioning authority', () => {
+  test('control plane has bucket object access and two Stripe secret reads, and no key release authority', () => {
     const tf = source('control-plane');
     const grant = resource(tf, 'google_storage_bucket_iam_member');
     expect(grant).toMatch(/role\s*=\s*"roles\/storage\.objectUser"/);
@@ -245,8 +268,27 @@ describe('cloud box Terraform (local static contracts; no Google calls)', () => 
     expect(secrets).toMatch(/role\s*=\s*"roles\/secretmanager\.secretAccessor"/);
     expect(secrets).toContain('toset([var.stripe_webhook_secret_id, var.stripe_api_key_secret_id])');
     expect(secrets).toContain('serviceAccount:${google_service_account.control_plane.email}');
-    expect(tf).not.toMatch(/resource "google_(?:project_iam|kms_|compute_|secret_manager_secret")/);
-    expect(tf).not.toMatch(/roles\/(?:owner|editor|storage\.admin|compute\.|cloudkms\.|iam\.serviceAccountUser|secretmanager\.admin)/);
+    expect(tf).not.toMatch(/resource "google_(?:kms_|compute_|secret_manager_secret"|project_iam_binding|project_iam_policy)/);
+    expect(tf).not.toMatch(/roles\/(?:owner|editor|storage\.admin|compute\.|cloudkms\.|secretmanager\.admin|iam\.serviceAccountTokenCreator)/);
+  });
+
+  test('control plane gets Compute rights only with live provisioning: create-only, in the box project, acting as the box account', () => {
+    const tf = source('control-plane');
+    const role = resource(tf, 'google_project_iam_custom_role');
+    const member = resource(tf, 'google_project_iam_member');
+    const user = resource(tf, 'google_service_account_iam_member');
+    for (const block of [role, member, user]) expect(block).toMatch(/count\s*=\s*var\.live_provisioning \? 1 : 0/);
+    const permissions = [...role.match(/permissions = \[([\s\S]*?)\]/)![1]!.matchAll(/"([a-z.A-Z]+)"/g)].map(match => match[1]!);
+    expect(permissions).toEqual(['compute.disks.create', 'compute.instances.create', 'compute.instances.setMetadata',
+      'compute.instances.setServiceAccount', 'compute.subnetworks.use']);
+    expect(role).toMatch(/project\s*=\s*var\.box_project_id/);
+    expect(member).toMatch(/project\s*=\s*var\.box_project_id/);
+    expect(member).toMatch(/role\s*=\s*google_project_iam_custom_role\.provision\[0\]\.name/);
+    expect(member).toContain('serviceAccount:${google_service_account.control_plane.email}');
+    expect(user).toContain('service_account_id = "projects/${var.box_project_id}/serviceAccounts/${var.box_service_account_email}"');
+    expect(user).toMatch(/role\s*=\s*"roles\/iam\.serviceAccountUser"/);
+    const live = blocks(tf, 'variable').find(block => block.startsWith('variable "live_provisioning"'))!;
+    expect(live).toMatch(/default\s*=\s*false/);
   });
 
   test.each(modules)('%s outputs resource identifiers only', module => {

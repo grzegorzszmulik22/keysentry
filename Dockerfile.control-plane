@@ -1,0 +1,29 @@
+# check=skip=FromPlatformFlagConstDisallowed
+# The hosted control plane for Cloud Run: packages/control-plane/src/main.ts and the shared modules it imports, bundled
+# into one file and checked against packages/control-plane/scripts/bundle-policy.mjs. Never the watcher, the CLI or the
+# box image. Single platform on purpose (Cloud Run runs linux/amd64), base images pinned by the same digests as Dockerfile.
+FROM --platform=linux/amd64 node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY tsconfig.json LICENSE NOTICE ./
+COPY src/ src/
+COPY packages/control-plane/package.json packages/control-plane/tsconfig.json packages/control-plane/
+COPY packages/control-plane/src/ packages/control-plane/src/
+COPY packages/control-plane/scripts/ packages/control-plane/scripts/
+COPY packages/control-plane/ui/ packages/control-plane/ui/
+RUN node packages/control-plane/scripts/build.mjs --out /build/out/control-plane.mjs
+
+FROM --platform=linux/amd64 gcr.io/distroless/nodejs24-debian13:nonroot@sha256:cb606325b7ec4af55462cb0b424a53b452a5b4a894ffe841fcf1048d216fb9f8
+ARG KEYSENTRY_BUILD_COMMIT=dev
+LABEL org.opencontainers.image.source="https://github.com/grzenio22/keysentry" \
+      org.opencontainers.image.revision="${KEYSENTRY_BUILD_COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+WORKDIR /app
+COPY --from=build /build/out/control-plane.mjs /app/
+COPY --from=build /build/LICENSE /build/NOTICE /app/
+# Configuration comes from Cloud Run: non-secret variables and Secret Manager references, never secret values.
+ENV NODE_ENV=production
+USER 65532
+EXPOSE 8080
+ENTRYPOINT ["/nodejs/bin/node", "/app/control-plane.mjs"]

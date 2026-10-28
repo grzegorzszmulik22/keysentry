@@ -252,7 +252,8 @@ export function createRelayStore(options:RelayOptions):RelayStore {
       await ready();
       const index = await readIndex(boxId);
       const pruned = await pruneBlobs(boxId,index);
-      const blobId = randomBytes(16).toString('base64url'), expiresAt = now()+duration;
+      // Lower-case hex: a blob id in a Cloud Storage URL can never look like a provider key to the egress guard.
+      const blobId = randomBytes(16).toString('hex'), expiresAt = now()+duration;
       const stored:CiphertextBlob = {kind:input.kind,ciphertext:input.ciphertext,expiresAt};
       const bytes = bytesOf(stored);
       const held = index.blobs.reduce((sum,entry)=>sum+entry.bytes,0);

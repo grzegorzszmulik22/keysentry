@@ -33,9 +33,17 @@ export interface AccountsOptions {
   boxQuota?: number;
 }
 interface Ceremony { challenge: string; expires: number; kind: 'registration' | 'assertion'; accountId?: string; client: string }
+/** What the web page shows: the plan and the account's boxes, never billing identifiers. */
+export interface AccountOverview {
+  accountId: string;
+  plan: 'free' | 'paid';
+  boxes: { name: string; state: 'pending' | 'active' }[];
+  boxQuota: number;
+}
 export interface RegisterAccountInput { challengeId: string; clientDataJSON: Buffer; attestationObject: Buffer }
 export interface SignInInput {
-  accountId: string; challengeId: string; credentialId: string;
+  /** Omitted for a discoverable-credential sign-in: the credential id names the account. */
+  accountId?: string; challengeId: string; credentialId: string;
   clientDataJSON: Buffer; authenticatorData: Buffer; signature: Buffer;
 }
 export interface AccountLogin { account: Account; session: AccountSession; cookie: string }
@@ -124,14 +132,16 @@ export function createAccounts(opts: AccountsOptions) {
     while ((byClient.get(owner)?.length ?? 0) >= maxPerClient) dropChallenge(byClient.get(owner)![0]!);
     while (challenges.size >= maxChallenges) dropChallenge(challenges.keys().next().value as string);
     const ceremonyId = token(); const challenge = token();
-    challenges.set(ceremonyId, { challenge, kind, accountId, client: owner, expires: now() + challengeTtlMs });
+    // A registration ceremony carries the id the new account will have; the page uses its bytes as the passkey's user
+    // handle. Lower-case hex: an id in a Cloud Storage URL can never look like a provider key to the egress guard.
+    challenges.set(ceremonyId, { challenge, kind, accountId: kind === 'registration' ? randomBytes(32).toString('hex') : accountId, client: owner, expires: now() + challengeTtlMs });
     byClient.set(owner, [...(byClient.get(owner) ?? []), ceremonyId]);
     return { id: ceremonyId, challenge, rpId: config.rpId };
   }
   function consume(challengeId: string, kind: Ceremony['kind'], accountId?: string): Ceremony {
     const value = typeof challengeId === 'string' ? challenges.get(challengeId) : undefined;
     if (value) dropChallenge(challengeId);
-    if (!value || value.expires <= now() || value.kind !== kind || value.accountId !== accountId) fail();
+    if (!value || value.expires <= now() || value.kind !== kind || (kind === 'assertion' && value.accountId !== accountId)) fail();
     return value;
   }
   async function get(accountId: string): Promise<Account | null> { return storage.get<Account>(`accounts/${id(accountId)}`); }
@@ -184,7 +194,11 @@ export function createAccounts(opts: AccountsOptions) {
     cookieName: COOKIE,
     /** Set-Cookie value that removes the session cookie with matching attributes. */
     clearCookie: `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${config.secure ? '; Secure' : ''}`,
-    registrationChallenge(client?: string) { return begin('registration', client); },
+    /** `userId` is the new account id's 32 bytes (base64url): the page passes them as the passkey's user handle. */
+    registrationChallenge(client?: string) {
+      const ceremony = begin('registration', client);
+      return { ...ceremony, userId: Buffer.from(challenges.get(ceremony.id)!.accountId!, 'hex').toString('base64url') };
+    },
     async register(input: RegisterAccountInput): Promise<AccountLogin> {
       const ceremony = consume(input.challengeId, 'registration');
       return accountLock(async () => {
@@ -194,8 +208,8 @@ export function createAccounts(opts: AccountsOptions) {
           credential = verifyRegistration({ ...input, expectedChallenge: Buffer.from(ceremony.challenge, 'base64url'), expectedOrigins: [opts.origin], rpId: config.rpId, requireUserVerification: true });
         } catch { return fail(); }
         const credentialKey = `credentials/${hashOf(credential.id)}`;
-        if (await storage.get(credentialKey)) fail();
-        const account: Account = { id: token(), credential: { ...credential, createdAt: new Date(now()).toISOString() }, plan: 'free', createdAt: new Date(now()).toISOString() };
+        if (await storage.get(credentialKey) || await get(ceremony.accountId ?? '-')) fail();
+        const account: Account = { id: ceremony.accountId ?? token(), credential: { ...credential, createdAt: new Date(now()).toISOString() }, plan: 'free', createdAt: new Date(now()).toISOString() };
         // Every record is rolled back if any write fails, so a refused registration never burns the passkey.
         const written: string[] = [];
         try {
@@ -209,14 +223,26 @@ export function createAccounts(opts: AccountsOptions) {
         }
       });
     },
-    async assertionChallenge(accountId: string, client?: string) {
+    /**
+     * With an account id: a challenge for that account's passkey. Without one: a discoverable-credential challenge,
+     * where the browser offers the user's keysentry passkeys and the credential id names the account.
+     */
+    async assertionChallenge(accountId?: string, client?: string) {
+      if (accountId === undefined) return begin('assertion', client);
       const account = await get(accountId); if (!account) fail();
       return { ...begin('assertion', client, accountId), credentialId: account.credential.id };
     },
     async signIn(input: SignInInput): Promise<AccountLogin> {
       const ceremony = consume(input.challengeId, 'assertion', input.accountId);
       return accountLock(async () => {
-        const account = await get(input.accountId); if (!account || account.credential.id !== input.credentialId) fail();
+        let accountId = input.accountId;
+        if (accountId === undefined) {
+          if (typeof input.credentialId !== 'string' || input.credentialId.length === 0 || input.credentialId.length > 1400) fail();
+          const index = await storage.get<{ accountId?: unknown }>(`credentials/${hashOf(input.credentialId)}`);
+          if (typeof index?.accountId !== 'string') fail();
+          accountId = index.accountId;
+        }
+        const account = await get(accountId); if (!account || account.credential.id !== input.credentialId) fail();
         let result: ReturnType<typeof verifyAssertion>;
         try {
           result = verifyAssertion({ ...input, credential: account.credential, expectedChallenge: Buffer.from(ceremony.challenge, 'base64url'), expectedOrigins: [opts.origin], requireUserVerification: true });
@@ -271,6 +297,15 @@ export function createAccounts(opts: AccountsOptions) {
       });
     },
     get,
+    /** Plan and boxes for the signed-in page. */
+    async overview(accountId: string): Promise<AccountOverview> {
+      const account = await get(accountId); if (!account) fail();
+      const held = await boxes(account.id);
+      const list = Object.entries(held.boxes)
+        .filter((entry): entry is [string, 'pending' | 'active'] => entry[1] === 'pending' || entry[1] === 'active')
+        .map(([name, state]) => ({ name, state })).sort((a, b) => a.name.localeCompare(b.name));
+      return { accountId: account.id, plan: account.plan === 'paid' ? 'paid' : 'free', boxes: list, boxQuota };
+    },
     /**
      * H1: holds the name for this account before any Compute call. Refuses an unpaid account (402), an account at
      * its quota (403) and a name another account holds (409). Retrying a name this account already reserved is allowed.

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
+    <title>keysentry cloud box</title>
+    <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/app/app.css">
+    <script type="module" src="/app/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="app-header">
+      <span class="app-brand">keysentry</span>
+      <button type="button" id="sign-out" class="button secondary" hidden>Sign out</button>
+    </header>
+    <main id="main" class="page" tabindex="-1">
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <section id="view-loading" aria-labelledby="loading-title">
+        <h1 id="loading-title" tabindex="-1">Cloud box account</h1>
+        <p class="muted">Checking whether you are signed in.</p>
+      </section>
+
+      <section id="view-signed-out" aria-labelledby="signed-out-title" hidden>
+        <h1 id="signed-out-title" tabindex="-1">Cloud box account</h1>
+        <p>A cloud box runs the keysentry watcher for you on a confidential machine. You need an account only for a cloud box; keysentry on your own computer works without one.</p>
+        <p>Your account uses a passkey: no password and no email address. The passkey stays on your device or in your password manager.</p>
+        <div class="actions">
+          <button type="button" id="sign-up" class="button">Create an account with a passkey</button>
+          <button type="button" id="sign-in" class="button secondary">Sign in with a passkey</button>
+        </div>
+      </section>
+
+      <section id="view-signed-in" aria-labelledby="account-title" hidden>
+        <h1 id="account-title" tabindex="-1">Your cloud box account</h1>
+
+        <section class="panel" aria-labelledby="plan-title">
+          <h2 id="plan-title">Plan</h2>
+          <p id="plan-text"></p>
+          <p id="checkout-text" class="muted" hidden>Stripe handles the payment on its own page. You come back here when it is done, and the plan changes once Stripe confirms the payment.</p>
+          <button type="button" id="checkout" class="button" hidden>Start the paid plan</button>
+        </section>
+
+        <section class="panel" aria-labelledby="boxes-title">
+          <h2 id="boxes-title">Boxes</h2>
+          <p id="boxes-empty" class="muted">No boxes yet.</p>
+          <ul id="boxes-list" class="box-list" hidden></ul>
+        </section>
+
+        <section id="create-panel" class="panel" aria-labelledby="create-title" hidden>
+          <h2 id="create-title">Create a box</h2>
+          <p>keysentry creates a confidential machine with this name. Only the computer whose device key you enter can send it tokens, after checking what the machine runs.</p>
+          <form id="create-form" novalidate>
+            <div class="field">
+              <label for="box-name">Box name</label>
+              <p id="box-name-help" class="help">Lowercase letters, digits and hyphens, starting with a letter. For example: team-box.</p>
+              <input id="box-name" name="name" type="text" required maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="box-name-help">
+            </div>
+            <div class="field">
+              <label for="device-key">Device public key</label>
+              <p id="device-key-help" class="help">On the computer you use keysentry on, run <code>keysentry box card</code> and paste the device public key it prints. It is a public key, not a secret.</p>
+              <textarea id="device-key" name="deviceKey" rows="2" required autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="device-key-help"></textarea>
+            </div>
+            <p id="create-error" class="field-error" hidden></p>
+            <button type="submit" id="create" class="button">Create box</button>
+          </form>
+        </section>
+        <p id="create-unavailable" class="muted" hidden></p>
+      </section>
+    </main>
+    <noscript><p class="page">This page needs JavaScript to use your passkey.</p></noscript>
+  </body>
+</html>

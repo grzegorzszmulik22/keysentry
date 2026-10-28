@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, test } from 'vitest';
 import { json } from '../../../test/helpers/fake-http.js';
 import type { HttpClient, HttpRequest } from '../../../src/types.js';
-import { BillingUnavailableError, createBilling } from '../src/billing.js';
+import { BillingUnavailableError, CheckoutError, createBilling, isStripeCheckoutUrl } from '../src/billing.js';
 
 const secret = 'whsec_local_emulator_only';
 const apiKey = 'rk_test_localonly0123';
@@ -207,5 +207,74 @@ describe('M3: subscription status updates', () => {
     await deliver(ctx, checkout('evt-two', { subscription: 'sub-two' }));
     await deliver(ctx, update('evt-old-sub', 'canceled', 1_792_137_900));
     expect(ctx.account).toMatchObject({ plan: 'paid', subscriptionId: 'sub-two' });
+  });
+});
+
+describe('Stripe Checkout creation', () => {
+  const ORIGIN = 'https://control.example';
+  function stripe(reply: (req: HttpRequest) => ReturnType<HttpClient['request']> | Awaited<ReturnType<HttpClient['request']>>) {
+    const ctx = setup();
+    const calls: HttpRequest[] = [];
+    const http: HttpClient = { async request(req) { calls.push(req); return reply(req); } };
+    const billing = createBilling({ storage: ctx.storage, accounts: ctx.accounts, endpointSecret: secret, priceId: 'price_plan', stripe: { http, apiKey }, now: () => now });
+    return { ...ctx, billing, calls };
+  }
+  const created = (req: HttpRequest) => {
+    const form = new URLSearchParams(req.body);
+    return json(200, { id: 'cs_test_new', object: 'checkout.session', mode: form.get('mode'), client_reference_id: form.get('client_reference_id'),
+      url: 'https://checkout.stripe.com/c/pay/cs_test_new#fragment' });
+  };
+
+  test('creates a subscription-mode session for the configured price with the account as client_reference_id', async () => {
+    const ctx = stripe(created);
+    expect(await ctx.billing.checkout({ accountId: 'account-one', origin: ORIGIN })).toEqual({ url: 'https://checkout.stripe.com/c/pay/cs_test_new#fragment' });
+    expect(ctx.calls).toHaveLength(1);
+    const [call] = ctx.calls;
+    expect(call).toMatchObject({ method: 'POST', url: 'https://api.stripe.com/v1/checkout/sessions' });
+    expect(call!.headers).toMatchObject({ authorization: `Bearer ${apiKey}`, 'content-type': 'application/x-www-form-urlencoded' });
+    expect(Object.fromEntries(new URLSearchParams(call!.body))).toEqual({
+      mode: 'subscription', 'line_items[0][price]': 'price_plan', 'line_items[0][quantity]': '1',
+      client_reference_id: 'account-one', 'metadata[accountId]': 'account-one', 'subscription_data[metadata][accountId]': 'account-one',
+      success_url: `${ORIGIN}/?checkout=done`, cancel_url: `${ORIGIN}/?checkout=cancelled`,
+    });
+  });
+  test('a returning customer keeps their Stripe customer', async () => {
+    const ctx = stripe(created);
+    ctx.account.customerId = 'cus_returning';
+    await ctx.billing.checkout({ accountId: 'account-one', origin: ORIGIN });
+    expect(new URLSearchParams(ctx.calls[0]!.body).get('customer')).toBe('cus_returning');
+  });
+  test('refuses a paid or unknown account before calling Stripe', async () => {
+    const ctx = stripe(created);
+    ctx.account.plan = 'paid';
+    await expect(ctx.billing.checkout({ accountId: 'account-one', origin: ORIGIN })).rejects.toMatchObject({ status: 409, message: 'This account already has the paid plan.' });
+    await expect(ctx.billing.checkout({ accountId: 'someone-else', origin: ORIGIN })).rejects.toMatchObject({ status: 403 });
+    await expect(ctx.billing.checkout({ accountId: '../x', origin: ORIGIN })).rejects.toMatchObject({ status: 403 });
+    await expect(ctx.billing.checkout({ accountId: 'account-one', origin: 'http://control.example' })).rejects.toThrow('Invalid checkout return origin.');
+    expect(ctx.calls).toEqual([]);
+  });
+  test.each([
+    ['Stripe rejects the request', () => json(400, { error: { message: `planted ${apiKey} detail`, type: 'invalid_request_error' } }), 502],
+    ['the key lacks a permission', () => json(403, { error: { message: 'planted permission detail' } }), 502],
+    ['Stripe is rate limiting', () => json(429, { error: { message: 'planted' } }), 503],
+    ['Stripe fails', () => json(500, { error: { message: 'planted' } }), 503],
+    ['the network fails', () => { throw new Error(`planted socket ${apiKey}`); }, 503],
+    ['the session is not in subscription mode', (req: HttpRequest) => json(200, { ...created(req).json<Record<string, unknown>>(), mode: 'payment' }), 502],
+    ['the session names another account', (req: HttpRequest) => json(200, { ...created(req).json<Record<string, unknown>>(), client_reference_id: 'other' }), 502],
+    ['the URL is not Stripe Checkout', (req: HttpRequest) => json(200, { ...created(req).json<Record<string, unknown>>(), url: 'https://checkout.stripe.com.example/x' }), 502],
+    ['the body is not JSON', () => ({ status: 200, headers: {}, text: 'planted', json: () => { throw new Error('planted'); } }), 502],
+  ] as const)('maps %s to fixed text', async (_name, reply, status) => {
+    const ctx = stripe(reply as never);
+    const error = await ctx.billing.checkout({ accountId: 'account-one', origin: ORIGIN }).then(() => null, (value: unknown) => value as CheckoutError);
+    expect(error).toBeInstanceOf(CheckoutError);
+    expect(error).toMatchObject({ status });
+    expect(error!.message).toBe(status === 503 ? 'Billing is temporarily unavailable.' : 'Checkout could not be started.');
+    expect(String(error!.message)).not.toMatch(/planted|rk_test/);
+    expect(ctx.account.plan).toBe('free');
+  });
+  test('only the hosted Stripe Checkout page counts as a checkout URL', () => {
+    expect(isStripeCheckoutUrl('https://checkout.stripe.com/c/pay/cs_test_1#x')).toBe(true);
+    for (const value of ['http://checkout.stripe.com/c', 'https://checkout.stripe.com:8443/c', 'https://user@checkout.stripe.com/c',
+      'https://evil.example/https://checkout.stripe.com', 'javascript:alert(1)', 42]) expect(isStripeCheckoutUrl(value)).toBe(false);
   });
 });

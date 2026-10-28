@@ -9,6 +9,6 @@ output "ciphertext_bucket_name" {
 }
 
 output "service_account_email" {
-  description = "Dedicated control-plane identity with object access to its bucket and read access to two Stripe entries."
+  description = "Dedicated control-plane identity: its bucket objects, two Stripe credentials to read, and box creation only when live."
   value       = google_service_account.control_plane.email
 }

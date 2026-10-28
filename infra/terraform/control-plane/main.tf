@@ -1,5 +1,19 @@
 # Not deployed. A public HTTPS service (browsers, the CLI, boxes and Stripe call it directly; every route authenticates
-# its own caller) whose state lives in one private bucket. Live box provisioning is not granted here.
+# its own caller) whose state lives in one private bucket. It runs Dockerfile.control-plane's image by digest. The
+# Stripe credentials stay in Secret Manager: the service gets their references and reads them itself at startup.
+# Live box provisioning, and the Compute rights it needs, exist only when live_provisioning = true.
+locals {
+  # Secret Manager references, read by the process through the metadata-server token (never secret values).
+  stripe_webhook_secret_ref = "projects/${var.project_id}/secrets/${var.stripe_webhook_secret_id}/versions/latest"
+  stripe_api_key_secret_ref = "projects/${var.project_id}/secrets/${var.stripe_api_key_secret_id}/versions/latest"
+
+  live_env = var.live_provisioning ? {
+    KEYSENTRY_CONTROL_PLANE_LIVE  = "1"
+    KEYSENTRY_BOX_ZONE            = var.box_zone
+    KEYSENTRY_BOX_SUBNETWORK      = var.box_subnetwork
+    KEYSENTRY_BOX_IMAGE_REFERENCE = var.box_image_reference
+  } : {}
+}
 resource "google_service_account" "control_plane" {
   project      = var.project_id
   account_id   = "${var.name_prefix}-run"
@@ -52,7 +66,8 @@ resource "google_storage_bucket_iam_member" "objects" {
   member = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
-# The Stripe webhook signing secret and restricted API key are created out of band; only read access is granted.
+# The Stripe webhook signing secret and restricted API key are created out of band; only read access is granted. The
+# process reads them through the Secret Manager API at startup (secretmanager.versions.access).
 resource "google_secret_manager_secret_iam_member" "stripe" {
   for_each  = toset([var.stripe_webhook_secret_id, var.stripe_api_key_secret_id])
   project   = var.project_id
@@ -82,6 +97,9 @@ resource "google_cloud_run_v2_service" "control_plane" {
 
     containers {
       image = var.image_reference
+      # The image's own entry (Dockerfile.control-plane), stated so another image's entrypoint cannot run instead.
+      command = ["/nodejs/bin/node"]
+      args    = ["/app/control-plane.mjs"]
 
       ports {
         container_port = 8080
@@ -123,25 +141,74 @@ resource "google_cloud_run_v2_service" "control_plane" {
         value = tostring(var.trusted_proxy_hops)
       }
       env {
-        name = "KEYSENTRY_STRIPE_WEBHOOK_SECRET"
-        value_source {
-          secret_key_ref {
-            secret  = var.stripe_webhook_secret_id
-            version = "latest"
-          }
-        }
+        name  = "KEYSENTRY_STRIPE_WEBHOOK_SECRET_REF"
+        value = local.stripe_webhook_secret_ref
       }
       env {
-        name = "KEYSENTRY_STRIPE_API_KEY"
-        value_source {
-          secret_key_ref {
-            secret  = var.stripe_api_key_secret_id
-            version = "latest"
-          }
+        name  = "KEYSENTRY_STRIPE_API_KEY_REF"
+        value = local.stripe_api_key_secret_ref
+      }
+      dynamic "env" {
+        for_each = local.live_env
+        content {
+          name  = env.key
+          value = env.value
         }
       }
     }
   }
 
-  depends_on = [google_storage_bucket_iam_member.objects, google_secret_manager_secret_iam_member.stripe]
+  lifecycle {
+    precondition {
+      condition     = !var.live_provisioning || (var.box_zone != "" && var.box_subnetwork != "" && var.box_image_reference != "")
+      error_message = "live_provisioning needs box_zone, box_subnetwork and box_image_reference."
+    }
+    precondition {
+      condition     = !var.live_provisioning || (startswith(var.box_subnetwork, "projects/${var.box_project_id}/regions/") && endswith(var.box_service_account_email, "@${var.box_project_id}.iam.gserviceaccount.com"))
+      error_message = "The box subnetwork and service account must belong to box_project_id."
+    }
+    precondition {
+      condition     = !var.live_provisioning || contains(var.allowed_image_digests, element(concat(split("@", var.box_image_reference), [""]), 1))
+      error_message = "The box image digest must be in allowed_image_digests."
+    }
+  }
+
+  depends_on = [
+    google_storage_bucket_iam_member.objects,
+    google_secret_manager_secret_iam_member.stripe,
+    google_project_iam_member.provision,
+    google_service_account_iam_member.box_user,
+  ]
+}
+
+# Live provisioning only: exactly the permissions instances.insert needs for the Terraform-shaped box (instance,
+# boot disk, metadata, attached service account, existing subnet), in the box project, and nothing else.
+resource "google_project_iam_custom_role" "provision" {
+  count       = var.live_provisioning ? 1 : 0
+  project     = var.box_project_id
+  role_id     = "${replace(var.name_prefix, "-", "_")}_provisioner"
+  title       = "keysentry control plane box provisioner"
+  description = "Creates keysentry box instances; cannot read, change or delete them."
+  permissions = [
+    "compute.disks.create",
+    "compute.instances.create",
+    "compute.instances.setMetadata",
+    "compute.instances.setServiceAccount",
+    "compute.subnetworks.use",
+  ]
+}
+
+resource "google_project_iam_member" "provision" {
+  count   = var.live_provisioning ? 1 : 0
+  project = var.box_project_id
+  role    = google_project_iam_custom_role.provision[0].name
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+# Attaching the box service account to a new instance needs iam.serviceAccounts.actAs on that one account.
+resource "google_service_account_iam_member" "box_user" {
+  count              = var.live_provisioning ? 1 : 0
+  service_account_id = "projects/${var.box_project_id}/serviceAccounts/${var.box_service_account_email}"
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.control_plane.email}"
 }

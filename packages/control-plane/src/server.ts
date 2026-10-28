@@ -4,14 +4,16 @@ import { isIP } from 'node:net';
 import { verifyAttestation, type JwksFetcher } from '../../../src/box/attestation/index.js';
 import { Lru } from './lock.js';
 import { isBoxName, isDeviceKey } from './provision.js';
+import { UI_ASSETS } from './ui-assets.js';
 
 interface Session { accountId: string; id: string; csrf: string }
 interface Authentication { account: unknown; session: Session; cookie: string }
 export interface AccountsService {
   registrationChallenge(client?: string): unknown;
   register(input: {challengeId:string;clientDataJSON:Buffer;attestationObject:Buffer}): Promise<Authentication>;
-  assertionChallenge(accountId: string, client?: string): Promise<unknown>;
-  signIn(input: {accountId:string;challengeId:string;credentialId:string;clientDataJSON:Buffer;authenticatorData:Buffer;signature:Buffer}): Promise<Authentication>;
+  /** Without an account id: a discoverable-credential challenge (the web page's sign-in). */
+  assertionChallenge(accountId: string | undefined, client?: string): Promise<unknown>;
+  signIn(input: {accountId?:string;challengeId:string;credentialId:string;clientDataJSON:Buffer;authenticatorData:Buffer;signature:Buffer}): Promise<Authentication>;
   authenticate(cookie: string | undefined): Session | null | Promise<Session | null>;
   clearSession(cookie: string | undefined): void | Promise<void>;
   ownsBox(accountId: string, boxId: string): Promise<boolean>;
@@ -25,6 +27,8 @@ export interface AccountsService {
   cachedSession?(cookie: string | undefined): boolean;
   clearCookie?: string;
   addBox?(accountId: string, boxId: string): Promise<void>;
+  /** Plan, quota and boxes for `GET /account` (the web page). */
+  overview?(accountId: string): Promise<unknown>;
 }
 interface RelayService {
   publish(boxId:string,message:unknown):Promise<{id:string}>;
@@ -63,7 +67,11 @@ export interface ControlPlaneServerOptions {
   port?: number;
   /** A factory receives the finalized origin after a random port has been bound. */
   accounts: AccountsService | ((origin:string)=>AccountsService);
-  billing: {handle(rawBody:Buffer,signatureHeader:string):Promise<unknown>};
+  billing: {
+    handle(rawBody:Buffer,signatureHeader:string):Promise<unknown>;
+    /** `POST /billing/checkout`: a Stripe Checkout Session for this account; errors carry a status, never Stripe's text. */
+    checkout?(input:{accountId:string;origin:string}):Promise<{url:string}>;
+  };
   relay: RelayService;
   provisioner?: {provision(input:{name:string;deviceKey:string}):Promise<unknown>};
   boxAttestation?: BoxAttestationOptions;
@@ -88,7 +96,9 @@ export interface ControlPlaneServerOptions {
 class HttpError extends Error {
   constructor(readonly status:number, message:string) { super(message); }
 }
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+// The web page: same-origin script, style and image files only, no inline anything, Trusted Types with no policies.
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; "
+  + "frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const RELAYED: Record<number,string> = {
   400:'Invalid request.', 409:'Invalid request.', 413:'Invalid request.', 429:'Please wait before trying again.',
@@ -173,10 +183,17 @@ function jsonRecord(body:Buffer):Record<string,unknown> {
 }
 type Route =
   | {kind:'health'} | {kind:'session'} | {kind:'webhook'} | {kind:'boxes'} | {kind:'auth';path:string}
-  | {kind:'messages';boxId:string;sessionId?:string} | {kind:'blobs';boxId:string} | {kind:'blob';boxId:string;blobId:string};
+  | {kind:'messages';boxId:string;sessionId?:string} | {kind:'blobs';boxId:string} | {kind:'blob';boxId:string;blobId:string}
+  | {kind:'asset';path:string} | {kind:'account'} | {kind:'checkout'};
 function route(raw:string):Route|null {
-  if (raw==='/healthz') return {kind:'health'};
+  // Cloud Run reserves some paths ending in `z`, so `/health` is the hosted health path; `/healthz` stays for loopback.
+  if (raw==='/health'||raw==='/healthz') return {kind:'health'};
+  // Stripe Checkout returns to `/?checkout=done` or `/?checkout=cancelled`; the page reads the query itself.
+  if (raw==='/'||raw==='/?checkout=done'||raw==='/?checkout=cancelled') return {kind:'asset',path:'/'};
+  if (raw.startsWith('/app/')&&Object.hasOwn(UI_ASSETS,raw)) return {kind:'asset',path:raw};
   if (raw==='/session') return {kind:'session'};
+  if (raw==='/account') return {kind:'account'};
+  if (raw==='/billing/checkout') return {kind:'checkout'};
   if (raw==='/billing/webhook') return {kind:'webhook'};
   if (raw==='/boxes') return {kind:'boxes'};
   if (['/auth/register/challenge','/auth/register/finish','/auth/login/challenge','/auth/login/finish'].includes(raw)) return {kind:'auth',path:raw};
@@ -190,8 +207,10 @@ function route(raw:string):Route|null {
 }
 const METHODS:Record<Route['kind'],string[]> = {
   health:['GET'], blob:['GET'], session:['GET','DELETE'], messages:['GET','POST'],
-  webhook:['POST'], boxes:['POST'], auth:['POST'], blobs:['POST'],
+  webhook:['POST'], boxes:['POST'], auth:['POST'], blobs:['POST'], asset:['GET'], account:['GET'], checkout:['POST'],
 };
+/** Credentialed routes that accept only a browser session (never a box credential). */
+const SESSION_ONLY = new Set<Route['kind']>(['session','boxes','account','checkout']);
 type Principal = {kind:'box';boxId:string} | {kind:'session';session:Session} | {kind:'none';presented:boolean};
 const sha256 = (value:string) => createHash('sha256').update(value).digest('hex');
 function budgetOf(value:number|undefined,fallback:number):number {
@@ -233,7 +252,8 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
   const buckets=new Lru<string,{at:number;tokens:number}>(bucketLimit);
   const headers:Record<string,string>={
     'Content-Security-Policy':CSP,'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
-    'Cache-Control':'no-store','Permissions-Policy':'publickey-credentials-get=(self)',
+    'Cache-Control':'no-store','Permissions-Policy':'publickey-credentials-get=(self), publickey-credentials-create=(self)',
+    'X-Frame-Options':'DENY','Cross-Origin-Opener-Policy':'same-origin','Cross-Origin-Resource-Policy':'same-origin',
     'Content-Type':'application/json; charset=utf-8',
   };
   if(origin.protocol==='https:') headers['Strict-Transport-Security']='max-age=31536000';
@@ -242,6 +262,13 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
     // L5: a body that was refused or never read is not drained; the connection closes after this response.
     res.writeHead(status,{...headers,...(req.complete?{}:{Connection:'close'})});
     res.end(JSON.stringify(value));log('request',status);
+  }
+  /** A static page file: the same security headers (strict CSP), its own media type, never cached. */
+  function sendAsset(req:IncomingMessage,res:ServerResponse,path:string) {
+    const asset=UI_ASSETS[path];
+    if(!asset) fail(404,'Not found.');
+    res.writeHead(200,{...headers,'Content-Type':asset.type,'Content-Length':String(Buffer.byteLength(asset.body)),...(req.complete?{}:{Connection:'close'})});
+    res.end(asset.body);log('request',200);
   }
   function take(key:string,limit:number):boolean {
     const current=now();
@@ -351,8 +378,8 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
       const target=route(req.url??'');
       let who:Principal={kind:'none',presented:false};
       if(target?.kind==='webhook') {if(!take(`webhook:${client}`,webhookBudget)) limited(res,webhookBudget);}
-      else if(target&&['session','boxes','messages','blobs','blob'].includes(target.kind)) {
-        const resolved=await principal(req,res,client,target.kind==='session'||target.kind==='boxes');
+      else if(target&&['session','boxes','account','checkout','messages','blobs','blob'].includes(target.kind)) {
+        const resolved=await principal(req,res,client,SESSION_ONLY.has(target.kind));
         who=resolved.who;
         if(who.kind==='box') {if(!take(`box:${who.boxId}`,boxBudget)) limited(res,boxBudget);}
         else if(who.kind==='session') {if(!take(`account:${who.session.accountId}`,budget)) limited(res,budget);}
@@ -363,6 +390,7 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
       const allowed=METHODS[target.kind];
       if(!allowed.includes(req.method??'')){res.setHeader('Allow',allowed.join(', '));fail(405,'Method is not allowed.');}
       if(target.kind==='health'){send(req,res,200,{ok:true});return;}
+      if(target.kind==='asset'){sendAsset(req,res,target.path);return;}
       if(target.kind==='webhook') {
         const body=await rawBody(req,Math.min(max,256*1024));
         // Validate JSON media/body while passing untouched bytes to the signature verifier.
@@ -383,16 +411,21 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
         const raw=target.path;
         const body=jsonRecord(await rawBody(req,Math.min(max,64*1024)));
         if(raw==='/auth/register/challenge'){exact(body,[]);send(req,res,200,await accounts().registrationChallenge(client));return;}
-        if(raw==='/auth/login/challenge'){exact(body,['accountId']);const id=identifier(body.accountId);let challenge:unknown;try{challenge=await accounts().assertionChallenge(id,client);}catch{fail(403,'Sign in could not be verified.');}send(req,res,200,challenge);return;}
+        if(raw==='/auth/login/challenge'){
+          // `{}` asks for a discoverable-credential challenge (the web page); `{accountId}` for that account's passkey.
+          exact(body,[],['accountId']);const id=body.accountId===undefined?undefined:identifier(body.accountId);
+          let challenge:unknown;try{challenge=await accounts().assertionChallenge(id,client);}catch{fail(403,'Sign in could not be verified.');}
+          send(req,res,200,challenge);return;
+        }
         let result:Authentication;
         if(raw==='/auth/register/finish') {
           exact(body,['challengeId','clientDataJSON','attestationObject']);
           const input={challengeId:identifier(body.challengeId),clientDataJSON:bytes(body.clientDataJSON,16*1024),attestationObject:bytes(body.attestationObject,32*1024)};
           try{result=await accounts().register(input);}catch{fail(403,'Registration could not be verified.');}
         } else {
-          exact(body,['accountId','challengeId','credentialId','clientDataJSON','authenticatorData','signature']);
+          exact(body,['challengeId','credentialId','clientDataJSON','authenticatorData','signature'],['accountId']);
           if(typeof body.credentialId!=='string'||body.credentialId.length>1400) fail(400);
-          const input={accountId:identifier(body.accountId),challengeId:identifier(body.challengeId),credentialId:body.credentialId,clientDataJSON:bytes(body.clientDataJSON,16*1024),authenticatorData:bytes(body.authenticatorData,16*1024),signature:bytes(body.signature,1024)};
+          const input={...(body.accountId===undefined?{}:{accountId:identifier(body.accountId)}),challengeId:identifier(body.challengeId),credentialId:body.credentialId,clientDataJSON:bytes(body.clientDataJSON,16*1024),authenticatorData:bytes(body.authenticatorData,16*1024),signature:bytes(body.signature,1024)};
           try{result=await accounts().signIn(input);}catch{fail(403,'Sign in could not be verified.');}
         }
         res.setHeader('Set-Cookie',result.cookie);
@@ -407,10 +440,31 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
         }
         send(req,res,200,{accountId:active.accountId,csrf:active.csrf});return;
       }
+      if(target.kind==='account') {
+        const active=signedIn(who);
+        const service=accounts();
+        if(!service.overview) fail(503,'Accounts are unavailable.');
+        send(req,res,200,await service.overview(active.accountId));return;
+      }
+      if(target.kind==='checkout') {
+        const active=signedIn(who);csrf(req,active);
+        const body=jsonRecord(await rawBody(req,Math.min(max,1024)));exact(body,[]);
+        if(!opts.billing.checkout) fail(503,'Billing is temporarily unavailable.');
+        let session:{url:string};
+        try{session=await opts.billing.checkout({accountId:active.accountId,origin:origin.origin});}
+        catch(error){
+          const status=(error as {status?:unknown}|null)?.status;
+          if(status===409) fail(409,'This account already has the paid plan.');
+          if(status===403) fail(403,'Sign in again to start checkout.');
+          if(status===503) fail(503,'Billing is temporarily unavailable.');
+          fail(502,'Checkout could not be started.');
+        }
+        send(req,res,200,{url:session.url});return;
+      }
       if(target.kind==='boxes') {
         const active=signedIn(who);csrf(req,active);
         const service=accounts();
-        if(!opts.provisioner||!service.reserveBox||!service.confirmBox||!service.releaseBox) fail(503,'Provisioning is unavailable.');
+        if(!opts.provisioner||!service.reserveBox||!service.confirmBox||!service.releaseBox) fail(503,'Creating boxes is not available yet.');
         const body=jsonRecord(await rawBody(req,Math.min(max,4096)));exact(body,['name','deviceKey']);
         if(!isBoxName(body.name)) fail(400,'Box names use lowercase letters, digits and hyphens, and start with a letter.');
         if(!isDeviceKey(body.deviceKey)) fail(400,'The enrollment device key is invalid.');
@@ -426,7 +480,7 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
         }
         let operation:unknown;
         try{operation=await opts.provisioner.provision({name,deviceKey});}
-        catch{await service.releaseBox(active.accountId,name).catch(()=>undefined);fail(502,'Box provisioning failed.');}
+        catch{await service.releaseBox(active.accountId,name).catch(()=>undefined);fail(502,'The box could not be created. Try again in a few minutes.');}
         await service.confirmBox(active.accountId,name);
         send(req,res,201,{boxId:name,operation});return;
       }
@@ -479,10 +533,19 @@ export function createControlPlaneServer(opts:ControlPlaneServerOptions) {
       }
       return {port:address.port,origin:origin.origin};
     },
-    async close():Promise<void> {
-      clearInterval(cleanup);bearers.clear();bearerOf.clear();verified.clear();buckets.clear();
-      if(!server.listening)return;
-      await new Promise<void>((resolve,reject)=>{server.close(error=>error?reject(new Error('Control plane could not close.')):resolve());server.closeIdleConnections();});
+    /**
+     * Stops accepting connections and lets requests in progress finish; after `deadlineMs` (graceful shutdown on
+     * SIGTERM: Cloud Run allows ten seconds) the remaining connections are closed.
+     */
+    async close(options:{deadlineMs?:number}={}):Promise<void> {
+      clearInterval(cleanup);
+      if(server.listening) {
+        let timer:NodeJS.Timeout|undefined;
+        if(options.deadlineMs!==undefined) {timer=setTimeout(()=>server.closeAllConnections(),Math.max(0,options.deadlineMs));timer.unref();}
+        try {await new Promise<void>((resolve,reject)=>{server.close(error=>error?reject(new Error('Control plane could not close.')):resolve());server.closeIdleConnections();});}
+        finally {if(timer)clearTimeout(timer);}
+      }
+      bearers.clear();bearerOf.clear();verified.clear();buckets.clear();
     },
     /** A bearer for one box's relay routes (local emulator and tests). Replaces that box's previous bearer. */
     issueBoxToken(boxId:string):string {

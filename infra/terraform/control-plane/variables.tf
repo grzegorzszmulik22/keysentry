@@ -81,7 +81,7 @@ variable "stripe_webhook_secret_id" {
 }
 
 variable "stripe_api_key_secret_id" {
-  description = "Existing Secret Manager secret ID holding a Stripe restricted key that can only read subscriptions."
+  description = "Existing Secret Manager secret ID holding a Stripe restricted key: Checkout Sessions write, Subscriptions read."
   type        = string
   nullable    = false
   validation {
@@ -128,5 +128,49 @@ variable "trusted_proxy_hops" {
   validation {
     condition     = var.trusted_proxy_hops >= 1 && var.trusted_proxy_hops <= 10 && floor(var.trusted_proxy_hops) == var.trusted_proxy_hops
     error_message = "trusted_proxy_hops must be a whole number from 1 to 10 (2 behind an external Application Load Balancer)."
+  }
+}
+
+variable "live_provisioning" {
+  description = "Create boxes for paying accounts (KEYSENTRY_CONTROL_PLANE_LIVE=1) and grant the Compute rights that needs."
+  type        = bool
+  default     = false
+  nullable    = false
+  validation {
+    condition     = var.live_provisioning == true || var.live_provisioning == false
+    error_message = "live_provisioning must be true or false."
+  }
+}
+
+variable "box_zone" {
+  description = "Zone for new boxes, in the box subnet's region (live provisioning only)."
+  type        = string
+  default     = ""
+  nullable    = false
+  validation {
+    condition     = var.box_zone == "" || can(regex("^[a-z]+(-[a-z]+)+[0-9]+-[a-z]$", var.box_zone))
+    error_message = "box_zone must be a zone such as us-central1-a, or empty."
+  }
+}
+
+variable "box_subnetwork" {
+  description = "Existing private box subnet, projects/BOX_PROJECT/regions/REGION/subnetworks/NAME (live provisioning only)."
+  type        = string
+  default     = ""
+  nullable    = false
+  validation {
+    condition     = var.box_subnetwork == "" || can(regex("^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/regions/[a-z]+(-[a-z]+)+[0-9]+/subnetworks/[a-z]([a-z0-9-]{0,61}[a-z0-9])?$", var.box_subnetwork))
+    error_message = "box_subnetwork must be a full subnetwork path, or empty."
+  }
+}
+
+variable "box_image_reference" {
+  description = "Box image pinned by digest; the digest must be in allowed_image_digests (live provisioning only)."
+  type        = string
+  default     = ""
+  nullable    = false
+  validation {
+    condition     = var.box_image_reference == "" || can(regex("^[a-z0-9.-]+/[A-Za-z0-9._/-]+@sha256:[a-f0-9]{64}$", var.box_image_reference))
+    error_message = "box_image_reference must contain a registry, repository path and @sha256 digest, or be empty."
   }
 }
