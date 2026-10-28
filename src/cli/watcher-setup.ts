@@ -45,29 +45,17 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
   if (!deps.interactive || deps.json) throw new CliError('Watcher setup needs an interactive terminal and cannot print secrets in JSON.');
   const platform = options.platform ?? 'compose';
   if (!Object.hasOwn(TEMPLATES, platform)) throw new CliError('Choose compose, railway, fly, render, or github-actions for the watcher.');
-  const config: WatcherConfig = { ...deps.config, notify: { channels: deps.config.notify.channels.filter(channel => channel.kind !== 'console') } };
   const protectedHosts = deps.protectedHosts ?? deps.config.armed?.hosts ?? [];
-  const deployKey = randomBytes(32), stateKey = randomBytes(32), vaultPassphrase = randomBytes(32);
-  const watcherKey = generateDeviceKey();
-  // Printable random bytes have full entropy and avoid quoting or newline ambiguities in platform settings.
-  const printablePassphrase = Buffer.from(vaultPassphrase.toString('base64url'));
-  vaultPassphrase.fill(0);
   try {
-    const sealed = sealWatcherConfig(config, deployKey);
-    const outputDir = resolve(deps.outputDir), sealedConfigPath = join(outputDir, 'watcher-config.sealed');
-    await mkdir(outputDir, { recursive: true, mode: 0o700 });
-    await writeFile(sealedConfigPath, `${sealed}\n`, { mode: 0o600, flag: 'wx' });
-    const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config });
-    await deps.vault.set('watcher/signing/private', watcherKey.privateKeyDer);
-    await deps.vault.set('watcher/signing/public', watcherKey.publicKeyDer);
-    await deps.audit.append({ kind: 'watcher:setup', summary: 'Watcher deployment prepared.', data: { platform, watcherKeyId: watcherKey.keyId } });
+    const prepared = await createWatcherDeployment(deps, platform);
+    const { values, deployment } = prepared;
     const write = deps.writeTerminal;
     write(deployment?.exportedCredentialNames?.length ? `Exported credential names: ${deployment.exportedCredentialNames.join(', ')}.` : 'Exported credential names: none.');
     write('Store the following values in the platform\'s secret settings only. They are shown once. Keep a separate secure backup.');
-    write(`KEYSENTRY_WATCHER_KEY=${deployKey.toString('base64')}`);
-    write(`KEYSENTRY_STATE_KEY=${stateKey.toString('base64')}`);
-    write(`KEYSENTRY_VAULT_PASSPHRASE=${printablePassphrase.toString()}`);
-    write(`KEYSENTRY_WATCHER_CONFIG=${sealed}`);
+    write(`KEYSENTRY_WATCHER_KEY=${values.KEYSENTRY_WATCHER_KEY}`);
+    write(`KEYSENTRY_STATE_KEY=${values.KEYSENTRY_STATE_KEY}`);
+    write(`KEYSENTRY_VAULT_PASSPHRASE=${values.KEYSENTRY_VAULT_PASSPHRASE}`);
+    write(`KEYSENTRY_WATCHER_CONFIG=${values.KEYSENTRY_WATCHER_CONFIG}`);
     if (deployment) {
       write(`KEYSENTRY_WATCHER_VAULT=${deployment.vaultBlob}`);
       write('The encrypted vault bootstrap initializes the encrypted vault on first start. The watcher keeps its updated encrypted vault and state on the private persistent state volume. Keep deployment keys and the passphrase outside that volume.');
@@ -91,7 +79,42 @@ export async function setupWatcher(deps: WatcherSetupDependencies, options: Watc
     }
     if (protectedHosts.includes(platform as HostId)) write('This watcher runs on a platform it protects. An incident there requires you to rotate the watcher\'s own tokens by hand and run watcher setup again.');
     write(`Use ${TEMPLATES[platform]}. Follow the ${platform} steps in deploy/README.md for secret settings, private persistent storage, and stopping the watcher.`);
-    return { sealedConfigPath, template: TEMPLATES[platform], watcherKeyId: watcherKey.keyId };
+    return { sealedConfigPath: prepared.sealedConfigPath, template: TEMPLATES[platform], watcherKeyId: prepared.watcherKeyId };
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError('Watcher setup could not finish. No deployment was started.');
+  }
+}
+
+export interface WatcherDeploymentValues {
+  /** The deployment variables, as the hosted platform or the cloud box receives them. */
+  values: { KEYSENTRY_WATCHER_KEY: string; KEYSENTRY_STATE_KEY: string; KEYSENTRY_VAULT_PASSPHRASE: string; KEYSENTRY_WATCHER_CONFIG: string };
+  deployment: { vaultBlob: string; exportedCredentialNames?: string[] } | undefined;
+  sealedConfigPath: string;
+  watcherKeyId: string;
+}
+
+/** New deploy, state and watcher keys, the sealed config and the portable vault. Shared by watcher setup and the cloud box. */
+export async function createWatcherDeployment(deps: Pick<WatcherSetupDependencies, 'vault' | 'audit' | 'config' | 'outputDir' | 'prepareDeployment'>,
+  platform: WatcherPlatform | 'cloud-box'): Promise<WatcherDeploymentValues> {
+  const config: WatcherConfig = { ...deps.config, notify: { channels: deps.config.notify.channels.filter(channel => channel.kind !== 'console') } };
+  const deployKey = randomBytes(32), stateKey = randomBytes(32), vaultPassphrase = randomBytes(32);
+  const watcherKey = generateDeviceKey();
+  // Printable random bytes have full entropy and avoid quoting or newline ambiguities in platform settings.
+  const printablePassphrase = Buffer.from(vaultPassphrase.toString('base64url'));
+  vaultPassphrase.fill(0);
+  try {
+    const sealed = sealWatcherConfig(config, deployKey);
+    const outputDir = resolve(deps.outputDir), sealedConfigPath = join(outputDir, 'watcher-config.sealed');
+    await mkdir(outputDir, { recursive: true, mode: 0o700 });
+    await writeFile(sealedConfigPath, `${sealed}\n`, { mode: 0o600, flag: 'wx' });
+    const deployment = await deps.prepareDeployment({ stateKey, vaultPassphrase: printablePassphrase, watcherKey, config });
+    await deps.vault.set('watcher/signing/private', watcherKey.privateKeyDer);
+    await deps.vault.set('watcher/signing/public', watcherKey.publicKeyDer);
+    await deps.audit.append({ kind: 'watcher:setup', summary: 'Watcher deployment prepared.', data: { platform, watcherKeyId: watcherKey.keyId } });
+    return { sealedConfigPath, watcherKeyId: watcherKey.keyId, deployment: deployment ?? undefined,
+      values: { KEYSENTRY_WATCHER_KEY: deployKey.toString('base64'), KEYSENTRY_STATE_KEY: stateKey.toString('base64'),
+        KEYSENTRY_VAULT_PASSPHRASE: printablePassphrase.toString(), KEYSENTRY_WATCHER_CONFIG: sealed } };
   } catch (error) {
     if (error instanceof CliError) throw error;
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError('A watcher config already exists in the output directory. Choose a new directory for this setup.');

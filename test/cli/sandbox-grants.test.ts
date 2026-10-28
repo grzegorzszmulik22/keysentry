@@ -215,3 +215,15 @@ test('watcher grants place the user directory under its configured state directo
     { ...env, KEYSENTRY_USER_DIR: f.userDir }, f.bundle);
   expect(explicit.writePaths).toContain(directory(f.userDir));
 });
+
+test('the box agent can write only its state directory and read the launcher token beside it', async () => {
+  const f = await fixture();
+  const state = join(f.cwd, 'box-state');
+  const result = await permissionOptionsForBin(f.argv('box', 'agent', '--state-dir', state), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle, { userDir: f.userDir });
+  expect(result.writePaths).toEqual([directory(join(f.cwd, '.keysentry')), directory(f.userDir), directory(state)]);
+  expect(result.readPaths).toEqual(expect.arrayContaining([directory(state), directory(resolve('/run/container_launcher'))]));
+  expect(result.allowChildProcess).toBe(true);
+  const check = await permissionOptionsForBin(f.argv('box', 'check', 'local-box'), { KEYSENTRY_VAULT: 'encrypted-file' }, f.bundle, { userDir: f.userDir });
+  expect(check.writePaths).toEqual([directory(join(f.cwd, '.keysentry')), directory(f.userDir)]);
+  expect(check.allowChildProcess).toBe(false);
+});

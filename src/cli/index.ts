@@ -26,6 +26,7 @@ import { approveAutopilot } from './autopilot-approvals.js';
 import { approvedOutcome } from '../approvals/index.js';
 import { listPasskeys } from './passkeys.js';
 import { bootstrapWatcher } from './watcher-bootstrap.js';
+import { registerBoxCommands, type BoxCommandsOptions } from './box.js';
 import { CREDENTIAL_NAMES, VaultLockedError, VaultReadOnlyError, VaultUnavailableError } from '../vault/index.js';
 
 export { createRuntime } from './runtime.js';
@@ -45,6 +46,10 @@ export interface CliOptions extends RuntimeOptions {
   guardGit?: GitRunner;
   confirmFirstRunSave?: () => Promise<boolean>;
   confirmDashboard?: () => Promise<boolean>;
+  /** Stops a long-running watch started by an embedder, such as the cloud box agent. */
+  signal?: AbortSignal;
+  /** Test and embedding hooks for the cloud box commands. */
+  box?: Partial<Pick<BoxCommandsOptions, 'loadLocalBox' | 'loopback' | 'emulatorControl' | 'startWatcher' | 'allowListKeys' | 'sessionTimeoutMs' | 'pollMs'>>;
 }
 
 function role(value: string): TokenRole {
@@ -157,7 +162,9 @@ export async function runCli(args: string[] = process.argv.slice(2), options: Cl
   registerPhase2Commands(program, { getRuntime, watcherConfig: () => deployment?.config,
     human, emit, diagnostic, interactive, json: () => !!program.opts().json, setExit: code => { exitCode = code; },
     env: options.env ?? process.env, now: options.now, promptIO: options.promptIO,
-    confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser });
+    confirmAdoption: options.confirmAdoption, openBrowser: options.openBrowser, signal: options.signal });
+  registerBoxCommands(program, { getRuntime: () => getRuntime(), human, emit, diagnostic, json: () => !!program.opts().json,
+    setExit: code => { exitCode = code; }, promptIO: options.promptIO, env: options.env ?? process.env, ...options.box });
   program.commands.find(command => command.name() === 'autopilot')!.command('resume')
     .description('Publish a signed recovery message for a paused Actions watcher')
     .option('--relay', 'Send recovery through the configured watcher relay')

@@ -12,3 +12,5 @@ export { createControlPlaneServer } from './server.js';
 export type { AccountsService, ControlPlaneServerOptions } from './server.js';
 export { startEmulator } from './emulator/index.js';
 export type { Emulator, EmulatorOptions, EmulatorSwitches, EmulatorReleasePolicy, EmulatorBoxConfig, EmulatorTokenInput } from './emulator/index.js';
+export { startLocalBox } from './local-box.js';
+export type { LocalBox, LocalBoxOptions, LocalBoxRuntime } from './local-box.js';

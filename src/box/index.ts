@@ -4,3 +4,4 @@ export * from './attestation/index.js';
 export * from './handshake/index.js';
 export * from './seal/index.js';
 export * from './allowlist/index.js';
+export * from './agent/index.js';

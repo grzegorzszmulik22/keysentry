@@ -26,6 +26,7 @@ export interface Phase2CommandsOptions {
   env: NodeJS.ProcessEnv; now?: () => Date; promptIO?: PromptIO;
   confirmAdoption?: (question: string) => Promise<boolean>;
   openBrowser?: (url: string) => Promise<void>;
+  signal?: AbortSignal;
 }
 const collect = (value: string, previous: string[] = []) => [...previous, ...value.split(',').map(item => item.trim()).filter(Boolean)];
 function number(value: string): number {
@@ -250,6 +251,6 @@ export function registerPhase2Commands(program: Command, opts: Phase2CommandsOpt
           return { ok, reasons: ok ? [] : ['The watcher installation integrity could not be verified.'] };
         },
         ...(!sealed ? { applyAdoptionUpdates: async updates => { await rt.autopilotManager().applyAdoptionUpdates(updates); } } : {}),
-      }, options));
+      }, { ...options, ...(opts.signal ? { signal: opts.signal } : {}) }));
     });
 }

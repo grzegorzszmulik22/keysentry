@@ -1,0 +1,31 @@
+# The cloud box image: the same reproducible release bundle as Dockerfile, started as `keysentry box agent`.
+# Single platform (Confidential Space VMs are amd64), base images pinned by the same digests as Dockerfile.
+FROM --platform=linux/amd64 node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY . .
+ARG KEYSENTRY_BUILD_COMMIT=dev
+ENV KEYSENTRY_BUILD_COMMIT=${KEYSENTRY_BUILD_COMMIT}
+RUN npm run release:build
+# The private state directory, created here because the runtime image has no shell.
+RUN mkdir /box-state && chmod 0700 /box-state
+
+FROM --platform=linux/amd64 gcr.io/distroless/nodejs24-debian13:nonroot@sha256:cb606325b7ec4af55462cb0b424a53b452a5b4a894ffe841fcf1048d216fb9f8
+ARG KEYSENTRY_BUILD_COMMIT=dev
+LABEL org.opencontainers.image.source="https://github.com/grzenio22/keysentry" \
+      org.opencontainers.image.revision="${KEYSENTRY_BUILD_COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+# Confidential Space launch policy (notes/phase4-facts.md §2): the operator cannot change the command, container
+# logs stay inside the VM on the production image, and memory monitoring cannot be turned on. There is no
+# allow_env_override label, so no environment variable can be added at launch.
+LABEL "tee.launch_policy.allow_cmd_override"="false" \
+      "tee.launch_policy.log_redirect"="debugonly" \
+      "tee.launch_policy.monitoring_memory_allow"="never"
+WORKDIR /app
+COPY --from=build /build/dist-release/out/keysentry.mjs /build/dist-release/out/release-manifest.json /app/
+COPY --from=build /build/LICENSE /build/NOTICE /app/
+COPY --from=build --chown=65532:65532 --chmod=0700 /box-state/ /var/lib/keysentry-box/
+ENV KEYSENTRY_VAULT=encrypted-file NODE_ENV=production
+USER 65532
+ENTRYPOINT ["/nodejs/bin/node", "/app/keysentry.mjs", "box", "agent"]

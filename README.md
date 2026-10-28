@@ -346,6 +346,40 @@ The templates cover Docker Compose, Railway, Fly, Render and scheduled GitHub Ac
 
 The watcher resumes interrupted work, polls the relay and feeds, handles incident waves and approvals, settles due grace, runs monitoring and sends a daily signed heartbeat. If no external notification channel has accepted a message within 24 hours, state is unwritable, the armed plan is invalid or clock skew exceeds five minutes, it enters alert-only mode. Console output does not satisfy this delivery check. Acceptance by a channel does not prove that a person read the message. Status shows the plan, waves and deadlines, delivery time and next settlement. An optional public approval server needs an HTTPS origin and correctly configured proxy/binding; `--port` alone does not provide TLS.
 
+## Cloud box (not launched)
+
+The cloud box is a hosted watcher that would run inside a Google Cloud Confidential Space VM. It is built and tested,
+but it is **not launched**: there is no hosted box to sign up for, and nothing in this repository creates cloud
+resources. You can run the whole flow on your own computer against a local emulator:
+
+```sh
+npm run dev -- box provision --emulator                 # from a source checkout; keeps running
+keysentry box check local-box                           # in another terminal: verify before anything is sent
+keysentry box send-tokens local-box                     # verify again, then seal this project's watcher deployment to the box
+npm run dev -- box provision --emulator --mode unlock-on-restart
+keysentry box unlock local-box                          # after a restart, in unlock-on-restart mode
+keysentry box allowlist verify                          # the signed public log of allowed box images
+```
+
+`box check` prints every check by name: the attestation token's signature and issuer, both nonces (the box's key
+and your fresh challenge), production debug status, supported hardware, `STABLE` support, memory monitoring off,
+no environment or command override, the box's project and service account, and the image digest against the signed
+allow-list. `send-tokens` and `unlock` refuse with the failed check named and send nothing. The box receives the same
+deployment `watcher setup` creates, sealed to its attested key, and runs the same watcher. In the emulator, the checks
+use the emulator's test keys and digests, and the output says so.
+
+The three ways the box keeps tokens at rest: *standard* (a Cloud KMS key released only to the allowed image in
+keysentry's project and service account), *bring your own KMS* (the key and its release policy in your own project),
+and *unlock on restart* (part of the key stays on your computer; after a restart the box pauses autopilot, sends one
+notice, and waits for `keysentry box unlock`).
+
+> Your keys are decrypted only inside a confidential machine running the exact open-source build you can verify. Our
+> staff cannot log in to it and the cloud provider cannot read its memory. In the standard option we control the
+> key-release policy; every change to it is public. With bring-your-own-KMS, only you control it.
+
+What that claim still relies on (Google's attestation service and signing keys, the Confidential Space image, and
+the TDX or SEV hardware) is in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md#cloud-box).
+
 ## Notifications
 
 ```sh

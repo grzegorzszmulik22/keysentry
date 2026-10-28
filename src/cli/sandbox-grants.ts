@@ -8,6 +8,8 @@ import { createStateCipher, createStateStore, statePaths } from '../core/store.j
 import { openVault } from '../vault/index.js';
 import { loadConfigMetadata, type ConfigMetadata } from './config.js';
 import { inventorySchema } from './schemas.js';
+import { BOX_STATE_DIR } from '../box/agent/main.js';
+import { DEFAULT_TOKEN_PATH } from '../box/agent/tee.js';
 
 interface GrantDependencies {
   userDir?: string;
@@ -148,6 +150,12 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
     writePaths.push(directory(stateDir)); extraReads.push(directory(stateDir));
     if (env.KEYSENTRY_WATCHER_CONFIG_FILE) extraReads.push(resolve(metadata.cwd, env.KEYSENTRY_WATCHER_CONFIG_FILE));
   }
+  const boxAgent = command === 'box' && args.includes('agent');
+  if (boxAgent) {
+    // The sealed record and the watcher's encrypted state, and the launcher's default attestation token.
+    const boxState = directory(resolve(metadata.cwd, argument('--state-dir') ?? BOX_STATE_DIR));
+    writePaths.push(boxState); extraReads.push(boxState, directory(resolve(dirname(DEFAULT_TOKEN_PATH))));
+  }
   const output = argument('--output', '-o');
   if (command === 'plan' && output) writePaths.push(resolve(metadata.cwd, output));
   const reportOutput = argument('--out');
@@ -173,7 +181,7 @@ export async function permissionOptionsForBin(argv: string[], env: NodeJS.Proces
   return {
     readPaths: [directory(metadata.cwd), directory(userDir), bundle, join(dirname(bundle), 'release-manifest.json'), metadata.configPath, ...metadata.dotenvRoots.map(directory), ...extraReads],
     writePaths: [...new Set(writePaths)],
-    allowChildProcess: command === undefined || ['guard', 'ui', 'watch'].includes(command)
+    allowChildProcess: command === undefined || ['guard', 'ui', 'watch'].includes(command) || boxAgent
       || command === 'passkey' && args.includes('register') || await needsVaultHelper(env, userDir),
   };
 }

@@ -20,7 +20,7 @@ import { cacheNotificationMessage, type NotifyChannelSettings } from './notifica
 import { createWatcherStateStore } from './watcher-state.js';
 import { planIdSchema } from './schemas.js';
 
-export { setupWatcher, watcherStatus } from './watcher-setup.js';
+export { createWatcherDeployment, setupWatcher, watcherStatus } from './watcher-setup.js';
 export type { WatcherSetupDependencies, WatcherDeploymentSecrets, WatcherPlatform } from './watcher-setup.js';
 
 export interface WatchRuntimeDependencies {

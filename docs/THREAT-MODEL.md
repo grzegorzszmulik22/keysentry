@@ -252,6 +252,62 @@ GitHub provenance. Public attestation, release upload, and npm publishing jobs a
 the repository is private. Public publishing, independent reproducibility, and signing-key
 operations still need maintainer validation before a release.
 
+## Cloud box
+
+**Status.** The cloud box is built and tested against a local emulator. It is not launched: no box, control plane,
+KMS key or allow-list entry exists in any cloud project, and nothing here has run on Confidential Space hardware.
+The emulator signs tokens with local test keys; passing its checks says nothing about real hardware.
+
+**The claim** (used verbatim in the CLI and README): "Your keys are decrypted only inside a confidential machine
+running the exact open-source build you can verify. Our staff cannot log in to it and the cloud provider cannot read
+its memory. In the standard option we control the key-release policy; every change to it is public. With
+bring-your-own-KMS, only you control it."
+
+**What the CLI checks before anything is sent.** The box makes fresh X25519 and Ed25519 keys at every boot and asks
+the Confidential Space launcher for an attestation token whose nonces are a hash of both public keys and the CLI's
+fresh challenge. The CLI verifies the RS256 signature against Google's published keys (or the certificate chain to
+the pinned Confidential Space root), issuer, audience, time with 60 seconds of skew, both nonces, secure boot,
+`dbgstat == disabled-since-boot`, `swname == CONFIDENTIAL_SPACE`, TDX or SEV hardware, `STABLE` support, memory
+monitoring off, no environment or command override, the project and service account, and the image digest against
+the signed allow-list. It also checks that the attestation is signed by the key the box announced. The bundle is
+encrypted to the attested key, bound to the session, and signed by the user's device key; the box acknowledges only
+after sealing it at rest. Every exchange passes through the relay, which is untrusted: it can delay, drop or reorder
+messages, but a substituted key or an old attestation fails a named check and no token is sent.
+
+**What remains trusted.**
+
+- Google's attestation service, its token signing keys and the Confidential Space root certificate. A forged token
+  signed by those keys would pass every check.
+- The Confidential Space launcher and image: launch-policy enforcement (no command or environment override, logs
+  only on debug images, no memory monitoring), the token server, and the absence of operator login on production images.
+- Intel TDX or AMD SEV hardware, firmware and their memory encryption. Side channels and hardware flaws are outside
+  what keysentry can detect.
+- Cloud KMS and STS enforcing the key-release condition (image digest, project and service account). In the standard
+  option keysentry sets that condition; changes to the allowed digests are visible in the public allow-list, but a
+  first-time client cannot detect a log that was rolled back as a whole (it keeps a checkpoint after its first check).
+  With bring-your-own-KMS the customer sets it.
+- The open-source box image itself: it is the same release bundle as the CLI, built reproducibly, and the allow-list
+  should only ever list digests of reviewed releases.
+
+**Known limits of this build.**
+
+- The first device to enroll a box comes from routing outside the box (instance metadata in production). Whoever
+  controls that routing can enroll a box to their own device, which gives them a box holding *their* tokens and
+  denies service to the user; it cannot reveal the user's tokens, because the user's CLI encrypts only to a box that
+  answers its own signed challenge. Later sessions use the device keys sealed inside the record.
+- A complete, older sealed record of the same box can be restored by whoever controls its disk; there is no
+  monotonic counter. The box would run the older deployment until new tokens are sent.
+- In unlock-on-restart mode, notification settings for the one restart notice are sealed under KMS alone, so a
+  locked box can still reach the user. Those channel secrets have the standard option's protection, not the device
+  share's. The notice is signed by the box's per-boot key, which the user cannot check; it grants nothing and only
+  asks the user to run `keysentry box unlock`, which verifies the box again.
+- Plaintext lives in the box process's memory while the watcher runs. Buffers the box owns are cleared; JavaScript
+  strings cannot be, and garbage collection decides when they disappear.
+- Unverified on real infrastructure: whether a non-root container user can reach the launcher socket, whether
+  Node's permission model allows that Unix-socket connection, whether the container's state directory survives a
+  VM restart, and how the relay authenticates a box (this build presents an attestation token for the relay's own
+  origin; the control plane does not yet accept it).
+
 ## Actors and remaining risks
 
 | Actor | What they could try | Response and residual risk |
@@ -288,10 +344,10 @@ operations still need maintainer validation before a release.
 
 ## Later phases
 
-The trust design also describes public-origin passkey enrollment, confidential cloud boxes,
-and team/enterprise roles. Those remain later work, not protections established by the local dashboard. No cloud box or control plane is
-deployed here, and there is no current claim that confidential hardware prevents operators or a
-cloud provider from accessing a running keysentry instance. Legacy monitor policy remains distinct from the
+The trust design also describes public-origin passkey enrollment and team/enterprise roles. Those
+remain later work, not protections established by the local dashboard. The cloud box is built but
+not launched (see [Cloud box](#cloud-box)): no cloud box or control plane is deployed, so no running
+keysentry instance is protected by confidential hardware today. Legacy monitor policy remains distinct from the
 signed armed-plan scope; enabling one does not authorize the other.
 
 Before public release, the maintainer must finish integration review, exercise real OS vaults,
