@@ -4,7 +4,7 @@ You can start with local files and add platforms when you need them. You do not 
 
 There are two different permission questions: **what your token allows**, and **what keysentry does with it**. Railway, Vercel and Render do not document a read-only token that can read all the variable values needed for a scan. Their tokens can allow writes even while keysentry is only scanning. Use the narrowest token below, and review `keysentry doctor` before rotating.
 
-This page describes phases 1 and 2 and vendor documentation checked on 27 October 2026. The [phase 1 research notes](../notes/phase1-facts.md) and [phase 2 facts](../notes/phase2-facts.md) record the evidence and its limits. Adapters have been tested against fakes, **not live accounts**. There has been **no external audit yet**. An item marked unverified is not a promise that the platform will accept that operation with that token.
+This page describes phases 1 and 2 and vendor documentation checked on 27 October 2026. Adapters have been tested against fakes, **not live accounts**. There has been **no external audit yet**. An item marked unverified is not a promise that the platform will accept that operation with that token.
 
 ## Local files and saved data
 
@@ -89,7 +89,7 @@ Choose an explicit short expiry: the recorded default is 20 years. Tokens can be
 
 keysentry reads app names through `GET https://api.machines.dev/v1/apps?org_slug=...` unless names are configured. It reads secret names, digests and creation times with GraphQL at `https://api.fly.io/graphql`, and treats every value as sealed. Approved changes use Machines API `POST /v1/apps/{app}/secrets` with selected `{ values }`, which stages the secrets without activating Machines.
 
-Activation lists all Machines, leases each in order, and updates its unchanged config with its current version and the available minimum secrets version. It releases the lease and confirms the new started version before moving to the next running Machine. Previously stopped/suspended Machines stay stopped and must report the new version. Empty apps remain unconfirmed. A partial or failed update stops the sequence; API readiness is not an application health check. Token acceptance, real lease/update timing and stopped/suspended behavior still need live-account validation. See the [Fly module notes](../notes/hosts.md#fly-phase-2-machines-api).
+Activation lists all Machines, leases each in order, and updates its unchanged config with its current version and the available minimum secrets version. It releases the lease and confirms the new started version before moving to the next running Machine. Previously stopped/suspended Machines stay stopped and must report the new version. Empty apps remain unconfirmed. A partial or failed update stops the sequence; API readiness is not an application health check. Token acceptance, real lease/update timing and stopped/suspended behavior still need live-account validation.
 
 Fly's [secret documentation](https://docs.fly.io/apps/secrets) says plaintext cannot be read back. The [Machines API specification](https://docs.fly.io/api/machines/openapi.json) nevertheless describes `show_secrets=true` and a secret `value` field. Whether this returns values, and with which token, is **unverified**; this adapter does not use it. The [Machines API reference](https://docs.fly.io/llms.txt) also describes secret-write endpoints and secret versions for machine updates. Deploy access can run application code that reads secrets, even when the secret-listing API does not reveal them.
 
@@ -108,7 +108,7 @@ Actions **variables** are different: their values are readable with Variables: r
 
 ### Phase 5 and 6 hosts and secret stores
 
-These adapters were built from vendor documentation without live accounts. Every request shape, the token choice and what is **unverified** are in the module notes: [notes/hosts-a.md](../notes/hosts-a.md) (Netlify, Heroku, DigitalOcean), [notes/hosts-b.md](../notes/hosts-b.md) (Cloudflare Workers and Pages, Supabase Edge Functions, Coolify, Zeabur) and [notes/secret-stores.md](../notes/secret-stores.md) (Kubernetes, AWS Secrets Manager, Vault KV, Doppler, Infisical). `keysentry doctor` shows the same token guidance.
+These adapters were built from vendor documentation without live accounts. Request shapes and token choices are in the adapter sources under `src/hosts/`. `keysentry doctor` shows the same token guidance.
 
 | Host | Choose | What keysentry reads | What an approved write changes |
 |---|---|---|---|
@@ -162,7 +162,7 @@ Usage costs calculated from OpenAI or Anthropic token counts are estimates from 
 | Neon | `NEON_ADMIN_KEY`, a personal API key of the same user | `GET https://console.neon.tech/api/v2/auth` | `POST /api_keys`; delete the old key by hand because Neon exposes no value hints |
 | Upstash | `UPSTASH_ADMIN_EMAIL` + `UPSTASH_ADMIN_KEY`, a Developer API key with Read/Write | Redis `GET https://<db>.upstash.io/ping`; QStash `GET /v2/queues`; database and QStash user lists at `api.upstash.com` | `POST /v2/redis/reset-password/{id}` or `/v2/qstash/rotate-token/{id}`: an atomic roll that invalidates the old credential at once |
 
-See [notes/providers-a.md](../notes/providers-a.md) and [notes/providers-b.md](../notes/providers-b.md) for what is unverified.
+None of these adapters has been run against a live account yet.
 
 ### Guided and local providers
 
@@ -220,7 +220,7 @@ the watcher's 24-hour window forces alert-only.
 
 The watcher reads official platform feeds and curated news sources through the guarded client. Feed servers
 receive normal GET request metadata and conditional cache headers, not credentials from application inventory.
-The bundled sources and publisher ownership are in `src/autopilot/sources.ts` and [phase 2 facts](../notes/phase2-facts.md).
+The bundled sources and publisher ownership are in `src/autopilot/sources.ts`.
 News alone never authorizes rotation. Only defined corroborated evidence plus a valid signed plan can execute.
 
 An armed plan can include HTTPS application health checks. Their hosts are explicit user rules with purpose
@@ -253,7 +253,7 @@ An explicit `keysentry verify` can fetch `SHA256SUMS` and `SHA256SUMS.sig` from 
 
 All application requests use the injected `HttpClient`; the CLI uses an HTTPS egress allow-list and records each attempt's host, method, purpose, time, allowed/blocked outcome and available HTTP status. It records no headers, request/response bodies or secret-bearing URLs. `keysentry network` shows that receipt. A host on the allow-list can still be compromised; the receipt is a record, not proof that a response was truthful.
 
-The Node permission sandbox is an additional file/process limit. On Node 22 it is enabled only from **22.23.4** onward; Node 22 has no `--allow-net` control. The in-client egress guard is the network control. See [recorded Node versions and advisories](../notes/phase1-facts.md#4-nodejs-permission-model-versions). Agent-environment checks also have limits: `CLAUDECODE=1` alone occurs in human IDE terminals, while dedicated child-session and other documented agent markers are used to refuse mutations. They do not isolate keys from other software running as your user.
+The Node permission sandbox is an additional file/process limit. On Node 22 it is enabled only from **22.23.4** onward; Node 22 has no `--allow-net` control. The in-client egress guard is the network control. See [Node's permission documentation](https://nodejs.org/docs/latest-v22.x/api/permissions.html). Agent-environment checks also have limits: `CLAUDECODE=1` alone occurs in human IDE terminals, while dedicated child-session and other documented agent markers are used to refuse mutations. They do not isolate keys from other software running as your user.
 
 ## Things keysentry never does
 

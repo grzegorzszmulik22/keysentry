@@ -1,6 +1,6 @@
 # Feed fixtures
 
-Recorded 2026-10-27 by the orchestrator for phase 2 (incidents and corroboration). Real items are trimmed to title,
+Recorded 2026-10-27 for phase 2 (incidents and corroboration). Real items are trimmed to title,
 link, date and at most the first two sentences of the summary.
 
 | File | Origin | Real or synthetic |

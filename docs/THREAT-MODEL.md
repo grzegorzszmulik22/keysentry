@@ -2,7 +2,7 @@
 
 keysentry needs access to secret values to compare their copies and replace them. This is a local
 CLI, loopback dashboard and optional watcher that you host. You choose the projects and credentials they can
-use. Its [trust promise](superpowers/specs/2026-10-27-trust-autopilot-design.md#3-the-trust-promise)
+use. Its [trust promise](GUIDE.md#the-trust-promise)
 guides the design; the [access guide](ACCESS.md) describes the actual integration permissions.
 
 This model covers 1.0 phases 1–3: vault storage, encrypted state, network restrictions, an audit log,
@@ -198,8 +198,7 @@ computer, and a server that does not close the session gets an "unconfirmed" not
 child-process use on supported patched versions. On Node 22 it is enabled only at **22.23.4 or
 later**. Node 22 has no network permission flag; the client allow-list remains the network control.
 The helper allowance needed for OS vaults is not a separate sandbox for those helpers. Node's
-permission model does not protect against malicious code; see [Node's documented limits](https://nodejs.org/docs/latest-v22.x/api/permissions.html)
-and the [recorded version facts](../notes/phase1-facts.md#4-nodejs-permission-model-versions).
+permission model does not protect against malicious code; see [Node's documented limits](https://nodejs.org/docs/latest-v22.x/api/permissions.html).
 Inside the permission model Node refuses `fsync`, so keysentry's writes are atomic (temporary file and
 rename) but not forced to disk: they survive a keysentry crash, and a power loss within seconds of a
 rotation can lose the newest value. Recovery then reports a possible leftover key and revokes nothing;

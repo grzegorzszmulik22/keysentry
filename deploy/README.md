@@ -217,7 +217,7 @@ read on 2026-12-01. Dashboard template publishing steps are in
 1. Copy `deploy/github-actions/keysentry-watch.yml` to
    `.github/workflows/keysentry-watch.yml` in a repository you control, on its
    default branch. Review the pinned actions: each is pinned to a full commit SHA
-   recorded in `notes/phase1-facts.md` (actions/cache v6.1.0 verified 2026-10-27).
+   (actions/cache v6.1.0 verified 2026-10-27).
 2. Add the five setup values under Settings > Secrets and variables > Actions >
    Repository secrets. Add the ordinary repository variable
    `KEYSENTRY_RELEASE_TAG`, for example `v1.0.0`, selecting a release you reviewed.

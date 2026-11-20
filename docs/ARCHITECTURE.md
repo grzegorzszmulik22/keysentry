@@ -4,7 +4,7 @@ keysentry is a local CLI and loopback dashboard with an optional self-hosted wat
 team's hosts, rotates them in a safe order with one redeploy per service, verifies the new keys, revokes the old ones,
 and monitors keys so it can contain or rotate them when it sees suspicious use.
 
-The contracts every module implements are in `src/types.ts` (owned by the orchestrator; do not edit). All network
+The contracts every module implements are in `src/types.ts`. All network
 access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/helpers/fake-http.ts`).
 
 ## Non-negotiable safety rules (every module)
@@ -23,9 +23,9 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 
 ## Layout and ownership
 
-| Path | Module | Wave |
+| Path | Module | Build stage |
 |---|---|---|
-| `src/types.ts`, `test/helpers/*` | contracts and test helpers (orchestrator) | 0 |
+| `src/types.ts`, `test/helpers/*` | contracts and test helpers | 0 |
 | `src/security/` | encryption/signing primitives and tamper-evident audit | phase 1, waves 0-1 |
 | `src/vault/` | OS stores, encrypted-file/env/memory backends, credential roles and key helpers | phase 1, wave 1 |
 | `src/net/`, `src/http.ts` | egress rules, guarded HTTP and network receipt | phase 1, wave 1 |
@@ -49,7 +49,7 @@ access goes through `HttpClient` (`src/http.ts`); tests use `FakeHttp` (`test/he
 
 Tests live in `test/<module>/*.test.ts`. Each module exports its public API from `src/<module>/index.ts`.
 
-## Wave 1
+## Core, hosts and providers
 
 ### core (`src/core/`)
 Public API (`src/core/index.ts`):
@@ -127,7 +127,7 @@ One module per provider exporting a `ProviderAdapter`; `src/providers/index.ts` 
 - **crypto-wallet** (guided). guidance must start with: "Move funds to a new wallet first; rotating the variable does not protect funds already exposed."
 - **app-secret** (generate). rotate returns `generateSecret(oldValue)`, oldRevoked false, note that sessions/JWTs signed with the old secret become invalid. verify ok.
 
-## Wave 2
+## Rotation and monitoring
 
 ### rotate (`src/rotate/`)
 `executePlan(plan: RotationPlan, inv: Inventory, deps: EngineDeps, opts: RotateOptions): Promise<RotationReport>` with
@@ -183,7 +183,7 @@ Public API (`src/monitor/index.ts`):
 - `notify.ts`: `createConsoleNotifier(log)` and `createWebhookNotifier(url, http)` (POST JSON `{ text, content }` so Slack and Discord both accept it), `combineNotifiers(...)`.
 - `daemon.ts`: `runMonitorOnce(ctx): Promise<{ signals: Signal[]; decisions: Decision[] }>` and `runMonitor(ctx, { intervalMs, signal?: AbortSignal })`. ctx carries inventory, hosts, providers, providerCtx, policy, state store, notifier, rotate executor, fingerprint key, log, clock.
 
-## Wave 3
+## CLI
 
 ### CLI (`src/cli/`) and README
 

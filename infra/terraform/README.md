@@ -5,7 +5,7 @@ uses local fakes; no project, service, key or VM has been provisioned by this wo
 or shared root that applies these modules together.
 
 All roots require Terraform `>= 1.6` and pin `hashicorp/google` to `8.9.0`. Resource names, claims and arguments are
-based on [the verified phase 4 facts](../../notes/phase4-facts.md), sections 3–4. Projects, enabled APIs and the box
+based on Google Cloud Confidential Space documentation checked in October 2026. Projects, enabled APIs and the box
 image's Artifact Registry repository must already exist. Provider authentication is external; there are no
 credential, plaintext token, key-share or private-key inputs. Outputs contain resource identifiers only.
 
@@ -43,7 +43,7 @@ directly to the VM service account or control plane. Principal sets use the pool
 contains the pool owner's **project number**, not its project ID. No service-account impersonation is involved.
 
 Use only digests approved by the verified signed public allow-list. Terraform does not fetch or verify that log,
-publish policy changes, or enforce its append-only history. The orchestrator must connect those release checks;
+publish policy changes, or enforce its append-only history. Those release checks must be connected separately;
 editing this variable alone is not proof of an approved release. Keep each pool dedicated to this provider: an
 additional provider in the same pool could otherwise mint the same mapped attribute. KMS keys rotate every 90 days;
 key rings and keys have `prevent_destroy`, and keys additionally use `deletion_policy = "PREVENT"`. These guards

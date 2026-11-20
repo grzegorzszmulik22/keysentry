@@ -1,4 +1,4 @@
-// Run vitest inside the Codex sandbox (no esbuild child process). usage: node tools/vitest-sandbox.mjs test/<module>
+// Run vitest in process, without an esbuild child process (for sandboxed environments). usage: node tools/vitest-sandbox.mjs test/<module>
 import { startVitest } from 'vitest/node';
 import ts from 'typescript';
 

@@ -4,7 +4,7 @@ keysentry runs on your computer and talks directly to the services you choose. S
 keysentry account. The [access guide](docs/ACCESS.md) explains which credentials each integration needs,
 what those credentials could do, and what keysentry actually asks them to do.
 
-The [trust promise](docs/superpowers/specs/2026-10-27-trust-autopilot-design.md#3-the-trust-promise)
+The [trust promise](docs/GUIDE.md#the-trust-promise)
 sets the direction for 1.0. This document describes phase 1 and its limits. There has been **no external
 security audit**, and adapters have **not yet been run against live accounts**. Tests use recorded
 formats and fake HTTP clients. Build and publishing workflows are prepared; that does not establish
@@ -15,8 +15,8 @@ that a public release has been published or independently reproduced.
 Use [GitHub's private vulnerability reporting page for keysentry](https://github.com/grzenio22/keysentry/security/advisories/new).
 Include the affected version or commit, the command you ran, the expected result, and a small
 reproduction with invented credentials. Do not include a working token, vault contents, or an
-unencrypted state file. If private reporting is unavailable to you while the repository is private,
-ask the repository owner to arrange private access; do not put sensitive details in a public issue.
+unencrypted state file.
+Do not put sensitive details in a public issue.
 
 Our response targets are to acknowledge a report within **72 hours** and fix a confirmed critical
 issue within **7 days**. These are targets, not a service guarantee. We will coordinate a disclosure
@@ -32,8 +32,8 @@ The CLI requires Node.js **22.13 or later**. Its optional Node permission sandbo
 supported, patched versions. On the Node 22 line it requires **22.23.4 or later**; running on an older
 22.x version does not enable that sandbox. Node 22 has no network permission flag: the HTTP client's
 host allow-list is the network control. The Node permission model is an extra boundary and does not
-make malicious code safe to run. See the [recorded version and permission facts](notes/phase1-facts.md#4-nodejs-permission-model-versions)
-and [Node's permission documentation](https://nodejs.org/docs/latest-v22.x/api/permissions.html).
+make malicious code safe to run. See
+[Node's permission documentation](https://nodejs.org/docs/latest-v22.x/api/permissions.html).
 
 ## Dependencies and installation
 

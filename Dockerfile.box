@@ -17,7 +17,7 @@ ARG KEYSENTRY_BUILD_COMMIT=dev
 LABEL org.opencontainers.image.source="https://github.com/grzenio22/keysentry" \
       org.opencontainers.image.revision="${KEYSENTRY_BUILD_COMMIT}" \
       org.opencontainers.image.licenses="Apache-2.0"
-# Confidential Space launch policy (notes/phase4-facts.md §2): the operator cannot change the command, container
+# Confidential Space launch policy: the operator cannot change the command, container
 # logs stay inside the VM on the production image, and memory monitoring cannot be turned on. There is no
 # allow_env_override label, so no environment variable can be added at launch.
 LABEL "tee.launch_policy.allow_cmd_override"="false" \

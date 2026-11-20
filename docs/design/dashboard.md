@@ -1,6 +1,6 @@
 # Dashboard design direction
 
-For the agents building `src/dashboard/client`. The dashboard is a local page that answers three questions for a
+For contributors working on `src/dashboard/client`. The dashboard is a local page that answers three questions for a
 developer who just heard about a breach: where do my keys live, what is at risk, and what exactly will keysentry do
 if I press this button. It must feel calm and exact, like a well-kept key cabinet, never like an alarm panel.
 

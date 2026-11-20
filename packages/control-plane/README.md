@@ -38,7 +38,7 @@ Built and tested locally (fakes, happy-dom and the loopback emulator):
 Not verified, because it needs real accounts: Stripe (Checkout Session creation, the restricted key's permissions,
 webhook delivery), Cloud Run (startup, `X-Forwarded-For`, SIGTERM timing), Secret Manager reads, Cloud Storage under
 load, Compute instance creation, reads, stops and starts with the custom role, and the Confidential Space tokens of a
-real box. See `notes/control-plane.md` for the deploy steps and the list.
+real box. See [Deploy steps](#deploy-steps-written-not-run) below.
 
 Known limits: one instance only (per-box and per-account work is serialized in process and Cloud Storage writes have no
 compare-and-swap, so Terraform pins `max_instance_count = 1`; a revision rollout can briefly run two, and the other
@@ -52,7 +52,6 @@ Run from the repository root:
 
 ```powershell
 node tools/vitest-sandbox.mjs packages/control-plane/test
-node tools/vitest-sandbox.mjs tools/probes/phase4/control-plane
 npx tsc -p packages/control-plane/tsconfig.json --noEmit
 npx tsc -p packages/control-plane/tsconfig.ui.json --noEmit
 node tools/vitest-sandbox.mjs test/infra/terraform.test.ts
@@ -312,3 +311,41 @@ Network, firewall, box IAM and KMS are prerequisites (`infra/terraform/box`).
 
 `startLocalBox({ bootBox, boxId?, enrollmentDeviceKey? })` runs the emulator, a loopback control plane and one box
 provisioned through emulator Compute. `close()` closes both listeners even if the box fails to stop.
+
+## Deploy steps (written, not run)
+
+Prerequisites: a control-plane project and the box project (`infra/terraform/box` applied there), billing enabled,
+these APIs enabled in the control-plane project: Cloud Run, Secret Manager, Cloud Storage, IAM, Artifact Registry
+(and Compute in the box project for live provisioning). Use Stripe test mode end to end first.
+
+1. **Stripe (test mode).** Create the product and a recurring price (`price_...`). Create a restricted key with
+   Checkout Sessions: Write and Subscriptions: Read. Create the webhook endpoint `https://ORIGIN/billing/webhook` for
+   `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`,
+   `customer.subscription.updated`, `customer.subscription.deleted`, and copy its signing secret. Set the failed-payment
+   setting to end in `unpaid` or `canceled`.
+2. **Secrets.** In the control-plane project, create two secrets (for example `keysentry-stripe-webhook` and
+   `keysentry-stripe-api-key`) and add one version each, without a trailing newline, e.g.
+   `printf '%s' "$VALUE" | gcloud secrets versions add keysentry-stripe-webhook --data-file=- --project=$PROJECT`.
+3. **Image.** From a clean checkout:
+   `docker build -f Dockerfile.control-plane --build-arg KEYSENTRY_BUILD_COMMIT=$(git rev-parse HEAD) -t $REGION-docker.pkg.dev/$PROJECT/$REPO/control-plane:$COMMIT .`,
+   push it, and take its digest (`...@sha256:...`).
+4. **Origin.** Decide the final public origin now (passkeys are bound to its host name). Either a custom domain mapped to
+   the service, or the service's `run.app` URL (known after the first apply; then set `public_origin` and apply again
+   before anyone signs up).
+5. **Terraform.** In `infra/terraform/control-plane`: `terraform init`, then `terraform plan` with `project_id`,
+   `region`, `bucket_name`, `image_reference` (digest), `public_origin`, `stripe_price_id`, `stripe_webhook_secret_id`,
+   `stripe_api_key_secret_id`, `box_project_id`, `box_service_account_email`, `allowed_image_digests` (from the signed
+   allow-list), `trusted_proxy_hops` (2 behind an external Application Load Balancer) and `live_provisioning = false`.
+   Review, then `terraform apply`.
+6. **Check.** `curl https://ORIGIN/health` → `{"ok":true}`; logs show `{"event":"started","status":0}` (a
+   `config-invalid` or `secret-unavailable` line names the setting to fix). Open `https://ORIGIN/`, create an account with
+   a passkey, start checkout, pay with Stripe's test card, and confirm the webhook turns the plan to paid; sign out and
+   sign in again.
+7. **Live provisioning.** Set `live_provisioning = true`, `box_zone`, `box_subnetwork`
+   (`projects/BOX_PROJECT/regions/REGION/subnetworks/NAME-subnet`) and `box_image_reference` (digest in the allowed list);
+   apply. Create one box from the page with the key from `keysentry box card`; check the instance in the box project. If
+   `instances.insert` answers 403, the reply names the missing permission: add it to the custom role.
+8. **Live mode.** Repeat 1–2 with live Stripe keys and a new webhook secret; add secret versions (the service reads
+   `latest` at startup, so redeploy or restart it after a rotation).
+9. **Rollback.** Apply again with the previous `image_reference` digest. The bucket keeps state across revisions.
+

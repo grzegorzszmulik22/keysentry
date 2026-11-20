@@ -11,7 +11,7 @@ Read it with three limits in mind:
   meets your control objectives.
 - **The mapping covers only what keysentry itself does.** Your identity provider, hosting platforms, providers,
   devices and processes carry most of each control.
-- **Some features have been tested only against fakes** (see "Not verified yet" in `docs/BUILD-REPORT.md`): no adapter
+- **Some features have been tested only against fakes**: no adapter
   has run against a live account, and the cloud box and hosted control plane are not launched.
 
 ## Evidence you can collect

@@ -1,6 +1,6 @@
 # Cloud box fixtures
 
-Recorded 2026-10-27 by the orchestrator (see `notes/phase4-facts.md`):
+Recorded 2026-10-27 from public Google and Project Oak sources:
 
 | File | Source | Notes |
 |---|---|---|
