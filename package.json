@@ -2,6 +2,14 @@
   "name": "keysentry",
   "version": "0.1.0",
   "description": "Breach-day key rotation and key monitoring: find every copy of every secret across your hosts, rotate in a safe order with one redeploy per service, verify, revoke, and rotate automatically on suspicious use.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/grzegorzszmulik22/keysentry.git"
+  },
+  "homepage": "https://github.com/grzegorzszmulik22/keysentry#readme",
+  "bugs": {
+    "url": "https://github.com/grzegorzszmulik22/keysentry/issues"
+  },
   "type": "module",
   "bin": {
     "keysentry": "dist/keysentry.mjs"
