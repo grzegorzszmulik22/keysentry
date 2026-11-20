@@ -2,9 +2,9 @@ services:
   - type: worker
     name: keysentry-watcher
     runtime: image
-    # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
+    # After the first release, replace this tag with ghcr.io/grzegorzszmulik22/keysentry@sha256:<release-digest>.
     image:
-      url: ghcr.io/grzenio22/keysentry:1.0.0
+      url: ghcr.io/grzegorzszmulik22/keysentry:1.0.0
     plan: 0.5c-512mb
     numInstances: 1
     envVars:

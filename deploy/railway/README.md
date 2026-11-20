@@ -5,7 +5,7 @@ Copy this entire folder so the Infrastructure as Code entry point remains at
 for setup values, persistent state, and health checks.
 
 1. Create an image service in a Railway project using the released
-   `ghcr.io/grzenio22/keysentry` digest. Add a 1 GiB volume mounted at `/data`,
+   `ghcr.io/grzegorzszmulik22/keysentry` digest. Add a 1 GiB volume mounted at `/data`,
    prepare it as owner 65532 with mode 0700, and keep one replica.
 2. Paste `KEYSENTRY_WATCHER_CONFIG`, `KEYSENTRY_WATCHER_KEY`,
    `KEYSENTRY_STATE_KEY`, `KEYSENTRY_VAULT_PASSPHRASE`, and

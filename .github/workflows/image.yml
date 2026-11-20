@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           docker buildx build --provenance=true --sbom=true \
             --build-arg "KEYSENTRY_BUILD_COMMIT=$GITHUB_SHA" \
-            --tag "ghcr.io/grzenio22/keysentry:$GITHUB_REF_NAME" \
+            --tag "ghcr.io/grzegorzszmulik22/keysentry:$GITHUB_REF_NAME" \
             --output type=oci,dest=keysentry-image.tar .
       - name: Sign in to GHCR
         id: login
@@ -43,8 +43,8 @@ jobs:
           set -euo pipefail
           docker buildx build --provenance=true --sbom=true \
             --build-arg "KEYSENTRY_BUILD_COMMIT=$GITHUB_SHA" \
-            --tag "ghcr.io/grzenio22/keysentry:$GITHUB_REF_NAME" \
-            --tag "ghcr.io/grzenio22/keysentry:${GITHUB_REF_NAME#v}" \
+            --tag "ghcr.io/grzegorzszmulik22/keysentry:$GITHUB_REF_NAME" \
+            --tag "ghcr.io/grzegorzszmulik22/keysentry:${GITHUB_REF_NAME#v}" \
             --metadata-file image-metadata.json --push .
       - name: Sign out of GHCR
         if: ${{ always() && !github.event.repository.private }}

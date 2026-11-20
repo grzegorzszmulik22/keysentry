@@ -6,8 +6,8 @@ primary_region = "ams"
 # KEYSENTRY_VAULT_PASSPHRASE, KEYSENTRY_WATCHER_VAULT.
 
 [build]
-  # After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
-  image = "ghcr.io/grzenio22/keysentry:1.0.0"
+  # After the first release, replace this tag with ghcr.io/grzegorzszmulik22/keysentry@sha256:<release-digest>.
+  image = "ghcr.io/grzegorzszmulik22/keysentry:1.0.0"
 
 [env]
   KEYSENTRY_STATE_DIR = "/data"

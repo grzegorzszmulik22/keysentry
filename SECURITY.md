@@ -12,7 +12,7 @@ that a public release has been published or independently reproduced.
 
 ## Report a security issue privately
 
-Use [GitHub's private vulnerability reporting page for keysentry](https://github.com/grzenio22/keysentry/security/advisories/new).
+Use [GitHub's private vulnerability reporting page for keysentry](https://github.com/grzegorzszmulik22/keysentry/security/advisories/new).
 Include the affected version or commit, the command you ran, the expected result, and a small
 reproduction with invented credentials. Do not include a working token, vault contents, or an
 unencrypted state file.

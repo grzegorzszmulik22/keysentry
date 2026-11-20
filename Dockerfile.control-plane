@@ -16,7 +16,7 @@ RUN node packages/control-plane/scripts/build.mjs --out /build/out/control-plane
 
 FROM --platform=linux/amd64 gcr.io/distroless/nodejs24-debian13:nonroot@sha256:cb606325b7ec4af55462cb0b424a53b452a5b4a894ffe841fcf1048d216fb9f8
 ARG KEYSENTRY_BUILD_COMMIT=dev
-LABEL org.opencontainers.image.source="https://github.com/grzenio22/keysentry" \
+LABEL org.opencontainers.image.source="https://github.com/grzegorzszmulik22/keysentry" \
       org.opencontainers.image.revision="${KEYSENTRY_BUILD_COMMIT}" \
       org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app

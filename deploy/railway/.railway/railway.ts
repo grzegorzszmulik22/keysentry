@@ -6,8 +6,8 @@ import { image, preserve, project, service, volume } from 'railway';
 export default function () {
   const data = volume('keysentry-data', { sizeMB: 1024 });
   const watcher = service('watcher', {
-    // After the first release, replace this tag with ghcr.io/grzenio22/keysentry@sha256:<release-digest>.
-    source: image('ghcr.io/grzenio22/keysentry:1.0.0'),
+    // After the first release, replace this tag with ghcr.io/grzegorzszmulik22/keysentry@sha256:<release-digest>.
+    source: image('ghcr.io/grzegorzszmulik22/keysentry:1.0.0'),
     env: {
       KEYSENTRY_STATE_DIR: '/data',
       KEYSENTRY_VAULT: 'encrypted-file',

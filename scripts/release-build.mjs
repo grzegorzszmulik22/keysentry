@@ -66,7 +66,7 @@ async function npmCliPath(env) {
 }
 
 export function releasePackageManifest(pkg, env = process.env) {
-  const repository = env.KEYSENTRY_RELEASE_REPO || 'grzenio22/keysentry';
+  const repository = env.KEYSENTRY_RELEASE_REPO || 'grzegorzszmulik22/keysentry';
   return {
     name: pkg.name,
     version: pkg.version,

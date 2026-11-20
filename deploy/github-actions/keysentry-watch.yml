@@ -45,7 +45,7 @@ jobs:
             echo 'Set the KEYSENTRY_RELEASE_TAG repository variable to a release tag.' >&2
             exit 1
           fi
-          gh release download "$RELEASE_TAG" --repo grzenio22/keysentry --pattern keysentry.mjs --pattern release-manifest.json --pattern SHA256SUMS
+          gh release download "$RELEASE_TAG" --repo grzegorzszmulik22/keysentry --pattern keysentry.mjs --pattern release-manifest.json --pattern SHA256SUMS
           # Select only the two known filenames; never trust paths from a checksum file.
           grep -E '^[a-f0-9]{64}  (keysentry\.mjs|release-manifest\.json)$' SHA256SUMS > checked-sums
           test "$(wc -l < checked-sums)" -eq 2

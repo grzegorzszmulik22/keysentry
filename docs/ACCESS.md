@@ -249,7 +249,7 @@ it. The running host can access plaintext in memory despite at-rest encryption. 
 the applications it protects; an incident on the watcher's own platform requests guided credential rotation.
 See [deployment instructions](../deploy/README.md) for platform settings, scheduled-run delays and cache limits.
 
-An explicit `keysentry verify` can fetch `SHA256SUMS` and `SHA256SUMS.sig` from `https://github.com/grzenio22/keysentry/releases/download/v<version>/` through the same guarded client. The release key list is empty in this phase, so online signature verification reports **unconfigured** until a trusted public key is embedded. Offline integrity compares the bundle with the adjacent manifest; it is not independent evidence of who published both files.
+An explicit `keysentry verify` can fetch `SHA256SUMS` and `SHA256SUMS.sig` from `https://github.com/grzegorzszmulik22/keysentry/releases/download/v<version>/` through the same guarded client. The release key list is empty in this phase, so online signature verification reports **unconfigured** until a trusted public key is embedded. Offline integrity compares the bundle with the adjacent manifest; it is not independent evidence of who published both files.
 
 All application requests use the injected `HttpClient`; the CLI uses an HTTPS egress allow-list and records each attempt's host, method, purpose, time, allowed/blocked outcome and available HTTP status. It records no headers, request/response bodies or secret-bearing URLs. `keysentry network` shows that receipt. A host on the allow-list can still be compromised; the receipt is a record, not proof that a response was truthful.
 

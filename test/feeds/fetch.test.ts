@@ -12,7 +12,7 @@ describe('fetchFeed', () => {
     const result = await fetchFeed(http, source, { etag: '"old"', lastModified: 'Sun, 25 Oct 2026 12:00:00 GMT' });
     expect(result).toEqual({ status: 'ok', items: [], etag: '"new"', lastModified: 'Mon, 26 Oct 2026 12:00:00 GMT' });
     expect(http.calls[0]?.headers).toMatchObject({ 'If-None-Match': '"old"', 'If-Modified-Since': 'Sun, 25 Oct 2026 12:00:00 GMT' });
-    expect(http.calls[0]?.headers?.['User-Agent']).toMatch(/^keysentry\/[^\s]+ \(\+https:\/\/github.com\/grzenio22\/keysentry\)$/);
+    expect(http.calls[0]?.headers?.['User-Agent']).toMatch(/^keysentry\/[^\s]+ \(\+https:\/\/github.com\/grzegorzszmulik22\/keysentry\)$/);
   });
 
   test('handles 304 without parsing a body and preserves cached validators', async () => {

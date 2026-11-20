@@ -6,7 +6,7 @@ import { RELEASE_PUBLIC_KEYS, RELEASE_REPO } from '../../src/release/release-key
 import { BUILD_COMMIT, BUILD_VERSION } from '../../src/release/build-info.js';
 
 const bundleHash = 'a'.repeat(64);
-const base = 'https://github.com/grzenio22/keysentry/releases/download/v1.0.0/';
+const base = 'https://github.com/grzegorzszmulik22/keysentry/releases/download/v1.0.0/';
 const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const publicDer = publicKey.export({ type: 'spki', format: 'der' });
 const keyId = createHash('sha256').update(publicDer).digest('hex').slice(0, 16);
@@ -132,6 +132,6 @@ test.each(['owner/repo/../../other', 'owner/repo?token=value', 'https://example.
 test('build info has safe source-mode defaults', () => {
   expect(BUILD_VERSION).toBe('0.0.0-dev');
   expect(BUILD_COMMIT).toBe('dev');
-  expect(RELEASE_REPO).toBe('grzenio22/keysentry');
+  expect(RELEASE_REPO).toBe('grzegorzszmulik22/keysentry');
   expect(RELEASE_PUBLIC_KEYS).toEqual([]);
 });

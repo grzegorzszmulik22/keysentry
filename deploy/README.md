@@ -44,11 +44,11 @@ The templates have been checked locally as text and YAML, not deployed.
    `KEYSENTRY_WATCHER_CONFIG`. Do not mount an unsealed JSON configuration.
 
 3. Select the released image. Until the first image release, templates use
-   `ghcr.io/grzenio22/keysentry:1.0.0` and include a digest replacement comment.
+   `ghcr.io/grzegorzszmulik22/keysentry:1.0.0` and include a digest replacement comment.
    Replace it with the published immutable reference before deployment:
 
    ```text
-   ghcr.io/grzenio22/keysentry@sha256:<release-digest>
+   ghcr.io/grzegorzszmulik22/keysentry@sha256:<release-digest>
    ```
 
    Do not deploy the literal placeholder. Private GHCR images need your own

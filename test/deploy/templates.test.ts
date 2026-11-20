@@ -5,7 +5,7 @@ import { parse } from 'yaml';
 const root = new URL('../../', import.meta.url);
 const read = (path: string) => readFile(new URL(path, root), 'utf8');
 const yaml = async (path: string) => parse(await read(path));
-const image = 'ghcr.io/grzenio22/keysentry';
+const image = 'ghcr.io/grzegorzszmulik22/keysentry';
 const secrets = ['KEYSENTRY_VAULT_PASSPHRASE', 'KEYSENTRY_STATE_KEY', 'KEYSENTRY_WATCHER_KEY', 'KEYSENTRY_WATCHER_CONFIG', 'KEYSENTRY_WATCHER_VAULT'];
 const cachePin = '55cc8345863c7cc4c66a329aec7e433d2d1c52a9';
 
@@ -112,7 +112,7 @@ describe('watcher deployment contracts (static; no Docker or platform calls)', (
 
   test('unreleased image references explicitly require replacing the tag with the released digest', async () => {
     for (const path of ['deploy/compose/docker-compose.yml', 'deploy/render/render.yaml', 'deploy/fly/fly.toml', 'deploy/railway/.railway/railway.ts']) {
-      expect(await read(path)).toContain('ghcr.io/grzenio22/keysentry@sha256:<release-digest>');
+      expect(await read(path)).toContain('ghcr.io/grzegorzszmulik22/keysentry@sha256:<release-digest>');
     }
   });
 
@@ -140,7 +140,7 @@ describe('watcher deployment contracts (static; no Docker or platform calls)', (
     const download = steps.find((step: { id?: string }) => step.id === 'release');
     expect(download.run).toContain('SHA256SUMS');
     expect(download.run).toContain('sha256sum --check');
-    expect(download.run).toContain('--repo grzenio22/keysentry');
+    expect(download.run).toContain('--repo grzegorzszmulik22/keysentry');
     expect(download.run).toContain('--pattern keysentry.mjs');
     expect(steps.indexOf(download)).toBeLessThan(steps.findIndex((step: { id?: string }) => step.id === 'watch'));
     expect(await read('deploy/github-actions/keysentry-watch.yml')).not.toMatch(/\bnpx\b/);

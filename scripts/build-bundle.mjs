@@ -46,7 +46,7 @@ export async function buildBundle({ outFile = resolve(REPOSITORY_ROOT, 'dist/key
   const define = {
     __KEYSENTRY_VERSION__: JSON.stringify(pkg.version),
     __KEYSENTRY_COMMIT__: JSON.stringify(env.KEYSENTRY_BUILD_COMMIT || 'dev'),
-    __KEYSENTRY_RELEASE_REPO__: JSON.stringify(env.KEYSENTRY_RELEASE_REPO || 'grzenio22/keysentry'),
+    __KEYSENTRY_RELEASE_REPO__: JSON.stringify(env.KEYSENTRY_RELEASE_REPO || 'grzegorzszmulik22/keysentry'),
   };
   // esbuild's JavaScript API starts a service process using process.env. This
   // dedicated build script filters that environment while the service exists.
